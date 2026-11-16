@@ -34,6 +34,13 @@ impl App {
         if self.astation_reauth.is_none() {
             return false;
         }
+        // A Station's message through Astation's proxy while Astation
+        // authenticates the local link again: ignored, with the route's
+        // runtime.log line (design I.5.8).
+        if let AstationMessage::LocalRoute(text) = message {
+            self.astation_client.local_route_ignored(text);
+            return true;
+        }
         // A routed link (§R9.7b) is authenticated with the connect path's
         // semantics; meanwhile its r9 traffic goes on (not consumed here).
         if self.astation_routed {
@@ -220,6 +227,9 @@ mod tests {
     /// (`None` once Atem closed the socket).
     struct Peer {
         send: mpsc::UnboundedSender<AstationMessage>,
+        /// Text sent as it is (the Station's messages Astation's proxy
+        /// forwards).
+        raw: mpsc::UnboundedSender<String>,
         recv: mpsc::UnboundedReceiver<Option<AstationMessage>>,
         /// The temp profile stands in for the user's (src/test_profile.rs).
         _profile: crate::test_profile::Scope,
@@ -251,6 +261,16 @@ mod tests {
     /// An App whose socket authenticated with `ASTATION` (a saved session in a
     /// temp dir; never the user's config) and a scripted Astation peer.
     async fn connected_app() -> (App, Peer) {
+        connected_app_with(None).await
+    }
+
+    /// [`connected_app`]; with `local`, the link is a local link with the
+    /// host route `local` (`host.delegated` on: it answers the Station's
+    /// challenge Astation's proxy forwards, design I.5.8), authenticated as
+    /// the connect path does.
+    async fn connected_app_with(
+        local: Option<crate::session_protocol::r9::route::RouteHandle>,
+    ) -> (App, Peer) {
         let state = tempfile::tempdir().unwrap();
         crate::pairing::tests::write_bound(
             state.path(),
@@ -263,6 +283,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (send, mut outgoing) = mpsc::unbounded_channel::<AstationMessage>();
+        let (raw, mut outgoing_raw) = mpsc::unbounded_channel::<String>();
         let (incoming, recv) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -273,6 +294,13 @@ mod tests {
                         let Some(message) = message else { break };
                         let json = serde_json::to_string(&message).unwrap();
                         if socket.send(WsMessage::Text(json)).await.is_err() {
+                            let _ = incoming.send(None);
+                            break;
+                        }
+                    }
+                    text = outgoing_raw.recv() => {
+                        let Some(text) = text else { break };
+                        if socket.send(WsMessage::Text(text)).await.is_err() {
                             let _ = incoming.send(None);
                             break;
                         }
@@ -298,22 +326,42 @@ mod tests {
         // Keep process_astation_messages away from the user's profile.
         app.last_session_refresh = Some(Instant::now());
         app.astation_client = AstationClient::new_with_test_state(ATEM_ID, state.path());
-        app.astation_client
-            .connect_raw(&format!("ws://{address}"))
-            .await
-            .unwrap();
-        // The connect-time authentication is covered by websocket_client tests.
-        app.astation_client.pin_astation_for_test(ASTATION);
-        app.astation_connected = true;
-        (
-            app,
-            Peer {
-                send,
-                recv,
-                _profile: profile,
-                _state: state,
-            },
-        )
+        if let Some(route) = local {
+            let paths = crate::paths::ProfilePaths::in_dir(state.path()).cred;
+            app.astation_client = AstationClient::new_with_test_state(ATEM_ID, state.path())
+                .with_agent(std::sync::Arc::new(crate::memory::cred_agent::test_agent(
+                    &paths,
+                )))
+                .with_local_host_route(route, ASTATION);
+            // Astation authenticates the link as on any connect.
+            send.send(auth_required(ASTATION, &"a".repeat(64))).unwrap();
+            send.send(status("authenticated", &[("method", "session_proof")]))
+                .unwrap();
+            app.astation_client
+                .connect_without_pairing(&format!("ws://{address}"))
+                .await
+                .unwrap();
+            app.astation_connected = true;
+            app.astation_link_gen += 1;
+        } else {
+            app.astation_client
+                .connect_raw(&format!("ws://{address}"))
+                .await
+                .unwrap();
+            // The connect-time authentication is covered by websocket_client tests.
+            app.astation_client.pin_astation_for_test(ASTATION);
+            app.astation_connected = true;
+        }
+        let mut peer = Peer {
+            send,
+            raw,
+            recv,
+            _profile: profile,
+            _state: state,
+        };
+        // The connect path's own `auth`: not a re-authentication's.
+        while peer.recv.try_recv().is_ok() {}
+        (app, peer)
     }
 
     /// Runs the TUI's Astation step until the peer receives an `auth` message
@@ -875,5 +923,179 @@ mod tests {
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert_eq!(errors[0]["data"]["code"], "unsupported_version");
         assert!(app.hosted.as_ref().unwrap().inbox.is_empty());
+    }
+
+    /// A host route state at `log`'s head for `host-1`.
+    fn route_ready(
+        log: &crate::session_protocol::membership::r9log::TestLog,
+    ) -> crate::session_protocol::r9::route::RouteHandle {
+        use crate::session_protocol::membership::r9log::secret;
+        use crate::session_protocol::r9::route::{self, RouteIdentity, RouteState};
+        let handle = route::new_handle();
+        route::set(
+            &handle,
+            RouteState::Ready {
+                id: RouteIdentity {
+                    account_id: "acct-1".into(),
+                    genesis_hash: log.log.genesis_hash(),
+                    host_id: "host-1".into(),
+                    head: log.log.head(),
+                    chain: std::sync::Arc::new(
+                        log.log.entries().iter().map(|e| e.hash()).collect(),
+                    ),
+                },
+                key: std::sync::Arc::new(crate::session_protocol::r9::HostKey::new(&secret(
+                    "reauth host",
+                ))),
+            },
+        );
+        handle
+    }
+
+    /// Runs the App's Astation step until Atem sent a `host_route` (at most
+    /// 3 s, as [`next_auth`]), skipping anything else; its text. Panics if
+    /// the socket closes.
+    async fn next_route(app: &mut App, peer: &mut Peer) -> String {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                app.process_astation_messages().await;
+                while let Ok(frame) = peer.recv.try_recv() {
+                    match frame {
+                        Some(frame) => {
+                            if let Some(route) = routes(&[Some(frame)]).pop() {
+                                return route;
+                            }
+                        }
+                        None => panic!("Atem closed the socket"),
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("no host_route reached Astation")
+    }
+
+    /// The `host_route` texts among what Atem sent.
+    fn routes(frames: &[Option<AstationMessage>]) -> Vec<String> {
+        frames
+            .iter()
+            .flatten()
+            .filter_map(|m| match m {
+                AstationMessage::SessionWire(text) if text.contains(r#""op":"host_route""#) => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Design I.5.8 through Astation's `:8080` proxy (`host.delegated` on;
+    /// session-v1 R9.7b, Atem's reading for a local link): the App answers
+    /// the Station's challenge on its authenticated local link with the
+    /// relay link's proof (for the pairing's Astation id and this host's
+    /// `atem_id`), once per authentication; none while Astation
+    /// re-authenticates the link, a fresh one after it. The Station's
+    /// verdict never makes the link routed, and a refusal keeps it: it is
+    /// owner-present Astation's (the refusal's runtime.log line is the
+    /// route's), with no reconnect.
+    #[tokio::test]
+    async fn a_local_link_answers_the_stations_challenge_per_authentication_and_keeps_a_refusal() {
+        use crate::session_protocol::membership::r9log::{TestLog, secret};
+        use atem_client::host_route::{
+            HostChallenge, HostRouteRefusal, RelayReply, RouteKind, verify_host_route_message,
+            verify_host_route_message_as,
+        };
+        let mut log = TestLog::genesis("acct-1", &secret("reauth astation"));
+        log.add_host("host-1", 1, &secret("reauth host"));
+        let (mut app, mut peer) = connected_app_with(Some(route_ready(&log))).await;
+        let link = app.astation_link_gen;
+        // A proxy proof, which the relay's verifier refuses.
+        let verified = |route: &str, challenge: &HostChallenge| {
+            assert_eq!(
+                verify_host_route_message(
+                    &log.log,
+                    route.as_bytes(),
+                    &challenge.nonce,
+                    ASTATION,
+                    ATEM_ID,
+                ),
+                Err(HostRouteRefusal::Malformed("type")),
+                "never a relay route"
+            );
+            verify_host_route_message_as(
+                RouteKind::Proxy,
+                &log.log,
+                route.as_bytes(),
+                &challenge.nonce,
+                ASTATION,
+                ATEM_ID,
+            )
+            .map(|r| r.host_id)
+        };
+        let first = HostChallenge::new(ASTATION);
+        peer.raw.send(first.to_json().to_string()).unwrap();
+        let sent = next_route(&mut app, &mut peer).await;
+        assert_eq!(verified(&sent, &first).as_deref(), Ok("host-1"));
+        // A second one in this authentication: ignored.
+        peer.raw
+            .send(HostChallenge::new(ASTATION).to_json().to_string())
+            .unwrap();
+        assert!(routes(&pump(&mut app, &mut peer).await).is_empty());
+        // Astation re-authenticates the link: none meanwhile.
+        peer.send
+            .send(auth_required(ASTATION, &"c".repeat(64)))
+            .unwrap();
+        next_auth(&mut app, &mut peer).await;
+        let lines = app.astation_client.local_route_lines_for_test();
+        peer.raw
+            .send(HostChallenge::new(ASTATION).to_json().to_string())
+            .unwrap();
+        assert!(
+            routes(&pump(&mut app, &mut peer).await).is_empty(),
+            "re-authenticating"
+        );
+        assert_eq!(
+            app.astation_client.local_route_lines_for_test(),
+            lines + 1,
+            "ignored with a runtime.log line"
+        );
+        peer.send
+            .send(status("authenticated", &[("method", "session_proof")]))
+            .unwrap();
+        // (`send` and `raw` are two channels: one after the other.)
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !app.astation_connected {
+                app.process_astation_messages().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("re-authenticated");
+        assert_eq!(app.astation_link_gen, link + 1);
+        let fresh = HostChallenge::new(ASTATION);
+        peer.raw.send(fresh.to_json().to_string()).unwrap();
+        let sent = next_route(&mut app, &mut peer).await;
+        assert_eq!(
+            verified(&sent, &fresh).as_deref(),
+            Ok("host-1"),
+            "a fresh one after the re-authentication"
+        );
+        assert!(routes(&pump(&mut app, &mut peer).await).is_empty(), "one");
+        // The Station refuses the proof: the link stays, not routed, no
+        // reconnect.
+        peer.raw
+            .send(
+                RelayReply::refused(&HostRouteRefusal::StaleLog)
+                    .to_json()
+                    .to_string(),
+            )
+            .unwrap();
+        let frames = pump(&mut app, &mut peer).await;
+        assert!(frames.iter().all(Option::is_some), "the socket stays open");
+        assert!(app.astation_connected && !app.astation_routed);
+        assert_eq!(app.astation_link_gen, link + 1);
+        assert!(app.astation_reconnect_at.is_none());
+        assert!(!app.astation_client.is_ws_closed());
     }
 }

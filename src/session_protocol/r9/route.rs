@@ -16,17 +16,43 @@
 //! The answer is made by the link's reader task as the challenge arrives
 //! (the connect-time authentication reads nothing else meanwhile), from a
 //! [`RouteHandle`] the broker keeps current each pass ([`RouteState`]).
+//!
+//! Astation's local link (`:8080`) carries the same challenge from the
+//! selected Station, forwarded unchanged by Astation's proxy, so the Station
+//! can tell which host calls it (the delegated host-work design I.5.8,
+//! "Which host is calling"; `host.delegated` only, [`Carrier::Local`]). It
+//! is answered through the same code, for the same room and `atem_id` as
+//! the relay link, with a proof of the proxy kind (`atem-host-route-proxy`,
+//! [`RouteKind::Proxy`]; proposed, for Astation's agreement), which no
+//! relay verifier takes for a route: Atem doesn't authenticate its local
+//! peer, so whoever holds the local link may get a proof for a nonce it
+//! chose, and must not route a relay connection as this host with it. The
+//! rules are a local link's: only while Astation has authenticated the link
+//! (as the paired Astation), once per authenticated generation (a
+//! re-authentication on the socket is a new one), and never again on the
+//! socket once this host's identity changed on it (host-work-v1 §11.4, "An
+//! identity change": retired by the bridge, or found by the route at a
+//! challenge or an authentication). The link's client answers it in order
+//! with Astation's messages, never the reader, so a challenge Astation
+//! forwards right after its authentication reply is judged after that
+//! reply; one that comes before is ignored with a line. Its verdict is
+//! informational: a runtime.log line.
 use super::HostKey;
 use atem_client::encoding::Hash32;
 use atem_client::host_route::{
-    HostChallenge, HostRouteBody, RelayReply, host_route_message, sign_host_route,
+    HostChallenge, HostRouteBody, RelayReply, RouteKind, host_route_message, sign_host_route_as,
 };
 use atem_client::membership::Head;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// runtime.log lines about challenges on one link at most.
+/// runtime.log lines about challenges on one link at most: a relay link
+/// once, a local link per authentication (each re-authentication on its
+/// socket has its own allowance, so a long-lived local link keeps logging
+/// its answers and verdicts) ...
 const MAX_LINES_PER_LINK: u32 = 8;
+/// ... under this cap for the whole socket.
+const MAX_LINES_PER_SOCKET: u32 = 32;
 /// How long a challenge that arrives while the runtime is still opening its
 /// device list waits for it (the link connects while the broker starts).
 pub const STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -103,11 +129,87 @@ pub fn set(handle: &RouteHandle, state: RouteState) -> bool {
     serving_again
 }
 
+/// Which carrier a link's challenges come over (§R9.7b; the delegated
+/// host-work design I.5.8, "Which host is calling").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Carrier {
+    /// The relay identity link: the relay's challenge, answered by the
+    /// link's reader as it arrives, before Astation authenticated the link,
+    /// once per link.
+    Relay,
+    /// Astation's local link (`:8080`), which forwards the Station's
+    /// challenge and its verdict unchanged (`host.delegated` only): its
+    /// proof is the proxy kind.
+    Local,
+}
+
+impl Carrier {
+    /// The kind of proof the carrier gives: a local link's is the proxy
+    /// kind, which no relay verifier takes for a route (proposed, for
+    /// Astation's agreement), so whoever holds the host's local link can't
+    /// route a relay connection as this host with it.
+    pub fn kind(self) -> RouteKind {
+        match self {
+            Carrier::Relay => RouteKind::Relay,
+            Carrier::Local => RouteKind::Proxy,
+        }
+    }
+}
+
+/// Who a proof speaks for: a [`RouteState::Ready`] without its head (the
+/// host at a new head is the same host). A re-verify changes it (a new
+/// `host_channel_key`), and so do a new account or genesis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteWho {
+    account_id: String,
+    genesis_hash: Hash32,
+    host_id: String,
+    /// The public half of `host_channel_key`.
+    key: Option<atem_client::PublicKey>,
+}
+
+impl RouteWho {
+    fn of(state: &RouteState) -> Option<RouteWho> {
+        use atem_client::KeyProvider;
+        let RouteState::Ready { id, key } = state else {
+            return None;
+        };
+        Some(RouteWho {
+            account_id: id.account_id.clone(),
+            genesis_hash: id.genesis_hash,
+            host_id: id.host_id.clone(),
+            key: key.keys.public_key(&key.id).ok(),
+        })
+    }
+}
+
+/// A local link's authentication and identity ([`Carrier::Local`]).
+#[derive(Debug, Default)]
+struct LocalAuth {
+    /// The authenticated generation now; 0 while Astation hasn't
+    /// authenticated the link, or authenticates it again.
+    generation: u64,
+    /// The generations so far.
+    generations: u64,
+    /// The generation whose challenge was answered, and the one whose
+    /// proof got its verdict.
+    answered: Option<u64>,
+    judged: Option<u64>,
+    /// The route identity the link's socket is bound to: the host's at its
+    /// first authentication, or at its first answer when the device list
+    /// couldn't serve then.
+    bound: Option<RouteWho>,
+    /// This host's identity changed on the link's socket: nothing more is
+    /// answered on it.
+    retired: bool,
+}
+
 /// One link's challenge state: the room and `atem_id` it was opened with,
 /// whether its one proof went out and the relay's verdict came, whether
 /// Astation authenticated it, the lines written.
 pub struct LinkRoute {
     handle: RouteHandle,
+    carrier: Carrier,
     room: String,
     atem_id: String,
     proof_sent: bool,
@@ -118,13 +220,19 @@ pub struct LinkRoute {
     proved: Arc<AtomicBool>,
     /// Set here once the relay's `host_route_ok` for that proof came.
     routed_ok: Arc<AtomicBool>,
+    /// [`Carrier::Local`] only.
+    local: LocalAuth,
     lines: u32,
+    /// Lines on the whole socket (a local link's allowance renews at each
+    /// authentication, under [`MAX_LINES_PER_SOCKET`]).
+    socket_lines: u32,
 }
 
 impl LinkRoute {
     pub fn new(handle: RouteHandle, room: &str, atem_id: &str) -> Self {
         LinkRoute {
             handle,
+            carrier: Carrier::Relay,
             room: room.to_owned(),
             atem_id: atem_id.to_owned(),
             proof_sent: false,
@@ -132,8 +240,71 @@ impl LinkRoute {
             authenticated: Arc::default(),
             proved: Arc::default(),
             routed_ok: Arc::default(),
+            local: LocalAuth::default(),
             lines: 0,
+            socket_lines: 0,
         }
+    }
+
+    /// A local link's challenge state (Astation's `:8080`): `room` and
+    /// `atem_id` are the relay link's (the relay room, the pairing's
+    /// Astation id; this host's `atem_id`).
+    pub fn local(handle: RouteHandle, room: &str, atem_id: &str) -> Self {
+        LinkRoute {
+            carrier: Carrier::Local,
+            ..LinkRoute::new(handle, room, atem_id)
+        }
+    }
+
+    /// A local link: Astation authenticated it (a connect, or a
+    /// re-authentication on its socket): a new generation, which may answer
+    /// one challenge. The socket's first authentication binds it to the
+    /// host's route identity now (if the device list can serve).
+    pub fn authenticated(&mut self) {
+        // This authentication's allowance of lines (the socket's cap stays).
+        self.lines = 0;
+        let local = &mut self.local;
+        local.generations += 1;
+        local.generation = local.generations;
+        // The socket's identity, checked at each authentication too: one
+        // that moved while Astation authenticated the link again retires it
+        // now, not at the next challenge.
+        let state = self
+            .handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        self.local_same_identity(&state);
+    }
+
+    /// A local link: Astation is authenticating it again; no challenge is
+    /// answered until it did.
+    pub fn unauthenticated(&mut self) {
+        self.local.generation = 0;
+    }
+
+    /// A local link: this host's identity changed on its socket (the
+    /// bridge's identity rules, host-work-v1 §11.4): nothing more is
+    /// answered on it, whatever its authentication.
+    pub fn retire(&mut self) {
+        self.local.retired = true;
+    }
+
+    /// A local link: a challenge or verdict that came before (or while)
+    /// Astation authenticated the link: never answered, never a verdict,
+    /// one runtime.log line within the link's bound.
+    pub fn ignore(&mut self, text: &str) {
+        if is_host_challenge(text) {
+            self.log("ignored: Astation hasn't authenticated this local link");
+        } else {
+            self.log_reply("ignored: Astation hasn't authenticated this local link");
+        }
+    }
+
+    /// A local link: retired ([`LinkRoute::retire`], or a challenge under
+    /// another route identity than the socket's).
+    pub fn retired(&self) -> bool {
+        self.local.retired
     }
 
     /// The flag the link's client sets once Astation authenticated the
@@ -154,9 +325,24 @@ impl LinkRoute {
         self.routed_ok.clone()
     }
 
+    /// The runtime.log lines written on this link's socket so far (tests).
+    #[cfg(test)]
+    pub fn socket_lines(&self) -> u32 {
+        self.socket_lines
+    }
+
+    /// Whether one more runtime.log line fits the link's bounds (counted).
+    fn line_allowed(&mut self) -> bool {
+        if self.lines >= MAX_LINES_PER_LINK || self.socket_lines >= MAX_LINES_PER_SOCKET {
+            return false;
+        }
+        self.lines += 1;
+        self.socket_lines += 1;
+        true
+    }
+
     fn log(&mut self, line: &str) {
-        if self.lines < MAX_LINES_PER_LINK {
-            self.lines += 1;
+        if self.line_allowed() {
             eprintln!("atem runtime: r9: host_challenge {line}");
         }
     }
@@ -175,21 +361,35 @@ impl LinkRoute {
             self.log("ignored: another room than this link's");
             return None;
         }
-        // One challenge per link, only before it is routed or
-        // Astation-authenticated (a later one is no new connection).
-        if self.verdict || self.authenticated.load(Ordering::SeqCst) {
-            self.log("ignored: the link is already routed or authenticated");
-            return None;
-        }
-        if self.proof_sent {
-            self.log("ignored: this link already answered a challenge");
-            return None;
+        match self.carrier {
+            // Only while Astation has authenticated it, once per
+            // authentication, never once retired.
+            Carrier::Local => {
+                if !self.local_may_answer() {
+                    return None;
+                }
+            }
+            // One challenge per link, only before it is routed or
+            // Astation-authenticated (a later one is no new connection).
+            Carrier::Relay => {
+                if self.verdict || self.authenticated.load(Ordering::SeqCst) {
+                    self.log("ignored: the link is already routed or authenticated");
+                    return None;
+                }
+                if self.proof_sent {
+                    self.log("ignored: this link already answered a challenge");
+                    return None;
+                }
+            }
         }
         let state = self
             .handle
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        if self.carrier == Carrier::Local && !self.local_same_identity(&state) {
+            return None;
+        }
         let (id, key) = match state {
             RouteState::Ready { id, key } => (id, key),
             RouteState::Off(why) => {
@@ -210,9 +410,10 @@ impl LinkRoute {
             nonce: challenge.nonce,
             head: id.head,
         };
-        match sign_host_route(&key.keys, &key.id, &body) {
+        match sign_host_route_as(self.carrier.kind(), &key.keys, &key.id, &body) {
             Ok(proof) => {
                 self.proof_sent = true;
+                self.local.answered = Some(self.local.generation);
                 self.proved.store(true, Ordering::SeqCst);
                 self.log(&format!("answered at head {}", body.head.seq));
                 Some(host_route_message(&proof).to_string())
@@ -220,6 +421,53 @@ impl LinkRoute {
             Err(e) => {
                 self.log(&format!("not answered: {}", e.code()));
                 None
+            }
+        }
+    }
+}
+
+impl LinkRoute {
+    /// A local link answers a challenge only while Astation has
+    /// authenticated it, once per authentication, never once retired
+    /// (logged otherwise).
+    fn local_may_answer(&mut self) -> bool {
+        if self.local.retired {
+            self.log("ignored: this host's identity changed on this link");
+            return false;
+        }
+        let generation = self.local.generation;
+        if generation == 0 {
+            self.log("ignored: Astation hasn't authenticated this local link");
+            return false;
+        }
+        if self.local.answered == Some(generation) {
+            self.log("ignored: this authentication of the link already answered a challenge");
+            return false;
+        }
+        true
+    }
+
+    /// Whether `state` is the route identity a local link's socket is bound
+    /// to (binding it when it isn't bound yet: at the socket's first
+    /// authentication or answer while the device list can serve); another
+    /// one retires the link (logged once).
+    fn local_same_identity(&mut self, state: &RouteState) -> bool {
+        if self.local.retired {
+            return false;
+        }
+        let Some(now) = RouteWho::of(state) else {
+            return true;
+        };
+        match &self.local.bound {
+            None => {
+                self.local.bound = Some(now);
+                true
+            }
+            Some(bound) if *bound == now => true,
+            Some(_) => {
+                self.local.retired = true;
+                self.log("not answered: this host's identity changed on this link; nothing more is answered on it");
+                false
             }
         }
     }
@@ -259,18 +507,42 @@ impl LinkRoute {
             RelayReply::Ok { .. } => "ok",
             RelayReply::Refused { .. } => "refused",
         };
-        if !self.proof_sent {
-            self.log_reply(&format!("{what} ignored: no proof was sent on this link"));
-            return None;
-        }
-        if self.verdict {
-            self.log_reply(&format!("{what} ignored: this link already has a verdict"));
-            return None;
+        match self.carrier {
+            // A local link: the proof of its current authentication's.
+            Carrier::Local => {
+                let generation = self.local.generation;
+                if generation == 0 || self.local.answered != Some(generation) {
+                    self.log_reply(&format!(
+                        "{what} ignored: no proof was sent in this authentication of the local link"
+                    ));
+                    return None;
+                }
+                if self.local.judged == Some(generation) {
+                    self.log_reply(&format!("{what} ignored: this proof already has a verdict"));
+                    return None;
+                }
+            }
+            Carrier::Relay => {
+                if !self.proof_sent {
+                    self.log_reply(&format!("{what} ignored: no proof was sent on this link"));
+                    return None;
+                }
+                if self.verdict {
+                    self.log_reply(&format!("{what} ignored: this link already has a verdict"));
+                    return None;
+                }
+            }
         }
         let (host_id, head) = match reply {
             RelayReply::Refused { code } => {
-                self.verdict = true;
-                self.log_reply(&format!("refused: {code}"));
+                self.judged();
+                if self.carrier == Carrier::Local {
+                    self.log_reply(&format!(
+                        "refused through Astation's local link: {code}; the link stays, and the Station refuses its calls"
+                    ));
+                } else {
+                    self.log_reply(&format!("refused: {code}"));
+                }
                 return Some(RouteResult::Refused(code));
             }
             RelayReply::Ok { host_id, head } => (host_id, head),
@@ -296,15 +568,32 @@ impl LinkRoute {
             self.log_reply("ok ignored: a head this host doesn't hold");
             return None;
         }
-        self.verdict = true;
-        self.routed_ok.store(true, Ordering::SeqCst);
-        self.log_reply(&format!("ok at head {}", head.seq));
+        self.judged();
+        if self.carrier == Carrier::Local {
+            // The Station's association for this link's calls: the link
+            // stays Astation's, never routed.
+            self.log_reply(&format!(
+                "ok at head {} through Astation's local link",
+                head.seq
+            ));
+        } else {
+            self.routed_ok.store(true, Ordering::SeqCst);
+            self.log_reply(&format!("ok at head {}", head.seq));
+        }
         Some(RouteResult::Routed { host_id, head })
     }
 
+    /// The verdict for this link's proof came (on a local link, for its
+    /// current authentication's).
+    fn judged(&mut self) {
+        match self.carrier {
+            Carrier::Relay => self.verdict = true,
+            Carrier::Local => self.local.judged = Some(self.local.generation),
+        }
+    }
+
     fn log_reply(&mut self, line: &str) {
-        if self.lines < MAX_LINES_PER_LINK {
-            self.lines += 1;
+        if self.line_allowed() {
             eprintln!("atem runtime: r9: host_route {line}");
         }
     }
@@ -331,20 +620,56 @@ mod tests {
 
     fn ready(log: &TestLog) -> RouteHandle {
         let handle = new_handle();
-        set(
-            &handle,
-            RouteState::Ready {
-                id: RouteIdentity {
-                    account_id: "acct-1".into(),
-                    genesis_hash: log.log.genesis_hash(),
-                    host_id: "host-1".into(),
-                    head: log.log.head(),
-                    chain: Arc::new(log.log.entries().iter().map(|e| e.hash()).collect()),
-                },
-                key: Arc::new(HostKey::new(&secret("route host"))),
-            },
-        );
+        set(&handle, ready_with(log, "route host"));
         handle
+    }
+
+    /// `host-1` at `log`'s head, signing with `secret(seed)`.
+    fn ready_with(log: &TestLog, seed: &str) -> RouteState {
+        RouteState::Ready {
+            id: RouteIdentity {
+                account_id: "acct-1".into(),
+                genesis_hash: log.log.genesis_hash(),
+                host_id: "host-1".into(),
+                head: log.log.head(),
+                chain: Arc::new(log.log.entries().iter().map(|e| e.hash()).collect()),
+            },
+            key: Arc::new(HostKey::new(&secret(seed))),
+        }
+    }
+
+    /// A local link's `answer` checked as a Station checks it: a proxy
+    /// proof for `nonce`, [`ROOM`] and `atem-x` (the proxy kind's verifier),
+    /// which the relay's verifier refuses (its type: a local link's proof is
+    /// never a relay route: Atem doesn't authenticate its local peer).
+    fn proxy_verified(
+        log: &TestLog,
+        answer: &str,
+        nonce: &[u8; 32],
+    ) -> Result<atem_client::host_route::HostRoute, atem_client::host_route::HostRouteRefusal> {
+        use atem_client::host_route::{
+            RouteKind, verify_host_route_message, verify_host_route_message_as,
+        };
+        assert_eq!(
+            verify_host_route_message(&log.log, answer.as_bytes(), nonce, ROOM, "atem-x"),
+            Err(HostRouteRefusal::Malformed("type")),
+            "never a relay route"
+        );
+        verify_host_route_message_as(
+            RouteKind::Proxy,
+            &log.log,
+            answer.as_bytes(),
+            nonce,
+            ROOM,
+            "atem-x",
+        )
+    }
+
+    /// A fresh challenge for `room`, and its text.
+    fn challenge_for(room: &str) -> (HostChallenge, String) {
+        let challenge = HostChallenge::new(room);
+        let text = challenge.to_json().to_string();
+        (challenge, text)
     }
 
     fn ok(host_id: &str, head: Head) -> String {
@@ -491,5 +816,272 @@ mod tests {
             .to_json()
             .to_string();
         assert_eq!(r8.on_reply(&refused), None);
+    }
+
+    /// Through Astation's `:8080` proxy (design I.5.8; Atem's reading of
+    /// R9.7b for a local link, `host.delegated` only): the Station's
+    /// challenge is answered only while Astation has authenticated the
+    /// link, only for the link's room (the relay room, as on the relay),
+    /// once per authenticated generation, with the relay's proof (the
+    /// shared verifier accepts it); a re-authentication on the socket is a
+    /// new generation, which answers a fresh one.
+    #[test]
+    fn a_local_link_answers_once_per_authentication_for_its_room() {
+        let mut log = TestLog::genesis("acct-1", &secret("route astation"));
+        log.add_host("host-1", 1, &secret("route host"));
+        let mut link = LinkRoute::local(ready(&log), ROOM, "atem-x");
+        // Before Astation authenticated the link: ignored.
+        let (_, text) = challenge_for(ROOM);
+        assert_eq!(link.answer(&text), None, "before authentication");
+        link.authenticated();
+        // Another room than the link's: ignored.
+        assert_eq!(link.answer(&challenge_for("another-room").1), None);
+        // The link's room: the proof of the relay link's inputs, of the
+        // proxy kind, for this challenge.
+        let (challenge, text) = challenge_for(ROOM);
+        let answer = link.answer(&text).expect("answered once authenticated");
+        let route = proxy_verified(&log, &answer, &challenge.nonce).unwrap();
+        assert_eq!(route.host_id, "host-1");
+        assert_eq!(route.head, log.log.head());
+        // A second challenge in the same authentication: ignored.
+        assert_eq!(link.answer(&challenge_for(ROOM).1), None, "a second one");
+        // Astation authenticating the link again: none while it runs, one
+        // fresh one once it did.
+        link.unauthenticated();
+        assert_eq!(
+            link.answer(&challenge_for(ROOM).1),
+            None,
+            "re-authenticating"
+        );
+        link.authenticated();
+        let (fresh, text) = challenge_for(ROOM);
+        let answer = link.answer(&text).expect("a fresh one");
+        assert!(proxy_verified(&log, &answer, &fresh.nonce).is_ok());
+        assert_eq!(link.answer(&challenge_for(ROOM).1), None);
+        // A relay link's proof stays the relay kind.
+        let mut relay = LinkRoute::new(ready(&log), ROOM, "atem-x");
+        let (challenge, text) = challenge_for(ROOM);
+        let answer = relay.answer(&text).unwrap();
+        assert!(
+            atem_client::host_route::verify_host_route_message(
+                &log.log,
+                answer.as_bytes(),
+                &challenge.nonce,
+                ROOM,
+                "atem-x"
+            )
+            .is_ok()
+        );
+        // A device list that can't serve: no answer, as on the relay.
+        let off = new_handle();
+        set(&off, RouteState::Off("device list held"));
+        let mut held = LinkRoute::local(off, ROOM, "atem-x");
+        held.authenticated();
+        assert_eq!(held.answer(&challenge_for(ROOM).1), None);
+    }
+
+    /// A verdict on a local link counts only for the proof of its current
+    /// authentication, once: a refusal carries the verifier's code (the
+    /// caller keeps the link), an ok is checked as on the relay and never
+    /// makes the link routed.
+    #[test]
+    fn a_local_links_verdict_counts_only_for_its_authentications_proof() {
+        let mut log = TestLog::genesis("acct-1", &secret("route astation"));
+        log.add_host("host-1", 1, &secret("route host"));
+        let head = log.log.head();
+        let refused = RelayReply::refused(&HostRouteRefusal::StaleLog)
+            .to_json()
+            .to_string();
+        let mut link = LinkRoute::local(ready(&log), ROOM, "atem-x");
+        link.authenticated();
+        // No proof yet: neither verdict is this link's.
+        assert_eq!(link.on_reply(&ok("host-1", head)), None);
+        assert_eq!(link.on_reply(&refused), None);
+        assert!(link.answer(&challenge_for(ROOM).1).is_some());
+        assert_eq!(
+            link.on_reply(&refused),
+            Some(RouteResult::Refused("stale_log".into()))
+        );
+        assert_eq!(link.on_reply(&refused), None, "one verdict");
+        assert_eq!(link.on_reply(&ok("host-1", head)), None, "one verdict");
+        // The next authentication: only its own proof's verdict.
+        link.unauthenticated();
+        link.authenticated();
+        assert_eq!(
+            link.on_reply(&ok("host-1", head)),
+            None,
+            "no proof in this authentication"
+        );
+        assert!(link.answer(&challenge_for(ROOM).1).is_some());
+        assert_eq!(link.on_reply(&ok("host-2", head)), None, "another host");
+        assert_eq!(
+            link.on_reply(&ok("host-1", head)),
+            Some(RouteResult::Routed {
+                host_id: "host-1".into(),
+                head
+            })
+        );
+        assert!(
+            !link.routed_ok_flag().load(Ordering::SeqCst),
+            "a local link is never routed"
+        );
+    }
+
+    /// host-work-v1 §11.4, "An identity change", on a local link: once this
+    /// host's identity changed on the link's socket nothing more is answered
+    /// on it, whatever its authentication: retired by the bridge (the
+    /// identity rules), or found by the link itself, which is bound to the
+    /// route identity of its first authentication (or of its first answer,
+    /// when the device list wasn't open then): a challenge under another
+    /// one (a re-verify's new `host_channel_key`) is refused and retires it.
+    /// A new socket answers under the new identity.
+    #[test]
+    fn a_local_link_answers_nothing_once_the_hosts_identity_changed() {
+        let mut log = TestLog::genesis("acct-1", &secret("route astation"));
+        log.add_host("host-1", 1, &secret("route host"));
+        // Retired by the bridge.
+        let handle = ready(&log);
+        let mut link = LinkRoute::local(handle.clone(), ROOM, "atem-x");
+        link.authenticated();
+        assert!(!link.retired());
+        link.retire();
+        assert!(link.retired());
+        assert_eq!(link.answer(&challenge_for(ROOM).1), None);
+        link.unauthenticated();
+        link.authenticated();
+        assert_eq!(
+            link.answer(&challenge_for(ROOM).1),
+            None,
+            "a later authentication"
+        );
+        // Bound at its authentication: a re-verify before its first challenge.
+        let mut link = LinkRoute::local(handle.clone(), ROOM, "atem-x");
+        link.authenticated();
+        log.add_host("host-1", 2, &secret("route host 2"));
+        set(&handle, ready_with(&log, "route host 2"));
+        assert_eq!(
+            link.answer(&challenge_for(ROOM).1),
+            None,
+            "another identity"
+        );
+        assert!(link.retired());
+        // A new socket answers under the new identity.
+        let mut fresh = LinkRoute::local(handle.clone(), ROOM, "atem-x");
+        fresh.authenticated();
+        let (challenge, text) = challenge_for(ROOM);
+        let answer = fresh.answer(&text).expect("the new identity's");
+        assert!(proxy_verified(&log, &answer, &challenge.nonce).is_ok());
+        // The list opened after the authentication: bound at the first answer.
+        let starting = new_handle();
+        let mut late = LinkRoute::local(starting.clone(), ROOM, "atem-x");
+        late.authenticated();
+        set(&starting, ready_with(&log, "route host 2"));
+        assert!(late.answer(&challenge_for(ROOM).1).is_some());
+        late.unauthenticated();
+        late.authenticated();
+        log.add_host("host-1", 3, &secret("route host 3"));
+        set(&starting, ready_with(&log, "route host 3"));
+        assert_eq!(late.answer(&challenge_for(ROOM).1), None);
+        assert!(late.retired());
+        // The same identity read again (the list reopened, a new head): the
+        // same link answers in its next authentication.
+        let same = new_handle();
+        set(&same, ready_with(&log, "route host 3"));
+        let mut kept = LinkRoute::local(same.clone(), ROOM, "atem-x");
+        kept.authenticated();
+        assert!(kept.answer(&challenge_for(ROOM).1).is_some());
+        log.add_native("dev-phone", &["control", "view"]);
+        set(&same, ready_with(&log, "route host 3"));
+        kept.unauthenticated();
+        kept.authenticated();
+        assert!(
+            kept.answer(&challenge_for(ROOM).1).is_some(),
+            "a new head, the same identity"
+        );
+        assert!(!kept.retired());
+    }
+
+    /// The route's identity is checked at each authentication too, not only
+    /// at a challenge: a re-verify that lands while Astation authenticates
+    /// the link again retires it at once (so the bridge reconnects it with
+    /// no challenge needed).
+    #[test]
+    fn a_local_link_checks_its_identity_at_each_authentication() {
+        let mut log = TestLog::genesis("acct-1", &secret("route astation"));
+        log.add_host("host-1", 1, &secret("route host"));
+        let handle = ready(&log);
+        let mut link = LinkRoute::local(handle.clone(), ROOM, "atem-x");
+        link.authenticated();
+        link.unauthenticated();
+        log.add_host("host-1", 2, &secret("route host 2"));
+        set(&handle, ready_with(&log, "route host 2"));
+        link.authenticated();
+        assert!(link.retired(), "retired at the authentication");
+        assert_eq!(link.answer(&challenge_for(ROOM).1), None);
+        // The same identity again (a new head): not retired.
+        let mut kept = LinkRoute::local(handle.clone(), ROOM, "atem-x");
+        kept.authenticated();
+        kept.unauthenticated();
+        log.add_native("dev-phone", &["control", "view"]);
+        set(&handle, ready_with(&log, "route host 2"));
+        kept.authenticated();
+        assert!(!kept.retired());
+    }
+
+    /// A challenge or verdict that reaches a local link before (or while)
+    /// Astation authenticates it is ignored with a runtime.log line
+    /// (`ignore`, never an answer). The link's lines are bounded twice: each
+    /// authentication has its own allowance, so a long-lived local link
+    /// keeps logging its answers and verdicts across re-authentications,
+    /// under a cap for the whole socket.
+    #[test]
+    fn a_local_links_lines_are_bounded_per_authentication_and_per_socket() {
+        let mut log = TestLog::genesis("acct-1", &secret("route astation"));
+        log.add_host("host-1", 1, &secret("route host"));
+        let mut link = LinkRoute::local(ready(&log), ROOM, "atem-x");
+        link.ignore(&challenge_for(ROOM).1);
+        assert_eq!(link.socket_lines(), 1, "an early challenge logged");
+        let refused = RelayReply::refused(&HostRouteRefusal::StaleLog)
+            .to_json()
+            .to_string();
+        link.ignore(&refused);
+        assert_eq!(link.socket_lines(), 2, "an early verdict logged");
+        link.authenticated();
+        // Even authenticated, `ignore` never answers.
+        link.ignore(&challenge_for(ROOM).1);
+        assert!(
+            link.answer(&challenge_for(ROOM).1).is_some(),
+            "still unanswered"
+        );
+        // One authentication's allowance.
+        for _ in 0..20 {
+            link.ignore(&challenge_for(ROOM).1);
+        }
+        // (The two before the authentication were the earlier allowance's.)
+        assert_eq!(
+            link.socket_lines(),
+            2 + MAX_LINES_PER_LINK,
+            "one authentication"
+        );
+        // Each re-authentication logs its answer and verdict again, until
+        // the socket's cap.
+        for cycle in 0..40 {
+            link.unauthenticated();
+            link.authenticated();
+            let before = link.socket_lines();
+            assert!(link.answer(&challenge_for(ROOM).1).is_some());
+            if before < MAX_LINES_PER_SOCKET {
+                assert_eq!(
+                    link.socket_lines(),
+                    before + 1,
+                    "cycle {cycle}: its answer logged"
+                );
+            }
+        }
+        assert_eq!(
+            link.socket_lines(),
+            MAX_LINES_PER_SOCKET,
+            "the socket's cap"
+        );
     }
 }

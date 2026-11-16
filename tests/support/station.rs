@@ -54,6 +54,16 @@
 //!   device list, as if the link were that account's.
 //! - Bytes the shared reader refuses get no answer (kept in
 //!   [`FakeStation::sent`]).
+//! - [`FakeStation::require_proof`]: a Station that requires the host's
+//!   fresh route proof on each link before it serves the link's calls (the
+//!   delegated host-work design I.5.8, "Which host is calling": session-v1
+//!   R9.7b's challenge, carried through Astation's local `:8080` proxy
+//!   unchanged). It challenges a link it hasn't served, verifies the host's
+//!   `host_route` with the shared verifier of the proxy kind (a forwarded
+//!   proof is never a relay route) against its own device list,
+//!   answers the verdict, and only then serves the link's calls and
+//!   announces its `heads` there; until then every call gets its typed
+//!   refusal. Off (the default) it needs no proof, as before.
 //!
 //! What a well-behaved Station never does, for the host's defences:
 //! [`FakeStation::heads_with`] (heads naming any feeds, another origin's
@@ -75,7 +85,10 @@ use atem_client::control::{
     RefusalCode, RefusedCall, RelayError, ToStation, build_control, principal_key_of,
 };
 use atem_client::encoding::Hash32;
-use atem_client::membership::Head;
+use atem_client::host_route::{
+    HostChallenge, HostRoute, HostRouteRefusal, RelayReply, RouteKind, verify_host_route_message_as,
+};
+use atem_client::membership::{Head, Membership};
 use atem_client::{KeyProvider, SignedObject, SoftwareKeys};
 use serde_json::Value;
 use std::sync::mpsc;
@@ -124,6 +137,24 @@ impl Held {
     }
 }
 
+/// A host's `host_route` on a link ([`FakeStation::require_proof`]): the
+/// challenge's nonce, the bytes the host sent and the shared verifier's
+/// verdict.
+#[derive(Debug, Clone)]
+pub struct ProofSeen {
+    pub link: u64,
+    /// `None`: no challenge was open on the link.
+    pub nonce: Option<[u8; 32]>,
+    pub message: String,
+    pub verdict: Result<HostRoute, HostRouteRefusal>,
+}
+
+/// What a link's proof must name ([`FakeStation::require_proof`]).
+struct ProofRule {
+    room: String,
+    atem_id: String,
+}
+
 /// One account at this Station: its device list and its one control feed
 /// (§11.4, "One feed per account").
 struct Account {
@@ -131,6 +162,8 @@ struct Account {
     genesis_hash: Hash32,
     /// The device list from its genesis (`seq` n is `entries[n - 1]`).
     entries: Vec<SignedObject>,
+    /// The same list, verified (a proof is checked against it).
+    membership: Membership,
     head: Head,
     /// How many feeds the account had here (a reset mints the next): its
     /// `n`th `feed_id` is `feed_id(origin, account, n)`.
@@ -150,6 +183,7 @@ impl Account {
             account_id,
             genesis_hash: log.genesis_hash(),
             entries: log.entries.iter().map(|e| e.object().clone()).collect(),
+            membership: log.log.clone(),
             head: log.log.head(),
             feeds: 1,
             records: Vec::new(),
@@ -262,6 +296,13 @@ pub struct FakeStation {
     retired_below: u64,
     /// Records signed so far (their `record_id`s).
     minted: u64,
+    /// While set, each link must prove its host first
+    /// ([`FakeStation::require_proof`]): the challenges open, by link, the
+    /// links whose proof verified, and every proof the host sent.
+    proof: Option<ProofRule>,
+    challenges: std::collections::HashMap<u64, [u8; 32]>,
+    proved: std::collections::HashSet<u64>,
+    proofs: Vec<ProofSeen>,
 }
 
 impl FakeStation {
@@ -303,7 +344,38 @@ impl FakeStation {
             sent_on: Vec::new(),
             retired_below: 0,
             minted: 0,
+            proof: None,
+            challenges: Default::default(),
+            proved: Default::default(),
+            proofs: Vec::new(),
         }
+    }
+
+    /// From now on a link's calls are served only after the host proved on
+    /// it which host it is (the module docs): on a link it hasn't served
+    /// yet the Station sends `host_challenge` for `room` (instead of its
+    /// `heads`) and expects the proof for `room` and `atem_id` (the host's
+    /// relay room and `atem_id`, as a relay checks them).
+    pub fn require_proof(&mut self, room: &str, atem_id: &str) {
+        self.proof = Some(ProofRule {
+            room: room.to_owned(),
+            atem_id: atem_id.to_owned(),
+        });
+    }
+
+    /// A fresh `host_challenge` on `link` now, for the room
+    /// [`FakeStation::require_proof`] named (the Station asking again).
+    pub fn challenge(&mut self, link: u64) {
+        let room = &self.proof.as_ref().expect("require_proof first").room;
+        let challenge = HostChallenge::new(room);
+        self.challenges.insert(link, challenge.nonce);
+        self.out.send(link, challenge.to_json().to_string());
+    }
+
+    /// Every `host_route` the host sent so far (read by
+    /// [`FakeStation::serve`] and the others as they come), in order.
+    pub fn proofs(&self) -> &[ProofSeen] {
+        &self.proofs
     }
 
     pub fn origin(&self) -> &str {
@@ -377,6 +449,10 @@ impl FakeStation {
         self.attach(link);
         let mut served = Vec::new();
         while let Ok((from, bytes)) = self.calls.try_recv() {
+            if is_host_route(&bytes) {
+                self.on_proof(from, bytes);
+                continue;
+            }
             served.push(self.answer(from, bytes));
         }
         served
@@ -439,6 +515,10 @@ impl FakeStation {
                 .calls
                 .recv_timeout(left)
                 .expect("the host sent no such Station call");
+            if is_host_route(&bytes) {
+                self.on_proof(from, bytes);
+                continue;
+            }
             if held(&ToStation::decode(bytes.as_bytes())) {
                 self.sent.push(bytes.clone());
                 self.sent_on.push(from);
@@ -480,6 +560,7 @@ impl FakeStation {
         if same {
             let served = self.served_mut();
             served.entries = log.entries.iter().map(|e| e.object().clone()).collect();
+            served.membership = log.log.clone();
             served.head = log.log.head();
             return;
         }
@@ -726,6 +807,16 @@ impl FakeStation {
         if self.link != Some(link) {
             self.link = Some(link);
             self.last_heads = None;
+            if self.proof.is_some()
+                && !self.proved.contains(&link)
+                && !self.challenges.contains_key(&link)
+            {
+                self.challenge(link);
+            }
+        }
+        // No `heads` before the link's proof, when one is required.
+        if !self.serves(link) {
+            return;
         }
         let due = self.last_heads.is_none_or(|at| at.elapsed() >= HEARTBEAT);
         if due && !self.silent {
@@ -733,10 +824,55 @@ impl FakeStation {
         }
     }
 
-    /// The Station's own `heads`, on the served link if there is one.
+    /// The Station's own `heads`, on the served link if there is one (and
+    /// it proved its host, when [`FakeStation::require_proof`] says so).
     fn send_heads(&mut self) {
-        if self.link.is_some() {
+        if self.link.is_some_and(|link| self.serves(link)) {
             self.heads_now();
+        }
+    }
+
+    /// Whether the Station serves `link`'s calls: no proof required, or
+    /// the link's verified.
+    fn serves(&self, link: u64) -> bool {
+        self.proof.is_none() || self.proved.contains(&link)
+    }
+
+    /// The host's `host_route` on `link`, checked against the Station's own
+    /// device list (the shared verifier, the challenge's nonce and the
+    /// required room and `atem_id`) and answered with the verdict; a proof
+    /// that verifies lets the link's calls be served, and its `heads` go
+    /// at once (unless silenced). A challenge takes one proof.
+    fn on_proof(&mut self, link: u64, message: String) {
+        let nonce = self.challenges.remove(&link);
+        let verdict = match (&self.proof, nonce) {
+            (Some(rule), Some(nonce)) => verify_host_route_message_as(
+                RouteKind::Proxy,
+                &self.own.membership,
+                message.as_bytes(),
+                &nonce,
+                &rule.room,
+                &rule.atem_id,
+            ),
+            _ => Err(HostRouteRefusal::Malformed("no challenge on this link")),
+        };
+        let reply = match &verdict {
+            Ok(route) => RelayReply::ok(route),
+            Err(refusal) => RelayReply::refused(refusal),
+        };
+        self.out.send(link, reply.to_json().to_string());
+        let verified = verdict.is_ok();
+        self.proofs.push(ProofSeen {
+            link,
+            nonce,
+            message,
+            verdict,
+        });
+        if verified {
+            self.proved.insert(link);
+            if self.link == Some(link) && !self.silent {
+                self.send_heads();
+            }
         }
     }
 
@@ -826,6 +962,20 @@ impl FakeStation {
     /// Answers the host's call `bytes` (already in `sent`) on `link`.
     fn reply(&mut self, link: u64, bytes: &str) -> Result<ToStation, RelayError> {
         let call = ToStation::decode(bytes.as_bytes());
+        // A link that hasn't proved its host, when one is required: every
+        // call refused, nothing served or counted.
+        if !self.serves(link) {
+            let refused = match &call {
+                Ok(ToStation::ControlSync(_)) => Some(RefusedCall::ControlSync),
+                Ok(ToStation::MembershipFetch(_)) => Some(RefusedCall::MembershipFetch),
+                Ok(ToStation::ControlAck(_)) => Some(RefusedCall::ControlAck),
+                Err(_) => None,
+            };
+            if let Some(refused) = refused {
+                self.out.send(link, refusal(refused).to_string());
+            }
+            return call;
+        }
         let reply = match &call {
             Ok(ToStation::ControlSync(sync)) => Some(self.page(sync)),
             Ok(ToStation::MembershipFetch(fetch)) => Some(self.fetched(*fetch)),
@@ -952,7 +1102,7 @@ impl Pump {
                     let mut station = station.lock().unwrap_or_else(|e| e.into_inner());
                     station.serve_latest();
                     if last.elapsed() >= Duration::from_secs(1) {
-                        if station.link.is_some() {
+                        if station.link.is_some_and(|link| station.serves(link)) {
                             station.heads_now();
                         }
                         last = Instant::now();
@@ -975,4 +1125,10 @@ impl Drop for Pump {
             let _ = thread.join();
         }
     }
+}
+
+/// Whether `bytes` is a `host_route` (the host's answer to a challenge).
+fn is_host_route(bytes: &str) -> bool {
+    serde_json::from_str::<Value>(bytes)
+        .is_ok_and(|value| value["type"] == "relay" && value["op"] == "host_route")
 }

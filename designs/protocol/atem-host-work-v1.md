@@ -2281,6 +2281,36 @@ calling"):
   the host's `host_channel_key` at its device list's head, carried through
   the proxy.
 
+**Built on the host** (**Atem's reading**, behind the debug-only hook
+`host.delegated`; session-v1 R9.7b, "Through Astation's `:8080` proxy").
+Through `:8080` the host answers the Station's challenge, which Astation's
+proxy forwards with the proof and the verdict unchanged, on its local link
+once Astation authenticated that link as the paired Astation, through the
+same code and for the same inputs as its relay link (the relay room, the
+pairing's Astation id, and its own `atem_id`, at its device list's head),
+but with a proof of the **proxy kind** (**proposed, for Astation's
+agreement**): `atem-host-route-proxy`, the same fields signed over
+`enc(["atem-host-route-proxy-v1", jcs(body)])`. The Station accepts it only
+on Astation's native-bound forwarding connection and never as a relay
+route; the relay's verifier refuses it. Atem doesn't authenticate its local
+peer, so a proof given there must never route a relay connection as this
+host. The host answers once per authenticated link generation (a
+re-authentication on the socket answers a fresh one; a second challenge in
+one generation is ignored), never before or while Astation authenticates
+the link (ignored with a runtime.log line), never for another room, and
+never again on a socket where the host's identity changed ("An identity
+change" below: the new socket answers under the new identity; a
+trust-generation-only change while Astation re-authenticates the link is
+still open, before activation). The verdict is informational on the host,
+a runtime.log line: a `host_route_ok` is the Station's association for the
+link's calls (the link stays an Astation-authenticated local link, never
+routed); a `host_route_refused` keeps the link (owner-present Astation),
+and the Station refuses the link's calls as it does today, so the gate
+stays closed and `atem status`'s `Control feeds:` line shows that refusal.
+The calls themselves (`control_sync`, `membership_fetch`, `control_ack` and
+the Station's `heads`) are unchanged. With the hook off a local link
+ignores the challenge, as before.
+
 **One feed per account** (**Atem's proposal, agreed with Astation
 (2026-11-11, #120 comment 6810116314), for Auth/Portal's agreement**; the design's "each Station's control feed"
 doesn't say whose records a link may read). The Station keeps one control
@@ -2540,7 +2570,9 @@ own Station's feed:
       read it) open the gate.
 
     A local link (`:8080`) is reconnected the same way: its
-    authentication is the socket's too. As a defence besides, a
+    authentication is the socket's too, and so is the route proof it gave
+    the Station through Astation's proxy ("Which host is calling"), which
+    answers nothing more on that socket meanwhile. As a defence besides, a
     continuation's page applies only when its `after` is the committed
     cursor of the store it reaches, so a store replaced since (hosting
     swaps in the new identity's fresh store) never takes another

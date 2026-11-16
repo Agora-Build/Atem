@@ -156,6 +156,10 @@ pub async fn run_runtime(config_dir: PathBuf) -> Result<()> {
     // starts writing to the profile (`instance_id`, `atem_id`).
     let profile = crate::profile::Sources::current().ok();
     let mut app = crate::app::App::new();
+    // With `host.delegated` on, its local link answers the Station's
+    // challenge that Astation's proxy forwards (design I.5.8).
+    app.local_route_proof =
+        crate::app::local_route_proof_for(crate::runtime::test_hooks::host_features());
     app.spawn_astation_connect();
     let options = server::Options {
         idle: idle_timeout(),

@@ -384,3 +384,105 @@ fn a_station_close_after_a_reverify_reconnects_once_with_the_hook_on() {
         });
     }
 }
+
+/// Design I.5.8 on a local link (`host.delegated` on): the host's identity
+/// moving on the live link (a re-verify) retires the socket's local route
+/// proof as the bridge's identity rules say, so nothing more is answered on
+/// that socket (whatever its authentication), and the App reconnects it
+/// once; the next socket's route answers under the new identity.
+#[test]
+fn a_reverify_on_a_live_local_link_retires_its_route_proof_and_reconnects() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let (mut s, _) = rv_covered(&mut rig, root, &os, start);
+        rv_link(&mut rig, 7, 41);
+        let handle = rig.app.host_route.clone();
+        rig.app
+            .astation_client
+            .local_route_for_test(handle.clone(), "room");
+        passes(&mut rig, 1);
+        assert!(!rig.app.astation_client.local_route_retired());
+        assert_eq!(rig.app.identity_reconnect, None);
+        reverify(&mut rig, root, &mut s);
+        passes(&mut rig, 1);
+        assert!(
+            rig.app.astation_client.local_route_retired(),
+            "nothing more answered on that socket"
+        );
+        assert_eq!(
+            rig.app.identity_reconnect.map(|(_, socket)| socket),
+            Some(41)
+        );
+        assert!(rig.app.identity_reconnect_due(false, false));
+        // The next socket: its route answers under the new identity.
+        rv_link(&mut rig, 8, 42);
+        rig.app.astation_client.local_route_for_test(handle, "room");
+        passes(&mut rig, 1);
+        assert!(!rig.app.astation_client.local_route_retired());
+        assert_eq!(rig.app.identity_reconnect, None);
+    });
+}
+
+/// A local route that found another route identity on its socket itself
+/// (here: bound to one `host_channel_key`, a challenge under another; the
+/// bridge's own identity rules saw no move, as when the device list's
+/// identity moves while the Station link is down during a
+/// re-authentication) has the App reconnect that socket, as the bridge's
+/// rules do.
+#[test]
+fn a_local_route_retired_by_another_identity_reconnects_its_socket() {
+    use crate::session_protocol::membership::r9log::{TestLog, secret};
+    use crate::session_protocol::r9::route::{self, RouteIdentity, RouteState};
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        rv_covered(&mut rig, root, &os, start);
+        rv_link(&mut rig, 7, 41);
+        let mut log = TestLog::genesis("acct-rv", &secret("rv astation"));
+        log.add_host("host-rv", 1, &secret("rv host 1"));
+        let state = |log: &TestLog, seed: &str| RouteState::Ready {
+            id: RouteIdentity {
+                account_id: "acct-rv".into(),
+                genesis_hash: log.log.genesis_hash(),
+                host_id: "host-rv".into(),
+                head: log.log.head(),
+                chain: std::sync::Arc::new(log.log.entries().iter().map(|e| e.hash()).collect()),
+            },
+            key: std::sync::Arc::new(crate::session_protocol::r9::HostKey::new(&secret(seed))),
+        };
+        let handle = rig.app.host_route.clone();
+        // Bound at its authentication to the first key, then a challenge
+        // under a re-verify's new key.
+        route::set(&handle, state(&log, "rv host 1"));
+        rig.app
+            .astation_client
+            .local_route_for_test(handle.clone(), "room");
+        log.add_host("host-rv", 2, &secret("rv host 2"));
+        route::set(&handle, state(&log, "rv host 2"));
+        let challenge = atem_client::host_route::HostChallenge::new("room")
+            .to_json()
+            .to_string();
+        assert_eq!(
+            rig.app.astation_client.local_route_message(&challenge),
+            None
+        );
+        assert!(
+            rig.app.astation_client.local_route_retired(),
+            "found itself"
+        );
+        assert_eq!(rig.app.identity_reconnect, None);
+        passes(&mut rig, 1);
+        assert_eq!(
+            rig.bridge.station.as_ref().unwrap().feed.moved_socket(),
+            None,
+            "the bridge's rules saw no move"
+        );
+        assert_eq!(
+            rig.app.identity_reconnect.map(|(_, socket)| socket),
+            Some(41)
+        );
+    });
+}

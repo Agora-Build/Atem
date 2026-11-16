@@ -24,6 +24,11 @@ pub enum SignLabel {
     ChannelClient,
     /// `atem-host-route` bodies (§R9.7b).
     HostRoute,
+    /// `atem-host-route-proxy` bodies (§R9.7b, a Station's challenge through
+    /// Astation's `:8080` proxy; proposed, for Astation's agreement): the
+    /// host route proof's fields under their own domain, so a proof given
+    /// on a local link is never a relay route.
+    HostRouteProxy,
     /// A host's `enc_sig` inside a `host_enc_key` entry (delegated
     /// host-work design II.4.1): Ed25519 by its `host_key` over
     /// [`SigningInput::fields`], not over a body.
@@ -50,6 +55,7 @@ impl SignLabel {
             SignLabel::ChannelHost => "atem-ch1-host-sig-v1",
             SignLabel::ChannelClient => "atem-ch1-client-sig-v1",
             SignLabel::HostRoute => "atem-host-route-v1",
+            SignLabel::HostRouteProxy => "atem-host-route-proxy-v1",
             SignLabel::HostEncKey => "atem-host-enc-key-v1",
             SignLabel::HostWorkControl => "atem-host-work-control-v1",
             SignLabel::Envelope => "atem-envelope-v1",
@@ -66,6 +72,7 @@ impl SignLabel {
             "atem-push-hint" => Some(SignLabel::PushHint),
             "atem-seen" => Some(SignLabel::Seen),
             "atem-host-route" => Some(SignLabel::HostRoute),
+            "atem-host-route-proxy" => Some(SignLabel::HostRouteProxy),
             "atem-host-work-control" => Some(SignLabel::HostWorkControl),
             "atem-envelope" => Some(SignLabel::Envelope),
             "atem-result" => Some(SignLabel::Result),
@@ -143,7 +150,7 @@ mod tests {
 
     /// Every label, in one list. The match fails to compile until a new
     /// label is listed here too, so the distinctness test covers it.
-    const LABELS: [SignLabel; 12] = [
+    const LABELS: [SignLabel; 13] = [
         SignLabel::MembershipEntry,
         SignLabel::RecoveryCosign,
         SignLabel::BrowserGrant,
@@ -156,6 +163,7 @@ mod tests {
         SignLabel::HostWorkControl,
         SignLabel::Envelope,
         SignLabel::Result,
+        SignLabel::HostRouteProxy,
     ];
 
     const fn listed(label: SignLabel) -> usize {
@@ -172,6 +180,7 @@ mod tests {
             SignLabel::HostWorkControl => 9,
             SignLabel::Envelope => 10,
             SignLabel::Result => 11,
+            SignLabel::HostRouteProxy => 12,
         }
     }
 

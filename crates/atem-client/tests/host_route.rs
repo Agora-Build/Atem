@@ -6,8 +6,9 @@ mod support;
 
 use atem_client::encoding::b64u;
 use atem_client::host_route::{
-    HostChallenge, HostRouteBody, HostRouteRefusal, MAX_ID_BYTES, host_route_message,
-    sign_host_route, verify_host_route, verify_host_route_message,
+    HostChallenge, HostRouteBody, HostRouteRefusal, MAX_ID_BYTES, RouteKind, host_route_message,
+    sign_host_route, sign_host_route_as, verify_host_route, verify_host_route_as,
+    verify_host_route_message, verify_host_route_message_as,
 };
 use atem_client::membership::Membership;
 use atem_client::{KeyId, SignedObject};
@@ -206,5 +207,94 @@ fn every_refusal_code_is_a_reply_code_and_replies_round_trip() {
     assert_eq!(
         RelayReply::parse(br#"{"type":"relay","op":"push_ack","acks":[]}"#),
         None
+    );
+}
+
+/// The proxy kind (the delegated host-work design I.5.8 through Astation's
+/// `:8080`; proposed, for Astation's agreement) is domain separated from the
+/// relay's: its own body `type` (`atem-host-route-proxy`) and signing label
+/// (`atem-host-route-proxy-v1`) over the same fields. A proof a host gives
+/// on a local link verifies only as a proxy proof: the relay's verifier
+/// refuses it, so it never routes a relay connection as that host; a relay
+/// proof is refused by the proxy verifier; and a body relabelled to the
+/// other kind keeps no valid signature.
+#[test]
+fn a_proxy_proof_is_its_own_kind_and_never_a_relay_route() {
+    use atem_client::SignLabel;
+    let (v, book, clock) = (Vectors::load(), Book::load(), Clock::at(1_793_264_000_000));
+    let log = log_l(&v, &clock);
+    let challenge = HostChallenge::new("astation-test-1");
+    let body = HostRouteBody::at(&log, "host-a", ATEM_ID, &challenge);
+    let proxy = sign_host_route_as(RouteKind::Proxy, &book.provider, &host_a(), &body).unwrap();
+    let relay = sign_host_route(&book.provider, &host_a(), &body).unwrap();
+    assert_eq!(proxy.label(), SignLabel::HostRouteProxy);
+    assert_eq!(proxy.body()["type"], "atem-host-route-proxy");
+    assert_eq!(relay.label(), SignLabel::HostRoute);
+    assert_eq!(
+        sign_host_route_as(RouteKind::Relay, &book.provider, &host_a(), &body).unwrap(),
+        relay,
+        "the relay kind is sign_host_route's"
+    );
+    let verify = |kind, proof: &SignedObject| {
+        let message = host_route_message(proof).to_string();
+        let whole = verify_host_route_message_as(
+            kind,
+            &log,
+            message.as_bytes(),
+            &challenge.nonce,
+            "astation-test-1",
+            ATEM_ID,
+        );
+        let alone = verify_host_route_as(
+            kind,
+            &log,
+            proof.to_json().to_string().as_bytes(),
+            &challenge.nonce,
+            "astation-test-1",
+            ATEM_ID,
+        );
+        assert_eq!(whole, alone);
+        whole
+    };
+    let route = verify(RouteKind::Proxy, &proxy).unwrap();
+    assert_eq!((route.host_id.as_str(), route.head), ("host-a", log.head()));
+    assert_eq!(
+        verify(RouteKind::Relay, &relay).map(|r| r.head),
+        Ok(log.head())
+    );
+    // Across the kinds: refused, by the relay's own verifier too.
+    assert_eq!(
+        verify(RouteKind::Relay, &proxy),
+        Err(HostRouteRefusal::Malformed("type"))
+    );
+    let message = host_route_message(&proxy).to_string();
+    assert_eq!(
+        verify_host_route_message(
+            &log,
+            message.as_bytes(),
+            &challenge.nonce,
+            "astation-test-1",
+            ATEM_ID
+        ),
+        Err(HostRouteRefusal::Malformed("type")),
+        "a local link's proof routes no relay connection"
+    );
+    assert_eq!(
+        verify(RouteKind::Proxy, &relay),
+        Err(HostRouteRefusal::Malformed("type"))
+    );
+    // Relabelled to the other kind, a signature is no longer valid.
+    let relabel = |proof: &SignedObject, to: &str| {
+        let mut wire = proof.to_json();
+        wire["body"]["type"] = json!(to);
+        SignedObject::parse(wire.to_string().as_bytes()).unwrap()
+    };
+    assert_eq!(
+        verify(RouteKind::Relay, &relabel(&proxy, "atem-host-route")),
+        Err(HostRouteRefusal::BadSignature)
+    );
+    assert_eq!(
+        verify(RouteKind::Proxy, &relabel(&relay, "atem-host-route-proxy")),
+        Err(HostRouteRefusal::BadSignature)
     );
 }

@@ -18,11 +18,22 @@
 //!   [`verify_host_route_message`] (the whole relay message) or
 //!   [`verify_host_route`] (its `proof`), against the log it verified.
 //!
+//! A Station's challenge that Astation's local `:8080` proxy forwards (the
+//! delegated host-work design I.5.8; **proposed, for Astation's
+//! agreement**) is answered with a proof of its own kind,
+//! [`RouteKind::Proxy`]: `atem-host-route-proxy`, the same fields signed over
+//! `enc(["atem-host-route-proxy-v1", jcs(body)])`, built by
+//! [`sign_host_route_as`] and verified by [`verify_host_route_message_as`]
+//! (or [`verify_host_route_as`]). The relay's verifier refuses it, so a
+//! proof a host gives on a local link never routes a relay connection as
+//! that host, and the proxy verifier refuses a relay proof.
+//!
 //! Only a verified proof gives a route. A query-string `atem_id`, the room
 //! code, a login or an old pairing never does; nothing falls back.
 use serde_json::{Map, Value, json};
 
 use crate::canonical::{self, Numbers};
+use crate::domain::SignLabel;
 use crate::encoding::{Hash32, b64u, b64u_decode_array};
 use crate::error::{Error, Result};
 use crate::membership::{Head, Membership};
@@ -195,6 +206,44 @@ impl HostChallenge {
     }
 }
 
+// ----------------------------------------------------------------- kind
+
+/// Which carrier a proof is made for. The kinds are domain separated:
+/// each has its own body `type` and signing label over the same fields, so
+/// a proof of one kind never verifies as the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteKind {
+    /// The relay's challenge on the host's relay link: `atem-host-route`,
+    /// signed over `enc(["atem-host-route-v1", jcs(body)])`. Only this
+    /// kind gives a relay route (carrier B).
+    Relay,
+    /// A Station's challenge that Astation's local `:8080` proxy forwards
+    /// (the delegated host-work design I.5.8; **proposed, for Astation's
+    /// agreement**): `atem-host-route-proxy`, signed over
+    /// `enc(["atem-host-route-proxy-v1", jcs(body)])`. A Station accepts it
+    /// only on Astation's native-bound forwarding connection, never as a
+    /// relay route.
+    Proxy,
+}
+
+impl RouteKind {
+    /// The body's `type`.
+    pub const fn body_type(self) -> &'static str {
+        match self {
+            RouteKind::Relay => "atem-host-route",
+            RouteKind::Proxy => "atem-host-route-proxy",
+        }
+    }
+
+    /// The signing label.
+    pub const fn label(self) -> SignLabel {
+        match self {
+            RouteKind::Relay => SignLabel::HostRoute,
+            RouteKind::Proxy => SignLabel::HostRouteProxy,
+        }
+    }
+}
+
 // ----------------------------------------------------------------- body
 
 /// The proof's body.
@@ -223,9 +272,15 @@ impl HostRouteBody {
         }
     }
 
+    /// The relay kind's body ([`HostRouteBody::to_json_as`]).
     pub fn to_json(&self) -> Value {
+        self.to_json_as(RouteKind::Relay)
+    }
+
+    /// The body of `kind` (its `type`; the fields are the same).
+    pub fn to_json_as(&self, kind: RouteKind) -> Value {
         json!({
-            "type": "atem-host-route",
+            "type": kind.body_type(),
             "v": 1,
             "account_id": self.account_id,
             "genesis_hash": self.genesis_hash.to_hex(),
@@ -237,13 +292,13 @@ impl HostRouteBody {
         })
     }
 
-    /// Exactly the body of §R9.7b.
-    fn read(body: &Value) -> std::result::Result<Self, HostRouteRefusal> {
+    /// Exactly the body of §R9.7b, of `kind`.
+    fn read(body: &Value, kind: RouteKind) -> std::result::Result<Self, HostRouteRefusal> {
         let o = body.as_object().ok_or(malformed("body"))?;
         if o.len() != BODY_FIELDS.len() || !o.keys().all(|k| BODY_FIELDS.contains(&k.as_str())) {
             return Err(malformed("body fields"));
         }
-        if o.get("type").and_then(Value::as_str) != Some("atem-host-route") {
+        if o.get("type").and_then(Value::as_str) != Some(kind.body_type()) {
             return Err(malformed("type"));
         }
         Ok(HostRouteBody {
@@ -265,8 +320,10 @@ impl HostRouteBody {
     }
 }
 
-/// The host signs `body` with its `host_channel_key` (behind `provider`).
-pub fn sign_host_route(
+/// The host signs `body` as a proof of `kind` with its `host_channel_key`
+/// (behind `provider`): the one builder of both kinds.
+pub fn sign_host_route_as(
+    kind: RouteKind,
     provider: &dyn KeyProvider,
     host_key: &KeyId,
     body: &HostRouteBody,
@@ -277,7 +334,16 @@ pub fn sign_host_route(
     {
         return Err(Error::Malformed("an id of 1 to 256 bytes"));
     }
-    SignedObject::sign(provider, host_key, body.to_json())
+    SignedObject::sign(provider, host_key, body.to_json_as(kind))
+}
+
+/// [`sign_host_route_as`] the relay kind.
+pub fn sign_host_route(
+    provider: &dyn KeyProvider,
+    host_key: &KeyId,
+    body: &HostRouteBody,
+) -> Result<SignedObject> {
+    sign_host_route_as(RouteKind::Relay, provider, host_key, body)
 }
 
 /// `{"type":"relay","op":"host_route","v":1,"proof":{body, sig}}`.
@@ -399,6 +465,26 @@ pub fn verify_host_route(
     expected_room: &str,
     expected_atem_id: &str,
 ) -> std::result::Result<HostRoute, HostRouteRefusal> {
+    verify_host_route_as(
+        RouteKind::Relay,
+        log,
+        proof_json,
+        expected_nonce,
+        expected_room,
+        expected_atem_id,
+    )
+}
+
+/// [`verify_host_route`] of a proof of `kind`: a proof of the other kind is
+/// `malformed` (its `type`), checked before anything else of its body.
+pub fn verify_host_route_as(
+    kind: RouteKind,
+    log: &Membership,
+    proof_json: &[u8],
+    expected_nonce: &[u8; NONCE_BYTES],
+    expected_room: &str,
+    expected_atem_id: &str,
+) -> std::result::Result<HostRoute, HostRouteRefusal> {
     let object = SignedObject::parse(proof_json).map_err(|e| match e {
         Error::UnknownType => malformed("type"),
         Error::TooLarge => malformed("too large"),
@@ -407,6 +493,7 @@ pub fn verify_host_route(
         _ => malformed("proof"),
     })?;
     verify_object(
+        kind,
         log,
         &object,
         expected_nonce,
@@ -424,6 +511,26 @@ pub fn verify_host_route_message(
     expected_room: &str,
     expected_atem_id: &str,
 ) -> std::result::Result<HostRoute, HostRouteRefusal> {
+    verify_host_route_message_as(
+        RouteKind::Relay,
+        log,
+        message,
+        expected_nonce,
+        expected_room,
+        expected_atem_id,
+    )
+}
+
+/// [`verify_host_route_message`] of a proof of `kind` (the message is the
+/// same `host_route` for both kinds).
+pub fn verify_host_route_message_as(
+    kind: RouteKind,
+    log: &Membership,
+    message: &[u8],
+    expected_nonce: &[u8; NONCE_BYTES],
+    expected_room: &str,
+    expected_atem_id: &str,
+) -> std::result::Result<HostRoute, HostRouteRefusal> {
     let o = relay_message(message, "host_route", &["proof"])?;
     let object = SignedObject::from_value(&o["proof"]).map_err(|e| match e {
         Error::UnknownType => malformed("type"),
@@ -432,6 +539,7 @@ pub fn verify_host_route_message(
         _ => malformed("proof"),
     })?;
     verify_object(
+        kind,
         log,
         &object,
         expected_nonce,
@@ -441,16 +549,17 @@ pub fn verify_host_route_message(
 }
 
 fn verify_object(
+    kind: RouteKind,
     log: &Membership,
     object: &SignedObject,
     expected_nonce: &[u8; NONCE_BYTES],
     expected_room: &str,
     expected_atem_id: &str,
 ) -> std::result::Result<HostRoute, HostRouteRefusal> {
-    if object.label() != crate::domain::SignLabel::HostRoute {
+    if object.label() != kind.label() {
         return Err(malformed("type"));
     }
-    let body = HostRouteBody::read(object.body())?;
+    let body = HostRouteBody::read(object.body(), kind)?;
     if log.frozen().is_some() {
         return Err(HostRouteRefusal::Frozen);
     }

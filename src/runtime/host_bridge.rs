@@ -2225,12 +2225,22 @@ impl HostBridge {
         // link is there only then): the host's identity moved while its link
         // was up (a re-verify on the live link, this pass's re-pin
         // included): that socket is reconnected once, so the next link is
-        // authenticated, and proves its route, under the new identity.
+        // authenticated, and proves its route, under the new identity. On a
+        // local link its route proof (design I.5.8) answers nothing more on
+        // that socket meanwhile, and one that found another identity on its
+        // socket itself (moved while the Station link was down) is
+        // reconnected the same way.
         self.station_identity();
-        if let Some(socket) = self
+        let moved = self
             .station
             .as_ref()
-            .and_then(|station| station.feed.moved_socket())
+            .and_then(|station| station.feed.moved_socket());
+        let socket = app.astation_client.socket_id();
+        if moved == Some(socket) {
+            app.astation_client.retire_local_route();
+        }
+        let retired = app.astation_client.local_route_retired().then_some(socket);
+        if let Some(socket) = moved.or(retired)
             && app.identity_reconnect.is_none_or(|(_, s)| s != socket)
         {
             app.identity_reconnect = Some((std::time::Instant::now(), socket));
