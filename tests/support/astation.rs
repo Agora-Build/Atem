@@ -24,6 +24,8 @@ pub enum Event {
 
 enum Cmd {
     Send(String),
+    /// These, in order, in one write: the host reads them together.
+    SendAll(Vec<String>),
     Close,
 }
 
@@ -37,6 +39,15 @@ pub enum AuthReply {
     Grant { session_id: String, token: String },
     /// `auth{status: denied}` with this message.
     Deny(String),
+    /// No reply: the `auth` arrives as an `Event::Message`, and the test
+    /// answers it when it likes ([`authenticated`]): Astation slow to accept
+    /// a re-authentication.
+    Withhold,
+}
+
+/// Astation's `authenticated`, as the fake answers an accepted `auth`.
+pub fn authenticated() -> Value {
+    json!({"type": "statusUpdate", "data": {"status": "authenticated", "data": {}}})
 }
 
 pub struct FakeAstation {
@@ -66,6 +77,14 @@ impl LinkSender {
     pub fn send(&self, link: u64, text: String) {
         if let Some(tx) = self.0.lock().unwrap().get(&link) {
             let _ = tx.send(Cmd::Send(text));
+        }
+    }
+
+    /// `texts`, in order, in one write on `link` (one flush): the host
+    /// reads them together.
+    pub fn send_all(&self, link: u64, texts: Vec<String>) {
+        if let Some(tx) = self.0.lock().unwrap().get(&link) {
+            let _ = tx.send(Cmd::SendAll(texts));
         }
     }
 
@@ -207,6 +226,16 @@ async fn serve(
                         return;
                     }
                 }
+                Some(Cmd::SendAll(texts)) => {
+                    for text in texts {
+                        if socket.feed(Message::Text(text)).await.is_err() {
+                            return;
+                        }
+                    }
+                    if socket.flush().await.is_err() {
+                        return;
+                    }
+                }
                 Some(Cmd::Close) | None => {
                     let _ = socket.close(None).await;
                     return;
@@ -282,10 +311,7 @@ async fn answer_auth(
     AUTHS.lock().unwrap().push(value["data"]["data"].clone());
     let answer = auth.lock().unwrap().clone();
     let (reply, accepted) = match answer {
-        AuthReply::Authenticated => (
-            json!({"type": "statusUpdate", "data": {"status": "authenticated", "data": {}}}),
-            true,
-        ),
+        AuthReply::Authenticated => (authenticated(), true),
         AuthReply::Grant { session_id, token } => (
             json!({"type": "statusUpdate", "data": {"status": "auth", "data": {"status": "granted",
                 "session_id": session_id, "token": token}}}),
@@ -296,6 +322,10 @@ async fn answer_auth(
                 "message": message}}}),
             false,
         ),
+        AuthReply::Withhold => {
+            let _ = events.send(Event::Message(n, value));
+            return true;
+        }
     };
     if socket.send(Message::Text(reply.to_string())).await.is_err() {
         return false;

@@ -372,6 +372,19 @@ impl FakeStation {
         self.out.send(link, challenge.to_json().to_string());
     }
 
+    /// `before` (Astation's own message, as its `authenticated`) and right
+    /// behind it a fresh `host_challenge` on `link` (as
+    /// [`FakeStation::challenge`]), in one write: the host reads them
+    /// together, as a challenge Astation's proxy forwards right after
+    /// Astation's reply.
+    pub fn challenge_behind(&mut self, link: u64, before: String) {
+        let room = &self.proof.as_ref().expect("require_proof first").room;
+        let challenge = HostChallenge::new(room);
+        self.challenges.insert(link, challenge.nonce);
+        self.out
+            .send_all(link, vec![before, challenge.to_json().to_string()]);
+    }
+
     /// Every `host_route` the host sent so far (read by
     /// [`FakeStation::serve`] and the others as they come), in order.
     pub fn proofs(&self) -> &[ProofSeen] {

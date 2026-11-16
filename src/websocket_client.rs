@@ -843,9 +843,10 @@ impl AstationClient {
         &mut self,
         text: &str,
     ) -> Option<crate::session_protocol::r9::route::RouteResult> {
+        let trust_gen = self.capture_trust_gen();
         let route = self.local_route.as_mut()?;
         if crate::session_protocol::r9::route::is_host_challenge(text) {
-            if let Some(answer) = route.answer(text) {
+            if let Some(answer) = route.answer_under(text, trust_gen) {
                 let _ = self.try_send_wire(answer, false);
             }
             return None;
@@ -1175,17 +1176,31 @@ impl AstationClient {
         self.local_route.as_ref().map_or(0, crate::session_protocol::r9::route::LinkRoute::socket_lines)
     }
 
-    /// Pretend this socket is a local link Astation authenticated, with a
-    /// route for `room` from `handle` (`with_local_host_route`'s).
+    /// Pretend this socket is a local link the paired Astation `room`
+    /// authenticated, with a route for `room` from `handle`
+    /// (`with_local_host_route`'s), taken as the connect path takes an
+    /// authentication (`mark_route_authenticated`).
     #[cfg(test)]
     pub(crate) fn local_route_for_test(
         &mut self,
         handle: crate::session_protocol::r9::route::RouteHandle,
         room: &str,
     ) {
-        let mut route = crate::session_protocol::r9::route::LinkRoute::local(handle, room, "atem-test");
-        route.authenticated();
-        self.local_route = Some(route);
+        self.local_room = Some(room.to_owned());
+        self.connected_astation_id = Some(room.to_owned());
+        self.local_route = Some(crate::session_protocol::r9::route::LinkRoute::local(handle, room, "atem-test"));
+        self.mark_route_authenticated();
+    }
+
+    /// Pretend Astation began authenticating this local link again, as
+    /// `answer_auth_required` takes its `auth_required`: its route answers
+    /// nothing until Astation's reply (`upgrade_routed`, as the App's
+    /// re-authentication takes it).
+    #[cfg(test)]
+    pub(crate) fn local_route_unauthenticated_for_test(&mut self) {
+        if let Some(route) = self.local_route.as_mut() {
+            route.unauthenticated();
+        }
     }
 
     /// Pretend the client's socket is `socket_id` (a reconnect makes a new
@@ -1749,12 +1764,23 @@ impl AstationClient {
         if let Some(flag) = &self.route_authenticated {
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+        // Under the pairing's trust generation now: a local route retires
+        // itself when it isn't its socket's (a rebind meanwhile).
+        let trust_gen = self.capture_trust_gen();
         if let Some(route) = self.local_route.as_mut()
             && self.local_room.is_some()
             && self.connected_astation_id == self.local_room
         {
-            route.authenticated();
+            route.authenticated_under(trust_gen);
         }
+    }
+
+    /// The pairing's host trust generation this connection runs under (its
+    /// capture, which a rebind on it adopts), if it captured one.
+    fn capture_trust_gen(&self) -> Option<u64> {
+        self.capture
+            .as_ref()
+            .map(|capture| capture.state.host_trust_gen)
     }
 
     /// Astation's reply while it authenticates a routed link (§R9.7b), with
@@ -3252,6 +3278,8 @@ mod tests {
         Auth,
         /// Waits for Atem's next `host_route`.
         Route,
+        /// Waits until the test says (it did its part first).
+        Await(tokio::sync::oneshot::Receiver<()>),
     }
 
     /// A test local Astation (`:8080`) whose proxy forwards the Station's
@@ -3296,6 +3324,9 @@ mod tests {
                         while routes.len() == before {
                             next(&mut socket, &mut routes, WAIT).await.expect("a host_route");
                         }
+                    }
+                    Step::Await(ready) => {
+                        let _ = tokio::time::timeout(WAIT, ready).await;
                     }
                 }
             }
@@ -3352,23 +3383,42 @@ mod tests {
             .with_agent(std::sync::Arc::new(crate::memory::cred_agent::test_agent(&paths)))
     }
 
-    /// Plays the App's part on `client`'s link until `server` ends: the
-    /// local route's messages to `local_route_message` (the verdicts that
-    /// counted returned), Astation's `auth_required` answered and its
-    /// `authenticated` taken as the App's re-authentication does
-    /// (`upgrade_routed`); every other message the client read too.
+    /// The client's next message, until `server` ended and nothing it sent
+    /// before is left unread (`None`): a slow client still handles all of
+    /// it, never only what it read in time.
+    async fn next_message(
+        client: &mut AstationClient,
+        server: &tokio::task::JoinHandle<Vec<String>>,
+    ) -> Option<AstationMessage> {
+        loop {
+            let finished = server.is_finished();
+            let next = tokio::time::timeout(Duration::from_millis(50), client.recv_message_async()).await;
+            if let Ok(Some(message)) = next {
+                return Some(message);
+            }
+            if finished {
+                return None;
+            }
+            if matches!(next, Ok(None)) {
+                // The socket closed: the server ends soon.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    /// Plays the App's part on `client`'s link until `server` ends and
+    /// every message it sent was handled: the local route's messages to
+    /// `local_route_message` (the verdicts that counted returned),
+    /// Astation's `auth_required` answered and its `authenticated` taken as
+    /// the App's re-authentication does (`upgrade_routed`); every other
+    /// message the client read too.
     async fn play_app(
         client: &mut AstationClient,
         server: &tokio::task::JoinHandle<Vec<String>>,
     ) -> (Vec<crate::session_protocol::r9::route::RouteResult>, Vec<AstationMessage>) {
         let mut verdicts = Vec::new();
         let mut others = Vec::new();
-        while !server.is_finished() {
-            let Ok(Some(message)) =
-                tokio::time::timeout(Duration::from_millis(50), client.recv_message_async()).await
-            else {
-                continue;
-            };
+        while let Some(message) = next_message(client, server).await {
             match &message {
                 AstationMessage::LocalRoute(text) => {
                     verdicts.extend(client.local_route_message(text));
@@ -3599,6 +3649,99 @@ mod tests {
         assert!(!client.local_route_retired());
         play_app(&mut client, &server).await;
         assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    /// host-work-v1 §11.4 "An identity change" on a local link, the trust
+    /// generation alone: a route proof names no trust generation, so the
+    /// route's own identity (account, genesis, host and key) can't tell. The
+    /// local route is bound to the pairing's host trust generation at the
+    /// socket's first authentication (the client's capture) and retires
+    /// itself when a later authentication, or a challenge, is under another
+    /// one: `atem pair verify` rebinding the pairing (`OpCall::Rebind`, the
+    /// capture adopting it) before Astation authenticates the link again,
+    /// or on the live link before a challenge. Nothing more is answered on
+    /// that socket.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_local_link_retires_itself_when_its_pairing_trust_generation_moves() {
+        use crate::session_protocol::membership::r9log::{TestLog, secret};
+        use crate::session_protocol::r9::route;
+        let mut log = TestLog::genesis("acct-1", &secret("ws astation"));
+        log.add_host("host-1", 1, &secret("ws host"));
+        let handle = route::new_handle();
+        route::set(&handle, route_ready(&log, "ws host"));
+        let state = tempfile::tempdir().unwrap();
+        let _profile = crate::test_profile::use_dir(state.path());
+        let mut client = local_client(state.path()).with_local_host_route(handle.clone(), "mac-local");
+        let challenge = || {
+            atem_client::host_route::HostChallenge::new("mac-local")
+                .to_json()
+                .to_string()
+        };
+        // `atem pair verify`'s rebind, as `App::rebind_for_verification`.
+        let rebind = |client: &mut AstationClient| {
+            let capture = client.capture().unwrap().clone();
+            let before = capture.state.clone();
+            let after =
+                crate::pairing::rebind_for_verification(capture.sources(), &before, "mac-local")
+                    .unwrap();
+            client.adopt_binding(&before, &after).unwrap();
+            after.host_trust_gen
+        };
+        // The rebind lands before Astation authenticates the link again.
+        let (url, server) = proxying_astation(vec![
+            Step::Send(auth_required_text("mac-local", &"a".repeat(64))),
+            Step::Auth,
+            Step::Send(authenticated_text()),
+            Step::Send(challenge()),
+            Step::Route,
+            Step::Send(auth_required_text("mac-local", &"b".repeat(64))),
+            Step::Auth,
+            Step::Send(authenticated_text()),
+            Step::Send(challenge()),
+        ])
+        .await;
+        client.connect_without_pairing(&url).await.unwrap();
+        let mut rebound = None;
+        while let Some(message) = next_message(&mut client, &server).await {
+            match &message {
+                AstationMessage::LocalRoute(text) => {
+                    client.local_route_message(text);
+                }
+                AstationMessage::StatusUpdate { status, .. } if status == "auth_required" => {
+                    // The connect path answered the first one.
+                    if rebound.is_none() {
+                        rebound = Some(rebind(&mut client));
+                    }
+                    client.answer_auth_required(&message).await.unwrap();
+                }
+                AstationMessage::StatusUpdate { status, .. } if status == "authenticated" => {
+                    client.upgrade_routed();
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(rebound, Some(2));
+        assert_eq!(server.await.unwrap().len(), 1, "only the first authentication's");
+        assert!(client.local_route_retired(), "retired at the authentication");
+        // On the live link: the rebind lands between Astation's
+        // authentication and the socket's first challenge.
+        let (rebound, ready) = tokio::sync::oneshot::channel();
+        let (url, server) = proxying_astation(vec![
+            Step::Send(auth_required_text("mac-local", &"c".repeat(64))),
+            Step::Auth,
+            Step::Send(authenticated_text()),
+            Step::Await(ready),
+            Step::Send(challenge()),
+        ])
+        .await;
+        client.connect_without_pairing(&url).await.unwrap();
+        assert!(!client.local_route_retired(), "a new socket");
+        assert_eq!(rebind(&mut client), 3);
+        rebound.send(()).unwrap();
+        play_app(&mut client, &server).await;
+        assert_eq!(server.await.unwrap(), Vec::<String>::new(), "not answered");
+        assert!(client.local_route_retired());
     }
 
     /// §R9.7b (N1): the upgrade of a routed link saves a granted session

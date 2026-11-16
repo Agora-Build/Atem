@@ -3728,17 +3728,20 @@ never promoted into host authority.
   the Station's refusal (on the relay a refused proof closes the link, and
   the line says there is no Station link; neither names the proof).
 - **An identity change** (host-work-v1 §11.4). A change the host's
-  identity rules see while the link is up (a re-verify, a new trust
-  generation, account or genesis) retires the socket's proof: nothing
-  more is answered on that socket, whatever its later authentication.
-  The route also checks its own identity (account, genesis, host and
-  `host_channel_key`) at each challenge and each re-authentication, and
-  one that moved retires it the same way. Either way the host reconnects
-  that link as §11.4 says, and the new socket answers under the new
-  identity. **Open (before activation):** a trust-generation-only change
-  (no new key) while Astation re-authenticates the link isn't caught yet,
-  on a local or a relay link: the identity rules forget the socket while
-  its Station link is down.
+  identity rules see (a re-verify, a new trust generation, account,
+  genesis or `host_channel_key`), while the link is up, before Astation
+  authenticates it again or while it does (a trust generation alone
+  included), retires the socket's proof: nothing more is answered on that
+  socket, whatever its later authentication. The route also checks its
+  own identity at each challenge and each re-authentication: the account,
+  genesis, host and `host_channel_key`, and, since a proof names no trust
+  generation, the pairing's host trust generation its socket was first
+  authenticated under (the link's capture, which `atem pair verify`'s
+  rebind moves). One that moved retires it the same way, so a challenge
+  read with Astation's re-authentication reply is never answered after
+  the pairing's trust generation moved, even before the host has taken
+  it. Either way the host reconnects that link as §11.4 says, and the new
+  socket answers under the new identity.
 
 With the hook off a local link ignores the challenge, as before (one
 runtime.log line per link).

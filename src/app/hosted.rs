@@ -301,11 +301,13 @@ impl App {
     /// host-work-v1 §11.4 "An identity change" (Astation's item 15 on
     /// #120; `host.delegated` only: the broker asks only then,
     /// `identity_reconnect`): the host's identity moved while its link was
-    /// up, so that socket's association (Astation's authentication of it,
-    /// and on the relay the route proof its challenge got) is the old
-    /// identity's, and the host never relabels it the new one's. Once
-    /// nothing is in flight (the waits of the route reconnect, above: the
-    /// re-verify's own operation first), the link is dropped and the normal
+    /// up, or while Astation authenticated it again (the same socket), so
+    /// that socket's association (Astation's authentication of it, and on
+    /// the relay the route proof its challenge got) is the old identity's,
+    /// and the host never relabels it the new one's. Once nothing is in
+    /// flight (the waits of the route reconnect, above: the re-verify's own
+    /// operation first, and a re-authentication until Astation answered,
+    /// then the link is up again), the link is dropped and the normal
     /// reconnect opens a new socket, which Astation authenticates and whose
     /// challenge the host answers under the new identity; its Station link
     /// then reads the feed from 0. Once per event: no link, or a link on

@@ -210,6 +210,12 @@ impl HostKey {
         keys.insert_ed25519(id.clone(), seed);
         HostKey { keys, id }
     }
+
+    /// The key's public half.
+    pub fn public_key(&self) -> Option<atem_client::PublicKey> {
+        use atem_client::KeyProvider;
+        self.keys.public_key(&self.id).ok()
+    }
 }
 
 impl std::fmt::Debug for HostKey {
