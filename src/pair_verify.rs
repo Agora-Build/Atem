@@ -383,10 +383,13 @@ pub(crate) struct HostPinning<'a> {
 /// Applies Astation's `deviceVerified` only while the pairing the
 /// verification started under is current, under the pairing lock: a
 /// certificate that arrives after `atem unpair` (or a new `atem pair`) is
-/// dropped and nothing is pinned. First the device list it carries is
-/// verified (r9 §R9.2: the whole chain, this host's `add_host` signed by the
-/// verified Astation, a genesis never frozen here) and pinned with the host
-/// channel key; then `complete_verification`; if that fails, the pin is
+/// dropped and nothing is pinned. A certificate naming another account
+/// than `verifyKeys` did is refused (host-work-v1 §11.5). Then the device
+/// list it carries is verified (r9 §R9.2: the whole chain, this host's
+/// `add_host` signed by the verified Astation, a genesis never frozen here;
+/// ending at that `add_host` or at the revealed key's `host_enc_key` right
+/// after it) and pinned with the host channel key and the ceremony's
+/// encryption key; then `complete_verification`; if that fails, the pin is
 /// taken back. `agent` must not be a `BoundAgent` (the lock is already held).
 pub(crate) fn apply_device_verified(
     capture: &crate::pairing::Captured,

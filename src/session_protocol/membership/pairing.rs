@@ -38,7 +38,9 @@ pub struct PairingInputs<'a> {
 /// pairing: the chain from the pinned genesis, no entry waiting on a
 /// pending one, a genesis this host never froze on, and the newest
 /// `add_host` of this host naming its key and trust generation, signed by
-/// the verified Astation (`Membership::check_pairing`).
+/// the verified Astation (`Membership::check_pairing`), and the entries
+/// ending there or at the revealed encryption key's `host_enc_key` right
+/// after it (host-work-v1 §11.5).
 pub fn verify_pairing_log(
     membership: Option<&Value>,
     inputs: &PairingInputs<'_>,

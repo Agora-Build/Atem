@@ -2330,6 +2330,11 @@ signs its `host_enc_key` right after the `add_host` (`verifyKeys` gains
 `account_id`, `verifyReveal` gains `host_enc_key` in the shape of R9.14's
 `host_enc_key` answer, and rule 4 of R9.6 lets one confirmation cover both
 entries; host-work-v1 §11.5, "The host encryption key in the ceremony").
+**Built on the host**, in every build (the reveal requires it): Atem reads
+`account_id` strictly, records the new key's `enc_kid` before the reveal,
+keeps the key with the pin, and takes entries ending at its `add_host` or
+at the revealed key's `host_enc_key` right after it (host-work-v1 §11.5,
+"Built on the host").
 
 ### R9.3 What Atem stores; carrying suffixes
 
@@ -5061,9 +5066,11 @@ is not advertised` (item 8, while unadvertised).
 - **The host's refusal** (no `host.senders` listed, and a native without
   `manage` while it is): `src/session_protocol/r9/tests.rs`
   (`host_enc_key_get`). **The host's answer** behind the hook:
-  `src/session_protocol/r9/host_enc_tests.rs` (the key made with the pin
-  and at a start, kept, replaced at a new generation, removed by `atem
-  unpair` and a new pin; its record, written and synced first, rebuilt
+  `src/session_protocol/r9/host_enc_tests.rs` (the key made in the
+  verification ceremony and kept with the pin, made at a start, kept,
+  replaced at a new generation, removed by `atem unpair` and replaced by a
+  new pin; after a ceremony whose entries end at the `add_host`, the same
+  key handed out; its record, written and synced first, rebuilt
   when lost; and over channels: a manager's answer, its `enc_sig`
   verified and its drafted entry accepted, `manage` per request, the
   others `forbidden`, `busy` without a key or when the record's write or
