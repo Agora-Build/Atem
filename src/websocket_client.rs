@@ -3454,7 +3454,7 @@ mod tests {
         for (route, challenge) in routes.iter().zip([&first, &fresh]) {
             // A proxy proof: the relay's verifier refuses it, so whoever
             // holds the host's local link can't route a relay connection as
-            // this host with it (the H-P review's finding 1).
+            // this host with it (Atem doesn't authenticate its local peer).
             assert_eq!(
                 verify_host_route_message(
                     &log.log,

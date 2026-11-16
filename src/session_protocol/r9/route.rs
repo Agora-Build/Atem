@@ -622,7 +622,7 @@ mod tests {
     /// A local link's `answer` checked as a Station checks it: a proxy
     /// proof for `nonce`, [`ROOM`] and `atem-x` (the proxy kind's verifier),
     /// which the relay's verifier refuses (its type: a local link's proof is
-    /// never a relay route, the H-P review's finding 1).
+    /// never a relay route: Atem doesn't authenticate its local peer).
     fn proxy_verified(
         log: &TestLog,
         answer: &str,
