@@ -130,7 +130,12 @@ impl HostBridge {
         let mut routed = Vec::new();
         if self.features.delegated {
             for mut r in self.delegated_active()? {
-                if unstarted(&r) && self.work_route_changed(&r.accepted()) {
+                if unstarted(&r)
+                    && self
+                        .work
+                        .config
+                        .route_changed_as(&r.accepted(), r.consent())
+                {
                     self.settle_task(&mut r, WorkState::Failed, details::ROUTE_CHANGED)?;
                     routed.push(r.task.task_id);
                 }

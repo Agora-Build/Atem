@@ -73,17 +73,49 @@ fn idle_timeout() -> Duration {
         .unwrap_or(server::IDLE_EXIT)
 }
 
-async fn shutdown_signal() {
+/// A SIGTERM or SIGINT reached this runtime (set by the watcher
+/// `shutdown_signal` starts): start-up steps that wait (the session
+/// journal's lock) give up at once, so a stop during start is prompt.
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process is an `atem runtime` that was asked to stop.
+pub fn stop_requested() -> bool {
+    STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// SIGTERM or SIGINT, handled from this call on: a task watches for them
+/// on the runtime's worker threads, so one that comes while the runtime
+/// starts is never the default action (which would leave no clean close).
+/// It marks the stop at once (`stop_requested`, read by the waits of the
+/// start) and ends the returned future, polled by the serve loop. With no
+/// signal handler the future never ends, as before.
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
     use tokio::signal::unix::{SignalKind, signal};
-    let (Ok(mut term), Ok(mut int)) = (
+    let watched = match (
         signal(SignalKind::terminate()),
         signal(SignalKind::interrupt()),
-    ) else {
-        return std::future::pending().await;
+    ) {
+        (Ok(mut term), Ok(mut int)) => {
+            let (stopped, watch) = tokio::sync::watch::channel(false);
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = int.recv() => {}
+                }
+                STOP_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = stopped.send(true);
+            });
+            Some(watch)
+        }
+        _ => None,
     };
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = int.recv() => {}
+    async move {
+        if let Some(mut watch) = watched
+            && watch.wait_for(|stop| *stop).await.is_ok()
+        {
+            return;
+        }
+        std::future::pending().await
     }
 }
 
@@ -94,6 +126,8 @@ async fn shutdown_signal() {
 pub async fn run_runtime(config_dir: PathBuf) -> Result<()> {
     // Taken now, before a rebuild can replace the executable on disk.
     let build = crate::memory::cred_agent::build_id();
+    // Before the lock: whoever sees this runtime's pid there may stop it.
+    let shutdown = shutdown_signal();
     IN_RUNTIME.store(true, std::sync::atomic::Ordering::SeqCst);
     if let Some(home) = dirs::home_dir() {
         let _ = std::env::set_current_dir(home);
@@ -131,7 +165,7 @@ pub async fn run_runtime(config_dir: PathBuf) -> Result<()> {
         clock: host_bridge::Clock::default(),
         ops: ops::OpEnv::for_user(),
     };
-    let served = server::serve(app, listener, options, shutdown_signal()).await;
+    let served = server::serve(app, listener, options, shutdown).await;
     // A clean exit takes its pid out of the lock and removes its socket.
     daemon::clear_held_pids();
     daemon::remove_socket(&files);

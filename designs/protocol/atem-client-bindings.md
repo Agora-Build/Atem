@@ -39,7 +39,8 @@ The two unadvertised features' results are host-work results too:
 - Released readers reject both, so Atem and Astation enable these features
   together (host-work-v1 §11.2, "Compatibility").
 
-Planned, advertised by no host yet: `host.senders`'s two session ops,
+Planned, advertised by no release build (a debug host lists the feature only
+behind its debug-only hook): `host.senders`'s two session ops,
 `control_records` and `host_enc_key_get`, go through `send_json` the same way
 (session-v1 R9.8, R9.14). The core refuses them without the feature, reads them
 as the host does and tracks each request, and their answers arrive as
@@ -1168,7 +1169,8 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 A Station that hosts integrations signs control records with their service
 keys, serves them in its control feed and accounts for the hosts'
 acknowledgments (delegated host-work design I.5; `atem-host-work-v1.md`
-§11; **planned**: no host advertises `host.senders` yet). The built-in
+§11; **planned**: no release build advertises `host.senders`; a debug
+host serves `control_records` behind its debug-only hook). The built-in
 Station uses the `atem-client` crate directly (`atem_client::control`); a
 Station written in another language uses these exports, which are the
 same code and pass the same vectors and fixtures

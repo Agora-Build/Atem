@@ -1006,7 +1006,16 @@ impl<J: Journal> SessionHost<J> {
     /// record naming this run's epoch, only if the journal is healthy (no
     /// failed write in this run, the start's resolution persisted). True
     /// when it was written.
+    ///
+    /// A run stopped before its recovery (a stop while its workers are
+    /// adopted) resolves its start first (r8 §I): what an unclean run left
+    /// queued is rejected as the start rules say before this run vouches,
+    /// so the next start never judges it as after a clean close, and work a
+    /// clean run left waiting keeps waiting. Its effects go nowhere: no
+    /// principal can be confirmed before the resolution (a connect runs
+    /// it first).
     pub fn close_cleanly(&mut self) -> bool {
+        self.resolve_once();
         if self.journal_halted || self.start_error.is_some() {
             return false;
         }

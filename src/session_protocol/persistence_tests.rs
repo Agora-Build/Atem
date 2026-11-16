@@ -380,6 +380,69 @@ fn the_clean_close_record_vouches_only_for_the_run_that_wrote_it() {
     assert!(!dir.path().join("halted/state/clean_close").exists());
 }
 
+/// r8 §I: a clean close vouches only for a run that resolved its start.
+/// A run that crashed with queued work, then a run stopped in order before
+/// its recovery (a SIGTERM while its workers were adopted): that stop
+/// resolves the start first, so the third run still rejects the crash's
+/// queued work "authorization history unknown", never judges it as after a
+/// clean close (cleanup review, finding 1).
+#[test]
+fn a_run_stopped_before_its_recovery_never_vouches_for_a_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    // The crashed run (epoch 8): `c1` holds control, its prompt queued.
+    {
+        let mut j = FileJournal::open(&state).unwrap();
+        j.append(journal::Record::Control {
+            principal: "c1".into(),
+            control: true,
+            control_gen: 1,
+            fence_seq: 0,
+        })
+        .unwrap();
+        j.append(journal::Record::Accepted {
+            request_id: rid(1),
+            target: serde_json::from_value(target()).unwrap(),
+            kind: ReceiptKind::Prompt,
+            payload_digest: "0".repeat(64),
+            payload: json!({"text": "run the tests"}),
+            updated_at: 1,
+            principal: "c1".into(),
+            control_gen: 1,
+            provenance: None,
+        })
+        .unwrap();
+    }
+    let open = |epoch: u64, previous: u64| {
+        SessionHost::open(
+            HostContext {
+                runtime_epoch: epoch,
+                ..ctx()
+            },
+            HostConfig::default(),
+            FileJournal::open(&state).unwrap(),
+            random_ids(),
+            Some(previous),
+        )
+        .unwrap()
+    };
+    // The next run (epoch 9) stops in order before its recovery.
+    let mut host = open(9, 8);
+    assert!(!host.previous_run_clean());
+    assert!(host.close_cleanly());
+    drop(host);
+    // The run after it: the crash's prompt never waits for `c1`.
+    let mut host = open(10, 9);
+    assert!(host.previous_run_clean());
+    host.restore_session(spec()).unwrap();
+    host.recover();
+    let r = host.receipt(&rid(1)).unwrap();
+    assert_eq!(
+        (r.state, r.detail.as_deref()),
+        (ReceiptState::Rejected, Some(DETAIL_HISTORY_UNKNOWN))
+    );
+}
+
 /// §H conformance: the fence write with both rollback outcomes, on disk.
 /// A failed fence whose rollback worked leaves the old control state; one
 /// whose rollback failed leaves the raised generation. Either way the run

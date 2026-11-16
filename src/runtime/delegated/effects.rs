@@ -50,8 +50,12 @@
 //!   future tasks (`classify` reads the feed store's coverage); tasks it
 //!   already has keep the rules they were admitted under, so nothing here.
 //!
-//! A host principal's actions (an interrupt for its `revoke_seq`) find no
-//! task: host senders aren't served in step 4 (`host.senders`).
+//! A host principal's only action is an interrupt for its revoke at
+//! `revoke_seq` (design II.3.1, "A later interrupt"): an intent for each of
+//! the host's tasks admitted before that revoke (its generation then below
+//! the revoke's `seq`) whose turn may run, never one admitted after a
+//! readmit. Its device-list stops are the device list's own effects
+//! (`host_senders::list_effects`).
 use crate::runtime::delegated::attempts::Attempt;
 use crate::runtime::delegated::details;
 use crate::runtime::delegated::intents::IntentReason;
@@ -138,6 +142,14 @@ pub fn act(store: &Store, tx: &Transaction, actions: &[HostAction]) -> Result<Ve
                 });
             }
             HostAction::Release(_) => release(store, tx, tasks)?,
+            HostAction::Interrupt { revocation, .. } if principal.starts_with("host:") => {
+                let before: Vec<Task> = tasks
+                    .iter()
+                    .filter(|(r, _)| admitted_before_revoke(r, revocation))
+                    .cloned()
+                    .collect();
+                interrupt(store, tx, principal, &before, revocation, &mut out)?
+            }
             HostAction::Interrupt { revocation, .. } => {
                 interrupt(store, tx, principal, tasks, revocation, &mut out)?
             }
@@ -147,13 +159,26 @@ pub fn act(store: &Store, tx: &Transaction, actions: &[HostAction]) -> Result<Ve
     Ok(out)
 }
 
+/// A host sender's task `r` was admitted before its revoke at `revocation`
+/// (the revoke's `seq` in decimal, as the control state names a host
+/// principal's revocation): its authorization generation then is below it.
+fn admitted_before_revoke(r: &WorkRecord, revocation: &str) -> bool {
+    let Ok(revoke_seq) = revocation.parse::<u64>() else {
+        return false;
+    };
+    r.delegated
+        .as_ref()
+        .and_then(|a| a.host_admitted())
+        .is_some_and(|(_, admitted)| admitted.generation < revoke_seq)
+}
+
 /// A delegated task a record acts on, with its live attempt.
-type Task = (WorkRecord, Option<Attempt>);
+pub(super) type Task = (WorkRecord, Option<Attempt>);
 
 /// `principal`'s delegated tasks that wait or run (`queued`, `blocked`,
 /// `submitting`, `submitted`), oldest first, each with its live attempt:
 /// one read, the principal filtered in SQL (`Store::delegated_active_of`).
-fn tasks_of(store: &Store, principal: &str) -> Result<Vec<Task>> {
+pub(super) fn tasks_of(store: &Store, principal: &str) -> Result<Vec<Task>> {
     let mut out = Vec::new();
     for r in store.delegated_active_of(principal)? {
         let live = store.live_attempt(&r.task.task_id)?;
@@ -168,7 +193,7 @@ fn tasks_of(store: &Store, principal: &str) -> Result<Vec<Task>> {
 /// cause is written with the attempt in `tx` (`Store::hold_withdrawal`), so
 /// the attempt's withdrawal isn't counted whoever makes it, the recovery
 /// after a crash included (review m5).
-fn stop(
+pub(super) fn stop(
     store: &Store,
     tx: &Transaction,
     tasks: &mut [Task],
@@ -223,7 +248,7 @@ fn release(store: &Store, tx: &Transaction, tasks: &mut [Task]) -> Result<()> {
 /// The interrupt for `principal`'s revocation `revocation`: an intent for
 /// each of its tasks (`tasks`) whose turn may run (its live attempt, or the
 /// attempt it started).
-fn interrupt(
+pub(super) fn interrupt(
     store: &Store,
     tx: &Transaction,
     principal: &str,
@@ -333,6 +358,7 @@ mod tests {
                 grant_expires_at: None,
                 device_list_seq: 3,
                 projects_matched: vec![],
+                host: None,
             }),
         };
         store.enqueue(&r).unwrap();

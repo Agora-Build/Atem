@@ -60,6 +60,8 @@ mod delegated_feed_pass;
 pub(super) use delegated_feed_pass::sync_clocks;
 #[path = "delegated/hints.rs"]
 mod delegated_hints;
+#[path = "delegated/host_pass.rs"]
+mod delegated_host_pass;
 #[path = "delegated/owner.rs"]
 mod delegated_owner;
 pub use delegated_owner::OwnerDone;
@@ -215,17 +217,28 @@ pub(super) struct State {
     /// the pinned device list before the start's recovery and any
     /// dispatch.
     pub(super) feeds: crate::runtime::delegated::feeds::Feeds,
-    /// The device list's head (`seq`, hash) the pending control records
-    /// were last applied again at (`feeds_reverify`): none since the feeds
-    /// loaded, so once at start.
-    reverified: Option<(u64, atem_client::encoding::Hash32)>,
+    /// The device list's head (`seq`, hash) and host-work's applied
+    /// device-list `seq` the pending control records were last applied
+    /// again at (`feeds_reverify`): none since the feeds loaded, so once at
+    /// start.
+    reverified: Option<(u64, atem_client::encoding::Hash32, u64)>,
     /// Pending control records a re-verification applied, their effects
     /// written with them, kept for Task 36's acknowledgments
     /// (`keep_reapplied`).
     reapplied: Vec<crate::runtime::delegated::feeds::Reapplied>,
     /// What control records' effects asked of the bridge once their
-    /// transaction committed, not carried out yet (`effects_pass`).
+    /// transaction committed, not carried out yet (`effects_pass`); host
+    /// senders' device-list effects add theirs (`host_senders_pass`).
     followups: Vec<crate::runtime::delegated::effects::Followup>,
+    /// The identity and committed device-list head (`seq`, hash) host
+    /// senders' device-list effects were last written up to
+    /// (`host_senders_pass`): a pass where neither moved reads nothing.
+    host_applied: Option<(HostTarget, u64, atem_client::encoding::Hash32)>,
+    /// Host-work's applied device-list `seq` as last written or read, with
+    /// the identity and the list's genesis it counts for
+    /// (`host_senders_pass`; `host_applied_seq` reads it, the store only
+    /// while it is unknown).
+    applied_seq: Option<(HostTarget, atem_client::encoding::Hash32, u64)>,
     /// Acknowledgments whose `sent` mark failed to write, and those the
     /// shared builder refused, in this run (their log lines: the first,
     /// then at powers of two).
@@ -317,6 +330,8 @@ impl State {
             reverified: None,
             reapplied: Vec::new(),
             followups: Vec::new(),
+            host_applied: None,
+            applied_seq: None,
             ack_failures: 0,
             ack_unbuilt: 0,
             kept: None,
@@ -495,7 +510,9 @@ impl HostBridge {
         // An invalid file turns hosting off only while it lasts: launches
         // not started wait, requests are `busy` and queued local tasks wait
         // as `paused` (`work_pass`); nothing is fenced.
-        let config = match Config::load(&self.work.dir) {
+        // Checked with the runtime's own host features (a route's
+        // host-sender principals load only with `host.senders`).
+        let config = match Config::load_for(&self.work.dir, self.features) {
             Ok(config) => {
                 if self.work.config_problem.take().is_some() {
                     eprintln!(
@@ -567,11 +584,13 @@ impl HostBridge {
             self.projects
                 .session(&p.scope_key(), Some(p.project.clone()));
         }
-        // `host.delegated` and `host.alerts` as the debug-only hook turned
-        // them on when the runtime started (step 4, Decision 10): listed
-        // with the other host-work features, so only with hosting on.
+        // `host.delegated`, `host.alerts` and `host.senders` as the
+        // debug-only hook turned them on when the runtime started (step 4,
+        // Decision 10): listed with the other host-work features, so only
+        // with hosting on.
         self.r9
             .set_delegated_features(self.features.delegated, self.features.alerts);
+        self.r9.set_senders_feature(self.features.senders);
         self.r9
             .enable_host_work(self.hosting_enabled() && self.work.store.is_some());
     }
@@ -602,6 +621,11 @@ impl HostBridge {
     /// don't depend on control records.
     pub(super) fn sender_class(&self, principal: &str) -> SenderClass {
         let Some(list) = self.open_list() else {
+            // A host sender is never v1 (design II.2.1): with no list to
+            // classify it on, it is refused (fail closed).
+            if principal.starts_with("host:") {
+                return SenderClass::Refused;
+            }
             return SenderClass::V1;
         };
         // Tests: a control view covering a service, in place of the feeds.
@@ -845,6 +869,9 @@ impl HostBridge {
             SenderClass::V1 => return Ok(None),
             // Its class can't be decided now (ruling T32b): nothing stored.
             SenderClass::Unchecked => return Err("busy"),
+            // A host sender that may not send (none reaches a channel: no
+            // channel principal is a `host:` one).
+            SenderClass::Refused => return Err("forbidden"),
         };
         let Some(list) = self.open_list() else {
             return Ok(None);
@@ -1039,8 +1066,10 @@ impl HostBridge {
                 .collect(),
         };
         let config = self.work.config.clone();
+        let senders = self.features.senders;
         let mut view = self.start_view();
         view.host_id = host_id;
+        view.senders = senders;
         view.scopes = scopes;
         // As `work_config` gave it when it loaded (a pass runs only with a
         // file that loaded and hosting on).
@@ -1100,8 +1129,14 @@ impl HostBridge {
                 self.read_kept();
                 if self.kept_here() {
                     self.ensure_feeds();
+                    // Host senders' device-list effects first, so a record
+                    // waiting for them sees them.
+                    self.host_senders_pass();
                     self.feeds_reverify();
                 }
+                // Host senders' later interrupts carried on channels: stops,
+                // served while paused (answered `busy` when they can't be).
+                self.control_records_pass();
             }
             // A stop always wins: what control records' effects asked once
             // they committed is carried out while paused too.
@@ -1127,7 +1162,16 @@ impl HostBridge {
         // records applied again once loaded and whenever the device list
         // moved (Task 32 review).
         self.ensure_feeds();
+        // Host senders' device-list effects after host-work's applied
+        // `seq` (design II.3.1): at a start, replayed before the recovery
+        // below; before the pending records, so one waiting for a host
+        // sender's revoke sees its effects.
+        self.host_senders_pass();
         self.feeds_reverify();
+        // Host senders' later interrupts carried on channels, after their
+        // revokes' effects (their intents wait for the recovery as the
+        // feed's do).
+        self.control_records_pass();
         // A load that found the control state damaged (or a new identity's
         // store not loaded yet) closes the services' r9 access at once
         // (ruling T35c).
@@ -1586,16 +1630,17 @@ impl HostBridge {
                 let (guard, check, delegated) = match delegated {
                     Some((launch, guard, check)) => (guard, Some(check), Some(launch)),
                     None => {
-                        let (flag, approved, dir, deadline) = (
+                        let (flag, approved, dir, deadline, features) = (
                             permit.clone(),
                             p.clone(),
                             self.work.dir.clone(),
                             *expires_at,
+                            self.features,
                         );
                         let guard: super::super::adopt::SpawnGuard = Arc::new(move || {
                             flag.load(Ordering::SeqCst)
                                 && host_now().wall_ms < deadline
-                                && Config::load(&dir).is_ok_and(|c| {
+                                && Config::load_for(&dir, features).is_ok_and(|c| {
                                     c.enabled && c.profile(&approved.id) == Some(&approved)
                                 })
                                 && crate::memory::project::project_key_for(&approved.cwd)
@@ -2827,6 +2872,7 @@ mod local_tests {
         include!("delegated/effects_tests.rs");
         include!("delegated/hold_fence_tests.rs");
         include!("delegated/reverify_tests.rs");
+        include!("delegated/host_effects_tests.rs");
     }
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::broker::{InProcess, Launcher};
@@ -4324,6 +4370,7 @@ principals = ["local"]
                 grant_expires_at: None,
                 device_list_seq: seq,
                 projects_matched: vec![],
+                host: None,
             };
             assert_eq!(record.delegated.as_ref(), Some(&admission));
             let hw::Request::Enqueue { task, .. } = &req else {

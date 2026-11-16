@@ -956,3 +956,397 @@ fn a_launch_waits_for_the_gates_device_list_part_too() {
         assert_eq!(launch_check(&v, l, 0), LaunchVerdict::Go);
     }
 }
+
+/// The list of [`log_with`], with host B and a project `build` listing this
+/// host and B with a task's ops; `change` edits it after.
+fn host_log(change: impl FnOnce(&mut TestLog)) -> TestLog {
+    use atem_client::membership::{ProjectOp, project_set};
+    log_with(|log| {
+        log.add_host("host-b", 1, &secret("start host b"));
+        log.append(
+            crate::session_protocol::membership::r9log::MAC,
+            project_set(
+                "build",
+                [HOST, "host-b"],
+                [ProjectOp::Message, ProjectOp::Notify, ProjectOp::Prompt],
+                0,
+            )
+            .unwrap(),
+        );
+        change(log);
+    })
+}
+
+/// Host B's task, admitted on `log`'s head through route `rh`, whose
+/// principals are `principals` (its consent the first that admits).
+fn host_task(log: &TestLog, principals: &[&str], deadline: u64) -> StartTask {
+    use crate::runtime::delegated::host_senders::{HostOp, HostSender, host_sender_permits};
+    let route = crate::runtime::host_work::Route {
+        id: "rh".into(),
+        revision: 1,
+        profile_id: "p".into(),
+        principals: principals.iter().map(|p| p.to_string()).collect(),
+        labels: vec![],
+        launch: Default::default(),
+        results: false,
+        auto_report: Default::default(),
+    };
+    let on = HostFeatures::parse("host.delegated,host.senders").unwrap();
+    assert!(matches!(
+        classify("host:host-b", &log.log, &super::super::NoFeeds, on),
+        SenderClass::Delegated(DelegatedSender::Host { .. })
+    ));
+    let sender = HostSender {
+        host_id: "host-b",
+        admitted: None,
+    };
+    let permit = host_sender_permits(&log.log, HOST, &sender, &route, HostOp::Task).unwrap();
+    let admission = Admission::for_host(&log.log, "host-b", &permit, "rh", 1).unwrap();
+    StartTask {
+        task_id: TASK.into(),
+        admission,
+        deadline,
+        target: Target {
+            account_id: "account-a".into(),
+            atem_device_id: HOST.into(),
+            host_trust_gen: 1,
+            session_id: S1.into(),
+            process_gen: P1.into(),
+        },
+        accepted: Accepted {
+            principal: "host:host-b".into(),
+            control_gen: 0,
+            authorization_expires_at: None,
+            route_id: "rh".into(),
+            route_revision: 1,
+            profile_id: "p".into(),
+            profile_revision: 1,
+            project: "local:project".into(),
+        },
+    }
+}
+
+/// [`view`], with `host.senders` on and route `rh` naming `principals`.
+fn host_view(log: &TestLog, principals: &[&str]) -> StartView {
+    let mut v = view(log);
+    v.senders = true;
+    let mut route = v.config.routes[0].clone();
+    route.id = "rh".into();
+    route.principals = principals.iter().map(|p| p.to_string()).collect();
+    v.config.routes.push(route);
+    v
+}
+
+/// Design I.4.3 for host senders (conditions 2 and 3, II.2.3, II.3.1,
+/// II.2.2): a host sender's task starts while its sender is a current host
+/// at the epoch its admission recorded, authorized at the recorded
+/// generation, and its consent's project still lists both hosts with a
+/// task's ops; a re-verification (a newer `add_host`) changes nothing. A
+/// revoke (and a readmit after it) is `cancelled`, `sender revoked`; so is
+/// a removal (and a re-add after it); a project narrowed or removed is
+/// `failed`, narrowed.
+#[test]
+fn the_start_check_refuses_a_revoked_narrowed_or_removed_host_sender() {
+    use crate::session_protocol::membership::r9log::MAC;
+    use atem_client::membership::entry::Action;
+    use atem_client::membership::{
+        ProjectOp, host_sender_readmit, host_sender_revoke, project_remove, project_set,
+    };
+    let start = |change: &dyn Fn(&mut TestLog)| {
+        let mut log = host_log(|_| {});
+        let task = host_task(&log, &["project:build"], LATER);
+        change(&mut log);
+        may_start(&host_view(&log, &["project:build"]), &task, Some(0))
+    };
+    assert_eq!(start(&|_| {}), Ok(()));
+    assert_eq!(
+        start(&|log| {
+            log.add_host("host-b", 2, &secret("start host b 2"));
+        }),
+        Ok(()),
+        "a new key changes nothing"
+    );
+    let revoke = |log: &mut TestLog| {
+        log.append(MAC, host_sender_revoke("host-b", false, 0).unwrap());
+    };
+    assert_eq!(start(&revoke), Err(Event::Revoked));
+    assert_eq!(
+        start(&|log| {
+            revoke(log);
+            log.append(MAC, host_sender_readmit("host-b", 0).unwrap());
+        }),
+        Err(Event::Revoked),
+        "a readmit admits only work signed after it"
+    );
+    let remove = |log: &mut TestLog| {
+        log.append(
+            MAC,
+            Action::RemoveHost {
+                host_id: "host-b".into(),
+            },
+        );
+    };
+    assert_eq!(start(&remove), Err(Event::Removed));
+    assert_eq!(
+        start(&|log| {
+            remove(log);
+            log.add_host("host-b", 3, &secret("start host b 3"));
+            log.append(
+                MAC,
+                project_set(
+                    "build",
+                    [HOST, "host-b"],
+                    [ProjectOp::Message, ProjectOp::Notify, ProjectOp::Prompt],
+                    0,
+                )
+                .unwrap(),
+            );
+        }),
+        Err(Event::Removed),
+        "a new epoch: never started after a re-add"
+    );
+    assert_eq!(
+        start(&|log| {
+            log.append(
+                MAC,
+                project_set("build", [HOST, "host-b"], [ProjectOp::Message], 0).unwrap(),
+            );
+        }),
+        Err(Event::Narrowed)
+    );
+    assert_eq!(
+        start(&|log| {
+            log.append(MAC, project_remove("build", 0).unwrap());
+        }),
+        Err(Event::Narrowed)
+    );
+    assert_eq!(
+        Event::Revoked.outcome(),
+        (WorkState::Cancelled, "sender revoked")
+    );
+    assert_eq!(
+        Event::Narrowed.outcome(),
+        (WorkState::Failed, "sender's authorization narrowed")
+    );
+}
+
+/// Conditions 4, 2a and the waits for a host sender's task (design I.4.3,
+/// II.5): the route must still name the entry that consented (another
+/// entry that would admit it doesn't count), at its revision; a frozen list
+/// fails it first; then the deadline; it waits for the journal, a deferred
+/// entry, and the host's own Station's gate (which a caught-up native's
+/// channel doesn't open); with `host.senders` off it waits too. A host
+/// sender is never held: a `hold` standing for its principal is ignored.
+#[test]
+fn a_host_senders_task_follows_its_route_and_the_own_stations_gate() {
+    let log = host_log(|_| {});
+    assert_eq!(
+        host_task(&log, &["project:build", "host:host-b"], LATER)
+            .admission
+            .host
+            .unwrap()
+            .consent,
+        "host:host-b",
+        "`host:` first"
+    );
+    let task = host_task(&log, &["local", "project:build"], LATER);
+    assert_eq!(
+        task.admission.host.as_ref().unwrap().consent,
+        "project:build"
+    );
+    let ok = |v: &StartView| may_start(v, &task, Some(0));
+    assert_eq!(ok(&host_view(&log, &["project:build"])), Ok(()));
+    assert_eq!(
+        ok(&host_view(&log, &["host:host-b"])),
+        Err(Event::RouteChanged),
+        "its consent, not another entry"
+    );
+    let mut v = host_view(&log, &["project:build"]);
+    v.config.routes[1].revision = 2;
+    assert_eq!(ok(&v), Err(Event::RouteChanged));
+    let mut v = host_view(&log, &["project:build"]);
+    v.list.as_mut().unwrap().frozen = true;
+    assert_eq!(ok(&v), Err(Event::AuthorityChanged));
+    let mut v = host_view(&log, &["project:build"]);
+    v.halted = true;
+    assert_eq!(ok(&v), Err(Event::Halted));
+    assert_eq!(
+        may_start(&host_view(&log, &["project:build"]), &task, Some(LATER)),
+        Err(Event::Expired)
+    );
+    let mut v = host_view(&log, &["project:build"]);
+    v.list.as_mut().unwrap().deferred = Some(DeferredStop {
+        seq: log.log.head().seq + 1,
+        until_ms: 0,
+        on: None,
+    });
+    assert_eq!(ok(&v), Err(Event::Deferred));
+    // The gate: closed, and a caught-up native's channel is no way in.
+    let mut v = host_view(&log, &["project:build"]);
+    v.gates = Gates::default();
+    v.gates.set_caught_up(BTreeSet::from([PHONE.to_string()]));
+    assert_eq!(ok(&v), Err(Event::GateClosed));
+    // `host.senders` off: it waits (its stops aren't read).
+    let mut v = host_view(&log, &["project:build"]);
+    v.senders = false;
+    assert_eq!(ok(&v), Err(Event::GateClosed));
+    // Never held.
+    let mut v = host_view(&log, &["project:build"]);
+    v.standings.insert(
+        "host:host-b".into(),
+        SenderStanding {
+            held: true,
+            ..SenderStanding::default()
+        },
+    );
+    assert_eq!(ok(&v), Ok(()));
+    // A record without its grant can't be checked: fail closed.
+    let mut bare = task.clone();
+    bare.admission.host = None;
+    assert_eq!(
+        may_start(&host_view(&log, &["project:build"]), &bare, Some(0)),
+        Err(Event::Narrowed)
+    );
+    // No host sender's launch exists (a host opens no channel): fail.
+    let launch = StartLaunch {
+        admission: task.admission.clone(),
+        profile: v.config.profiles[0].clone(),
+        expires_at: LATER,
+    };
+    assert_eq!(
+        launch_check(&host_view(&log, &["project:build"]), &launch, 0),
+        LaunchVerdict::Fail(details::AUTHORIZATION_NARROWED)
+    );
+}
+
+/// The admission record of a host sender's task (design I.4.1, "Changed for
+/// host senders"): its principal and principal key (the hex SHA-256 of the
+/// newest `add_host` key), its generation and epoch, the consent and the
+/// projects whose ops admitted it, those ops, no feed, scope or expiry;
+/// read back the same.
+#[test]
+fn a_host_senders_admission_records_its_grant() {
+    let log = host_log(|_| {});
+    let task = host_task(&log, &["host:host-b"], LATER);
+    let a = &task.admission;
+    let key = &log.log.host("host-b").unwrap().host_key;
+    assert_eq!(a.principal, "host:host-b");
+    assert_eq!(
+        a.principal_key,
+        atem_client::host_principal::host_principal_key(key).to_hex()
+    );
+    let added = log.log.host_membership_epoch("host-b").unwrap();
+    assert_eq!(
+        a.sender,
+        DelegatedSender::Host {
+            host_id: "host-b".into(),
+            generation: added,
+            epoch: added,
+        }
+    );
+    assert_eq!(
+        a.host,
+        Some(super::super::HostGrant {
+            consent: "host:host-b".into(),
+            projects: vec!["build".into()],
+        })
+    );
+    assert_eq!(a.ops_at_admission, ["message", "notify", "prompt"]);
+    assert_eq!(
+        (a.feed.as_ref(), a.grant_expires_at, &a.scope_at_admission),
+        (None, None, &serde_json::Value::Null)
+    );
+    assert_eq!(a.device_list_seq, log.log.head().seq);
+    let text = serde_json::to_string(a).unwrap();
+    assert_eq!(&serde_json::from_str::<Admission>(&text).unwrap(), a);
+}
+
+/// Session-v1 R9.14 item 3 for a host sender's task (design I.4.3, "The
+/// same check runs at the start"): its attempt waiting `accepted` behind
+/// another turn is withdrawn at `executing` when its sender was revoked,
+/// removed or narrowed out while it waited (the device list as it
+/// committed), keeping the event; unchanged, it starts.
+#[test]
+fn a_host_senders_attempt_is_withdrawn_at_executing() {
+    use crate::session_protocol::membership::r9log::MAC;
+    use atem_client::membership::entry::Action;
+    use atem_client::membership::{ProjectOp, host_sender_revoke, project_set};
+    let log = host_log(|_| {});
+    let task = host_task(&log, &["project:build"], LATER);
+    let changed = |change: &dyn Fn(&mut TestLog)| {
+        let mut log = host_log(|_| {});
+        change(&mut log);
+        state(&log)
+    };
+    let cases = [
+        (
+            "a host_sender_revoke",
+            changed(&|log| {
+                log.append(MAC, host_sender_revoke("host-b", true, 0).unwrap());
+            }),
+            Event::Revoked,
+        ),
+        (
+            "a remove_host",
+            changed(&|log| {
+                log.append(
+                    MAC,
+                    Action::RemoveHost {
+                        host_id: "host-b".into(),
+                    },
+                );
+            }),
+            Event::Removed,
+        ),
+        (
+            "a narrowing",
+            changed(&|log| {
+                log.append(
+                    MAC,
+                    project_set("build", [HOST, "host-b"], [ProjectOp::Message], 0).unwrap(),
+                );
+            }),
+            Event::Narrowed,
+        ),
+    ];
+    let mut rt = setup();
+    let shared = Arc::new(Mutex::new(host_view(&log, &["project:build"])));
+    rt.host
+        .set_start_check(Box::new(DelegatedStart(shared.clone())));
+    let mut n = 0;
+    for (what, list, event) in cases {
+        *shared.lock().unwrap() = host_view(&log, &["project:build"]);
+        n += 1;
+        let running = n;
+        submit(&mut rt, &shared, &task, running);
+        assert_eq!(state_of(&rt, running).0, ReceiptState::Executing, "{what}");
+        n += 1;
+        submit(&mut rt, &shared, &task, n);
+        assert_eq!(state_of(&rt, n).0, ReceiptState::Accepted, "{what}");
+        shared.lock().unwrap().list = Some(list);
+        let fx = rt.host.dispatch_report(&rid(running), done());
+        rt.apply(fx);
+        assert_eq!(
+            state_of(&rt, n),
+            (
+                ReceiptState::Rejected,
+                Some(DETAIL_WITHDRAWN_BY_HOST.to_string())
+            ),
+            "{what}"
+        );
+        assert_eq!(
+            shared.lock().unwrap().refused(&rid(n)),
+            Some(event),
+            "{what}"
+        );
+    }
+    *shared.lock().unwrap() = host_view(&log, &["project:build"]);
+    n += 1;
+    let running = n;
+    submit(&mut rt, &shared, &task, running);
+    n += 1;
+    submit(&mut rt, &shared, &task, n);
+    let fx = rt.host.dispatch_report(&rid(running), done());
+    rt.apply(fx);
+    assert_eq!(state_of(&rt, n).0, ReceiptState::Executing);
+}

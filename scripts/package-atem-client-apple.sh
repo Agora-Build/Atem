@@ -17,6 +17,9 @@
 set -euo pipefail
 VERSION="$1"
 OUT="$2"
+# A relative <output-dir> is the caller's, not the repository root's (the
+# script changes to the root below).
+case "$OUT" in /*) ;; *) OUT="$PWD/$OUT" ;; esac
 CONFORMANCE=0
 [ "${3:-}" = "--conformance" ] && CONFORMANCE=1
 cd "$(dirname "$0")/.."

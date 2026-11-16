@@ -592,6 +592,10 @@ fn euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// Why `FileJournal::open` gave up on a lock held elsewhere: the runtime
+/// was asked to stop meanwhile.
+pub const STOPPING: &str = "the runtime was asked to stop while it waited for the journal's lock";
+
 /// `dir` exists (created 0700 if missing), is a real directory owned by this
 /// user that nobody else can write to, and is 0700.
 fn private_dir(dir: &Path) -> Result<(), JournalError> {
@@ -790,6 +794,10 @@ impl FileJournal {
                     "{} is used by another process",
                     state_dir.display()
                 )));
+            }
+            // A runtime asked to stop while it starts doesn't wait it out.
+            if crate::runtime::stop_requested() {
+                return Err(JournalError(STOPPING.into()));
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         };

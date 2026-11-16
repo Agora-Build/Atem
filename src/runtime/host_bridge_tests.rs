@@ -6437,3 +6437,81 @@ async fn a_reconciled_turn_of_another_process_is_agent_exited() {
     assert_eq!(sessions[&ids[0]].chat.current_request_id(), None);
     let _ = sessions.get_mut(&ids[0]).unwrap().stop();
 }
+
+// ── The host encryption key (host senders; delegated host-work II.4.1) ──
+
+/// The host encryption key's file at `pairing`: its generation and bytes.
+fn host_enc_key(pairing: &crate::paths::PairingPaths) -> Option<(u64, Vec<u8>)> {
+    let bytes = std::fs::read(&pairing.host_enc_key).ok()?;
+    let file: Value = serde_json::from_slice(&bytes).unwrap();
+    Some((file["host_trust_gen"].as_u64().unwrap(), bytes))
+}
+
+/// A runtime start with the hook's `host.senders` on a pinned host that
+/// has no key (paired before it existed) makes one for its trust
+/// generation, and the next start keeps it. A re-pin read while it runs
+/// (`atem pair verify`: the next generation) gets a new key. With the hook
+/// off, as on main, none is made; with no pinned list, none either.
+#[test]
+fn the_host_enc_key_is_made_at_start_only_with_host_senders_on_a_pinned_host() {
+    use crate::runtime::test_hooks::HostFeatures;
+    use crate::session_protocol::membership::r9log::{TestLog, secret};
+    use crate::session_protocol::membership::{HostPin, MembershipHost};
+    let _profile = crate::test_profile::temp();
+    let senders = HostFeatures::parse("host.delegated,host.senders").unwrap();
+    let delegated = HostFeatures::parse("host.delegated").unwrap();
+    let dir = short_dir();
+    let sources = crate::profile::Sources::in_dir(&dir.path().join("profile"));
+    let pairing = sources.paths.pairing.clone();
+    let journal = dir.path().join("journal");
+    let open = |features| {
+        super::HostBridge::open_with_features(&journal, Some(&sources), Clock::default(), features)
+            .unwrap()
+    };
+
+    // No pinned list: none.
+    drop(open(senders));
+    assert_eq!(host_enc_key(&pairing), None);
+    assert!(!pairing.host_enc_generated.exists());
+
+    let mut log = TestLog::genesis(ACCOUNT, &secret("bridge astation"));
+    log.add_host(DEVICE, TRUST_GEN, &secret("bridge host"));
+    let pin = |log: &TestLog, generation: u64, seed: &str| {
+        let pin = HostPin {
+            host_id: DEVICE.into(),
+            host_trust_gen: generation,
+        };
+        MembershipHost::pin(&pairing, &journal, &pin, &log.log, &secret(seed)).unwrap();
+    };
+    pin(&log, TRUST_GEN, "bridge host");
+    // The hook off, or `host.delegated` alone: none, as on main.
+    for features in [HostFeatures::default(), delegated] {
+        drop(open(features));
+        assert_eq!(host_enc_key(&pairing), None, "{features:?}");
+        assert!(!pairing.host_enc_generated.exists());
+    }
+    // `host.senders`: made at start for the host's generation, kept at the
+    // next start.
+    drop(open(senders));
+    let (generation, made) = host_enc_key(&pairing).expect("made at start");
+    assert_eq!(generation, TRUST_GEN);
+    assert!(pairing.host_enc_generated.exists());
+    let mut bridge = open(senders);
+    assert_eq!(
+        host_enc_key(&pairing),
+        Some((TRUST_GEN, made.clone())),
+        "kept"
+    );
+
+    // `atem pair verify` while it runs: the new pin (which took the old key
+    // away) is read at the next pass, and its generation gets a new key.
+    log.add_host(DEVICE, TRUST_GEN + 1, &secret("bridge host 2"));
+    pin(&log, TRUST_GEN + 1, "bridge host 2");
+    assert_eq!(host_enc_key(&pairing), None);
+    let mut app = idle_app();
+    bridge.check_list();
+    pass(&mut bridge, &mut app);
+    let (generation, remade) = host_enc_key(&pairing).expect("made for the new pin");
+    assert_eq!(generation, TRUST_GEN + 1);
+    assert_ne!(remade, made);
+}

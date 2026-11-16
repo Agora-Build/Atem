@@ -2325,7 +2325,7 @@ fn revoked_grant_id(n: u32) -> String {
 }
 
 /// A browser grant from the phone, issued now, 50 min long.
-fn browser_of(rig: &mut Rig, n: u32) -> Identity {
+pub(super) fn browser_of(rig: &mut Rig, n: u32) -> Identity {
     let wall = rig.now.host.wall_ms;
     let (g, k) = rig.log.grant(
         "dev-phone",
@@ -3408,9 +3408,9 @@ fn the_pairing_copy_is_never_lowered_by_a_running_engine() {
 /// nothing is applied, answered or fenced.
 mod control_records {
     use super::*;
-    use atem_client::control::ControlRecord;
+    use atem_client::control::{ApplicationResult, ControlRecord, EffectKind, EffectResult};
     use atem_client::session::host_work::{ALERTS_FEATURE, DELEGATED_FEATURE, SENDERS_FEATURE};
-    use atem_client::session::r9::control_records_op;
+    use atem_client::session::r9::{ControlRecordsResult, RecordResult, control_records_op};
 
     const ID: &str = "aaaaaaaa-0000-4000-8000-0000000000c1";
 
@@ -3524,6 +3524,234 @@ mod control_records {
         // Asked again, the same; never a host-work request.
         assert_eq!(refusal(&mut rig, "ch-phone").0, "unsupported_version");
         assert!(rig.engine.take_host_work().is_empty());
+    }
+
+    /// The rig with hosting on and the hook's `host.delegated` and
+    /// `host.senders`: the phone and the bot connected.
+    fn senders_rig() -> Rig {
+        let mut rig = Rig::new();
+        rig.engine.enable_host_work(true);
+        rig.engine.set_delegated_features(true, false);
+        rig.engine.set_senders_feature(true);
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        rig.connect("ch-bot", bot());
+        rig
+    }
+
+    /// `plain` handed to the host on `handle`'s attachment as a client of
+    /// any build would send it (the client core builds no such message).
+    fn send_plain(rig: &mut Rig, handle: &str, plain: &Value) -> Vec<CEvent> {
+        let (att, authority) = match &rig.engine.chans[handle].phase {
+            Phase::Open(a) => (a.attachment.clone(), a.authority.clone()),
+            _ => panic!("{handle} is open"),
+        };
+        let plain = plain.to_string().into_bytes();
+        rig.run(|e, p| ((), e.on_record(&att, &authority, &plain, p)));
+        rig.pump();
+        rig.events(handle)
+    }
+
+    /// The results a runtime answers for `records`: each `pending`.
+    fn pending(records: &[ControlRecord]) -> Vec<RecordResult> {
+        records
+            .iter()
+            .map(|r| RecordResult {
+                record_id: r.record_id().into(),
+                result: ApplicationResult::Pending,
+                effects: vec![EffectResult {
+                    effect: EffectKind::Interrupt,
+                    result: ApplicationResult::Pending,
+                    why: None,
+                }],
+            })
+            .collect()
+    }
+
+    /// `host.senders` on (the debug hook, with `host.delegated`, hosting
+    /// on): the welcome lists it, and a native's `control_records` is served
+    /// (host-work-v1 §11.1, "Carriage"; design II.3.1): read strictly and
+    /// handed to the runtime, which holds the control state, with the
+    /// carrier's principal (no authority from carrying). Nothing is answered
+    /// until the runtime replies: its `control_records_result` (one result
+    /// per record), or its refusal naming the request. A service still gets
+    /// `forbidden`, and nothing of it reaches the runtime.
+    #[test]
+    fn control_records_is_handed_to_the_runtime_with_host_senders_on() {
+        let mut rig = senders_rig();
+        for handle in ["ch-phone", "ch-bot"] {
+            let features = welcome(&mut rig, handle).features;
+            assert!(
+                features.iter().any(|f| f == SENDERS_FEATURE),
+                "{features:?}"
+            );
+        }
+        let records = [record(1), record(2)];
+        let mono = rig.now.host.mono_ms;
+        let (id, frame) = rig
+            .attached("ch-phone")
+            .send_control_records(&records, mono)
+            .unwrap();
+        rig.send_frame("ch-phone", &frame);
+        assert!(rig.events("ch-phone").is_empty(), "the runtime answers");
+        let calls = rig.engine.take_control_records();
+        let [call] = calls.as_slice() else {
+            panic!("one call: {}", calls.len());
+        };
+        assert_eq!(
+            (call.carrier.as_str(), call.request.id.as_str()),
+            ("member:dev-phone", id.as_str())
+        );
+        assert_eq!(call.request.records, records);
+        let results = pending(&records);
+        rig.engine
+            .control_records_reply(&call.attachment, &id, Ok(results.clone()), mono);
+        rig.pump();
+        let events = rig.events("ch-phone");
+        let [CEvent::Family(message)] = events.as_slice() else {
+            panic!("one result: {events:?}");
+        };
+        let result = ControlRecordsResult::from_data(message.data.as_ref().unwrap()).unwrap();
+        assert_eq!((result.re.as_str(), result.results), (id.as_str(), results));
+        // The runtime's refusal names the request.
+        let (id, frame) = rig
+            .attached("ch-phone")
+            .send_control_records(&records[..1], mono)
+            .unwrap();
+        rig.send_frame("ch-phone", &frame);
+        let calls = rig.engine.take_control_records();
+        rig.engine.control_records_reply(
+            &calls[0].attachment,
+            &id,
+            Err(HostWorkError {
+                code: code::BUSY,
+                detail: Some("device list not serving"),
+            }),
+            mono,
+        );
+        rig.pump();
+        let events = rig.events("ch-phone");
+        let [CEvent::Error(e)] = events.as_slice() else {
+            panic!("an error: {events:?}");
+        };
+        assert_eq!(
+            (e.code.as_str(), e.re.as_deref(), e.detail.as_deref()),
+            ("busy", Some(id.as_str()), Some("device list not serving"))
+        );
+        // A service: a native's op.
+        assert_eq!(refusal(&mut rig, "ch-bot").0, "forbidden");
+        assert!(rig.engine.take_control_records().is_empty());
+        assert_eq!(rig.engine.status().attachments, 2);
+        assert!(rig.engine.take_host_work().is_empty());
+    }
+
+    /// A stop always wins (as `work_interrupt`'s ruling T27a): while hosting
+    /// is paused, `control_records` is still taken and handed to the
+    /// runtime, but only while the runtime says it can serve stops
+    /// (`enable_host_work_stops`), and only from a channel whose welcome
+    /// listed `host.senders` (one welcomed before the pause). A channel
+    /// welcomed during the pause lists no more and is refused as before;
+    /// so is everyone with the stops off, or with the hook's `host.senders`
+    /// off.
+    #[test]
+    fn control_records_is_taken_while_hosting_is_paused() {
+        let mut rig = senders_rig();
+        let records = [record(1)];
+        let send = |rig: &mut Rig, handle: &str| {
+            let message = control_records_op(ID, &records).unwrap();
+            send_plain(rig, handle, &message)
+        };
+        let not_advertised = || {
+            Some((
+                "unsupported_version".to_string(),
+                Some("host.senders is not advertised".to_string()),
+            ))
+        };
+        rig.engine.enable_host_work(false);
+        // Paused, the runtime unable to serve a stop: refused as before.
+        assert_eq!(
+            Rig::last_error(&send(&mut rig, "ch-phone")),
+            not_advertised()
+        );
+        assert!(rig.engine.take_control_records().is_empty());
+        // It can serve it: handed to the runtime, unanswered until it
+        // answers.
+        rig.engine.enable_host_work_stops(true);
+        assert!(send(&mut rig, "ch-phone").is_empty(), "the runtime answers");
+        let calls = rig.engine.take_control_records();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].request.records, records);
+        // A service: a native's op, as ever.
+        assert_eq!(refusal(&mut rig, "ch-bot").0, "forbidden");
+        // A channel welcomed during the pause lists no `host.senders`, so
+        // its `control_records` is refused, the stops on or not.
+        rig.advance(1000);
+        rig.connect("ch-new", phone());
+        let features = welcome(&mut rig, "ch-new").features;
+        assert!(
+            !features.iter().any(|f| f == SENDERS_FEATURE),
+            "{features:?}"
+        );
+        assert_eq!(Rig::last_error(&send(&mut rig, "ch-new")), not_advertised());
+        assert!(rig.engine.take_control_records().is_empty());
+        // The hook's `host.senders` off: nothing is taken.
+        rig.engine.set_senders_feature(false);
+        assert_eq!(
+            Rig::last_error(&send(&mut rig, "ch-phone")),
+            not_advertised()
+        );
+        assert!(rig.engine.take_control_records().is_empty());
+        assert!(rig.relay.is_empty());
+    }
+
+    /// Host-work-v1 §11.1, "Carriage": a service's record travels only in
+    /// its Station's feed, so a message holding one (alone or beside a host
+    /// principal's) is refused whole, `invalid_request`; so is one holding a
+    /// record that doesn't parse. Nothing of either reaches the runtime.
+    #[test]
+    fn a_service_record_or_an_unparsed_one_spoils_the_message() {
+        let mut rig = senders_rig();
+        let mut service = record(3).object().to_json();
+        service["body"]["principal"] = json!("service:svc-bot");
+        service["body"]["signer"] = json!("service:svc-bot");
+        service["body"]["action"] = json!("revoke");
+        service["body"]["interrupt_running"] = json!(false);
+        service["body"]
+            .as_object_mut()
+            .unwrap()
+            .remove("revoke_seq");
+        service["body"]["origin"] = json!("https://station-dev.agora.build");
+        service["body"]["feed_id"] = json!("0b9a8c7d-6e5f-4a3b-9c2d-1e0f9a8b7c6d");
+        service["body"]["principal_key"] = json!("ab".repeat(32));
+        service["body"]["about"]["integration_id"] = json!("i-bot");
+        assert!(ControlRecord::parse(service.to_string().as_bytes()).is_ok());
+        let mut unparsed = record(4).object().to_json();
+        unparsed["body"]
+            .as_object_mut()
+            .unwrap()
+            .remove("record_id");
+        for (records, detail) in [
+            (vec![service.clone()], "not a host principal's record"),
+            (
+                vec![record(1).object().to_json(), service],
+                "not a host principal's record",
+            ),
+            (
+                vec![record(1).object().to_json(), unparsed],
+                "not a control record",
+            ),
+        ] {
+            let message = json!({"type": "session", "data": {"v": 1, "op": "control_records",
+                "id": ID, "records": records}});
+            let events = send_plain(&mut rig, "ch-phone", &message);
+            assert_eq!(
+                Rig::last_error(&events),
+                Some(("invalid_request".into(), Some(detail.into())))
+            );
+            assert!(rig.engine.take_control_records().is_empty(), "{detail}");
+        }
+        assert_eq!(rig.engine.status().attachments, 2);
     }
 }
 
@@ -3767,10 +3995,11 @@ mod delegated_work_ops {
     }
 
     /// Step 4, Decision 10: the runtime hands the engine the hook's
-    /// features (`HostFeatures`, read once when it starts). `host.delegated`
-    /// and `host.alerts` are listed only when the hook turns them on, and
-    /// only while hosting is on (they are host-work features: a host lists
-    /// those only then, §1); `host.senders` never. Listed, their ops are
+    /// features (`HostFeatures`, read once when it starts). `host.delegated`,
+    /// `host.alerts` and `host.senders` are listed only when the hook turns
+    /// them on (the last two only with `host.delegated`), and only while
+    /// hosting is on (they are host-work features: a host lists those only
+    /// then, §1). Listed, `host.delegated`'s and `host.alerts`' ops are
     /// taken: decoded, queued for the runtime, and answered with what it
     /// says (`host.delegated`'s `busy` until their handlers exist, with its
     /// detail; `alert_list` here with `delegated::request`'s plain `busy`:
@@ -3799,12 +4028,30 @@ mod delegated_work_ops {
                 false,
                 [false, false, false],
             ),
+            (
+                Some("host.delegated,host.senders"),
+                true,
+                [true, false, true],
+            ),
+            (
+                Some("host.delegated,host.alerts,host.senders"),
+                true,
+                [true, true, true],
+            ),
+            (
+                Some("host.delegated,host.alerts,host.senders"),
+                false,
+                [false, false, false],
+            ),
+            // Ignored without `host.delegated` (the hook turns nothing on).
+            (Some("host.senders"), true, [false, false, false]),
         ];
         for (n, (hook, hosting, listed)) in cases.into_iter().enumerate() {
             let features =
                 hook.map_or_else(HostFeatures::default, |v| HostFeatures::parse(v).unwrap());
             rig.engine
                 .set_delegated_features(features.delegated, features.alerts);
+            rig.engine.set_senders_feature(features.senders);
             rig.engine.enable_host_work(hosting);
             let handle = format!("ch-{n}");
             rig.advance(1000);
@@ -3826,6 +4073,7 @@ mod delegated_work_ops {
         // nothing is answered before it answers.
         rig.engine
             .set_delegated_features(both.delegated, both.alerts);
+        rig.engine.set_senders_feature(false);
         rig.engine.enable_host_work(true);
         for op in OPS {
             let plain = message(&mut rig, "ch-2", op);
@@ -3863,9 +4111,10 @@ mod delegated_work_ops {
         assert!(rig.relay.is_empty());
     }
 
-    /// `host.alerts` without `host.delegated` is ignored (Decision 10): the
-    /// hook's value turns nothing on, and an engine handed it anyway lists
-    /// neither feature and takes none of the ops.
+    /// `host.alerts` or `host.senders` without `host.delegated` is ignored
+    /// (Decision 10): the hook's value turns nothing on, and an engine
+    /// handed them anyway lists none of the features and takes none of the
+    /// ops.
     #[test]
     fn host_alerts_without_host_delegated_is_ignored() {
         use crate::runtime::test_hooks::HostFeatures;
@@ -3873,9 +4122,14 @@ mod delegated_work_ops {
             HostFeatures::parse("host.alerts"),
             Ok(HostFeatures::default())
         );
+        assert_eq!(
+            HostFeatures::parse("host.alerts,host.senders"),
+            Ok(HostFeatures::default())
+        );
         let mut rig = Rig::new();
         rig.engine.enable_host_work(true);
         rig.engine.set_delegated_features(false, true);
+        rig.engine.set_senders_feature(true);
         rig.link_up();
         rig.connect("ch-phone", phone());
         let features = welcome(&mut rig, "ch-phone").features;
@@ -3900,7 +4154,7 @@ mod delegated_work_ops {
 
 /// `host_enc_key_get` (delegated host-work design II.4.1, feature
 /// `host.senders`): refused like `control_records` until the host
-/// advertises the feature.
+/// advertises the feature (served: `host_enc_tests`).
 mod host_enc_key_get {
     use super::*;
     use atem_client::session::host_work::SENDERS_FEATURE;
@@ -3970,6 +4224,31 @@ mod host_enc_key_get {
             rig.list("ch-phone"),
             vec![SID.to_string(), SID_B.to_string()]
         );
+        assert!(rig.engine.take_host_work().is_empty());
+        assert!(rig.relay.is_empty());
+    }
+
+    /// `host.senders` on (with `host.delegated`, hosting on): listed, and
+    /// the op is the host's to answer (`host_enc_tests`): a native member
+    /// without `manage` is `forbidden` there, a service already at the
+    /// channel's authority check.
+    #[test]
+    fn listed_with_host_senders_on() {
+        let mut rig = Rig::new();
+        rig.engine.enable_host_work(true);
+        rig.engine.set_delegated_features(true, false);
+        rig.engine.set_senders_feature(true);
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        rig.connect("ch-bot", bot());
+        let features = welcome(&mut rig, "ch-phone").features;
+        assert!(
+            features.iter().any(|f| f == SENDERS_FEATURE),
+            "{features:?}"
+        );
+        assert_eq!(refusal(&mut rig, "ch-phone"), ("forbidden".into(), None));
+        assert_eq!(refusal(&mut rig, "ch-bot").0, "forbidden");
         assert!(rig.engine.take_host_work().is_empty());
         assert!(rig.relay.is_empty());
     }
