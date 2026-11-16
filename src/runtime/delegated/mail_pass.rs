@@ -20,6 +20,19 @@ use crate::runtime::delegated::station::Call;
 use crate::runtime::delegated::sync::HostIdentity;
 use atem_client::control::RelayError;
 use atem_client::host_mail::mailbox::MailboxToHost;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// A runtime.log line that would come at every pass (a store the mailbox
+/// can't use): the first, then at powers of two.
+fn log_limited(count: &AtomicU64, line: impl FnOnce() -> String) {
+    let n = count.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        eprintln!("{} ({n} so far)", line());
+    }
+}
+
+static UNPREPARED: AtomicU64 = AtomicU64::new(0);
+static UNREADABLE: AtomicU64 = AtomicU64::new(0);
 
 impl HostBridge {
     /// The host's identity as the mailbox binds it: the session host's
@@ -60,18 +73,20 @@ impl HostBridge {
         {
             match mailbox_store::prepare(store) {
                 Ok(()) => self.work.mail_prepared = Some(identity.host),
-                Err(error) => {
-                    eprintln!(
+                Err(error) => log_limited(&UNPREPARED, || {
+                    format!(
                         "atem runtime: host senders' mailbox tables couldn't be made ({error:#})"
                     )
-                }
+                }),
             }
         }
         let observed = self.mail_store().and_then(|(store, identity)| {
             match mailbox_store::read(store, &identity) {
                 Ok(observed) => Some(observed),
                 Err(error) => {
-                    eprintln!("atem runtime: host senders' mailbox state unreadable ({error:#})");
+                    log_limited(&UNREADABLE, || {
+                        format!("atem runtime: host senders' mailbox state unreadable ({error:#})")
+                    });
                     None
                 }
             }
