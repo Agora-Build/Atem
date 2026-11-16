@@ -1553,11 +1553,18 @@ impl HostBridge {
             return;
         }
         let link_gen = self.r9_link;
-        self.station.get_or_insert_with(Station::new);
+        // With `host.senders` (the hook's) its `heads` carry the host's
+        // own mailbox head (host-work-v1 §11.5 rule 6).
+        let senders = self.features.senders;
+        self.station
+            .get_or_insert_with(|| Station::with_senders(senders));
         // The identity first: a new socket is authenticated under the
         // host's identity now (§11.4 "An identity change").
         self.station_identity();
-        self.station.get_or_insert_with(Station::new).sync_link(
+        let station = self
+            .station
+            .get_or_insert_with(|| Station::with_senders(senders));
+        station.sync_link(
             link_gen,
             app.astation_client.socket_id(),
             || station_link_kind(app),

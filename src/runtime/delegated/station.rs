@@ -33,11 +33,12 @@
 //! JSON is still known as one): that page is a Station fault the sync
 //! answers ([`Inbound::Page`] with the reader's error).
 use super::fetch::{DeviceListFetch, FetchApply};
+use super::mailbox::MailboxClient;
 use super::start::StationFetch;
 use super::sync::FeedSync;
 use atem_client::SignedObject;
 use atem_client::control::{
-    ControlSync, ControlSyncResult, Heads, MembershipFetch, RefusedCall, RelayError, ToHost,
+    Accept, ControlSync, ControlSyncResult, Heads, MembershipFetch, RefusedCall, RelayError, ToHost,
 };
 use atem_client::membership::Head;
 use serde_json::{Value, json};
@@ -128,6 +129,12 @@ pub struct Station {
     pub fetch: DeviceListFetch,
     /// The sync of the host's own Station's control feed.
     pub feed: FeedSync,
+    /// `host.senders` (the hook's, with `host.delegated`): `heads` is read
+    /// with its mailbox head (host-work-v1 §11.5 rule 6). Off, the link
+    /// reads exactly as main.
+    senders: bool,
+    /// The host's own mailbox (host senders' mail), only with `senders`.
+    pub mailbox: MailboxClient,
     /// The host's monotonic clock at the last tick (ms).
     now: u64,
     /// `heads` read.
@@ -160,6 +167,15 @@ fn call_name(call: RefusedCall) -> &'static str {
 impl Station {
     pub fn new() -> Station {
         Station::default()
+    }
+
+    /// A Station link of a host that runs `host.senders` (`senders`), or
+    /// not ([`Station::new`]).
+    pub fn with_senders(senders: bool) -> Station {
+        Station {
+            senders,
+            ..Station::default()
+        }
     }
 
     /// The link as the App has it now (`link_gen`: the r9 link generation, none
@@ -240,9 +256,17 @@ impl Station {
         if self.link.is_none() {
             return Inbound::Nothing;
         }
-        match ToHost::decode(bytes.as_bytes()) {
-            Ok(ToHost::Heads(heads)) => {
+        // `heads.mailbox` only with `host.senders` (rule 6): every other
+        // host reads `heads` exactly as §11.4 has it.
+        let accept = Accept {
+            mailbox: self.senders,
+        };
+        match ToHost::decode_with(bytes.as_bytes(), accept) {
+            Ok((ToHost::Heads(heads), mailbox)) => {
                 self.heads += 1;
+                if self.senders {
+                    self.mailbox.on_heads(mailbox);
+                }
                 // Another identity's association: nothing fetched, no head
                 // announced for the gate.
                 let moved = self.feed.moved_socket().is_some();
@@ -251,24 +275,24 @@ impl Station {
                     .and_then(|applied| self.fetch.on_heads(&heads.membership, &applied, deferred));
                 Inbound::Heads(heads, fetch)
             }
-            Ok(ToHost::MembershipFetchResult(result)) => match self.fetch.on_result(result) {
+            Ok((ToHost::MembershipFetchResult(result), _)) => match self.fetch.on_result(result) {
                 FetchApply::Carry(entries) => Inbound::Carry(entries),
                 FetchApply::Unasked => Inbound::Nothing,
             },
-            Ok(ToHost::MembershipFetchRefused(_)) => {
+            Ok((ToHost::MembershipFetchRefused(_), _)) => {
                 self.refused(RefusedCall::MembershipFetch);
                 self.fetch.on_refused();
                 Inbound::Nothing
             }
-            Ok(ToHost::ControlSyncRefused(_)) => {
+            Ok((ToHost::ControlSyncRefused(_), _)) => {
                 self.refused(RefusedCall::ControlSync);
                 Inbound::Nothing
             }
-            Ok(ToHost::ControlAckRefused(_)) => {
+            Ok((ToHost::ControlAckRefused(_), _)) => {
                 self.refused(RefusedCall::ControlAck);
                 Inbound::AckRefused
             }
-            Ok(ToHost::ControlSyncResult(page)) => Inbound::Page(Ok(page)),
+            Ok((ToHost::ControlSyncResult(page), _)) => Inbound::Page(Ok(page)),
             // A page the reader refused as a whole: a Station fault, for
             // the sync to answer (§11.4).
             Err(e) if is_page(bytes) => Inbound::Page(Err(e)),
@@ -493,6 +517,67 @@ mod tests {
             fetched(s.receive(&heads(5), Some(head(3)), None)),
             Some(MembershipFetch { after: 3 })
         );
+    }
+
+    /// `heads` with the host's own mailbox head (host-work-v1 §11.5 rule 6).
+    fn heads_with_mailbox(seq: u64, mailbox: Option<(&str, u64)>) -> String {
+        atem_client::control::HeadsWithMailbox {
+            heads: Heads {
+                feeds: Vec::new(),
+                membership: head(seq),
+            },
+            mailbox: mailbox.map(|(id, head)| atem_client::control::MailboxHead {
+                mailbox_id: id.into(),
+                head,
+            }),
+        }
+        .to_json()
+        .unwrap()
+        .to_string()
+    }
+
+    const MAILBOX: &str = "9d2f6c1e-3b4a-4c5d-8e6f-7a8b9c0d1e2f";
+
+    /// host-work-v1 §11.5 rule 6: with `host.senders` on, `heads` is read
+    /// with its optional mailbox head and the host records its own
+    /// mailbox's `{mailbox_id, head}`; a `heads` without one announces
+    /// none. Off (as on main), a `heads` naming a mailbox is refused by the
+    /// strict reader, counted and dropped, and one without it reads as
+    /// before.
+    #[test]
+    fn heads_carry_the_mailbox_head_only_with_host_senders() {
+        let mut s = Station::with_senders(true);
+        up(&mut s, 1);
+        assert!(matches!(
+            s.receive(&heads_with_mailbox(5, Some((MAILBOX, 12))), None, None),
+            Inbound::Heads(..)
+        ));
+        let announced = s.mailbox.announced().unwrap();
+        assert_eq!(
+            (announced.mailbox_id.as_str(), announced.head),
+            (MAILBOX, 12)
+        );
+        assert!(matches!(
+            s.receive(&heads_with_mailbox(5, None), None, None),
+            Inbound::Heads(..)
+        ));
+        assert_eq!(s.mailbox.announced(), None);
+        assert_eq!(s.dump()["unread"], 0);
+
+        // Off: exactly main.
+        let mut s = Station::new();
+        up(&mut s, 1);
+        assert_eq!(
+            s.receive(&heads_with_mailbox(5, Some((MAILBOX, 12))), None, None),
+            Inbound::Nothing
+        );
+        assert_eq!(s.dump()["unread"], 1);
+        assert_eq!(s.mailbox.announced(), None);
+        assert!(matches!(
+            s.receive(&heads_with_mailbox(5, None), None, None),
+            Inbound::Heads(..)
+        ));
+        assert_eq!(s.dump()["heads"], 1);
     }
 
     /// Without a device list nothing is fetched; a result is carried only
