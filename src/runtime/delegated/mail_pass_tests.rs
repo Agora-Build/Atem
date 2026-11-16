@@ -367,9 +367,11 @@ fn a_mailbox_page_that_cant_commit_commits_nothing() {
         };
         crate::runtime::delegated::mailbox_store::commit_page(store, &identity, &moved, None)
             .unwrap();
+        // (Its head the announced one: a head below the cursor would be a
+        // reset, rule 7.)
         mb_receive(
             &mut rig,
-            &mb_page(&syncs[0], 1, std::slice::from_ref(&cancel)),
+            &mb_page(&syncs[0], 5, std::slice::from_ref(&cancel)),
         );
         assert_eq!(mb_store(&rig).inbox, 0, "stale: nothing");
         assert_eq!(mb_store(&rig).cursor, Some((MB_MAILBOX.into(), 3)));
@@ -614,9 +616,10 @@ fn mb_result(rig: &LocalRig, host: &MbHost) -> Value {
 }
 
 /// Ruling R31 in the bridge: a result over the results' limits is left on
-/// the Station (no row, no done) and keeps host senders' gate closed; once
-/// room frees (the sending host's check took the kept one), the next step
-/// rewinds the cursor durably, the re-read keeps it and its done goes.
+/// the Station (no row, no done); once room frees (the sending host's check
+/// took the kept one), the next step rewinds the cursor durably, the
+/// re-read keeps it and its done goes. Ruling R35: it holds no gate, left
+/// there or read again (results start no work).
 #[test]
 fn a_result_over_the_limits_is_read_again_once_room_frees() {
     local_test(async |root| {
@@ -642,7 +645,7 @@ fn a_result_over_the_limits_is_read_again_once_room_frees() {
             (Some((MB_MAILBOX.into(), 2)), vec![1])
         );
         assert_eq!(mb_out(&mut rig), (vec![], vec![]), "no done for it");
-        assert!(!mb_gate(&rig), "not committed yet");
+        assert!(mb_gate(&rig), "a result left there holds no gate");
         rig.bridge
             .work
             .store
@@ -655,6 +658,7 @@ fn a_result_over_the_limits_is_read_again_once_room_frees() {
         let (syncs, _) = mb_out(&mut rig);
         assert_eq!(syncs.len(), 1);
         assert_eq!(syncs[0].after, 1, "read again from just before it");
+        assert!(mb_gate(&rig), "the re-read closes nothing");
         mb_receive(&mut rig, &mb_page(&syncs[0], 2, &[second]));
         let observed = mb_store(&rig);
         assert!(!observed.skipped);
@@ -783,7 +787,7 @@ fn a_waiting_object_with_no_room_is_judged_again_when_room_frees() {
 
 /// Review P4: a skip ends once its object expires: with no room ever
 /// freed, the rewind still comes once `D` passes the skipped object's
-/// expiry, and the gate's mailbox part no longer waits for it.
+/// expiry.
 #[test]
 fn a_skip_ends_in_the_bridge_once_its_object_expires() {
     local_test(async |root| {
@@ -809,9 +813,65 @@ fn a_skip_ends_in_the_bridge_once_its_object_expires() {
         assert_eq!(observed.cursor, Some((MB_MAILBOX.into(), 1)));
         let (syncs, _) = mb_out(&mut rig);
         assert_eq!(syncs[0].after, 1);
-        // The Station no longer lists it: read to the head, the gate open
-        // once the kept result goes.
+        // The Station no longer lists it: read to the head.
         mb_receive(&mut rig, &mb_page(&syncs[0], 2, &[]));
         assert!(!mb_store(&rig).skipped);
+    });
+}
+
+/// Ruling R35 in the bridge: a cancel left on the Station for want of room
+/// holds host senders' gate until it is read again: through the rewind
+/// once admission took a row, until the re-read opens it (then it waits
+/// for admission as any opened object).
+#[test]
+fn a_skipped_cancel_holds_the_gate_until_it_is_read_again() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = mb_host(&mut rig, root, &os);
+        rig.bridge.work.mail_limits.inbox = 1;
+        let admit = |rig: &LocalRig| {
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .execute("DELETE FROM mailbox_inbox", [])
+                .unwrap();
+        };
+        let head = rig.bridge.membership.as_ref().unwrap().head();
+        mb_heads(&mut rig, MB_MAILBOX, 2);
+        let (syncs, _) = mb_out(&mut rig);
+        let first = mb_cancel(&rig, &host, "host-b", &host.sender, head);
+        mb_receive(&mut rig, &mb_page(&syncs[0], 2, &[first]));
+        let (syncs, _) = mb_out(&mut rig);
+        let second = mb_cancel(&rig, &host, "host-b", &host.sender, head);
+        mb_receive(
+            &mut rig,
+            &mb_page(&syncs[0], 2, std::slice::from_ref(&second)),
+        );
+        let observed = mb_store(&rig);
+        assert!(observed.skipped_inbox);
+        assert!(!mb_gate(&rig));
+        assert!(
+            rig.bridge.mail_status().unwrap().contains("room"),
+            "{:?}",
+            rig.bridge.mail_status()
+        );
+        // Admission takes the first: the rewind, and the gate still waits.
+        admit(&rig);
+        mb_tick(&mut rig, &mut host, 1_000);
+        let (syncs, _) = mb_out(&mut rig);
+        assert_eq!(syncs[0].after, 1);
+        assert!(!mb_gate(&rig), "not read again yet");
+        mb_receive(&mut rig, &mb_page(&syncs[0], 2, &[second]));
+        let observed = mb_store(&rig);
+        assert!(!observed.skipped_inbox);
+        assert_eq!(observed.inbox, 1);
+        assert!(!mb_gate(&rig), "it waits for admission now");
+        admit(&rig);
+        mb_tick(&mut rig, &mut host, 1_000);
+        assert!(mb_gate(&rig));
     });
 }

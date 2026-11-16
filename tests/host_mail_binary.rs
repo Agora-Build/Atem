@@ -1326,6 +1326,73 @@ fn the_gates_mailbox_part_waits_for_the_head_and_the_inbox() {
     rig.until_mailbox("open again", |m| m["open"] == true);
 }
 
+/// Ruling R35: a flood of results over the sending host's results' share
+/// (64) leaves the 65th on the Station (no row, no done; back-pressure,
+/// never loss) and host senders' gate's mailbox part open: results start
+/// no work. A request over its inbox share (32) left there closes it until
+/// admission frees room and the host reads it again (the rewind to just
+/// before the result, which still finds no room and stays there, holding
+/// nothing); then it waits for admission as any opened request.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_results_flood_leaves_the_gate_open_and_a_skipped_request_closes_it() {
+    const ROOM: &str = "a mailbox object waits on the Station for room in this host's inbox";
+    let rig = Rig::start(Via::Relay, Hook::Senders);
+    let to = rig.receiver(1);
+    let head = rig.log.log.head();
+    {
+        let mut station = rig.station();
+        for _ in 0..65 {
+            rig.sender
+                .put_stored(&mut station, &rig.sender.result(&to, head));
+        }
+    }
+    let mailbox_id = rig.station().mailbox_id();
+    rig.online();
+    rig.within("the results read", || {
+        rig.cursor() == Some((mailbox_id.clone(), 65)) && rig.owed().is_empty()
+    });
+    assert_eq!(rig.count("mailbox_results"), 64);
+    assert_eq!(
+        rig.station().mailbox_positions(),
+        [65],
+        "left on the Station"
+    );
+    let mailbox = rig.until_mailbox("the gate", |m| m["announced"]["head"] == 65);
+    assert_eq!(mailbox["open"], true, "{mailbox}");
+    // 33 requests: 32 into the inbox, the 33rd left on the Station.
+    {
+        let mut station = rig.station();
+        for n in 0..33 {
+            let request = rig.sender.request(&to, head, &format!("Request {n}"));
+            rig.sender.put_stored(&mut station, &request);
+        }
+    }
+    rig.within("the requests read", || {
+        rig.cursor() == Some((mailbox_id.clone(), 98)) && rig.owed().is_empty()
+    });
+    assert_eq!(rig.inbox().len(), 32);
+    assert_eq!(rig.station().mailbox_positions(), [65, 98]);
+    rig.until_mailbox("closed by the request", |m| m["closed"] == ROOM);
+    // Admission takes the inbox: room frees, the host reads again from the
+    // result's position; the request opens, the result still waits.
+    rig.admit_all();
+    rig.within("the request read again", || {
+        rig.inbox().len() == 1 && rig.owed().is_empty()
+    });
+    assert_eq!(rig.station().mailbox_positions(), [65]);
+    rig.until_mailbox("waiting for admission", |m| {
+        m["closed"] == "1 mailbox object(s) wait for admission"
+    });
+    rig.admit_all();
+    rig.until_mailbox("open again", |m| m["open"] == true);
+    assert_eq!(rig.count("mailbox_results"), 64);
+    rig.offline();
+}
+
 // ── An identity change on the live link (§11.4, rule 8) ──
 
 /// The P-256 generator, uncompressed: a valid Astation signing key for the

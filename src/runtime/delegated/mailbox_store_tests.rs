@@ -1358,3 +1358,103 @@ fn an_expired_result_is_done_as_expired_never_skipped() {
     assert_eq!(b.owed(), [1, 2], "both done: neither is read again");
     assert_eq!(b.count("mailbox_results"), 0);
 }
+
+/// Ruling R35: a result left on the Station for want of room holds no gate
+/// (a result starts no work: host senders' tasks never wait for one); a
+/// request, cancel or complete left there does, until a read after the
+/// rewind passes its position (a later page of the first read doesn't: it
+/// only moves on). Through the rewind's re-read the mailbox stays read to
+/// the furthest position reached (`read_to`), so a re-read never closes the
+/// gate on its own; a reset forgets both.
+#[test]
+fn only_a_skipped_request_cancel_or_complete_holds_the_gate() {
+    let mail = Mail::new();
+    let mut b = Box::new();
+    let cx = DecideCx {
+        limits: Limits {
+            results_per_sender: 1,
+            inbox_per_sender: 1,
+            ..Limits::default()
+        },
+        ..mail.cx()
+    };
+    assert_eq!(
+        decided(b.put_with(&cx, &result_from(&mail, "host-b").to_json())),
+        Decision::Result
+    );
+    let second = result_from(&mail, "host-b");
+    assert_eq!(
+        decided(b.put_with(&cx, &second.to_json())),
+        Decision::Skipped
+    );
+    let observed = read(&b.store, &identity(1)).unwrap();
+    assert!(observed.skipped, "left on the Station");
+    assert!(!observed.skipped_inbox, "a result holds no gate");
+    assert_eq!(
+        decided(b.put_with(&cx, &mail.cancel().to_json())),
+        Decision::Opened
+    );
+    let fourth = mail.cancel();
+    assert_eq!(
+        decided(b.put_with(&cx, &fourth.to_json())),
+        Decision::Skipped
+    );
+    assert!(read(&b.store, &identity(1)).unwrap().skipped_inbox);
+    // A later page of the first read only moves on: it still waits there.
+    decided(b.put_with(&cx, &serde_json::json!("junk")));
+    let observed = read(&b.store, &identity(1)).unwrap();
+    assert!(observed.skipped_inbox, "position 4 not read again");
+    assert_eq!(
+        (observed.cursor, observed.read_to),
+        (Some((MAILBOX.into(), 5)), 5)
+    );
+    // Admission takes the opened cancel: room frees, the cursor rewinds to
+    // just before the lowest skipped position (the result's, 2).
+    b.store.db.execute("DELETE FROM mailbox_inbox", []).unwrap();
+    assert!(rewind_if_room(&b.store, &identity(1), cx.now_ms).unwrap());
+    let observed = read(&b.store, &identity(1)).unwrap();
+    assert_eq!(
+        (observed.cursor, observed.read_to),
+        (Some((MAILBOX.into(), 1)), 5),
+        "read to 5 still"
+    );
+    assert!(observed.skipped_inbox, "not read again yet");
+    // The re-read: the result left again (still no room for it), the
+    // opened cancel gone from the Station (done), then the fourth opens.
+    b.at = 1;
+    assert_eq!(
+        decided(b.put_with(&cx, &second.to_json())),
+        Decision::Skipped
+    );
+    let observed = read(&b.store, &identity(1)).unwrap();
+    assert!(observed.skipped && observed.skipped_inbox);
+    commit_page(
+        &b.store,
+        &identity(1),
+        &page(MAILBOX, 2, 5, 3, vec![]),
+        Some(&cx),
+    )
+    .unwrap();
+    b.at = 3;
+    assert_eq!(
+        decided(b.put_with(&cx, &fourth.to_json())),
+        Decision::Opened
+    );
+    let observed = read(&b.store, &identity(1)).unwrap();
+    assert!(!observed.skipped_inbox, "read again past it");
+    assert!(observed.skipped, "the result still waits there");
+    assert_eq!(
+        (observed.cursor, observed.read_to),
+        (Some((MAILBOX.into(), 4)), 5)
+    );
+    // A reset forgets both.
+    decided(b.put_with(&cx, &mail.cancel().to_json()));
+    assert!(read(&b.store, &identity(1)).unwrap().skipped_inbox);
+    mark_reset(&b.store, &identity(1), MAILBOX_2).unwrap();
+    let observed = read(&b.store, &identity(1)).unwrap();
+    assert!(!observed.skipped_inbox);
+    assert_eq!(
+        (observed.cursor, observed.read_to),
+        (Some((MAILBOX_2.into(), 0)), 0)
+    );
+}

@@ -699,6 +699,8 @@ mod tests {
             owed: Vec::new(),
             owed_count: 0,
             skipped: false,
+            skipped_inbox: false,
+            read_to: 0,
             rewind_due: false,
             skip_expires: None,
         };

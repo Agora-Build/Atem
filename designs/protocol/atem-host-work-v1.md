@@ -3516,9 +3516,9 @@ exactly as without this section):
 - an `atem-result` is never judged as an envelope: it is kept for the
   sending host's own check (`accept_result`, design II.4.4) with its exact
   bytes, `object_hash`, sender, id and mailbox position, committed with the
-  cursor and owing its done like any other object; a kept result holds no
-  gate (it starts no work), though one left on the Station for want of
-  room does until it is read again (below);
+  cursor and owing its done like any other object; a result holds no
+  gate, kept or left on the Station for want of room (below): it starts
+  no work;
 - **back-pressure, never loss (Atem's reading, for Astation's
   agreement):** an opened request, cancel or complete waiting for
   admission, or a kept result, that doesn't fit is never marked done and
@@ -3537,8 +3537,13 @@ exactly as without this section):
   rewind also comes once the delegated clock passes the expiry of every
   object left there (the Station has dropped them). A waiting object that
   decides to open with no room keeps waiting, never marked done, and is
-  judged again as soon as room frees. Until then host senders' gate stays
-  closed: the object isn't committed. Unlike
+  judged again as soon as room frees. A request, cancel or complete left
+  there keeps host senders' gate closed (it isn't committed) until a read
+  after the rewind passes its position; a result left there doesn't
+  (results start no work, and a flood of them must not hold task
+  admission). The host keeps the furthest position it read in the
+  mailbox, which a rewind doesn't lower: the re-read closes no gate on its
+  own, and a head below that position is a reset (rule 7). Unlike
   a pending overflow, which a sender's resend makes safe to mark done, a
   result is never resent once stored (design II.4.4);
 - **bounded storage (Atem's reading, for Astation's agreement):** anything
@@ -3563,10 +3568,11 @@ exactly as without this section):
   (a reused id's, the sender's own signature over two sealed parts, is
   kept longest after the reported ones);
 - host senders' gate also needs the mailbox read to the announced head with
-  no refusal, fault or reset waiting, no object left on the Station for
-  want of room, and every inbox row admitted (design II.5); until admission
-  is built an inbox row keeps it closed. `atem
-  status`'s `Control feeds:` line names this part.
+  no refusal, fault or reset waiting, no request, cancel or complete left
+  on the Station for want of room (a result left there holds none), and
+  every inbox row admitted (design II.5); until admission is
+  built an inbox row keeps it closed. `atem status`'s `Control feeds:` line
+  names this part.
 
 The receiving host's mailbox on the Station (design II.4.3): a sending host
 puts objects over its own link, and the receiving host syncs its own mailbox
