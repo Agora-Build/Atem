@@ -4758,8 +4758,9 @@ fn with_the_hook_off_a_local_link_ignores_the_stations_challenge_as_main_does() 
 /// and the device verified again, as a `deviceVerified` still in flight
 /// leaves them. The move counts against the re-authenticating socket.
 /// Once Astation answers, the link comes back on that socket with the
-/// Station's `heads` right behind it: nothing is asked or acknowledged
-/// there, and the link reconnects once, after Astation's answer. The new
+/// Station's `heads` right behind it (and on the local link a fresh
+/// challenge): nothing is asked, acknowledged or proved there, and the link
+/// reconnects once, after Astation's answer. The new
 /// socket proves itself at the grown list's head and the new identity's
 /// store reads the feed from 0 before the gate opens; its acks are trust
 /// generation 2's.
@@ -4805,8 +4806,14 @@ fn an_identity_moving_in_a_reauthentication_window(via: Via) {
     // `heads` right behind.
     *rig.astation.auth.lock().unwrap() = AuthReply::Authenticated;
     let sent_before = rig.station().sent_on(old_link).len();
-    rig.astation
-        .send(old_link, support::astation::authenticated().to_string());
+    // Through Astation's local link the Station challenges the old socket
+    // again, right behind the answer (read with it, before the pass that
+    // reconnects): never answered there.
+    let answer = support::astation::authenticated().to_string();
+    match via {
+        Via::Local => rig.station().challenge_behind(old_link, answer),
+        _ => rig.astation.send(old_link, answer),
+    }
     rig.station().heads_now();
     // The link reconnects, once, after Astation's answer.
     let new_link = rig.next_link(old_link);
@@ -4821,6 +4828,11 @@ fn an_identity_moving_in_a_reauthentication_window(via: Via) {
         sent_before,
         "nothing asked or acknowledged on the old association"
     );
+    if via == Via::Local {
+        rig.within("the old socket's challenge ignored", || {
+            rig.runtime_log().contains(IDENTITY_IGNORED)
+        });
+    }
     rig.link.set(new_link);
     rig.station().reassociate(2, new_link);
     // The new socket proves itself at the grown list's head.
@@ -4850,7 +4862,7 @@ fn an_identity_moving_in_a_reauthentication_window(via: Via) {
                     .filter(|proof| proof.link == old_link)
                     .count(),
                 1,
-                "one proof on the old socket"
+                "one proof on the old socket: the challenge after the window unanswered"
             );
         }
     }

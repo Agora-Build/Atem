@@ -24,6 +24,8 @@ pub enum Event {
 
 enum Cmd {
     Send(String),
+    /// These, in order, in one write: the host reads them together.
+    SendAll(Vec<String>),
     Close,
 }
 
@@ -75,6 +77,14 @@ impl LinkSender {
     pub fn send(&self, link: u64, text: String) {
         if let Some(tx) = self.0.lock().unwrap().get(&link) {
             let _ = tx.send(Cmd::Send(text));
+        }
+    }
+
+    /// `texts`, in order, in one write on `link` (one flush): the host
+    /// reads them together.
+    pub fn send_all(&self, link: u64, texts: Vec<String>) {
+        if let Some(tx) = self.0.lock().unwrap().get(&link) {
+            let _ = tx.send(Cmd::SendAll(texts));
         }
     }
 
@@ -213,6 +223,16 @@ async fn serve(
             command = commands.recv() => match command {
                 Some(Cmd::Send(text)) => {
                     if socket.send(Message::Text(text)).await.is_err() {
+                        return;
+                    }
+                }
+                Some(Cmd::SendAll(texts)) => {
+                    for text in texts {
+                        if socket.feed(Message::Text(text)).await.is_err() {
+                            return;
+                        }
+                    }
+                    if socket.flush().await.is_err() {
                         return;
                     }
                 }
