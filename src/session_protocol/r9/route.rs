@@ -325,9 +325,9 @@ impl LinkRoute {
         self.routed_ok.clone()
     }
 
-    /// The runtime.log lines written on this link so far (tests).
+    /// The runtime.log lines written on this link's socket so far (tests).
     #[cfg(test)]
-    pub fn lines(&self) -> u32 {
+    pub fn socket_lines(&self) -> u32 {
         self.socket_lines
     }
 
@@ -1040,12 +1040,12 @@ mod tests {
         log.add_host("host-1", 1, &secret("route host"));
         let mut link = LinkRoute::local(ready(&log), ROOM, "atem-x");
         link.ignore(&challenge_for(ROOM).1);
-        assert_eq!(link.lines(), 1, "an early challenge logged");
+        assert_eq!(link.socket_lines(), 1, "an early challenge logged");
         let refused = RelayReply::refused(&HostRouteRefusal::StaleLog)
             .to_json()
             .to_string();
         link.ignore(&refused);
-        assert_eq!(link.lines(), 2, "an early verdict logged");
+        assert_eq!(link.socket_lines(), 2, "an early verdict logged");
         link.authenticated();
         // Even authenticated, `ignore` never answers.
         link.ignore(&challenge_for(ROOM).1);
@@ -1058,18 +1058,30 @@ mod tests {
             link.ignore(&challenge_for(ROOM).1);
         }
         // (The two before the authentication were the earlier allowance's.)
-        assert_eq!(link.lines(), 2 + MAX_LINES_PER_LINK, "one authentication");
+        assert_eq!(
+            link.socket_lines(),
+            2 + MAX_LINES_PER_LINK,
+            "one authentication"
+        );
         // Each re-authentication logs its answer and verdict again, until
         // the socket's cap.
         for cycle in 0..40 {
             link.unauthenticated();
             link.authenticated();
-            let before = link.lines();
+            let before = link.socket_lines();
             assert!(link.answer(&challenge_for(ROOM).1).is_some());
             if before < MAX_LINES_PER_SOCKET {
-                assert_eq!(link.lines(), before + 1, "cycle {cycle}: its answer logged");
+                assert_eq!(
+                    link.socket_lines(),
+                    before + 1,
+                    "cycle {cycle}: its answer logged"
+                );
             }
         }
-        assert_eq!(link.lines(), MAX_LINES_PER_SOCKET, "the socket's cap");
+        assert_eq!(
+            link.socket_lines(),
+            MAX_LINES_PER_SOCKET,
+            "the socket's cap"
+        );
     }
 }

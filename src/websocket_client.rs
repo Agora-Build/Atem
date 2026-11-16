@@ -1172,7 +1172,7 @@ impl AstationClient {
     /// The runtime.log lines the local route wrote on this socket.
     #[cfg(test)]
     pub(crate) fn local_route_lines_for_test(&self) -> u32 {
-        self.local_route.as_ref().map_or(0, crate::session_protocol::r9::route::LinkRoute::lines)
+        self.local_route.as_ref().map_or(0, crate::session_protocol::r9::route::LinkRoute::socket_lines)
     }
 
     /// Pretend this socket is a local link Astation authenticated, with a
