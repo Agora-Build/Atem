@@ -898,10 +898,10 @@ records applied to the tasks from the host's own Station's feed through
   is built and tested against a fake Station that speaks only the shared
   builders;
 - the goldens are `fixtures/r9-vectors-station-calls.json` (agreed, as
-  marked in §11.4); O1 and O5, marked "for Astation's sign-off" below, were
-  signed off on 2026-11-13 (#156 comment 6858184397), and the correlation
-  amendment (wire rule 11), made on Astation's request, waits for its
-  sign-off on #156;
+  marked in §11.4); O1 and O5 were signed off on 2026-11-13 (#156 comment
+  6858184397) and are marked so below, and the correlation amendment (wire
+  rule 11), made on Astation's request, was signed off on 2026-11-14 (#156
+  comment 6885246159, #120 comment 6885269470);
 - the clock provider's tests run on real OSes (`scripts/clock-real-os.py`,
   `.github/workflows/clock-real-os.yml`);
 - `no_match`'s wire form and a selector-resolved task's status belong to
@@ -912,10 +912,13 @@ Passages written in step 4 say "as built in step 4" or "step 4". Astation
 answered step 4's contract questions on 2026-11-13 (#120 comments
 6848326392 and 6848463998, #164 comment 6858189009); marks written before
 those answers still read "for Astation" until a docs change marks them
-agreed, as step 3's were. The readings written since (§11.1's effects on
-the tasks and its service refusals, §11.4's acknowledgments and pacing)
-wait for Astation's answer. The hook activates nothing outside a debug
-build.
+agreed, as step 3's were. Astation answered the readings written since
+(§11.1's effects on the tasks and its service refusals, §11.4's
+acknowledgments and pacing) on 2026-11-14 (#120 comment 6885269470, which
+also agrees to the narrowed pacing), and the two host changes it asked for there
+(a hold's fence of session-v1, an identity change on the live link) on
+2026-11-15 (#120 comment 6889906767): each reading it agreed is marked
+agreed below. The hook activates nothing outside a debug build.
 
 ### 11.1 Control records
 
@@ -1217,7 +1220,8 @@ The rules:
 
    **A release lifts only holds issued before it** (**O1, requested by
    Astation (2026-11-13, #120 comment 6848326392)**; amended for step 4,
-   the built form for Astation's sign-off). Feed order alone can't protect
+   the built form **signed off by Astation (2026-11-13, #156 comment 6858184397; reaffirmed 2026-11-15, #120 comment 6889906767)**).
+   Feed order alone can't protect
    a newer hold: `feed_seq` isn't signed, and the evicted floor (rule 1)
    guards only evicted records, so a carrier could serve a release it
    withheld, or one refused before, after a newer hold. So:
@@ -1293,7 +1297,7 @@ principal's holds and releases were read from (one, for a host syncing its
 own Station), and a few hundred bytes more. The whole state (`to_json`,
 `"v": 2`) is the parts by principal under the device list's account and
 genesis. **A service's part keeps the hold's time** (`hold_issued_at`,
-O1; **for Astation's sign-off**, amended for step 4): the newest `issued_at` of every
+O1; **signed off by Astation (2026-11-13, #156 comment 6858184397; reaffirmed 2026-11-15, #120 comment 6889906767)**, amended for step 4): the newest `issued_at` of every
 hold verified for it (rule 6), present from its first hold on and whenever
 `held`. The format stays `"v": 2`. A stored part without it (written
 before O1) is read as "no hold's time known" only while `held` is false:
@@ -1342,8 +1346,9 @@ can't be decided yet. A grant entry under a kid the host never hashes
 (one the cred agent no longer retains) keeps that `busy`, where v1 answers
 `forbidden`; such a grant can't be honoured either way.
 
-**The effects on tasks, as built in step 4 (Atem's reading, for
-Astation).** A record's effects are written in its transaction with the
+**The effects on tasks, as built in step 4 (Atem's reading, agreed with Astation (2026-11-14, #120 comment 6885269470),
+except the last item, `host.delegated` off, which that answer doesn't
+name).** A record's effects are written in its transaction with the
 touched parts and the cursor (design I.5.5), a pending record's when it
 applies again; what needs the session host comes after that commit.
 - **`revoke`.** Every unstarted task of the service (`queued`, `blocked`,
@@ -1370,7 +1375,7 @@ applies again; what needs the session host comes after that commit.
   tasks end the same way, never holding their sessions
   until their deadlines.
 - **No service holds session-v1 while the control state is unchecked**
-  (**Atem's reading, for Astation**), on a
+  (**Atem's reading, agreed with Astation (2026-11-14, #120 comment 6885269470)**), on a
   host that keeps a control state: a host-work store whose control tables
   exist (read once when the store opens), whichever host identity it is
   bound to, or a store that exists and can't be opened or read. With
@@ -1435,7 +1440,7 @@ applies again; what needs the session host comes after that commit.
   counted whoever makes it: the start check, or the recovery after a crash
   (`withdrawn at recovery`).
 - **A hold also fences the service's session-v1, reversibly** (**Atem's
-  reading that implements Astation's item 7, #120, 2026-11-14**), so a held
+  reading that implements Astation's item 7, #120, 2026-11-14; agreed with Astation (2026-11-15, #120 comment 6889906767)**), so a held
   integration can't go around the delegated queue through the channel it
   already has. Behind `host.delegated`:
   - **The fence.** Every hold applied asks for it after its commit, like a
@@ -1474,7 +1479,9 @@ applies again; what needs the session host comes after that commit.
     no fence; while the committed state still holds it, the loaded state
     writes the fence at the next start, before any service is admitted
     (services are refused as unchecked until the state loads).
-  - **The residual** (**Atem's reading, for Astation**): a crash
+  - **The residual** (**Atem's reading, agreed with Astation (2026-11-15, #120 comment 6889906767) for a
+    crash, never for a reload that keeps the old attachments or queued
+    commands**): a crash
     between the commit of a hold and of its release (one page or pass) and
     their fence leaves no fence at all. After the restart the committed
     state shows the service released, so nothing is fenced, and the hold's
@@ -1488,7 +1495,8 @@ applies again; what needs the session host comes after that commit.
     under `host-work`, which no fence names), interrupts no running turn,
     and is undone by a `release`. Natives, browser grants and `local` are
     unaffected; a revoke wins over a hold and stays final.
-  - **v1 work the service had** (**Atem's reading of Astation's item 7**):
+  - **v1 work the service had** (**Atem's reading of Astation's item 7,
+    agreed with Astation (2026-11-15, #120 comment 6889906767)**):
     the fence is session-v1's §H, so v1 work follows v1's rules, as with a
     revoke's or the unchecked state's fence, and nothing of it waits for
     the release. A v1 task admitted before the service's cover ends
@@ -1496,7 +1504,8 @@ applies again; what needs the session host comes after that commit.
     turn is running is marked so while the turn goes on, never interrupted.
     A v1 launch reserved and not yet started is fenced the same way at the
     spawn boundary.
-  - **What a held service can't do over r9** (**Atem's reading**).
+  - **What a held service can't do over r9** (**Atem's reading,
+    agreed with Astation (2026-11-15, #120 comment 6889906767)**).
     Astation's answer lets reads and results go on through the authorized
     Station API where its lifecycle permits them. On the host, with its
     attachments closed and its `hello`s refused, a held service reads
@@ -1653,7 +1662,7 @@ record is pending or refused or kept as evidence (the bindings'
 sequence's `state` is v2, each step carries its `standing` and `why`, two
 sequences and three records are new in the file, and the checker's checks
 of parts, `why` and the bound below are new; its steps' other fields are as
-they were.) (**For Astation's sign-off**, amended for step 4, O1: the records
+they were.) (**Signed off by Astation (2026-11-13, #156 comment 6858184397; reaffirmed 2026-11-15, #120 comment 6889906767)**, amended for step 4, O1: the records
 `W1_release_withheld`…`W8_b_release_newer`, the sequences `Q21`…`Q27` (a
 withheld and a previously refused release after a newer hold, equal
 timestamps, a newer hold while held, holds from another feed, at no
@@ -1681,7 +1690,7 @@ alone: the ids each step counts and the oldest unpinned ones evicted past
 evicted, and every possible replay (an unrevoked principal's cover or
 release, its id not counted, issued no later than the floor then) refused
 as evidence with `why` `possible_replay`. It also derives O1 from the steps
-alone (**for Astation's sign-off**, amended for step 4): the hold's time as the newest
+alone (**signed off by Astation (2026-11-13, #156 comment 6858184397; reaffirmed 2026-11-15, #120 comment 6889906767)**, amended for step 4): the hold's time as the newest
 `issued_at` of every hold step that holds or finds the principal held while
 it isn't revoked, from `initial`'s; every release that reaches the rule
 (held, not revoked, not refused for another reason) `applied` exactly when
@@ -2050,7 +2059,7 @@ relay messages, not session ops, so no welcome feature gates them: the
 host's own `host.delegated` does. (This section said they arrive "with
 `host.senders` and delegated work"; the design's V.2 puts the feeds and
 the host's own fetch in step 4, Part I, so they come with `host.delegated`
-alone: **Atem's reading, for Astation's agreement**. Astation agreed to the
+alone: **Atem's reading, agreed with Astation (2026-11-14, #120 comment 6885269470)**. Astation agreed to the
 host's own fetch behind `host.delegated`, #164 comment 6858189009.) Types:
 `atem_client::control::relay`
 (every message, its reader and builder) and `atem_client::control::ledger`
@@ -2134,8 +2143,8 @@ messages, not these rules):
    principal's `interrupt_running`): it names the host's own Station feed
    (the feed of the Station its link reaches) and its cursor there.
 10. **Typed reasons** (**O5, requested by Astation (2026-11-13, #120
-    comment 6848326392)**; amended for step 4, the exact shape for
-    Astation's review). Each effect of a result may carry `why`, a code of
+    comment 6848326392)**; amended for step 4, the exact shape **signed off by Astation (2026-11-13, #156 comment 6858184397; reaffirmed 2026-11-15, #120 comment 6889906767)**).
+    Each effect of a result may carry `why`, a code of
     the shared vocabulary (§11.1, "The state, per principal": `Applied.why`'s
     codes), `{"effect":"release","result":"refused","why":"not_after_hold"}`.
     - **Writer.** An authenticated host writes a reason exactly where its
@@ -2215,7 +2224,7 @@ messages, not these rules):
       id is a correlation value, never authorization: a retired, timed-out,
       unsolicited or old-generation result advances nothing and can't
       reopen the gate. **Built on the host (step 4; Atem's reading
-      of the transition, for Astation, #120):** Astation asked to keep the
+      of the transition, agreed with Astation (2026-11-14, #120 comment 6885269470)):** Astation asked to keep the
       one-owed-call-per-physical-socket rule until this amendment is built
       and jointly tested, and never to retry uncorrelated. Every retry is
       now correlated, and the Station cancels an old generation's jobs, so
@@ -2442,7 +2451,7 @@ gate are design I.5.2 and I.5.8's, as §11.1 ("Resets") states them:
 unless marked; nothing on the wire changes).** The host syncs only its
 own Station's feed:
 
-- **What a `heads` announces** (**for Astation's agreement**: it narrows
+- **What a `heads` announces** (**agreed with Astation (2026-11-14, #120 comment 6885269470)**: it narrows
   the table's "each feed covering a principal with work on this host").
   The account's feed at the host's own Station must be named exactly
   once, empty or not, even when it covers no principal ("One feed per
@@ -2536,7 +2545,7 @@ own Station's feed:
   head (a resynchronization's) has nothing to be behind unless a later
   `heads` or its answer names more.
 - **Matching a page to its call** (wire rule 11; **Atem's reading of the
-  transition, for Astation**, see rule 11's "Built on the host").
+  transition, agreed with Astation (2026-11-14, #120 comment 6885269470)**, see rule 11's "Built on the host").
   - **A fresh id per call.** Every `control_sync` gets a fresh lowercase
     UUID v4 `request_id` from the host's CSPRNG: a retry and a new link
     generation's call too, even at the same cursor. One call is live at a
@@ -2723,7 +2732,7 @@ table of `host-work.sqlite`, made only with the hook on):
   body under that `record_id`. A row of the table that doesn't read, or
   that the writer wouldn't take, is kept as it is, logged once with no
   content, and never sent.
-- **What an ack names** (**Atem's reading, for Astation**). The claim of
+- **What an ack names** (**Atem's reading, agreed with Astation (2026-11-14, #120 comment 6885269470)**). The claim of
   the identity the host's store is bound to (its account, root, host id and
   trust generation), and the host's own Station's feed and its committed
   cursor, whatever feed a result's record was read from: a feedless
@@ -2732,7 +2741,7 @@ table of `host-work.sqlite`, made only with the hook on):
   cursor say how far the host reads the feed it reads now). A result of a
   record read from another Station's feed (one the host has left) is
   dropped unsent: the host has no link to that Station.
-- **Only this identity's store** (**Atem's reading, for Astation and
+- **Only this identity's store** (**Atem's reading, agreed with Astation (2026-11-14, #120 comment 6885269470); for
   Auth/Portal**). A store bound to another identity (hosting paused across
   a re-verify, §11.1) takes no page, applies no re-verification and sends
   no ack, its unsent results included: never under the new identity's
@@ -2745,7 +2754,7 @@ table of `host-work.sqlite`, made only with the hook on):
   owner command that opens the store) binds it. Until then services stay
   `busy` (§11.1): fail closed, a cost in liveness only.
 - **An identity change on the live link** (**Atem's reading that
-  implements Astation's item 15, #120**; "Matching a page to its call").
+  implements Astation's item 15, #120; agreed with Astation (2026-11-15, #120 comment 6889906767)**; "Matching a page to its call").
   An ack owed under the old identity never goes under the new one: the
   old store's results go aside with it, unsent ones included, and nothing
   is acknowledged on the old association after the change, the new
@@ -2754,7 +2763,7 @@ table of `host-work.sqlite`, made only with the hook on):
   on the old link (the Station refusing an old-association ack,
   metadata-free) advances nothing: no result is taken as delivered, and
   the new link starts its own connection.
-- **Resends, bounded** (**Atem's reading, for Astation**). A service's own
+- **Resends, bounded** (**Atem's reading, agreed with Astation (2026-11-14, #120 comment 6885269470)**). A service's own
   revoke's in-force result: on every connection (a link generation on its
   socket: a restart, a reconnection or a re-authentication starts one) and
   every 10 minutes on `D` (§11.6) while connected, until its `issued_at`
@@ -2995,7 +3004,7 @@ agreed with Astation 2026-11-16.
 `r9-control-ack-resign` (a native stop refused under the strict rule while
 the cursor moves past it, its re-sign alert kept, the re-signed copy
 applied, and a host that applied the original done for the copy),
-`r9-control-ack-reasons` (**for Astation's sign-off**, new in step 4,
+`r9-control-ack-reasons` (**signed off by Astation (2026-11-13, #156 comment 6858184397; reaffirmed 2026-11-15, #120 comment 6889906767)**, new in step 4,
 O5: the same scenario's acks with typed reasons on their refused and
 pending results, and the same ack without them, giving the same reports
 and re-sign alerts; a reason of a later version read as unrecognized
@@ -3045,7 +3054,7 @@ evidence, and a page that isn't strict JSON keeps the gate closed), `heads`,
 `control_ack` with both result forms, `membership_fetch` and its result, and
 the three refusals; and the invalid variants a reader refuses, each with its
 code (an unknown field, a `null`, a duplicate key, an unknown refusal code
-and a count over 64 among them). (**For Astation's sign-off**, amended for step 4,
+and a count over 64 among them). (**Signed off by Astation (2026-11-13, #156 comment 6858184397; reaffirmed 2026-11-15, #120 comment 6889906767)**, amended for step 4,
 O5: `control_ack_with_reasons`, partial effects whose effects not in force
 say why beside effects in force that say nothing, and
 `control_ack_with_unrecognized_reasons`, codes of a later version, one at
@@ -4337,7 +4346,7 @@ As built in step 4:
 - **With `host.delegated` turned off after tasks were accepted** (the
   debug-only hook removed), a started task's turn is still interrupted at
   its deadline.
-- **A task of unknown outcome. Atem's reading, for Astation to confirm.**
+- **A task of unknown outcome. Atem's reading, agreed with Astation (2026-11-14, #120 comment 6885269470).**
   It gets no deadline interrupt: the host can't identify its turn (design
   I.6.3; its alert tells the owner, §11.3, "Unknown outcomes" below). So a
   worker still alive whose chat arrives after the 60-second recovery
