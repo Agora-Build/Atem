@@ -429,12 +429,18 @@ fn trust_gen(dir: &Path) -> u64 {
 impl Verifier {
     /// Waits for `verifyCommit`, answers with `verifyKeys`.
     async fn keys(peer: &mut Peer, account: &str) -> Self {
+        Self::keys_naming(peer, account, account).await
+    }
+
+    /// [`Verifier::keys`], its `verifyKeys` naming `keys_account` (the
+    /// genesis, list and certificate stay `account`'s).
+    async fn keys_naming(peer: &mut Peer, account: &str, keys_account: &str) -> Self {
         let fake = FakeAstation::new();
         let log = crate::session_protocol::membership::r9log::TestLog::genesis(
             account,
             &fake.sign_secret_bytes(),
         );
-        Self::answer_commit(peer, fake, log, account).await
+        Self::answer_commit_naming(peer, fake, log, account, keys_account).await
     }
 
     /// A re-verify with the same Astation: waits for the next
@@ -450,6 +456,16 @@ impl Verifier {
         fake: FakeAstation,
         log: crate::session_protocol::membership::r9log::TestLog,
         account: &str,
+    ) -> Self {
+        Self::answer_commit_naming(peer, fake, log, account, account).await
+    }
+
+    async fn answer_commit_naming(
+        peer: &mut Peer,
+        fake: FakeAstation,
+        log: crate::session_protocol::membership::r9log::TestLog,
+        account: &str,
+        keys_account: &str,
     ) -> Self {
         let commit = peer.next("verifyCommit").await;
         let commitment: [u8; 32] = STANDARD
@@ -468,7 +484,7 @@ impl Verifier {
             recovery_sign_pub: STANDARD.encode([6u8; 32]),
             nonce: STANDARD.encode(nonce_s),
             genesis_hash: Some(log.genesis_hash().to_hex()),
-            account_id: Some(json!(account)),
+            account_id: Some(json!(keys_account)),
         });
         Self {
             fake,
@@ -2987,7 +3003,8 @@ fn the_reveal_carries_a_new_encryption_key_recorded_before_it() {
             let verifier = Verifier::keys(&mut peer, "acct-op").await;
             let reveal = peer.next("verifyReveal").await;
             let (enc_pub, _) = verifier.revealed_key(&reveal);
-            // Durable before the reveal went: on disk as it arrives.
+            // On disk as the reveal arrives (the order itself:
+            // `the_reveal_waits_for_the_record`).
             let recorded = json!({"v": 1, "host_trust_gen": verifier.advertised,
                 "kids": [kid_of(&enc_pub)]});
             assert_eq!(enc_record(&rt.profile), Some(recorded.clone()), "{attempt}");
@@ -3175,6 +3192,57 @@ fn a_key_entry_for_another_key_fails_the_verification() {
     });
 }
 
+/// host-work-v1 §11.5, the order: while the record write of the ceremony's
+/// key waits (a test gate on the record's path), nothing is revealed and no
+/// record is there; once it is written, the reveal goes and names the key
+/// the record lists. A reveal sent before (or without) that write would
+/// arrive while the gate holds it.
+#[test]
+fn the_reveal_waits_for_the_record() {
+    use crate::session_protocol::r9::host_enc::record_gate;
+    local(async {
+        let dir = Rc::new(short_dir());
+        paired(&dir.path().join("profile"));
+        let (url, mut peer) = Peer::listen().await;
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
+        let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+        let pairing = crate::paths::ProfilePaths::in_dir(&rt.profile).pairing;
+        let held = record_gate::hold(&pairing.host_enc_generated);
+        let mut op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+        let verifier = Verifier::keys(&mut peer, "acct-op").await;
+        // Atem reaches the record write and waits there.
+        tokio::time::timeout(WAIT, async {
+            while !held.writer_waits() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the record write is reached");
+        assert!(
+            !peer.drain(Duration::from_millis(500)).await,
+            "the link stays"
+        );
+        assert!(
+            !peer.seen.iter().any(|m| m["type"] == "verifyReveal"),
+            "nothing revealed while the record waits"
+        );
+        assert_eq!(enc_record(&rt.profile), None);
+        held.release();
+        let reveal = peer.next("verifyReveal").await;
+        let (enc_pub, _) = verifier.revealed_key(&reveal);
+        assert_eq!(
+            enc_record(&rt.profile),
+            Some(json!({"v": 1, "host_trust_gen": verifier.advertised,
+                "kids": [kid_of(&enc_pub)]}))
+        );
+        let (question, _, _) = op.ask().await;
+        op.answer(question, AnswerValue::No).await;
+        peer.next("verifyAbort").await;
+        assert!(op.done().await.is_err());
+        rt.shutdown().await;
+    });
+}
+
 /// host-work-v1 §11.5: a key whose id can't be recorded is never handed
 /// out: the ceremony aborts after `verifyKeys` with a short reason, sends
 /// no reveal, and pins nothing.
@@ -3194,7 +3262,7 @@ fn a_key_whose_id_cant_be_recorded_is_never_revealed() {
         let abort = peer.next("verifyAbort").await;
         assert_eq!(
             abort["data"]["reason"],
-            crate::runtime::ops::ENC_KEY_NOT_RECORDED
+            crate::pair_verify::ENC_KEY_NOT_RECORDED
         );
         assert!(
             !peer.seen.iter().any(|m| m["type"] == "verifyReveal"),
@@ -3213,9 +3281,11 @@ fn a_key_whose_id_cant_be_recorded_is_never_revealed() {
 }
 
 /// host-work-v1 §11.5: Atem refuses a `deviceVerified` whose signed
-/// certificate names another account than `verifyKeys` did (the account
-/// its `enc_sig` was made for): the verification fails and nothing is
-/// pinned or trusted.
+/// certificate names another account than `verifyKeys` did (the account its
+/// `enc_sig` was made for). Here that check alone refuses it: the genesis,
+/// the list (ending at the `add_host`) and the certificate are all genuine
+/// for the account Astation signs for, and only `verifyKeys.account_id`
+/// differs. Nothing is pinned, kept or trusted.
 #[test]
 fn a_certificate_for_another_account_than_verify_keys_named_is_refused() {
     local(async {
@@ -3225,24 +3295,27 @@ fn a_certificate_for_another_account_than_verify_keys_named_is_refused() {
         let keys = CredPaths::in_dir(&dir.path().join("profile"));
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
         let mut op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
-        let mut verifier = Verifier::keys(&mut peer, "acct-op").await;
+        let verifier = Verifier::keys_naming(&mut peer, "acct-op", "acct-other").await;
         let reveal = peer.next("verifyReveal").await;
-        verifier.revealed_key(&reveal);
-        // The certificate (and its list) name another account than the
-        // keys did.
-        verifier.account = "acct-other".into();
-        let mut log = crate::session_protocol::membership::r9log::TestLog::genesis(
+        // The reveal's enc_sig names the account verifyKeys did.
+        crate::session_protocol::membership::r9log::reveal_host_enc_key(
+            &reveal["data"],
             "acct-other",
-            &verifier.fake.sign_secret_bytes(),
-        );
+            &verifier.log.borrow().genesis_hash(),
+            &verifier.device_id,
+            verifier.advertised,
+        )
+        .expect("vouched for verifyKeys' account");
         let host_pub: [u8; 32] = atem_client::encoding::b64u_decode(
             reveal["data"]["host_channel_pub"].as_str().unwrap(),
         )
         .unwrap()
         .try_into()
         .unwrap();
-        log.add_host_pub(&verifier.device_id, verifier.advertised, &host_pub);
-        verifier.log = std::cell::RefCell::new(log);
+        verifier
+            .log
+            .borrow_mut()
+            .add_host_pub(&verifier.device_id, verifier.advertised, &host_pub);
         let certificate = verifier.certificate_for(&reveal);
         let (question, _, _) = op.ask().await;
         op.answer(question, AnswerValue::Yes).await;
@@ -3253,7 +3326,7 @@ fn a_certificate_for_another_account_than_verify_keys_named_is_refused() {
             abort["data"]["reason"]
                 .as_str()
                 .unwrap()
-                .contains("names another account (acct-other) than its keys did (acct-op)"),
+                .contains("names another account (acct-op) than its keys did (acct-other)"),
             "{abort}"
         );
         assert_eq!(

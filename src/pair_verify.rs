@@ -355,6 +355,55 @@ pub(crate) fn verify_keys_account(
     }
 }
 
+/// `verifyAbort` reason when this host couldn't record its new encryption
+/// key's id before the reveal (host-work-v1 §11.5): nothing is revealed.
+pub(crate) const ENC_KEY_NOT_RECORDED: &str =
+    "atem couldn't record its host encryption key; nothing was revealed";
+
+/// `verifyAbort` reason when the pairing the ceremony runs under changed
+/// (`atem unpair`, a new `atem pair`) before its key was made: nothing is
+/// recorded or revealed.
+pub(crate) const PAIRING_CHANGED: &str = "the pairing changed on atem; nothing was revealed";
+
+/// The failure for a ceremony key whose id couldn't be recorded (`why`).
+pub(crate) fn not_recorded(why: String) -> VerifyFailure {
+    VerifyFailure::local(
+        ENC_KEY_NOT_RECORDED,
+        anyhow!(
+            "Couldn't record this host's new encryption key before revealing it ({why}), so nothing was revealed or trusted."
+        ),
+    )
+}
+
+/// In the ceremony, after `verifyKeys` (host-work-v1 §11.5): the host's new
+/// encryption key, its id durably recorded
+/// (`r9::host_enc::make_for_ceremony_locked`), under the pairing lock and
+/// only while the pairing the ceremony runs under (`capture`) is current.
+/// Blocking. `Err`: the ceremony aborts before the reveal.
+pub(crate) fn make_ceremony_key(
+    capture: &crate::pairing::Captured,
+    vouch: &crate::session_protocol::r9::host_enc::Vouch<'_>,
+) -> Result<crate::session_protocol::r9::host_enc::CeremonyKey, VerifyFailure> {
+    let made = capture.apply(|| {
+        Ok(
+            crate::session_protocol::r9::host_enc::make_for_ceremony_locked(
+                &capture.sources().paths.pairing,
+                vouch,
+            ),
+        )
+    });
+    match made {
+        Ok(Ok(key)) => Ok(key),
+        Ok(Err(why)) => Err(not_recorded(why)),
+        // The pairing changed (`Captured::check`): nothing was attempted.
+        Err(error) if error.to_string() == crate::pairing::CHANGED => {
+            Err(VerifyFailure::local(PAIRING_CHANGED, error))
+        }
+        // The pairing lock or record couldn't be read: nothing recorded.
+        Err(error) => Err(not_recorded(format!("{error:#}"))),
+    }
+}
+
 /// Astation's signed answer after Touch ID.
 pub(crate) struct DeviceVerifiedReply {
     pub device_verified: SignedWire,
@@ -608,6 +657,47 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// host-work-v1 §11.5: the ceremony's key is made only while the
+    /// pairing the ceremony runs under is current. One changed meanwhile
+    /// (`atem unpair`, a new `atem pair`) aborts with its own reason and
+    /// records nothing; a record that can't be written aborts with
+    /// "couldn't record"; else the key is made and its id recorded.
+    #[test]
+    fn the_ceremony_key_needs_the_pairing_it_started_under() {
+        let vouch = |seed: &'static [u8; 32]| crate::session_protocol::r9::host_enc::Vouch {
+            account_id: "acct",
+            genesis_hash: &atem_client::encoding::Hash32([8; 32]),
+            host_id: "host-1",
+            host_trust_gen: 2,
+            host_seed: seed,
+        };
+        // The pairing changed: its own reason, nothing recorded.
+        let dir = tempfile::tempdir().unwrap();
+        let capture = crate::pairing::tests::bound_profile(dir.path(), "astation-1");
+        let src = capture.sources().clone();
+        crate::pairing::unpair(&src).unwrap();
+        let failure = make_ceremony_key(&capture, &vouch(&[9; 32])).unwrap_err();
+        assert_eq!(failure.abort_reason(), Some(PAIRING_CHANGED));
+        assert_eq!(failure.error().to_string(), crate::pairing::CHANGED);
+        assert!(
+            !src.paths.pairing.host_enc_generated.exists(),
+            "nothing recorded"
+        );
+        // The record can't be written: "couldn't record".
+        let dir = tempfile::tempdir().unwrap();
+        let capture = crate::pairing::tests::bound_profile(dir.path(), "astation-1");
+        let pairing = capture.sources().paths.pairing.clone();
+        std::fs::create_dir_all(pairing.host_enc_generated.join("in-the-way")).unwrap();
+        let failure = make_ceremony_key(&capture, &vouch(&[9; 32])).unwrap_err();
+        assert_eq!(failure.abort_reason(), Some(ENC_KEY_NOT_RECORDED));
+        std::fs::remove_dir_all(&pairing.host_enc_generated).unwrap();
+        // Current: made, its id recorded.
+        let key = make_ceremony_key(&capture, &vouch(&[9; 32])).unwrap();
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&pairing.host_enc_generated).unwrap()).unwrap();
+        assert_eq!(record["kids"], serde_json::json!([key.enc_kid()]));
     }
 
     /// A terminal with keys typed before the prompt (`pending`) and keys

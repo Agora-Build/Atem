@@ -301,11 +301,76 @@ impl Prior {
     }
 }
 
+/// Tests: a record write held while a test looks (the order of the record
+/// and the reveal, host-work-v1 §11.5). Keyed by the record's path, so tests
+/// in parallel never hold each other's.
+#[cfg(test)]
+pub(crate) mod record_gate {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Condvar, Mutex};
+
+    /// Open, and whether a writer waits.
+    type Gate = Arc<(Mutex<(bool, bool)>, Condvar)>;
+
+    static GATES: Mutex<Vec<(PathBuf, Gate)>> = Mutex::new(Vec::new());
+
+    /// A held record write: open again when released or dropped.
+    pub struct Held(PathBuf, Gate);
+
+    /// Holds every write of the record at `path` until released.
+    pub fn hold(path: &Path) -> Held {
+        let gate: Gate = Arc::default();
+        GATES
+            .lock()
+            .unwrap()
+            .push((path.to_path_buf(), gate.clone()));
+        Held(path.to_path_buf(), gate)
+    }
+
+    impl Held {
+        /// Whether a write waits at the gate now.
+        pub fn writer_waits(&self) -> bool {
+            self.1.0.lock().unwrap().1
+        }
+
+        pub fn release(self) {}
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            GATES.lock().unwrap().retain(|(p, _)| p != &self.0);
+            let (state, opened) = &*self.1;
+            state.lock().unwrap().0 = true;
+            opened.notify_all();
+        }
+    }
+
+    /// A record write at `path` waits here while a test holds it (at most a
+    /// minute, so a test that forgets never hangs).
+    pub(super) fn wait(path: &Path) {
+        let gate = GATES
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, g)| g.clone());
+        let Some(gate) = gate else { return };
+        let (state, opened) = &*gate;
+        let mut held = state.lock().unwrap();
+        held.1 = true;
+        let _ = opened
+            .wait_timeout_while(held, std::time::Duration::from_secs(60), |(open, _)| !*open)
+            .unwrap();
+    }
+}
+
 /// Makes the record of generation `generation` list `kid`, durably (fsync,
 /// rename, directory fsync). One that lists it already is synced (the file,
 /// then the directory): a record left visible by a failed directory fsync
 /// isn't durable yet, and the id must be before a key goes.
 fn record_kid(store: &mut Store, generation: u64, kid: [u8; 8]) -> Result<Prior, WriteError> {
+    #[cfg(test)]
+    record_gate::wait(&store.path(DlFile::HostEncGenerated));
     let (prior, mut kids) = match read_record(store) {
         Record::Of {
             host_trust_gen,

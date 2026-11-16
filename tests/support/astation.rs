@@ -387,6 +387,9 @@ pub struct Ceremony {
     /// The account's device list: the Mac's genesis, whose manager key is
     /// Astation's ceremony identity.
     pub log: super::r9log::TestLog,
+    /// The account `verifyKeys` names when it isn't `account` (a mismatch
+    /// Atem must refuse at `deviceVerified`); the reveal is checked for it.
+    pub keys_account: Option<String>,
     mac_secret: [u8; 32],
     nonce_s: [u8; 32],
     commit: Option<Value>,
@@ -398,6 +401,7 @@ impl Ceremony {
         Ceremony {
             account: account.into(),
             log: super::r9log::TestLog::genesis(account, &mac_secret),
+            keys_account: None,
             mac_secret,
             nonce_s: [7; 32],
             commit: None,
@@ -420,7 +424,12 @@ impl Ceremony {
             "sign_pub": b64(&sign_pub), "enc_pub": b64(&[5; 32]),
             "recovery_sign_pub": b64(&[6; 32]), "nonce": b64(&self.nonce_s),
             "genesis_hash": self.log.genesis_hash().to_hex(),
-            "account_id": self.account}})
+            "account_id": self.keys_account()}})
+    }
+
+    /// The account `verifyKeys` names.
+    fn keys_account(&self) -> &str {
+        self.keys_account.as_deref().unwrap_or(&self.account)
     }
 
     /// Checks `reveal` (a `verifyReveal`'s `data`) as Astation does, then
@@ -440,7 +449,7 @@ impl Ceremony {
         let host_trust_gen = commit["host_trust_gen"].as_u64().ok_or("host_trust_gen")?;
         let (enc_pub, enc_sig) = super::r9log::reveal_host_enc_key(
             reveal,
-            &self.account,
+            self.keys_account(),
             &self.log.genesis_hash(),
             &host_id,
             host_trust_gen,

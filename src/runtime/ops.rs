@@ -487,11 +487,6 @@ async fn pair_verify<U: OpUi>(
 /// can't be read (no local path; the remedy is shown locally).
 pub(crate) const FROZEN_GENESIS_UNREADABLE: &str = "this host's record of frozen device lists can't be read; pairing is refused until it is restored on the host";
 
-/// `verifyAbort` reason when this host couldn't record its new encryption
-/// key's id before the reveal (host-work-v1 §11.5): nothing is revealed.
-pub(crate) const ENC_KEY_NOT_RECORDED: &str =
-    "atem couldn't record its host encryption key; nothing was revealed";
-
 /// The CLI's answer to "does the code match?".
 fn code_answer(answer: Option<AnswerValue>) -> CodeAnswer {
     match answer {
@@ -683,31 +678,26 @@ pub(crate) async fn verify_device<U: OpUi>(
         );
         blocking(move || {
             let (account_id, genesis_hash, host_id, host_seed) = vouch;
-            capture.apply(|| {
-                crate::session_protocol::r9::host_enc::make_for_ceremony_locked(
-                    &capture.sources().paths.pairing,
-                    &crate::session_protocol::r9::host_enc::Vouch {
-                        account_id: &account_id,
-                        genesis_hash: &genesis_hash,
-                        host_id: &host_id,
-                        host_trust_gen,
-                        host_seed: &host_seed,
-                    },
-                )
-                .map_err(|e| anyhow!(e))
-            })
+            Ok(crate::pair_verify::make_ceremony_key(
+                &capture,
+                &crate::session_protocol::r9::host_enc::Vouch {
+                    account_id: &account_id,
+                    genesis_hash: &genesis_hash,
+                    host_id: &host_id,
+                    host_trust_gen,
+                    host_seed: &host_seed,
+                },
+            ))
         })
         .await
     };
     let enc_key = match enc_key {
-        Ok(key) => key,
+        Ok(Ok(key)) => key,
+        Ok(Err(failure)) => {
+            return Err(abandon_verification(client, &paths.trust, astation_id, failure).await);
+        }
         Err(error) => {
-            let failure = VerifyFailure::local(
-                ENC_KEY_NOT_RECORDED,
-                anyhow!(
-                    "Couldn't record this host's new encryption key before revealing it ({error:#}), so nothing was revealed or trusted."
-                ),
-            );
+            let failure = crate::pair_verify::not_recorded(format!("{error:#}"));
             return Err(abandon_verification(client, &paths.trust, astation_id, failure).await);
         }
     };
