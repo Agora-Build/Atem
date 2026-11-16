@@ -1955,6 +1955,69 @@ def reply_ok(r):
     )
 
 
+# host-work-v1 §4 "Status": a task's states; `detail` at most 1024 bytes.
+WORK_STATES = {
+    "queued", "blocked", "submitting", "submitted", "awaiting_result",
+    "completed", "failed", "cancelled", "expired", "outcome_unknown",
+}
+MAX_SELECT_AGENTS = 32  # one message reaches at most 32 agents (collaboration §5)
+
+
+def work_receipt_ok(w):
+    """A §5 `work` receipt as a sealed plaintext carries it: task_id,
+    receipt_id (UUID v4), state, detail, and `result` (a reference {kind, id,
+    version, digest}) exactly when completed, omitted while null."""
+    if not isinstance(w, dict):
+        return False
+    keys = sorted(w)
+    if keys not in (["detail", "receipt_id", "state", "task_id"], ["detail", "receipt_id", "result", "state", "task_id"]):
+        return False
+    if not (is_uuid(w["receipt_id"], 4) and w["state"] in WORK_STATES):
+        return False
+    if not (isinstance(w["detail"], str) and len(w["detail"].encode()) <= 1024):
+        return False
+    if ("result" in w) != (w["state"] == "completed"):
+        return False
+    r = w.get("result")
+    return r is None or (
+        isinstance(r, dict)
+        and sorted(r) == ["digest", "id", "kind", "version"]
+        and r["kind"] in ("memory", "vault")
+        and safe_int(r["version"], 1)
+        and isinstance(r["digest"], str)
+        and re.fullmatch(HEX64, r["digest"]) is not None
+    )
+
+
+def delivery_ok(recipient_id, d):
+    """One recipient's delivery in a status object (host-work-v1 §5
+    "Publish", and §11.5 "Status forms of a selector's resolution"):
+    stored; refused with a code a receipt carries; work, its task the
+    recipient's own; no_match, exactly {state}; resolved, 1 to 32 work
+    receipts each naming a distinct selector task (a UUID v5), never the
+    recipient's id."""
+    if not isinstance(d, dict):
+        return False
+    state = d.get("state")
+    if state == "stored":
+        return sorted(d) == ["state"]
+    if state == "refused":
+        return sorted(d) == ["code", "state"] and d["code"] in ("forbidden", "stale_target")
+    if state == "work":
+        return sorted(d) == ["state", "work"] and work_receipt_ok(d["work"]) and d["work"]["task_id"] == recipient_id
+    if state == "no_match":
+        return sorted(d) == ["state"]
+    if state == "resolved":
+        tasks = d.get("tasks")
+        if sorted(d) != ["state", "tasks"] or not isinstance(tasks, list) or not 1 <= len(tasks) <= MAX_SELECT_AGENTS:
+            return False
+        if not all(work_receipt_ok(t) and is_uuid(t["task_id"], 5) for t in tasks):
+            return False
+        ids = [t["task_id"] for t in tasks]
+        return len(set(ids)) == len(ids) and recipient_id not in ids
+    return False
+
+
 def receipts_ok(recipients):
     ids = [r.get("recipient_id") for r in recipients if isinstance(r, dict)]
     return (
@@ -1964,8 +2027,7 @@ def receipts_ok(recipients):
         and all(is_uuid(i, 4) for i in ids)
         and all(
             sorted(r) == ["delivery", "recipient_id"]
-            and isinstance(r["delivery"], dict)
-            and r["delivery"].get("state") in ("stored", "refused", "work")
+            and delivery_ok(r["recipient_id"], r["delivery"])
             for r in recipients
         )
     )
@@ -2330,6 +2392,19 @@ def check_host_envelope(file, data, report, context):
         case.equal(verdicts, {"open", "pending", "refused", "refused_authenticated", "accepted", "not_delivered"}, "every verdict")
         case.check(len(reasons) >= 31, f"{len(reasons)} reasons")
         case.check("result_id_mismatch" in reasons, "result_id_mismatch")
+    with report.case(file, "status forms") as case:
+        forms = set()
+        for v in data["objects"]:
+            plain = v.get("sealed", {}).get("plaintext")
+            if v["kind"] == "result" and plain is not None:
+                value = json.loads(plain)
+                for r in value.get("recipients", []):
+                    forms.add(r["delivery"]["state"])
+        case.check({"no_match", "resolved"} <= forms, f"a status carries each selector form ({sorted(forms)})")
+        resolved = json.loads(objects["status_resolved"]["sealed"]["plaintext"])
+        task = resolved["recipients"][0]["delivery"]["tasks"][0]["task_id"]
+        name = json.dumps([resolved["message_id"], resolved["recipients"][0]["recipient_id"], "ses-ab23cd45ef67"], separators=(",", ":"))
+        case.equal(task, uuid_v5(NAMESPACE_OID, name.encode()), "the example's task is the selector task id of session ses-ab23cd45ef67")
     with report.case(file, "result_id") as case:
         # host-work-v1 §11.5's examples of the derivation.
         case.equal(

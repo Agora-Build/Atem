@@ -10519,6 +10519,51 @@ fn host_envelope_vectors(book: &Book) -> Value {
         "host-a-enc-1",
     );
 
+    // A selector's status forms (host-work-v1 §11.5, "Status forms of a
+    // selector's resolution"): the contract's two examples, as host-b seals
+    // them, and two resolutions no builder seals.
+    let resolved_text = r#"{"kind":"status","message_id":"3f1e2d4c-5b6a-4978-8a9b-0c1d2e3f4a5b","recipients":[{"delivery":{"state":"resolved","tasks":[{"detail":"waiting for a ready agent","receipt_id":"79404b10-9aa1-4764-b3a2-b76e12f0af8c","state":"queued","task_id":"80160896-4fcd-5e6e-adac-98bac5497321"}]},"recipient_id":"7c6b5a49-3827-4e16-9d05-f4e3d2c1b0a9"}]}"#;
+    let no_match_text = r#"{"kind":"status","message_id":"3f1e2d4c-5b6a-4978-8a9b-0c1d2e3f4a5b","recipients":[{"delivery":{"state":"no_match"},"recipient_id":"7c6b5a49-3827-4e16-9d05-f4e3d2c1b0a9"}]}"#;
+    for (label, text, note) in [
+        (
+            "status_resolved",
+            resolved_text,
+            "host-b's status for a select recipient it resolved: one task, named by its selector task id UUIDv5(NAMESPACE_OID, json([message_id, recipient_id, session_id])) of session ses-ab23cd45ef67 (host-work-v1 §11.5's example)",
+        ),
+        (
+            "status_no_match",
+            no_match_text,
+            "host-b's status for a select recipient whose selectors matched no agent it would take the sender's work for (host-work-v1 §11.5's example)",
+        ),
+    ] {
+        let f = ba(&g, label);
+        let plain = ResultPlain::parse(text.as_bytes()).unwrap();
+        assert_eq!(&plain.to_bytes().unwrap()[..], text.as_bytes(), "{label}");
+        g.seal(label, note, f, MailPlain::Result(plain), "host-a-enc-1");
+    }
+    for (label, text, note) in [
+        (
+            "status_resolved_no_tasks",
+            resolved_text.replace(
+                r#"[{"detail":"waiting for a ready agent","receipt_id":"79404b10-9aa1-4764-b3a2-b76e12f0af8c","state":"queued","task_id":"80160896-4fcd-5e6e-adac-98bac5497321"}]"#,
+                "[]",
+            ),
+            "a resolution with no task (resolved holds 1 to the recipient's budget); no builder seals it",
+        ),
+        (
+            "status_resolved_v4_task",
+            resolved_text.replace(
+                "80160896-4fcd-5e6e-adac-98bac5497321",
+                "7c6b5a49-3827-4e16-9d05-f4e3d2c1b0a9",
+            ),
+            "a resolution whose task is named by the recipient's own UUID v4 id, not a selector task id; no builder seals it",
+        ),
+    ] {
+        assert!(ResultPlain::parse(text.as_bytes()).is_err(), "{label}");
+        let f = ba(&g, label);
+        g.seal_raw(label, note, MailKind::Result, f, text.as_bytes(), "host-a-enc-1");
+    }
+
     // The verdicts. Envelopes: host-b at generation 1 with its key.
     let to_b: (MailHost, &[&str]) = (MAIL_B1, &["host-b-enc-1"]);
     let at =
@@ -11208,6 +11253,64 @@ fn host_envelope_vectors(book: &Book) -> Value {
         Some(outbox(&request_id)),
         e,
     );
+    // The selector forms answer the row of the select message: its id, and
+    // the resolution's task as the sending host records it from the status.
+    let select_row = |task_ids: &[&str]| {
+        serde_json::json!({
+            "recipient": {"host_id": "host-b", "host_trust_gen": 1},
+            "message_id": "3f1e2d4c-5b6a-4978-8a9b-0c1d2e3f4a5b",
+            "cancel_complete_ids": [],
+            "task_ids": task_ids,
+        })
+    };
+    let resolved_row = select_row(&["80160896-4fcd-5e6e-adac-98bac5497321"]);
+    for (label, object, note, row) in [
+        (
+            "status_resolved_accepted",
+            "status_resolved",
+            "a status carrying a select recipient's resolution: accepted; the sending host records its task ids, in order",
+            resolved_row.clone(),
+        ),
+        (
+            "status_no_match_accepted",
+            "status_no_match",
+            "a status carrying a select recipient's no_match: accepted, final for that message",
+            select_row(&[]),
+        ),
+    ] {
+        g.check(
+            label,
+            note,
+            object,
+            &b,
+            to_a,
+            MAIL_NOW,
+            Some(row),
+            accepted.clone(),
+        );
+    }
+    for (label, note) in [
+        (
+            "status_resolved_no_tasks",
+            "resolved with no task isn't a status plaintext",
+        ),
+        (
+            "status_resolved_v4_task",
+            "resolved naming a task by the recipient's own id isn't a status plaintext",
+        ),
+    ] {
+        let e = g.refused_authenticated(label, "plaintext_malformed");
+        g.check(
+            label,
+            note,
+            label,
+            &b,
+            to_a,
+            MAIL_NOW,
+            Some(resolved_row.clone()),
+            e,
+        );
+    }
     let e = g.refused_authenticated("result_id_mismatch", "result_id_mismatch");
     g.check(
         "result_id_mismatch",
@@ -11246,7 +11349,7 @@ fn host_envelope_vectors(book: &Book) -> Value {
         "name": "r9-vectors-host-envelope",
         "kind": "vectors",
         "requires": "r9",
-        "note": "Envelopes and results between hosts (delegated host-work II.4.2, II.4.4; host-work-v1 §11.5). Each object is {body, sig, enc, ct}: the body signed by the sender's host_key (Ed25519) over enc([\"atem-envelope-v1\" or \"atem-result-v1\", jcs(body)]); the plaintext sealed with RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, empty AAD, to the recipient's host encryption key, info = enc([\"atem-envelope-seal-v1\" or \"atem-result-seal-v1\", account_id, genesis_hash (32 bytes), sender.host_id, u64(sender.host_trust_gen), recipient.host_id, u64(recipient.host_trust_gen), enc_kid, id, u64(created_at), u64(expires_at)]); sealed_hash = SHA-256(enc([enc, ct])). The sender's ephemeral is DeriveKeyPair(ikmE), ikmE = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Device lists: log L of r9-vectors-membership-log followed by `chain`, labels of `entries` (signed by dev-mac); the objects are signed at B = L + M7..M10 (head 10) unless their signed_at_head says otherwise. Objects: `signed_with` names the r9-vectors-keys host key whose signature `sig` is; `built` objects are what seal_envelope / seal_result make from the body's fields, `sealed.plaintext` and ikmE; `sealed` gives the seal's inputs and outputs (`plaintext`, or `plaintext_bytes` and `plaintext_sha256` over 4 KiB); `sealed_from` names the object whose sealed part it carries, `edited_from` the object it is after a change made after signing. Checks: `call` (open_envelope, or accept_result with `outbox`, the sending host's row) on L + `chain`, by `receiver` (its host_id, current host_trust_gen, the keys it accepts and every key it made at that generation, `generated`; r9-vectors-keys names), at `now`; `expect` is the verdict: open or accepted (with `sender`; the plaintext is the object's), not_delivered (with `sender` and the return grant's detail as `reason`), pending (the claimed host_id and host_trust_gen), refused (before the copy is shown to be the sender's, signed and intact (step 4): `reason` and `evidence` = SHA-256(enc([jcs(body), sig, enc, ct])), enc and ct empty when absent; it claims no id) or refused_authenticated (after it: the object's id, `reason` and `sender`, the {host_id, host_trust_gen} whose key verified it; it claims the id for that sender, (sender.host_id, id)). A key in neither `keys` nor `generated` is refused enc_key_not_accepted even beyond the receiver's head, after the checks that settle at any head, the times and a known generation's signature; one in `generated` only waits there. A result's reply carries its task's result_id = UUIDv5(NAMESPACE_OID 6ba7b812-9dad-11d1-80b4-00c04fd430c8, \"result:\" + task_id) (host-work-v1 §11.5, \"result_id\"): accept_result refuses another authenticated as result_id_mismatch, after the plaintext's strict reading and before the outbox row.",
+        "note": "Envelopes and results between hosts (delegated host-work II.4.2, II.4.4; host-work-v1 §11.5). Each object is {body, sig, enc, ct}: the body signed by the sender's host_key (Ed25519) over enc([\"atem-envelope-v1\" or \"atem-result-v1\", jcs(body)]); the plaintext sealed with RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, empty AAD, to the recipient's host encryption key, info = enc([\"atem-envelope-seal-v1\" or \"atem-result-seal-v1\", account_id, genesis_hash (32 bytes), sender.host_id, u64(sender.host_trust_gen), recipient.host_id, u64(recipient.host_trust_gen), enc_kid, id, u64(created_at), u64(expires_at)]); sealed_hash = SHA-256(enc([enc, ct])). The sender's ephemeral is DeriveKeyPair(ikmE), ikmE = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Device lists: log L of r9-vectors-membership-log followed by `chain`, labels of `entries` (signed by dev-mac); the objects are signed at B = L + M7..M10 (head 10) unless their signed_at_head says otherwise. Objects: `signed_with` names the r9-vectors-keys host key whose signature `sig` is; `built` objects are what seal_envelope / seal_result make from the body's fields, `sealed.plaintext` and ikmE; `sealed` gives the seal's inputs and outputs (`plaintext`, or `plaintext_bytes` and `plaintext_sha256` over 4 KiB); `sealed_from` names the object whose sealed part it carries, `edited_from` the object it is after a change made after signing. Checks: `call` (open_envelope, or accept_result with `outbox`, the sending host's row) on L + `chain`, by `receiver` (its host_id, current host_trust_gen, the keys it accepts and every key it made at that generation, `generated`; r9-vectors-keys names), at `now`; `expect` is the verdict: open or accepted (with `sender`; the plaintext is the object's), not_delivered (with `sender` and the return grant's detail as `reason`), pending (the claimed host_id and host_trust_gen), refused (before the copy is shown to be the sender's, signed and intact (step 4): `reason` and `evidence` = SHA-256(enc([jcs(body), sig, enc, ct])), enc and ct empty when absent; it claims no id) or refused_authenticated (after it: the object's id, `reason` and `sender`, the {host_id, host_trust_gen} whose key verified it; it claims the id for that sender, (sender.host_id, id)). A key in neither `keys` nor `generated` is refused enc_key_not_accepted even beyond the receiver's head, after the checks that settle at any head, the times and a known generation's signature; one in `generated` only waits there. A result's reply carries its task's result_id = UUIDv5(NAMESPACE_OID 6ba7b812-9dad-11d1-80b4-00c04fd430c8, \"result:\" + task_id) (host-work-v1 §11.5, \"result_id\"): accept_result refuses another authenticated as result_id_mismatch, after the plaintext's strict reading and before the outbox row, whatever the sender's standing (Atem's reading, host-work-v1 §11.5). A status's select recipient may carry {\"state\":\"no_match\"} or {\"state\":\"resolved\",\"tasks\":[…]} (host-work-v1 §11.5, \"Status forms of a selector's resolution\"): 1 to 32 §5 work receipts, each named by a distinct selector task id (a UUID v5), `result` omitted while null; never the recipient's own id.",
         "account_id": "acct-test-1",
         "genesis_hash": g.genesis.to_hex(),
         "now": MAIL_NOW,
