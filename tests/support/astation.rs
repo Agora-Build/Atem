@@ -374,6 +374,148 @@ pub fn write_encryption_mode(config: &Path, mode: &str) {
     std::fs::rename(temp, path).unwrap();
 }
 
+/// Astation's side of a device verification ceremony (session-v1 §R9.2
+/// "Pairing", host-work-v1 §11.5), signed as Astation signs it: its keys
+/// (`verifyKeys`, naming the account and its device list's genesis), its
+/// checks of the reveal (the host's encryption key and `enc_sig` among
+/// them), the device list grown with the host's `add_host` and, under the
+/// same confirmation, the `host_enc_key` of the revealed key at the next
+/// `seq` (unless the account's signing gate is closed), and the signed
+/// `deviceVerified` (account state `off`, no grants).
+pub struct Ceremony {
+    pub account: String,
+    /// The account's device list: the Mac's genesis, whose manager key is
+    /// Astation's ceremony identity.
+    pub log: super::r9log::TestLog,
+    mac_secret: [u8; 32],
+    nonce_s: [u8; 32],
+    commit: Option<Value>,
+}
+
+impl Ceremony {
+    pub fn new(account: &str) -> Self {
+        let mac_secret = super::r9log::secret("ceremony astation");
+        Ceremony {
+            account: account.into(),
+            log: super::r9log::TestLog::genesis(account, &mac_secret),
+            mac_secret,
+            nonce_s: [7; 32],
+            commit: None,
+        }
+    }
+
+    /// The `verifyKeys` message answering `commit` (a `verifyCommit`'s
+    /// `data`), kept for the reveal's checks.
+    pub fn verify_keys(&mut self, commit: &Value) -> Value {
+        use base64::Engine;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let sign_pub = p256::ecdsa::SigningKey::from_bytes((&self.mac_secret).into())
+            .unwrap()
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        self.commit = Some(commit.clone());
+        json!({"type": "verifyKeys", "data": {
+            "sign_pub": b64(&sign_pub), "enc_pub": b64(&[5; 32]),
+            "recovery_sign_pub": b64(&[6; 32]), "nonce": b64(&self.nonce_s),
+            "genesis_hash": self.log.genesis_hash().to_hex(),
+            "account_id": self.account}})
+    }
+
+    /// Checks `reveal` (a `verifyReveal`'s `data`) as Astation does, then
+    /// appends the host's `add_host` and, with `key_entry`, its
+    /// `host_enc_key` of the revealed key; the signed `deviceVerified`
+    /// message, and the revealed key's public half. `Err`: why Astation
+    /// would refuse the reveal (`verifyAbort`).
+    pub fn device_verified(
+        &mut self,
+        reveal: &Value,
+        key_entry: bool,
+    ) -> Result<(Value, [u8; 32]), String> {
+        use atem_client::encoding::{b64u_decode, enc, u64_field};
+        use base64::Engine;
+        let commit = self.commit.clone().ok_or("no verifyCommit")?;
+        let host_id = commit["device_id"].as_str().ok_or("device_id")?.to_owned();
+        let host_trust_gen = commit["host_trust_gen"].as_u64().ok_or("host_trust_gen")?;
+        let (enc_pub, enc_sig) = super::r9log::reveal_host_enc_key(
+            reveal,
+            &self.account,
+            &self.log.genesis_hash(),
+            &host_id,
+            host_trust_gen,
+        )?;
+        let key32 = |name: &str, b64u: bool| -> Result<[u8; 32], String> {
+            let text = reveal[name].as_str().ok_or(name.to_string())?;
+            let bytes = if b64u {
+                b64u_decode(text).map_err(|e| e.to_string())?
+            } else {
+                base64::engine::general_purpose::STANDARD
+                    .decode(text)
+                    .map_err(|e| e.to_string())?
+            };
+            bytes.try_into().map_err(|_| format!("{name} length"))
+        };
+        let host_pub = key32("host_channel_pub", true)?;
+        let commitment: [u8; 32] = base64::engine::general_purpose::STANDARD
+            .decode(commit["commitment"].as_str().ok_or("commitment")?)
+            .map_err(|e| e.to_string())?
+            .try_into()
+            .map_err(|_| "commitment length")?;
+        // One confirmation: the add_host, then the host's key right after.
+        self.log.add_host_pub(&host_id, host_trust_gen, &host_pub);
+        if key_entry {
+            self.log
+                .host_enc_key_entry(&host_id, host_trust_gen, &enc_pub, &enc_sig);
+        }
+        let transcript: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(enc(&[
+            b"atem-verify-transcript-v1",
+            &commitment,
+            &key32("nonce", false)?,
+            &self.nonce_s,
+        ]))
+        .into();
+        let certificate = enc(&[
+            b"atem-device-verified-v1",
+            self.account.as_bytes(),
+            &u64_field(1),
+            host_id.as_bytes(),
+            &key32("device_pub", false)?,
+            &key32("device_sign_pub", false)?,
+            &key32("unlock_auth_pub", false)?,
+            &transcript,
+            &u64_field(1),
+        ]);
+        let state = enc(&[
+            b"atem-account-state-v1",
+            self.account.as_bytes(),
+            &u64_field(1),
+            b"off",
+            b"",
+            &u64_field(1),
+        ]);
+        Ok((
+            json!({"type": "deviceVerified", "data": {
+                "device_verified": self.sign(&certificate),
+                "account_state": self.sign(&state),
+                "grants": [],
+                "membership": {"entries": self.log.wire()}}}),
+            enc_pub,
+        ))
+    }
+
+    /// A statement signed by Astation's ceremony identity (P-256, low S).
+    fn sign(&self, statement: &[u8]) -> Value {
+        use base64::Engine;
+        use p256::ecdsa::signature::Signer;
+        let key = p256::ecdsa::SigningKey::from_bytes((&self.mac_secret).into()).unwrap();
+        let signature: p256::ecdsa::Signature = key.sign(statement);
+        let signature = signature.normalize_s().unwrap_or(signature);
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        json!({"statement": b64(statement), "signature": b64(&signature.to_bytes())})
+    }
+}
+
 /// How the fake relay answers a host connection's route proof (§R9.7b).
 #[derive(Clone, Debug)]
 pub enum Reply {

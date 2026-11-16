@@ -147,3 +147,104 @@ fn pair_verify_runs_through_the_auto_started_runtime() {
     assert!(!written.contains("device verification failed"), "{written}");
     assert!(sandbox.runtime_pid().is_some(), "the runtime ran it");
 }
+
+/// The next message of type `kind` Atem sent the fake Astation (within
+/// `WAIT`), with the link it came on.
+#[track_caller]
+fn astation_saw(astation: &support::astation::FakeAstation, kind: &str) -> (u64, Value) {
+    use support::astation::Event;
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match astation.events.recv_timeout(left) {
+            Ok(Event::Message(link, value)) if value["type"] == kind => return (link, value),
+            Ok(_) => {}
+            Err(_) => panic!("Astation never got {kind}"),
+        }
+    }
+}
+
+/// host-work-v1 §11.5, through the real binary: a full `atem pair verify`
+/// with an Astation that signs the host's encryption key in the ceremony.
+/// The runtime reads `verifyKeys.account_id`, records its new key's id
+/// before the reveal, reveals `host_enc_key` (checked as Astation checks
+/// it), and on the signed `deviceVerified`, whose entries end at that key's
+/// `host_enc_key` right after the host's `add_host`, pins the device list
+/// and keeps the revealed key as `pairing/host_enc_key`. Then (gate
+/// closed) the same with entries ending at the `add_host`: the key is kept
+/// all the same.
+#[test]
+fn pair_verify_keeps_the_encryption_key_it_revealed() {
+    for key_entry in [true, false] {
+        let sandbox = Sandbox::new();
+        let config = sandbox.config();
+        support::profile::write_pairing(&config, support::astation::ASTATION, 1);
+        let astation = support::astation::FakeAstation::start();
+        let mut ceremony = support::astation::Ceremony::new("acct-bin");
+        let mut cli = sandbox.spawn(
+            &["pair", "verify"],
+            &sandbox.home,
+            &[("ASTATION_WS", &astation.url)],
+        );
+        let (link, commit) = astation_saw(&astation, "verifyCommit");
+        astation.send(link, ceremony.verify_keys(&commit["data"]).to_string());
+        let (_, reveal) = astation_saw(&astation, "verifyReveal");
+        let pairing = support::profile::ProfilePaths::in_dir(&config).pairing;
+        let read = |path: &std::path::Path| -> Option<Value> {
+            std::fs::read(path)
+                .ok()
+                .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+        };
+        // Its id was durable before the reveal went; no key file yet.
+        let recorded = read(&pairing.host_enc_generated).expect("recorded before the reveal");
+        assert!(!pairing.host_enc_key.exists(), "{key_entry}");
+        let (certificate, enc_pub) = ceremony
+            .device_verified(&reveal["data"], key_entry)
+            .unwrap_or_else(|e| panic!("Astation refuses the reveal: {e}"));
+        let kid = {
+            let key = atem_client::PublicKey::new(atem_client::Alg::X25519, &enc_pub).unwrap();
+            atem_client::keys::enc_kid(&key).unwrap()
+        };
+        assert_eq!(
+            recorded,
+            json!({"v": 1, "host_trust_gen": 2, "kids": [kid]}),
+            "{key_entry}"
+        );
+        cli.shows("Does the code on your Mac match? Type y or n:");
+        cli.send(b"y\r");
+        astation.send(link, certificate.to_string());
+        // The first escrow: refused (the storage key stays on the device).
+        astation_saw(&astation, "storageKeyRotate");
+        astation.send(
+            link,
+            json!({"type": "storageKeyRejected", "data": {"reason": "not now"}}).to_string(),
+        );
+        assert!(cli.exits(), "{key_entry}: {}", cli.written());
+        assert!(
+            cli.written().contains("Device verified"),
+            "{}",
+            cli.written()
+        );
+        // Pinned, with the revealed key kept for generation 2.
+        let list = read(&pairing.membership).expect("the device list is pinned");
+        let entries = list["entries"].as_array().unwrap();
+        let last = &entries.last().unwrap()["body"];
+        if key_entry {
+            assert_eq!(last["action"], "host_enc_key", "{list}");
+            assert_eq!(
+                last["enc_key"]["pub"],
+                atem_client::encoding::b64u(&enc_pub)
+            );
+        } else {
+            assert_eq!(last["action"], "add_host", "{list}");
+        }
+        let key = read(&pairing.host_enc_key).expect("the key is kept");
+        assert_eq!(key["host_trust_gen"], 2);
+        assert_eq!(key["pub"], atem_client::encoding::b64u(&enc_pub));
+        assert_eq!(read(&pairing.host_enc_generated), Some(recorded));
+        // The cred agent the escrow started stops (it holds this sandbox's
+        // keys).
+        let (_, _, locked) = sandbox.atem(&["cred", "lock"]);
+        assert!(locked, "{key_entry}");
+    }
+}
