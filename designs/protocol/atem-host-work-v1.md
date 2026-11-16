@@ -3471,8 +3471,9 @@ exactly as without this section):
 - an `atem-result` is never judged as an envelope: it is kept for the
   sending host's own check (`accept_result`, design II.4.4) with its exact
   bytes, `object_hash`, sender, id and mailbox position, committed with the
-  cursor and owing its done like any other object, and holds no gate (it
-  starts no work);
+  cursor and owing its done like any other object; a kept result holds no
+  gate (it starts no work), though one left on the Station for want of
+  room does until it is read again (below);
 - **back-pressure, never loss (Atem's reading, for Astation's
   agreement):** an opened request, cancel or complete waiting for
   admission, or a kept result, that doesn't fit is never marked done and
@@ -3486,8 +3487,13 @@ exactly as without this section):
   its cursor durably to just before that position, under the same
   `mailbox_id`, and reads on from there (rule 4 doesn't forbid an `after`
   below an earlier cursor): objects decided meanwhile come back as
-  duplicates and are marked done again, waiting ones are re-pointed. Until
-  then host senders' gate stays closed: the object isn't committed. Unlike
+  duplicates and are marked done again, waiting ones are re-pointed. A
+  later object left there keeps the room freed since the first, and the
+  rewind also comes once the delegated clock passes the expiry of every
+  object left there (the Station has dropped them). A waiting object that
+  decides to open with no room keeps waiting, never marked done, and is
+  judged again as soon as room frees. Until then host senders' gate stays
+  closed: the object isn't committed. Unlike
   a pending overflow, which a sender's resend makes safe to mark done, a
   result is never resent once stored (design II.4.4);
 - **bounded storage (Atem's reading, for Astation's agreement):** anything
