@@ -499,7 +499,11 @@ pub fn recipient(src: &crate::profile::Sources) -> Result<HostRecipient, String>
         .verified(&binding.astation_id)
         .map(|entry| entry.device_id.clone())
         .ok_or("this device isn't verified")?;
-    Ok(recipient_at(&src.paths.pairing, host_id, state.host_trust_gen))
+    Ok(recipient_at(
+        &src.paths.pairing,
+        host_id,
+        state.host_trust_gen,
+    ))
 }
 
 /// This host as the receiver of host-sender mail as `host_id` at trust
