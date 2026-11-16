@@ -3388,10 +3388,24 @@ list, and that the host's encryption key is signed in the verification
 ceremony (design status block, II.1, II.4.1, II.4.3, II.6). The five
 subsections below are concrete proposals for the two open items above, for
 the two SDK points Astation raised on 2026-11-07 (#120 comment 6701618182)
-and for the ceremony's fields. Each is **agreed with Astation 2026-11-16**: nothing in them is built, and their shared vectors come with
-the shared core once they are agreed.
+and for the ceremony's fields. Each is **agreed with Astation 2026-11-16**.
+**Built in the shared core:** the mailbox calls' readers and builders,
+`object_hash` and `heads`' mailbox head behind explicit feature handling
+("The mailbox calls"), the status forms and the selector task id, and
+`result_id` with both of its checks; `select`'s channel rule. Nothing else in
+them is built (the hosts' mailbox client and outbox, the Station's side,
+`select`'s `launch`, the ceremony's fields), and the mailbox calls' shared
+vectors come with a later change.
 
 #### The mailbox calls (agreed with Astation 2026-11-16)
+
+**Built in the shared core** (`atem_client::host_mail::mailbox`): every
+message below, read strictly and built as its reader reads it, each
+answer's match against its call (`answers`, the first echoed field that
+differs) and `object_hash`; `heads`' `mailbox` in `control::relay`, read
+only with `Accept { mailbox: true }` (`Heads::decode_with`,
+`ToHost::decode_with`), refused by every other reader. Not built: the
+hosts' mailbox client and outbox, and the Station's side.
 
 The receiving host's mailbox on the Station (design II.4.3): a sending host
 puts objects over its own link, and the receiving host syncs its own mailbox
@@ -3649,6 +3663,11 @@ moves to 11, and position 12 comes with the next call, `after: 11`.
 
 #### Status forms of a selector's resolution (agreed with Astation 2026-11-16)
 
+**Built in the shared core:** both forms (`Delivery::NoMatch`,
+`Delivery::Resolved`), the status object's receipt check
+(`status_recipients_valid`) and the selector task id
+(`session::select::selector_task_id`, which the runtime's resolution calls).
+
 A request's recipient whose destination is `select{selectors, budget}`
 ("`select` from host senders" below) is expanded once by the receiving host
 into a fixed resolution (collaboration §5; design II.6). A status object
@@ -3700,11 +3719,16 @@ other, and a resolution never changes.)
 - **Where they appear.** Only in a host's `atem-result` status objects,
   and on the sending host in `atem message status`. A channel never
   carries `select` (below), so no `message_publish` receipt or
-  `message_query` answer has them. The client core's receipt check
-  (`recipients_valid`) takes both forms only in a status object; a `work`
+  `message_query` answer has them. The client core's receipt check takes
+  both forms only in a status object (`status_recipients_valid`; a
+  channel's message receipt, `recipients_valid`, refuses them); a `work`
   receipt keeps its `task_id` equal to its `recipient_id`.
 
 #### `result_id` (agreed with Astation 2026-11-16)
+
+**Built in the shared core:** the derivation (`session::host_work::result_id`),
+the client's check (`Response::answers`) and the sending host's
+(`accept_result`, `result_id_mismatch`, with its host-envelope vector).
 
 Every reply to a task has one `result_id` (§4, "Reply"), derived from the
 task id as the host derives it today (`src/runtime/collab_results.rs`,

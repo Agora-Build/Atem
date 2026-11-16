@@ -696,8 +696,9 @@ impl FeedHead {
 /// `heads{feeds, membership}` (Station → host): on every (re)connection and
 /// every 30 seconds, and at once when a record is stored, each covering
 /// feed's head and the Station's device-list head. The announced list head
-/// is the Station's word, not signed authority (I.5.8). Stage 3 adds the
-/// host's mailbox head.
+/// is the Station's word, not signed authority (I.5.8). A host with
+/// `host.senders` also reads its mailbox head ([`HeadsWithMailbox`]); this
+/// type and its strict reader never carry it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Heads {
     /// At most [`MAX_HEAD_FEEDS`], a feed once.
@@ -2706,10 +2707,11 @@ mod tests {
     }
 
     #[test]
-    fn heads_without_mailbox_until_stage_3() {
-        // Stage 3 adds `mailbox:{mailbox_id, head}` for host senders (II.5).
-        // Until then a `heads` that carries one is refused, and the builder
-        // never writes one.
+    fn strict_heads_refuse_the_mailbox() {
+        // `mailbox:{mailbox_id, head}` is for hosts with `host.senders`
+        // (II.5; host-work-v1 §11.5 rule 6): the strict reader, every other
+        // host's, refuses a `heads` that carries one, and `Heads`' builder
+        // never writes one (`HeadsWithMailbox` does).
         let message = heads().to_json().unwrap();
         assert!(message.get("mailbox").is_none());
         let mut keys: Vec<&str> = message
