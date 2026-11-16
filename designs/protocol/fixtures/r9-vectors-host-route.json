@@ -643,6 +643,277 @@
   "kind": "vectors",
   "name": "r9-vectors-host-route",
   "note": "Host route proof (R9.7b). Body signed by the host's host_channel_key (Ed25519) over enc([\"atem-host-route-v1\", jcs(body)]). Verified against log L of r9-vectors-membership-log (E1..E6) followed by `chain` (entries of `entries`, signed by dev-mac), with the relay's `challenge` (nonce, room) and atem_id. Refusal order: malformed, frozen, wrong_account, unknown_host, bad_signature, stale_log, fork, nonce_mismatch, room_mismatch, atem_id_mismatch. `invalid_text` holds raw messages (duplicate keys) a strict parser refuses.",
+  "proxy": {
+    "cross": [
+      {
+        "chain": [],
+        "code": "malformed",
+        "label": "proxy_proof_to_the_relay_verifier",
+        "message": {
+          "op": "host_route",
+          "proof": {
+            "body": {
+              "account_id": "acct-test-1",
+              "atem_id": "hosta-0000000-1a2b3c4d",
+              "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+              "head": {
+                "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+                "seq": 6
+              },
+              "host_id": "host-a",
+              "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+              "room": "astation-test-1",
+              "type": "atem-host-route-proxy",
+              "v": 1
+            },
+            "sig": "7Z12vDTPBeWO9Ur-OVFibrNmkfvElk02HlccIlMH0AM9J92Dc5GWRuw6_YF8W5qYFUvF_T8FMVxONwhwmT1FAg"
+          },
+          "type": "relay",
+          "v": 1
+        },
+        "reason": "a proxy proof (at_head) is never a relay route: its type",
+        "verifier": "relay"
+      },
+      {
+        "chain": [],
+        "code": "malformed",
+        "label": "relay_proof_to_the_proxy_verifier",
+        "message": {
+          "op": "host_route",
+          "proof": {
+            "body": {
+              "account_id": "acct-test-1",
+              "atem_id": "hosta-0000000-1a2b3c4d",
+              "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+              "head": {
+                "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+                "seq": 6
+              },
+              "host_id": "host-a",
+              "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+              "room": "astation-test-1",
+              "type": "atem-host-route",
+              "v": 1
+            },
+            "sig": "sna0kIyn_XGrsq1EAQaD9v4poH-aUrJHy__gD_M-OlgAhm4JnZ8shZvGDyfYiAm-tl6i4jGnUeHtXngXFEvTBg"
+          },
+          "type": "relay",
+          "v": 1
+        },
+        "reason": "a relay proof (at_head) is never a proxy proof: its type",
+        "verifier": "proxy"
+      },
+      {
+        "chain": [],
+        "code": "bad_signature",
+        "label": "proxy_body_relabelled_relay",
+        "message": {
+          "op": "host_route",
+          "proof": {
+            "body": {
+              "account_id": "acct-test-1",
+              "atem_id": "hosta-0000000-1a2b3c4d",
+              "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+              "head": {
+                "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+                "seq": 6
+              },
+              "host_id": "host-a",
+              "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+              "room": "astation-test-1",
+              "type": "atem-host-route",
+              "v": 1
+            },
+            "sig": "7Z12vDTPBeWO9Ur-OVFibrNmkfvElk02HlccIlMH0AM9J92Dc5GWRuw6_YF8W5qYFUvF_T8FMVxONwhwmT1FAg"
+          },
+          "type": "relay",
+          "v": 1
+        },
+        "reason": "the proxy at_head proof with its type changed to atem-host-route, its signature kept: signed over the other label and type",
+        "verifier": "relay"
+      },
+      {
+        "chain": [],
+        "code": "bad_signature",
+        "label": "relay_body_relabelled_proxy",
+        "message": {
+          "op": "host_route",
+          "proof": {
+            "body": {
+              "account_id": "acct-test-1",
+              "atem_id": "hosta-0000000-1a2b3c4d",
+              "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+              "head": {
+                "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+                "seq": 6
+              },
+              "host_id": "host-a",
+              "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+              "room": "astation-test-1",
+              "type": "atem-host-route-proxy",
+              "v": 1
+            },
+            "sig": "sna0kIyn_XGrsq1EAQaD9v4poH-aUrJHy__gD_M-OlgAhm4JnZ8shZvGDyfYiAm-tl6i4jGnUeHtXngXFEvTBg"
+          },
+          "type": "relay",
+          "v": 1
+        },
+        "reason": "the relay at_head proof with its type changed to atem-host-route-proxy, its signature kept",
+        "verifier": "proxy"
+      }
+    ],
+    "note": "R9.7b through Astation's :8080 proxy (the delegated host-work design I.5.8; proposed, for Astation's agreement): the proof's fields under their own type atem-host-route-proxy, signed by the host's host_channel_key over enc([\"atem-host-route-proxy-v1\", jcs(body)]), against the same log, chain, challenge and atem_id as the relay cases. Each `valid` case verifies as the proxy kind only (the relay verifier refuses it, malformed, its type); every relay `valid` case is refused by the proxy verifier the same way. `cross` cases are refused by the verifier of the kind they name (`verifier`), with `code`. A Station accepts a proxy proof only on Astation's native-bound forwarding connection, never as a relay route.",
+    "valid": [
+      {
+        "chain": [],
+        "expect": {
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_id": "host-a"
+        },
+        "jcs": "{\"account_id\":\"acct-test-1\",\"atem_id\":\"hosta-0000000-1a2b3c4d\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"host_id\":\"host-a\",\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"room\":\"astation-test-1\",\"type\":\"atem-host-route-proxy\",\"v\":1}",
+        "label": "at_head",
+        "message": {
+          "op": "host_route",
+          "proof": {
+            "body": {
+              "account_id": "acct-test-1",
+              "atem_id": "hosta-0000000-1a2b3c4d",
+              "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+              "head": {
+                "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+                "seq": 6
+              },
+              "host_id": "host-a",
+              "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+              "room": "astation-test-1",
+              "type": "atem-host-route-proxy",
+              "v": 1
+            },
+            "sig": "7Z12vDTPBeWO9Ur-OVFibrNmkfvElk02HlccIlMH0AM9J92Dc5GWRuw6_YF8W5qYFUvF_T8FMVxONwhwmT1FAg"
+          },
+          "type": "relay",
+          "v": 1
+        },
+        "note": "host-a at log L's head (6) (the proxy kind)",
+        "signing_input_hex": "000000186174656d2d686f73742d726f7574652d70726f78792d7631000001737b226163636f756e745f6964223a22616363742d746573742d31222c226174656d5f6964223a22686f7374612d303030303030302d3161326233633464222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c2268656164223a7b2268617368223a2262656231383436396235383363316161393831623039646138656434363135333865613631373136393364333435663633313035633561623564306165613739222c22736571223a367d2c22686f73745f6964223a22686f73742d61222c226e6f6e6365223a2241414543417751464267634943516f4c4441304f4478415245684d554652595847426b6147787764486838222c22726f6f6d223a226173746174696f6e2d746573742d31222c2274797065223a226174656d2d686f73742d726f7574652d70726f7879222c2276223a317d"
+      },
+      {
+        "chain": [],
+        "expect": {
+          "head": {
+            "hash": "7cc348b5991f0995cb2a7b9300202dc8323733484fc49bfd264800447a2d4e3d",
+            "seq": 2
+          },
+          "host_id": "host-a"
+        },
+        "jcs": "{\"account_id\":\"acct-test-1\",\"atem_id\":\"hosta-0000000-1a2b3c4d\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"head\":{\"hash\":\"7cc348b5991f0995cb2a7b9300202dc8323733484fc49bfd264800447a2d4e3d\",\"seq\":2},\"host_id\":\"host-a\",\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"room\":\"astation-test-1\",\"type\":\"atem-host-route-proxy\",\"v\":1}",
+        "label": "at_ancestor",
+        "message": {
+          "op": "host_route",
+          "proof": {
+            "body": {
+              "account_id": "acct-test-1",
+              "atem_id": "hosta-0000000-1a2b3c4d",
+              "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+              "head": {
+                "hash": "7cc348b5991f0995cb2a7b9300202dc8323733484fc49bfd264800447a2d4e3d",
+                "seq": 2
+              },
+              "host_id": "host-a",
+              "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+              "room": "astation-test-1",
+              "type": "atem-host-route-proxy",
+              "v": 1
+            },
+            "sig": "25ZZV4Bttf2QbY9qCEH766JKHpeDwdZ-F5LbM5QgMlzXoo_c2E8F2BP9rbQWoQyTN-Mhxra4bV2MKgwqGS7_DA"
+          },
+          "type": "relay",
+          "v": 1
+        },
+        "note": "host-a at E2 (an ancestor of the verifier's head) (the proxy kind)",
+        "signing_input_hex": "000000186174656d2d686f73742d726f7574652d70726f78792d7631000001737b226163636f756e745f6964223a22616363742d746573742d31222c226174656d5f6964223a22686f7374612d303030303030302d3161326233633464222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c2268656164223a7b2268617368223a2237636333343862353939316630393935636232613762393330303230326463383332333733333438346663343962666432363438303034343761326434653364222c22736571223a327d2c22686f73745f6964223a22686f73742d61222c226e6f6e6365223a2241414543417751464267634943516f4c4441304f4478415245684d554652595847426b6147787764486838222c22726f6f6d223a226173746174696f6e2d746573742d31222c2274797065223a226174656d2d686f73742d726f7574652d70726f7879222c2276223a317d"
+      },
+      {
+        "chain": [
+          "H7_add_host_b"
+        ],
+        "expect": {
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_id": "host-a"
+        },
+        "jcs": "{\"account_id\":\"acct-test-1\",\"atem_id\":\"hosta-0000000-1a2b3c4d\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"host_id\":\"host-a\",\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"room\":\"astation-test-1\",\"type\":\"atem-host-route-proxy\",\"v\":1}",
+        "label": "verifier_ahead",
+        "message": {
+          "op": "host_route",
+          "proof": {
+            "body": {
+              "account_id": "acct-test-1",
+              "atem_id": "hosta-0000000-1a2b3c4d",
+              "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+              "head": {
+                "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+                "seq": 6
+              },
+              "host_id": "host-a",
+              "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+              "room": "astation-test-1",
+              "type": "atem-host-route-proxy",
+              "v": 1
+            },
+            "sig": "7Z12vDTPBeWO9Ur-OVFibrNmkfvElk02HlccIlMH0AM9J92Dc5GWRuw6_YF8W5qYFUvF_T8FMVxONwhwmT1FAg"
+          },
+          "type": "relay",
+          "v": 1
+        },
+        "note": "the at_head proof, verified on L + H7_add_host_b (head 7): head 6 is an ancestor (the proxy kind)",
+        "signing_input_hex": "000000186174656d2d686f73742d726f7574652d70726f78792d7631000001737b226163636f756e745f6964223a22616363742d746573742d31222c226174656d5f6964223a22686f7374612d303030303030302d3161326233633464222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c2268656164223a7b2268617368223a2262656231383436396235383363316161393831623039646138656434363135333865613631373136393364333435663633313035633561623564306165613739222c22736571223a367d2c22686f73745f6964223a22686f73742d61222c226e6f6e6365223a2241414543417751464267634943516f4c4441304f4478415245684d554652595847426b6147787764486838222c22726f6f6d223a226173746174696f6e2d746573742d31222c2274797065223a226174656d2d686f73742d726f7574652d70726f7879222c2276223a317d"
+      },
+      {
+        "chain": [
+          "H7_rekey_host_a"
+        ],
+        "expect": {
+          "head": {
+            "hash": "a659d582f83ee1406e088a0944564dd2b582b902d1411b889bd3c2ab7819f1be",
+            "seq": 7
+          },
+          "host_id": "host-a"
+        },
+        "jcs": "{\"account_id\":\"acct-test-1\",\"atem_id\":\"hosta-0000000-1a2b3c4d\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"head\":{\"hash\":\"a659d582f83ee1406e088a0944564dd2b582b902d1411b889bd3c2ab7819f1be\",\"seq\":7},\"host_id\":\"host-a\",\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"room\":\"astation-test-1\",\"type\":\"atem-host-route-proxy\",\"v\":1}",
+        "label": "after_rekey",
+        "message": {
+          "op": "host_route",
+          "proof": {
+            "body": {
+              "account_id": "acct-test-1",
+              "atem_id": "hosta-0000000-1a2b3c4d",
+              "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+              "head": {
+                "hash": "a659d582f83ee1406e088a0944564dd2b582b902d1411b889bd3c2ab7819f1be",
+                "seq": 7
+              },
+              "host_id": "host-a",
+              "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+              "room": "astation-test-1",
+              "type": "atem-host-route-proxy",
+              "v": 1
+            },
+            "sig": "Sw5BkPM2kSfbnkHp7rgXgCleu4HYNYuM_WBb4fvzugf1hGsg5gZ5c88c8Fsc9KAH6ORZzUDWKKYlfKVj-RbMDg"
+          },
+          "type": "relay",
+          "v": 1
+        },
+        "note": "host-a after H7_rekey_host_a, signed with its new key at head 7 (the proxy kind)",
+        "signing_input_hex": "000000186174656d2d686f73742d726f7574652d70726f78792d7631000001737b226163636f756e745f6964223a22616363742d746573742d31222c226174656d5f6964223a22686f7374612d303030303030302d3161326233633464222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c2268656164223a7b2268617368223a2261363539643538326638336565313430366530383861303934343536346464326235383262393032643134313162383839626433633261623738313966316265222c22736571223a377d2c22686f73745f6964223a22686f73742d61222c226e6f6e6365223a2241414543417751464267634943516f4c4441304f4478415245684d554652595847426b6147787764486838222c22726f6f6d223a226173746174696f6e2d746573742d31222c2274797065223a226174656d2d686f73742d726f7574652d70726f7879222c2276223a317d"
+      }
+    ]
+  },
   "relay_replies": {
     "invalid": [
       {

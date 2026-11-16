@@ -12,7 +12,9 @@ parts of the push hints and of the envelopes and results between hosts
 (RFC 9180 base mode, written here: opened, and sealed again from the
 ephemeral to the same bytes). It derives no verifier's verdict, but for
 `r9-vectors-host-envelope`, whose every check's verdict and reason it
-derives from the bytes, the device list and the receiver (II.4.2's checks 1
+derives from the bytes, and `r9-vectors-host-route`'s refusals across the
+two kinds of proof (relay and proxy), which follow from a proof's type and
+signature, the device list and the receiver (II.4.2's checks 1
 to 6 and II.4.4's, written here from host-work-v1 §11.5). The other files'
 `expect` and each `reason` are checked by the Rust runner
 (`crates/atem-client/tests/vectors.rs`) and the binding suites.
@@ -2987,12 +2989,104 @@ def check_station_calls(file, data, report, context):
         case.check({"control_sync_result_65_records", "heads_65_feeds", "control_ack_65_results", "membership_fetch_result_65_entries"} <= counts, "65 records, feeds, results and entries")
 
 
+# ------------------------------------------------- r9-vectors-host-route
+
+# The two kinds of host route proof (session-v1 R9.7b): their body `type` and
+# signing label. The proxy kind (a Station's challenge through Astation's
+# `:8080`) is proposed, for Astation's agreement.
+ROUTE_KINDS = {
+    "relay": ("atem-host-route", "atem-host-route-v1"),
+    "proxy": ("atem-host-route-proxy", "atem-host-route-proxy-v1"),
+}
+ROUTE_BODY_FIELDS = {"type", "v", "account_id", "genesis_hash", "host_id", "atem_id", "room", "nonce", "head"}
+
+
+def check_host_route(file, data, report, context):
+    """Recomputes every valid proof's jcs and signing input and verifies its
+    signature with the host's key at the verifier's head (log L's add_host,
+    then the case's `chain`), for both kinds; checks that a proof never
+    verifies under the other kind's label and type, and that each `cross`
+    case's code follows from its type and signature."""
+    mlog = context["membership_log"]
+    extra = {e["label"]: e["entry"]["body"] for e in data["entries"]}
+    challenge = data["challenge"]
+
+    def host_key(host_id, chain):
+        key = None
+        bodies = [v["entry"]["body"] for v in mlog["log"]] + [extra[label] for label in chain]
+        for body in bodies:
+            if body["action"] == "add_host" and body["host"]["host_id"] == host_id:
+                key = b64u_decode(body["host"]["host_key"]["pub"])
+            elif body["action"] == "remove_host" and body["host_id"] == host_id:
+                key = None
+        return key
+
+    def kind_of(body):
+        return next((k for k, (t, _) in ROUTE_KINDS.items() if body.get("type") == t), None)
+
+    def signed(body, label, sig, key):
+        return key is not None and verify("ed25519", key, sig, enc([label, jcs(body)]))
+
+    def check_valid(case, vector, kind):
+        proof = vector["message"]["proof"]
+        body, sig = proof["body"], b64u_decode(proof["sig"])
+        body_type, label = ROUTE_KINDS[kind]
+        case.equal(sorted(vector["message"]), ["op", "proof", "type", "v"], "message fields")
+        case.equal((vector["message"]["type"], vector["message"]["op"], vector["message"]["v"]), ("relay", "host_route", 1), "a host_route relay message")
+        case.equal(set(body), ROUTE_BODY_FIELDS, "the body's fields")
+        case.equal((body["type"], body["v"]), (body_type, 1), "type and v")
+        case.equal((body["nonce"], body["room"], body["atem_id"]), (challenge["message"]["nonce"], challenge["room"], challenge["atem_id"]), "the challenge's nonce and room, the relay's atem_id")
+        case.equal(body["genesis_hash"], context["genesis_hash"].hex(), "log L's genesis")
+        text = jcs(body)
+        case.equal(text, vector["jcs"], "jcs")
+        case.equal(enc([label, text]).hex(), vector["signing_input_hex"], "signing input")
+        key = host_key(body["host_id"], vector["chain"])
+        case.check(signed(body, label, sig, key), f"signature by {context['keys'].name_of(key)} over {label}")
+        for other, (other_type, other_label) in ROUTE_KINDS.items():
+            if other != kind:
+                relabelled = dict(body, type=other_type)
+                case.check(not signed(relabelled, other_label, sig, key), f"never valid as the {other} kind")
+                case.check(not signed(body, other_label, sig, key), f"not over {other_label}")
+        return body
+
+    relay_bodies = {}
+    for vector in data["valid"]:
+        with report.case(file, f"valid {vector['label']}") as case:
+            relay_bodies[vector["label"]] = check_valid(case, vector, "relay")
+    proxy = data["proxy"]
+    for vector in proxy["valid"]:
+        with report.case(file, f"proxy valid {vector['label']}") as case:
+            body = check_valid(case, vector, "proxy")
+            case.equal(dict(body, type="atem-host-route"), relay_bodies.get(vector["label"]), "the relay case's body but its type")
+            case.equal(vector["chain"], next(v["chain"] for v in data["valid"] if v["label"] == vector["label"]), "the relay case's chain")
+    codes = set()
+    for vector in proxy["cross"]:
+        with report.case(file, f"proxy cross {vector['label']}") as case:
+            verifier = vector["verifier"]
+            body = vector["message"]["proof"]["body"]
+            sig = b64u_decode(vector["message"]["proof"]["sig"])
+            kind = kind_of(body)
+            case.check(kind is not None, "a host route type")
+            if kind != verifier:
+                case.equal(vector["code"], "malformed", f"a {kind} proof to the {verifier} verifier: its type")
+            else:
+                label = ROUTE_KINDS[verifier][1]
+                key = host_key(body["host_id"], vector["chain"])
+                case.check(not signed(body, label, sig, key), f"its signature isn't over {label}")
+                case.equal(vector["code"], "bad_signature", "relabelled: bad_signature")
+            codes.add((verifier, vector["code"]))
+    with report.case(file, "proxy coverage") as case:
+        case.equal(sorted(v["label"] for v in proxy["valid"]), sorted(relay_bodies), "every valid relay case has its proxy case")
+        case.equal(codes, {(v, c) for v in ROUTE_KINDS for c in ("malformed", "bad_signature")}, "each verifier refuses the other kind and a relabelled proof")
+
+
 # ---------------------------------------------------------------------- main
 
 # In order: a checker may use what an earlier one recorded in `context`.
 CHECKERS = [
     ("r9-vectors-keys", check_keys),
     ("r9-vectors-membership-log", check_membership_log),
+    ("r9-vectors-host-route", check_host_route),
     ("r9-vectors-host-work-control", check_host_work_control),
     ("r9-vectors-push-hint", check_push_hint),
     ("r9-vectors-delegated-wire", check_delegated_wire),
