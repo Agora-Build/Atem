@@ -875,3 +875,71 @@ fn a_skipped_cancel_holds_the_gate_until_it_is_read_again() {
         assert!(mb_gate(&rig));
     });
 }
+
+/// Review finding 1 (ruling R35) in the bridge: A's cancel and C's are left
+/// on the Station, each sender's share full; room frees for C only, and the
+/// re-read leaves A's again and opens C's. Once admission drains the inbox
+/// and the cursor rewinds again, host senders' gate stays closed until the
+/// page for A's position commits.
+#[test]
+fn a_cancel_left_again_on_a_reread_holds_the_gate_until_read_again() {
+    use crate::session_protocol::membership::r9log::secret;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = mb_host(&mut rig, root, &os);
+        rig.bridge.work.mail_limits.inbox_per_sender = 1;
+        let entry = host.s.log.add_host("host-c", 1, &secret("host c"));
+        carry(&mut rig, &host.s.log, entry);
+        rig.bridge.sync_list_view();
+        let mut c = atem_client::SoftwareKeys::new();
+        c.insert_ed25519(atem_client::KeyId::new("host-b"), &secret("host c"));
+        let head = host.s.log.log.head();
+        let admit = |rig: &LocalRig, sender: Option<&str>| {
+            let db = &rig.bridge.work.store.as_ref().unwrap().db;
+            match sender {
+                Some(s) => db.execute("DELETE FROM mailbox_inbox WHERE sender_host=?1", [s]),
+                None => db.execute("DELETE FROM mailbox_inbox", []),
+            }
+            .unwrap();
+        };
+        // Read one page answering the live sync: the next object.
+        let page_with = |rig: &mut LocalRig, object: &Value| {
+            let (syncs, _) = mb_out(rig);
+            mb_receive(rig, &mb_page(&syncs[0], 4, std::slice::from_ref(object)));
+        };
+        mb_heads(&mut rig, MB_MAILBOX, 4);
+        let first_b = mb_cancel(&rig, &host, "host-b", &host.sender, head);
+        let first_c = mb_cancel(&rig, &host, "host-c", &c, head);
+        page_with(&mut rig, &first_b);
+        page_with(&mut rig, &first_c);
+        let a = mb_cancel(&rig, &host, "host-b", &host.sender, head);
+        let from_c = mb_cancel(&rig, &host, "host-c", &c, head);
+        page_with(&mut rig, &a);
+        page_with(&mut rig, &from_c);
+        assert!(mb_store(&rig).skipped_inbox);
+        // Room for C only: the re-read leaves A's again and opens C's.
+        admit(&rig, Some("host-c"));
+        mb_tick(&mut rig, &mut host, 1_000);
+        page_with(&mut rig, &a);
+        page_with(&mut rig, &from_c);
+        assert_eq!(mb_store(&rig).cursor, Some((MB_MAILBOX.into(), 4)));
+        assert!(!mb_gate(&rig));
+        // Admission drains the inbox: the rewind; closed until position 3
+        // is read again.
+        admit(&rig, None);
+        mb_tick(&mut rig, &mut host, 1_000);
+        let observed = mb_store(&rig);
+        assert_eq!(
+            (observed.cursor, observed.read_to, observed.inbox),
+            (Some((MB_MAILBOX.into(), 2)), 4, 0)
+        );
+        assert!(!mb_gate(&rig), "A's cancel isn't read again yet");
+        page_with(&mut rig, &a);
+        assert_eq!(mb_store(&rig).inbox, 1);
+        assert!(!mb_gate(&rig), "it waits for admission now");
+        admit(&rig, None);
+        mb_tick(&mut rig, &mut host, 1_000);
+        assert!(mb_gate(&rig));
+    });
+}

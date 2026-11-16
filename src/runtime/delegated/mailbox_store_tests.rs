@@ -1458,3 +1458,87 @@ fn only_a_skipped_request_cancel_or_complete_holds_the_gate() {
         (Some((MAILBOX_2.into(), 0)), 0)
     );
 }
+
+/// Review finding 1 (ruling R35): a request, cancel or complete left on the
+/// Station keeps holding the gate through a re-read of several pages. A's
+/// cancel (position 3) and B's (7) are left there, each sender's share full;
+/// room frees for B only, and the re-read leaves A's again (position 3) and
+/// opens B's (7): A's still waits there. Admission drains everything and the
+/// cursor rewinds again: until a page covers position 3 once more, it still
+/// holds the gate.
+#[test]
+fn a_skip_left_again_on_a_reread_still_holds_the_gate() {
+    let mut mail = Mail::new();
+    mail.log.add_host("host-c", 1, &secret("mail host c"));
+    let b = Box::new();
+    let cx = DecideCx {
+        limits: Limits {
+            inbox_per_sender: 1,
+            ..Limits::default()
+        },
+        ..mail.cx()
+    };
+    let from_c = || {
+        let mut c = SoftwareKeys::new();
+        c.insert_ed25519(KeyId::new("host-c"), &secret("mail host c"));
+        let fields = mail.fields("host-c", mail.log.log.head(), now_ms() + HOUR);
+        seal_envelope(
+            &c,
+            &KeyId::new("host-c"),
+            &fields,
+            &EnvelopePlain::Cancel { task_id: uuid() },
+            &mail.enc_pub,
+        )
+        .unwrap()
+    };
+    // One page: `after` to `through`, the object at `through` if any.
+    let read_page = |b: &Box, after: u64, through: u64, object: Option<&SignedObject>| {
+        let objects = object
+            .map(|o| vec![entry(through, &o.to_json().to_string())])
+            .unwrap_or_default();
+        let page = page(MAILBOX, after, 7, through, objects);
+        match commit_page(&b.store, &identity(1), &page, Some(&cx)).unwrap() {
+            Commit::Committed(c) => c.decided.into_iter().next(),
+            other => panic!("not committed: {other:?}"),
+        }
+    };
+    let held = |b: &Box| read(&b.store, &identity(1)).unwrap().skipped_inbox;
+    // Each sender's share full.
+    assert_eq!(
+        read_page(&b, 0, 1, Some(&mail.cancel())),
+        Some(Decision::Opened)
+    );
+    assert_eq!(read_page(&b, 1, 2, Some(&from_c())), Some(Decision::Opened));
+    // 1. The first read leaves A's cancel (3) and B's (7) on the Station.
+    let a = mail.cancel();
+    let c = from_c();
+    assert_eq!(read_page(&b, 2, 3, Some(&a)), Some(Decision::Skipped));
+    assert_eq!(read_page(&b, 3, 7, Some(&c)), Some(Decision::Skipped));
+    assert!(held(&b));
+    // 2. Admission takes B's row: the rewind to just before 3.
+    b.store
+        .db
+        .execute("DELETE FROM mailbox_inbox WHERE sender_host='host-c'", [])
+        .unwrap();
+    assert!(rewind_if_room(&b.store, &identity(1), cx.now_ms).unwrap());
+    assert_eq!(
+        read(&b.store, &identity(1)).unwrap().cursor,
+        Some((MAILBOX.into(), 2))
+    );
+    // 3. The re-read leaves A's again; 4. B's opens.
+    assert_eq!(read_page(&b, 2, 3, Some(&a)), Some(Decision::Skipped));
+    assert_eq!(read_page(&b, 3, 7, Some(&c)), Some(Decision::Opened));
+    assert!(held(&b), "A's cancel still waits on the Station");
+    // 5. Admission drains everything: the rewind again; until a page covers
+    // position 3 once more, it holds the gate.
+    b.store.db.execute("DELETE FROM mailbox_inbox", []).unwrap();
+    assert!(rewind_if_room(&b.store, &identity(1), cx.now_ms).unwrap());
+    let observed = read(&b.store, &identity(1)).unwrap();
+    assert_eq!(
+        (observed.cursor, observed.read_to),
+        (Some((MAILBOX.into(), 2)), 7)
+    );
+    assert!(observed.skipped_inbox, "not read again yet");
+    assert_eq!(read_page(&b, 2, 3, Some(&a)), Some(Decision::Opened));
+    assert!(!held(&b), "read again: nothing waits there");
+}

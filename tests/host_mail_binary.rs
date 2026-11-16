@@ -515,6 +515,17 @@ impl Rig {
         tx.commit().unwrap();
     }
 
+    /// Admission takes `sender`'s inbox rows only, in one transaction.
+    fn admit_from(&self, sender: &str) {
+        let mut db = self.db();
+        let tx = db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        tx.execute("DELETE FROM mailbox_inbox WHERE sender_host=?1", [sender])
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
     /// The host's `mailbox_done`s so far, each with the link it came on.
     fn dones(&self) -> Vec<(u64, MailboxDone)> {
         self.station()
@@ -1400,6 +1411,74 @@ fn a_results_flood_leaves_the_gate_open_and_a_skipped_request_closes_it() {
     rig.until_mailbox("open again", |m| m["open"] == true);
     assert_eq!(rig.count("mailbox_results"), 64);
     rig.offline();
+}
+
+/// Review finding 1 (ruling R35), two senders: a request of A's over A's
+/// inbox share (32) is left on the Station, then one of B's over B's. Room
+/// frees for B only: the re-read leaves A's again and opens B's. Then
+/// admission drains the inbox and the cursor rewinds again, the re-read's
+/// page held by the Station: host senders' gate stays closed until the page
+/// for A's position commits.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_request_left_again_on_a_reread_holds_the_gate_until_read_again() {
+    let rig = Rig::start(Via::Relay, Hook::Senders);
+    let to = rig.receiver(1);
+    let head = rig.log.log.head();
+    let b = SenderHost::new(&rig.log, OTHER_HOST, 1, &secret("host mail other host"));
+    {
+        let mut station = rig.station();
+        for n in 0..33 {
+            let request = rig.sender.request(&to, head, &format!("A {n}"));
+            rig.sender.put_stored(&mut station, &request);
+        }
+        for n in 0..33 {
+            b.put_stored(&mut station, &b.request(&to, head, &format!("B {n}")));
+        }
+    }
+    let mailbox_id = rig.station().mailbox_id();
+    rig.online();
+    rig.within("both senders read", || {
+        rig.cursor() == Some((mailbox_id.clone(), 66)) && rig.owed().is_empty()
+    });
+    assert_eq!(rig.inbox().len(), 64);
+    assert_eq!(rig.station().mailbox_positions(), [33, 66]);
+    // Room for B only: the re-read leaves A's again and opens B's.
+    rig.admit_from(OTHER_HOST);
+    rig.within("B's read again", || {
+        rig.inbox().len() == 33 && rig.station().mailbox_positions() == [33]
+    });
+    rig.within("read to the head", || {
+        rig.cursor() == Some((mailbox_id.clone(), 66)) && rig.owed().is_empty()
+    });
+    // Admission drains the inbox, with the Station holding the re-read's
+    // page: closed until the page for A's position commits.
+    rig.offline();
+    rig.admit_all();
+    let (held, call) = rig.hold(is_sync);
+    let MailboxToStation::Sync(call) = call else {
+        unreachable!()
+    };
+    assert_eq!(call.after, 32);
+    let mailbox = rig.until_mailbox("the rewind seen", |m| {
+        m["cursor"]["cursor"] == 32 && m["inbox"] == 0
+    });
+    assert_eq!(mailbox["open"], false, "{mailbox}");
+    rig.two_passes();
+    assert_eq!(rig.mailbox()["open"], false, "A's request isn't read again");
+    rig.answer(held);
+    rig.serve_until("A's read again", |rig| {
+        rig.inbox().len() == 1 && rig.owed().is_empty()
+    });
+    assert!(rig.station().mailbox_positions().is_empty());
+    rig.until_mailbox("waiting for admission", |m| {
+        m["closed"] == "1 mailbox object(s) wait for admission"
+    });
+    rig.admit_all();
+    rig.until_mailbox("open", |m| m["open"] == true);
 }
 
 // ── An identity change on the live link (§11.4, rule 8) ──

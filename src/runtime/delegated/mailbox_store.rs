@@ -57,8 +57,9 @@
 //!   ([`rewind_if_room`]) and it is read again. A request, cancel or
 //!   complete left there isn't committed: the gate's mailbox part stays
 //!   closed until a read after the rewind passes its position (the highest
-//!   such position, `skip_inbox`); a result left there holds no gate
-//!   (ruling R35: results start no work).
+//!   such position this read left there, `skip_inbox_now`, folded at the
+//!   rewind into the highest awaiting the re-read, `skip_inbox`); a result
+//!   left there holds no gate (ruling R35: results start no work).
 //! - **Bounded** ([`Limits`], [`prune`]): refusals keep their bytes within
 //!   a budget (unauthenticated first, then unreported, the oldest first;
 //!   the evidence hash stays) and unauthenticated refusal rows within a
@@ -169,8 +170,8 @@ const TABLES: &str = "
         one INTEGER PRIMARY KEY CHECK (one = 1), identity TEXT NOT NULL,
         mailbox_id TEXT NOT NULL, cursor INTEGER NOT NULL, skip_at INTEGER,
         skip_freed INTEGER NOT NULL DEFAULT 0, freed INTEGER NOT NULL DEFAULT 0,
-        skip_expires INTEGER, skip_inbox INTEGER, read_to INTEGER NOT NULL DEFAULT 0)
-        WITHOUT ROWID;
+        skip_expires INTEGER, skip_inbox INTEGER, read_to INTEGER NOT NULL DEFAULT 0,
+        skip_inbox_now INTEGER) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS mailbox_dones (
         mailbox_id TEXT NOT NULL, position INTEGER NOT NULL,
         PRIMARY KEY(mailbox_id, position)) WITHOUT ROWID;
@@ -224,13 +225,14 @@ const TABLES: &str = "
 /// The columns `mailbox_cursor` gained after its first shape (review P5: a
 /// store made by an earlier build of this mailbox gets them when its
 /// tables are made).
-const CURSOR_COLUMNS: [(&str, &str); 6] = [
+const CURSOR_COLUMNS: [(&str, &str); 7] = [
     ("skip_at", "INTEGER"),
     ("skip_freed", "INTEGER NOT NULL DEFAULT 0"),
     ("freed", "INTEGER NOT NULL DEFAULT 0"),
     ("skip_expires", "INTEGER"),
     ("skip_inbox", "INTEGER"),
     ("read_to", "INTEGER NOT NULL DEFAULT 0"),
+    ("skip_inbox_now", "INTEGER"),
 ];
 
 /// The mailbox's tables in `store`, made if missing (a cursor table of an
@@ -314,7 +316,7 @@ pub fn read(store: &Store, identity: &HostIdentity) -> Result<Observed> {
         .query_row(
             "SELECT skip_at IS NOT NULL, skip_at IS NOT NULL AND freed > skip_freed,
                 CASE WHEN skip_at IS NOT NULL THEN skip_expires END,
-                skip_inbox IS NOT NULL, max(cursor, read_to)
+                skip_inbox IS NOT NULL OR skip_inbox_now IS NOT NULL, max(cursor, read_to)
             FROM mailbox_cursor WHERE one=1",
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
@@ -371,8 +373,8 @@ pub fn mark_reset(store: &Store, identity: &HostIdentity, mailbox_id: &str) -> R
     own_cursor(&tx, identity)?;
     set_cursor(&tx, identity, mailbox_id, 0)?;
     tx.execute(
-        "UPDATE mailbox_cursor SET skip_at=NULL, skip_expires=NULL, skip_inbox=NULL, read_to=0
-        WHERE one=1",
+        "UPDATE mailbox_cursor SET skip_at=NULL, skip_expires=NULL, skip_inbox=NULL,
+            skip_inbox_now=NULL, read_to=0 WHERE one=1",
         [],
     )?;
     tx.execute("DELETE FROM mailbox_dones", [])?;
@@ -392,9 +394,14 @@ pub fn mark_reset(store: &Store, identity: &HostIdentity, mailbox_id: &str) -> R
 pub fn rewind_if_room(store: &Store, identity: &HostIdentity, now_ms: u64) -> Result<bool> {
     let tx = store.immediate()?;
     own_cursor(&tx, identity)?;
+    // The requests, cancels and completes this read left there now await
+    // the re-read (review finding 1): folded into those awaiting it.
     let rewound = tx.execute(
         "UPDATE mailbox_cursor SET cursor=min(cursor, skip_at - 1), skip_at=NULL,
-            skip_expires=NULL
+            skip_expires=NULL,
+            skip_inbox=CASE WHEN skip_inbox_now IS NULL THEN skip_inbox
+                ELSE max(coalesce(skip_inbox, 0), skip_inbox_now) END,
+            skip_inbox_now=NULL
         WHERE one=1 AND skip_at IS NOT NULL
             AND (freed > skip_freed OR skip_expires <= ?1)",
         [now_ms],
@@ -574,9 +581,13 @@ pub fn commit_page(
     }
     set_cursor(&tx, identity, &page.mailbox_id, page.through)?;
     // Ruling R35: a request, cancel or complete left on the Station holds
-    // the gate until a read covers its position again (after a rewind;
-    // a later page of the same read only moves on), then the highest one
-    // this page left there, if any.
+    // the gate until a read after a rewind covers its position again. Two
+    // kinds (review finding 1): those an earlier read left there, awaiting
+    // this re-read (`skip_inbox`, the highest of them: a page covering it
+    // re-read them all; a later page of the same read only moves on), and
+    // those this read leaves there (`skip_inbox_now`), which only the next
+    // rewind folds into the first, so a re-read leaving one there again
+    // never loses it to a higher one read since.
     tx.execute(
         "UPDATE mailbox_cursor SET skip_inbox=NULL
         WHERE one=1 AND skip_inbox > ?1 AND skip_inbox <= ?2",
@@ -584,7 +595,8 @@ pub fn commit_page(
     )?;
     if let Some(at) = skipped_inbox {
         tx.execute(
-            "UPDATE mailbox_cursor SET skip_inbox=max(coalesce(skip_inbox, 0), ?1) WHERE one=1",
+            "UPDATE mailbox_cursor SET skip_inbox_now=max(coalesce(skip_inbox_now, 0), ?1)
+            WHERE one=1",
             [at],
         )?;
     }
