@@ -98,9 +98,10 @@ pub fn verify_pairing_log(
 /// host-work-v1 §11.5: the entries end at this host's `add_host` (seq `A`;
 /// the signing gate closed, or the key entry's append failed), or at its
 /// `host_enc_key` at `A` + 1 naming exactly the key this ceremony revealed
-/// at its trust generation, with its `enc_sig` and no `retire_previous`
-/// (the chain already verified that `enc_sig` against the `add_host`'s key).
-/// Anything else fails the verification.
+/// at its trust generation, with its `enc_sig` (the chain already verified
+/// that `enc_sig` against the `add_host`'s key). Its `retire_previous` is
+/// taken either way: right after the `add_host` there is no previous key,
+/// so it changes nothing (R9.2). Anything else fails the verification.
 fn ends_at_this_ceremony(m: &Membership, inputs: &PairingInputs<'_>) -> Result<(), String> {
     use atem_client::membership::entry::Action;
     const NOT_AT_END: &str =
@@ -124,13 +125,12 @@ fn ends_at_this_ceremony(m: &Membership, inputs: &PairingInputs<'_>) -> Result<(
             host_trust_gen,
             enc_key,
             enc_sig,
-            retire_previous,
+            retire_previous: _,
         }) if host_id == inputs.host_id => {
             if *host_trust_gen != inputs.host_trust_gen
                 || enc_key.alg() != Alg::X25519
                 || enc_key.as_bytes() != inputs.enc_pub.as_slice()
                 || enc_sig.as_slice() != inputs.enc_sig.as_slice()
-                || *retire_previous
             {
                 return Err(
                     "the device list's host_enc_key for this host isn't the key this ceremony revealed"

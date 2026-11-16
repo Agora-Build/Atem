@@ -190,6 +190,29 @@ fn recorded(pairing: &PairingPaths) -> Option<(u64, Vec<String>)> {
     ))
 }
 
+/// host-work-v1 §11.5: the key entry may carry `retire_previous: true`:
+/// right after the `add_host` there is no previous key, so it changes
+/// nothing (R9.2), and the entry still names the revealed key and its
+/// `enc_sig`. Taken like the entry without it.
+#[test]
+fn the_ceremonys_key_entry_may_retire_a_previous_key_it_doesnt_have() {
+    let mut case = Case::new();
+    let action = atem_client::membership::host_enc_key(
+        HOST,
+        2,
+        &atem_client::PublicKey::new(atem_client::Alg::X25519, case.enc.enc_pub()).unwrap(),
+        case.enc.enc_sig(),
+        true,
+        1,
+    )
+    .unwrap();
+    case.log.append(super::r9log::MAC, action);
+    let m = case.verify(Some(&case.membership()), |_| {}).unwrap();
+    let keys = m.host_enc_key(HOST).expect("the key entry");
+    assert_eq!(keys.current.key.as_32(), Some(case.enc.enc_pub()));
+    assert_eq!(keys.previous, None);
+}
+
 /// host-work-v1 §11.5: the ceremony's entries may also end at this host's
 /// `host_enc_key` right after its `add_host`, naming the key this ceremony
 /// revealed and its `enc_sig`: verified, and pinned with the key kept.
@@ -220,8 +243,8 @@ fn the_list_may_end_at_the_ceremonys_own_host_enc_key() {
 /// host-work-v1 §11.5: anything else at the end fails the verification
 /// (nothing is pinned): a `host_enc_key` of this host that isn't the key
 /// this ceremony revealed (another key the host vouched for, valid on the
-/// chain), one with `retire_previous`, another host's entry after the
-/// `add_host`, or any entry after the key entry.
+/// chain, or another `enc_sig`), another host's entry after the `add_host`,
+/// or any entry after the key entry.
 #[test]
 fn a_list_ending_anywhere_else_is_refused() {
     let not_ours =
@@ -241,20 +264,6 @@ fn a_list_ending_anywhere_else_is_refused() {
     let e = case
         .verify(Some(&case.membership()), |i| i.enc_sig = [7; 64])
         .unwrap_err();
-    assert_eq!(e, not_ours);
-    // The revealed key with retire_previous.
-    let mut case = Case::new();
-    let action = atem_client::membership::host_enc_key(
-        HOST,
-        2,
-        &atem_client::PublicKey::new(atem_client::Alg::X25519, case.enc.enc_pub()).unwrap(),
-        case.enc.enc_sig(),
-        true,
-        1,
-    )
-    .unwrap();
-    case.log.append(super::r9log::MAC, action);
-    let e = case.verify(Some(&case.membership()), |_| {}).unwrap_err();
     assert_eq!(e, not_ours);
     // Another host's key entry right after this host's add_host.
     let mut case = Case::new();
