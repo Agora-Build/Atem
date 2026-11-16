@@ -60,7 +60,7 @@
 //!   Pending objects don't hold it. Only host senders wait for it.
 use super::fetch::{HEADS_PACE_MS, REFUSAL_BACKOFF_MS, STALL_PAUSE_MS};
 use super::station::StationLink;
-use super::sync::{HostIdentity, RETIRED_KEPT, SYNC_TIMEOUT_MS};
+use super::sync::{ALERT_EVERY_MS, HostIdentity, RETIRED_KEPT, SYNC_TIMEOUT_MS};
 use atem_client::control::{MailboxHead, RelayError};
 use atem_client::host_mail::mailbox::{
     MailboxDone, MailboxDoneResult, MailboxMismatch, MailboxSync, MailboxSyncResult,
@@ -142,6 +142,10 @@ struct DoneAsk {
     sent_at: u64,
 }
 
+/// §11.4's refusal lines, for the mailbox's two calls (rule 8).
+const REFUSED_SYNC: &str = "the Station refused this host's mailbox_sync (forbidden); retrying";
+const REFUSED_DONE: &str = "the Station refused this host's mailbox_done (forbidden); retrying";
+
 /// The most dones live per link generation (rule 8).
 pub const MAX_LIVE_DONES: usize = 8;
 
@@ -184,6 +188,29 @@ pub struct MailboxClient {
     dones_sent: u64,
     dones_answered: u64,
     unsolicited: u64,
+    /// The alerts (rule 8: §11.4's hourly alerts and refusals), per
+    /// [`Alert`] kind, the runtime.log lines not taken yet, and the run's
+    /// count and latest text (`atem status`).
+    alerts: [Hourly; 3],
+    lines: Vec<String>,
+    alerts_in_run: u64,
+    last_alert: Option<String>,
+}
+
+/// One kind of alert's hourly line: when it last went, and how many came
+/// since without one.
+#[derive(Debug, Default, Clone)]
+struct Hourly {
+    last: Option<u64>,
+    counted: u64,
+}
+
+/// The kinds of the mailbox's alerts.
+#[derive(Debug, Clone, Copy)]
+enum Alert {
+    Fault = 0,
+    SyncRefused = 1,
+    DoneRefused = 2,
 }
 
 /// A fresh `request_id` (rule 8): a lowercase UUID v4 from the operating
@@ -356,10 +383,11 @@ impl MailboxClient {
         })
     }
 
-    /// `applying` committed (the bridge observed the store since): a
-    /// resynchronization asked before it ends, and the next page is asked at once when the cursor moved and
-    /// the host is still behind; after a page that moved nothing while it
-    /// is, none for 30 s.
+    /// `applying` committed (the bridge observed the store since). A
+    /// refusal's or a fault's resynchronization ends only with a page
+    /// asked after its cause. The next page is asked at once when this one
+    /// moved the cursor and the host is still behind; after one that moved
+    /// nothing while it is, none for 30 s.
     pub fn committed(&mut self, applying: Applying) {
         self.pages += 1;
         let page = applying.page;
@@ -386,6 +414,7 @@ impl MailboxClient {
             return;
         }
         self.refusals += 1;
+        self.alert(Alert::SyncRefused, REFUSED_SYNC.into());
         self.retire_live();
         self.resync = Some(Resync::Refused);
         self.refused_at = Some(self.now);
@@ -422,6 +451,7 @@ impl MailboxClient {
     /// again on the next link generation.
     pub fn on_done_refused(&mut self) {
         self.refusals += 1;
+        self.alert(Alert::DoneRefused, REFUSED_DONE.into());
         self.dones_refused = true;
         for id in self.live_done_ids() {
             self.retire_done(&id);
@@ -455,7 +485,11 @@ impl MailboxClient {
             if self.dones.len() >= MAX_LIVE_DONES {
                 break;
             }
-            if self.dones.iter().any(|d| d.call.position == position) {
+            if self
+                .dones
+                .iter()
+                .any(|d| d.call.mailbox_id == *mailbox_id && d.call.position == position)
+            {
                 continue;
             }
             let call = MailboxDone {
@@ -544,6 +578,16 @@ impl MailboxClient {
         None
     }
 
+    /// The runtime.log lines not taken yet (alerts).
+    pub fn take_lines(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.lines)
+    }
+
+    /// The alerts in this run: how many, and the latest's text.
+    pub fn alerts(&self) -> (u64, Option<&str>) {
+        (self.alerts_in_run, self.last_alert.as_deref())
+    }
+
     /// The host's own mailbox as last announced.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn announced(&self) -> Option<&MailboxHead> {
@@ -619,13 +663,40 @@ impl MailboxClient {
         self.epoch += 1;
         self.resync = Some(Resync::Fault(code));
         self.stalled_at = Some(self.now);
-        if self.faults.is_power_of_two() {
-            eprintln!(
-                "atem runtime: {} mailbox page fault(s) from the Station (the last: {code}); host senders' gate stays closed and the page is asked again",
-                self.faults
-            );
-        }
+        self.alert(
+            Alert::Fault,
+            format!(
+                "Station sent a mailbox page it shouldn't ({code}); host senders' gate stays closed and the page is asked again"
+            ),
+        );
         PageCheck::Fault(code)
+    }
+
+    /// An alert: counted for `atem status`, and a runtime.log line now when
+    /// its kind's hour passed (with how many came since the last), else
+    /// counted for the next.
+    fn alert(&mut self, kind: Alert, text: String) {
+        self.alerts_in_run += 1;
+        self.last_alert = Some(text.clone());
+        let now = self.now;
+        let h = &mut self.alerts[kind as usize];
+        let due = h
+            .last
+            .is_none_or(|last| now < last || now >= last.saturating_add(ALERT_EVERY_MS));
+        if !due {
+            h.counted += 1;
+            return;
+        }
+        let more = std::mem::take(&mut h.counted);
+        h.last = Some(now);
+        let more = if more > 0 {
+            format!(" ({more} more since the last such line)")
+        } else {
+            String::new()
+        };
+        self.lines.push(format!(
+            "atem runtime: {text}{more}; at most one such line an hour"
+        ));
     }
 
     /// The announcement against the store's cursor: another mailbox, or a
@@ -644,7 +715,7 @@ impl MailboxClient {
                 );
             }
             self.reset = true;
-            self.retire_live();
+            self.retire_all();
         }
     }
 

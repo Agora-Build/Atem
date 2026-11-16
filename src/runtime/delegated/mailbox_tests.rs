@@ -396,3 +396,64 @@ fn a_page_beyond_the_announced_head_is_no_reset() {
     let call = sent(&mut c).expect("asked at once");
     assert_eq!(call.after, 5);
 }
+
+/// Review finding 5: a reset retires the live dones to the old mailbox
+/// (their answers drained), and the new mailbox's owed dones go at their
+/// own positions.
+#[test]
+fn a_reset_retires_the_live_dones() {
+    let mut c = client(10 * SEC, Some((MAILBOX, 2)));
+    owing(&mut c, (MAILBOX, 2), [1, 2]);
+    c.on_heads(head(MAILBOX, 2));
+    let old = c.take_outgoing().dones;
+    assert_eq!(positions(&old), [1, 2]);
+    c.on_heads(head(MAILBOX_2, 1));
+    assert_eq!(c.reset_due(), Some(MAILBOX_2.to_string()));
+    assert_eq!(c.on_done_result(answer(&old[0])), None, "drained");
+    owing(&mut c, (MAILBOX_2, 0), [1]);
+    c.reset_written();
+    let out = c.take_outgoing();
+    assert_eq!(out.dones.len(), 1);
+    assert_eq!(
+        (out.dones[0].mailbox_id.as_str(), out.dones[0].position),
+        (MAILBOX_2, 1)
+    );
+}
+
+/// Review finding 7 (rule 8: §11.4's alerts and refusals): each mailbox
+/// fault, `mailbox_sync_refused` and `mailbox_done_refused` is counted for
+/// `atem status` (how many, the latest) and gets a runtime.log line at most
+/// once an hour per kind.
+#[test]
+fn mailbox_faults_and_refusals_are_hourly_alerts() {
+    let mut c = client(10 * SEC, Some((MAILBOX, 2)));
+    c.on_heads(head(MAILBOX, 3));
+    let call = sent(&mut c).unwrap();
+    let mut never = page(&call, 3, 3);
+    never.request_id = "b06daa5d-9f48-4512-8a98-c6d98b159d8e".into();
+    c.on_page(Ok(never.clone()));
+    c.on_page(Ok(never.clone()));
+    c.on_sync_refused();
+    c.on_done_refused();
+    c.on_done_refused();
+    let lines = c.take_lines();
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains("mailbox_sync (forbidden)")));
+    assert!(lines.iter().any(|l| l.contains("mailbox_done (forbidden)")));
+    assert!(
+        lines
+            .iter()
+            .all(|l| l.ends_with("at most one such line an hour"))
+    );
+    let (n, latest) = c.alerts();
+    assert_eq!(n, 5);
+    assert!(latest.unwrap().contains("mailbox_done"));
+    c.tick(10 * SEC + 3_600 * SEC);
+    c.on_page(Ok(never));
+    let lines = c.take_lines();
+    assert_eq!(lines.len(), 1);
+    assert!(
+        lines[0].contains("1 more since the last such line"),
+        "{lines:?}"
+    );
+}
