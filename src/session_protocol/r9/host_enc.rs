@@ -1,11 +1,16 @@
 //! The host encryption key (delegated host-work design II.4.1, option (b);
-//! session-v1 R9.14 item 8; host-work-v1 §11.5, "The recipient's keys"), on
-//! the host, behind the debug-only hook's `host.senders`: the X25519 key
+//! session-v1 R9.14 item 8; host-work-v1 §11.5, "The recipient's keys" and
+//! "The host encryption key in the ceremony"), on the host: the X25519 key
 //! other hosts seal host-sender mail to, the record of every key id this
 //! host made at its trust generation, what `host_enc_key_get` answers a
-//! native manager, and this host as the receiver of that mail. With the
-//! hook off nothing here runs: no file is made and the op keeps its
-//! refusal.
+//! native manager, and this host as the receiver of that mail.
+//!
+//! - **In every build:** the verification ceremony's key
+//!   ([`make_for_ceremony_locked`], [`keep_at_pin`]), since its reveal
+//!   requires it (agreed with Astation 2026-11-16, no compatibility).
+//! - **Behind the debug-only hook's `host.senders`:** everything else (a
+//!   key made at a start, `host_enc_key_get`, the receiver). With the hook
+//!   off none of it runs: the op keeps its refusal.
 //!
 //! ```text
 //! <profile>/pairing/host_enc_key        {"v":1,"host_trust_gen":N,"secret":"<b64u>","pub":"<b64u>"}
@@ -15,33 +20,44 @@
 //! - **The key.** Plain, 0600, replaced whole like `host_channel_key`
 //!   (`membership::store`), so a host whose cred agent is locked still opens
 //!   its mail. One key per trust generation in this version (no rotation
-//!   within a generation): made with the device list's pin when a pairing
-//!   is verified and at `atem pair verify` (the next generation, beside the
-//!   new `host_channel_key`), and at a runtime start (or a reopen of the
-//!   list) on a pinned host that holds none for its generation. One of an
-//!   earlier generation is replaced then; one that can't be read is left as
-//!   it is (the op answers `busy`, and the start says why). Every pin, a pin
-//!   taken back and `atem unpair` delete both files; one left without the
-//!   list (by a build that doesn't know them) grants nothing and is no
-//!   device-list leftover: it doesn't fail the list's start closed.
+//!   within a generation):
+//!   - made in the verification ceremony (`atem pair`, and `atem pair
+//!     verify` in the next generation), after `verifyKeys`, vouched for by
+//!     the ceremony's new `host_channel_key` (`enc_sig`), its id recorded
+//!     before the reveal carries it, and kept with the device list's pin;
+//!   - with the hook, made at a runtime start (or a reopen of the list) on
+//!     a pinned host that holds none for its generation (paired before
+//!     this change). One of an earlier generation is replaced then; one that
+//!     can't be read is left as it is (the op answers `busy`, and the start
+//!     says why).
+//!
+//!   A pin replaces both files with its ceremony's; a pin taken back
+//!   removes the key and keeps the record (the reveal handed the key's id
+//!   out); `atem unpair` deletes both. One left without the list (by a build
+//!   that doesn't know them, or an aborted ceremony's record) grants nothing
+//!   and is no device-list leftover: it doesn't fail the list's start
+//!   closed.
 //! - **The record.** The `enc_kid` (R9.9's, `atem_client::keys::enc_kid`) of
 //!   every key made at the current generation, written (fsync, rename)
-//!   before the key file, and checked again before a key is handed out (one
-//!   that lists it already is synced, file and directory, first): II.4.2's
-//!   receiver refuses for good mail sealed to a key id the host
-//!   made but the record lacks. Only the current generation is kept. A lost
-//!   or unreadable record, or one of another generation, is rebuilt from
-//!   the key the host holds, with a runtime.log line.
+//!   before the key is handed out (the reveal, `host_enc_key_get`) or its
+//!   file written, and checked again before a key is handed out (one that
+//!   lists it already is synced, file and directory, first): II.4.2's
+//!   receiver refuses for good mail sealed to a key id the host made but the
+//!   record lacks. Only the current generation is kept. A lost or
+//!   unreadable record, or one of another generation, is rebuilt from the
+//!   key the host holds, with a runtime.log line.
 //! - **`host_enc_key_get`** (`R9Host`'s handler, [`hand_out`]): the key the
 //!   host holds for the welcome's trust generation and its `enc_sig`, the
 //!   host vouching for it with its `host_channel_key` (the shared core's
 //!   `sign_host_enc_key`). Nothing is made or rotated for a request; the
 //!   key's id is recorded first when the record lacks it, and a failed
-//!   write is `busy`, nothing handed out.
+//!   write is `busy`, nothing handed out. After a ceremony whose entries
+//!   ended at the `add_host`, it is the ceremony's key, with the same
+//!   `enc_sig`.
 //! - **The receiver's view** ([`recipient`]): this host's id and pairing
 //!   generation, the generation's key and the record, as II.4.2's receiver
 //!   takes them (`atem_client::host_mail::Recipient`).
-use atem_client::encoding::{b64u, hex, hex_decode_array};
+use atem_client::encoding::{Hash32, b64u, hex, hex_decode_array};
 use atem_client::host_mail::Recipient;
 use atem_client::keys::enc_kid_bytes;
 use atem_client::membership::{Membership, sign_host_enc_key};
@@ -285,11 +301,76 @@ impl Prior {
     }
 }
 
+/// Tests: a record write held while a test looks (the order of the record
+/// and the reveal, host-work-v1 §11.5). Keyed by the record's path, so tests
+/// in parallel never hold each other's.
+#[cfg(test)]
+pub(crate) mod record_gate {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Condvar, Mutex};
+
+    /// Open, and whether a writer waits.
+    type Gate = Arc<(Mutex<(bool, bool)>, Condvar)>;
+
+    static GATES: Mutex<Vec<(PathBuf, Gate)>> = Mutex::new(Vec::new());
+
+    /// A held record write: open again when released or dropped.
+    pub struct Held(PathBuf, Gate);
+
+    /// Holds every write of the record at `path` until released.
+    pub fn hold(path: &Path) -> Held {
+        let gate: Gate = Arc::default();
+        GATES
+            .lock()
+            .unwrap()
+            .push((path.to_path_buf(), gate.clone()));
+        Held(path.to_path_buf(), gate)
+    }
+
+    impl Held {
+        /// Whether a write waits at the gate now.
+        pub fn writer_waits(&self) -> bool {
+            self.1.0.lock().unwrap().1
+        }
+
+        pub fn release(self) {}
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            GATES.lock().unwrap().retain(|(p, _)| p != &self.0);
+            let (state, opened) = &*self.1;
+            state.lock().unwrap().0 = true;
+            opened.notify_all();
+        }
+    }
+
+    /// A record write at `path` waits here while a test holds it (at most a
+    /// minute, so a test that forgets never hangs).
+    pub(super) fn wait(path: &Path) {
+        let gate = GATES
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, g)| g.clone());
+        let Some(gate) = gate else { return };
+        let (state, opened) = &*gate;
+        let mut held = state.lock().unwrap();
+        held.1 = true;
+        let _ = opened
+            .wait_timeout_while(held, std::time::Duration::from_secs(60), |(open, _)| !*open)
+            .unwrap();
+    }
+}
+
 /// Makes the record of generation `generation` list `kid`, durably (fsync,
 /// rename, directory fsync). One that lists it already is synced (the file,
 /// then the directory): a record left visible by a failed directory fsync
 /// isn't durable yet, and the id must be before a key goes.
 fn record_kid(store: &mut Store, generation: u64, kid: [u8; 8]) -> Result<Prior, WriteError> {
+    #[cfg(test)]
+    record_gate::wait(&store.path(DlFile::HostEncGenerated));
     let (prior, mut kids) = match read_record(store) {
         Record::Of {
             host_trust_gen,
@@ -345,25 +426,150 @@ fn made_lines(key: &HostEncKey, replaced: Option<u64>, prior: &Prior) -> Vec<Str
     lines
 }
 
-/// With the device list's pin (`atem pair` and `atem pair verify`; the
-/// caller holds `trust_gen.lock` and just pinned the list, which removed
-/// any earlier key and record): the key of the pin's `generation`, beside
-/// its new `host_channel_key`. What happened, as runtime.log lines.
-pub fn make_at_pin_locked(pairing: &PairingPaths, generation: u64) -> Result<Vec<String>, String> {
-    let mut store = Store::new(pairing, &journal_of(pairing));
-    #[cfg(test)]
-    if let Some(fault) = PIN_FAULT.with(|f| f.take()) {
-        store.inject(fault);
+/// What a verification ceremony's key is vouched for (host-work-v1 §11.5):
+/// the account and genesis `verifyKeys` named, and this host's id and trust
+/// generation (`verifyCommit`'s), by the ceremony's new `host_channel_key`.
+pub struct Vouch<'a> {
+    pub account_id: &'a str,
+    pub genesis_hash: &'a Hash32,
+    pub host_id: &'a str,
+    pub host_trust_gen: u64,
+    /// The new `host_channel_key`'s seed (revealed as `host_channel_pub`).
+    pub host_seed: &'a [u8; 32],
+}
+
+/// A host encryption key made in a verification ceremony (host-work-v1
+/// §11.5), after `verifyKeys` and before the reveal: its `enc_sig` by the
+/// ceremony's new `host_channel_key`, and its id durably in the record
+/// before anything hands it out (only [`make_for_ceremony_locked`] makes
+/// one, so a reveal built from it always follows the record). The private
+/// key stays here, wiped on drop, until the pin keeps it as
+/// `pairing/host_enc_key` ([`keep_at_pin`]).
+pub struct CeremonyKey {
+    key: HostEncKey,
+    secret: Zeroizing<[u8; 32]>,
+    host_id: String,
+    enc_sig: [u8; 64],
+}
+
+impl std::fmt::Debug for CeremonyKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CeremonyKey")
+            .field("key", &self.key)
+            .field("host_id", &self.host_id)
+            .finish_non_exhaustive()
     }
-    let (key, prior) = make(&mut store, generation).map_err(|e| format!("cannot make it: {e}"))?;
-    Ok(made_lines(&key, None, &prior))
+}
+
+impl CeremonyKey {
+    /// `verifyCommit.device_id`: this host's id in the device list.
+    pub fn host_id(&self) -> &str {
+        &self.host_id
+    }
+
+    /// `verifyCommit.host_trust_gen`.
+    pub fn host_trust_gen(&self) -> u64 {
+        self.key.host_trust_gen
+    }
+
+    /// The X25519 public half.
+    pub fn enc_pub(&self) -> &[u8; 32] {
+        self.key.enc_pub()
+    }
+
+    /// Ed25519 by the ceremony's `host_channel_key` over
+    /// `enc(["atem-host-enc-key-v1", account_id, genesis_hash, host_id,
+    /// u64(host_trust_gen), enc_pub])`.
+    pub fn enc_sig(&self) -> &[u8; 64] {
+        &self.enc_sig
+    }
+
+    /// Its `enc_kid` (16 hex).
+    pub fn enc_kid(&self) -> String {
+        self.key.enc_kid()
+    }
 }
 
 #[cfg(test)]
 thread_local! {
-    /// Tests: the next write at a pin that fails.
-    pub(crate) static PIN_FAULT: std::cell::Cell<Option<store::Injected>> =
+    /// Tests: the next record write of a ceremony's key that fails.
+    pub(crate) static CEREMONY_FAULT: std::cell::Cell<Option<store::Injected>> =
         const { std::cell::Cell::new(None) };
+}
+
+/// In a verification ceremony, after `verifyKeys` (host-work-v1 §11.5;
+/// `atem pair` and `atem pair verify`, in every build: the reveal carries
+/// the key, required): a new key for the ceremony's trust generation, its
+/// `enc_sig` by the ceremony's new `host_channel_key` (the shared core's
+/// `sign_host_enc_key`), and its id durably in the record (fsync, rename,
+/// directory fsync; a record of another generation, or one that can't be
+/// read, is replaced by this generation's), before the reveal hands it out.
+/// The caller holds `trust_gen.lock`, under the pairing the ceremony runs
+/// in. Nothing else is written: the key file only at the pin. `Err`: why
+/// (the ceremony aborts before the reveal).
+pub fn make_for_ceremony_locked(
+    pairing: &PairingPaths,
+    vouch: &Vouch<'_>,
+) -> Result<CeremonyKey, String> {
+    if vouch.host_trust_gen == 0 {
+        return Err("no trust generation".into());
+    }
+    let (key, secret) = HostEncKey::generate(vouch.host_trust_gen);
+    let host_key = HostKey::new(vouch.host_seed);
+    let enc_sig = sign_host_enc_key(
+        &host_key.keys,
+        &host_key.id,
+        vouch.account_id,
+        vouch.genesis_hash,
+        vouch.host_id,
+        vouch.host_trust_gen,
+        key.enc_pub(),
+    )
+    .map_err(|e| format!("cannot sign it: {e}"))?
+    .try_into()
+    .map_err(|_| "cannot sign it: not a 64-byte signature".to_string())?;
+    let mut store = Store::new(pairing, &journal_of(pairing));
+    #[cfg(test)]
+    if let Some(fault) = CEREMONY_FAULT.with(|f| f.take()) {
+        store.inject(fault);
+    }
+    let prior = record_kid(&mut store, vouch.host_trust_gen, key.kid)
+        .map_err(|e| format!("cannot record its id: {e}"))?;
+    if let Prior::Unreadable(why) = prior {
+        eprintln!(
+            "atem: host encryption key: the record of keys made was unreadable ({why}); it now lists trust generation {}'s key (enc_kid {}) only",
+            vouch.host_trust_gen,
+            key.enc_kid()
+        );
+    }
+    Ok(CeremonyKey {
+        key,
+        secret,
+        host_id: vouch.host_id.to_string(),
+        enc_sig,
+    })
+}
+
+/// With the device list's pin (`atem pair` and `atem pair verify`;
+/// `MembershipHost::pin_locked`, under `trust_gen.lock`, before the list
+/// itself is written): the ceremony's key is kept as `pairing/host_enc_key`
+/// for its trust generation, its id in the record first (synced when it
+/// lists it already; a record lost or of another generation since the
+/// reveal is rebuilt). A write that fails fails the pin. What happened, as
+/// runtime.log lines.
+pub(crate) fn keep_at_pin(store: &mut Store, key: &CeremonyKey) -> Result<Vec<String>, WriteError> {
+    let generation = key.host_trust_gen();
+    let prior = record_kid(store, generation, key.key.kid)?;
+    store.replace(
+        DlFile::HostEncKey,
+        &key_bytes(generation, &key.secret, key.enc_pub()),
+    )?;
+    let mut lines = vec![format!(
+        "kept for trust generation {generation} (enc_kid {}), made in the verification",
+        key.enc_kid()
+    )];
+    lines.extend(prior.rebuilt(&key.key));
+    Ok(lines)
 }
 
 /// At a runtime start, or a reopen of the pinned device list, with the

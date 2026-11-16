@@ -2,7 +2,7 @@
 //! the terminal, never from stdin) and what happens when verification fails
 //! (the pending pin is dropped and Astation is told, unless it cancelled).
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::time::Duration;
@@ -283,6 +283,127 @@ pub(crate) async fn next_verify_message(client: &mut AstationClient) -> Result<A
     }
 }
 
+/// `verifyReveal.host_enc_key` (host-work-v1 §11.5): the host's new
+/// encryption key for the verification's trust generation, in the shape of
+/// session-v1 R9.14's `host_enc_key` answer without its `id` and `re`: the
+/// `host_enc_key` entry's own forms, which Astation copies into the entry it
+/// appends after the `add_host`. `host_id` and `host_trust_gen` are the
+/// `verifyCommit`'s `device_id` and `host_trust_gen`; `enc_sig` (base64url,
+/// 64 bytes) is pure Ed25519 by the new `host_channel_key` over
+/// `enc(["atem-host-enc-key-v1", account_id, genesis_hash, host_id,
+/// u64(host_trust_gen), enc_pub])`, the account and genesis `verifyKeys`'s.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevealHostEncKey {
+    pub host_id: String,
+    pub host_trust_gen: u64,
+    pub enc_key: RevealEncKey,
+    pub enc_sig: String,
+}
+
+impl RevealHostEncKey {
+    /// The reveal's object for the key a ceremony made (and recorded).
+    pub(crate) fn of(key: &crate::session_protocol::r9::host_enc::CeremonyKey) -> Self {
+        RevealHostEncKey {
+            host_id: key.host_id().to_string(),
+            host_trust_gen: key.host_trust_gen(),
+            enc_key: RevealEncKey {
+                alg: "x25519".into(),
+                public: atem_client::encoding::b64u(key.enc_pub()),
+            },
+            enc_sig: atem_client::encoding::b64u(key.enc_sig()),
+        }
+    }
+}
+
+/// `{"alg":"x25519","pub":"<b64u, 32 bytes>"}` (R9.1's key object).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevealEncKey {
+    pub alg: String,
+    #[serde(rename = "pub")]
+    pub public: String,
+}
+
+/// `verifyKeys.account_id` (host-work-v1 §11.5), read strictly: the account
+/// whose device list `genesis_hash` names, which the host's `enc_sig`
+/// binds before the reveal. Required (no compatibility, as for
+/// `genesis_hash`): missing (or `null`) or anything but an opaque id (R9.1:
+/// 1–128 bytes of `[A-Za-z0-9._:-]`) fails the ceremony, with a short
+/// `verifyAbort` reason.
+pub(crate) fn verify_keys_account(
+    value: Option<&serde_json::Value>,
+) -> Result<String, VerifyFailure> {
+    match value {
+        None | Some(serde_json::Value::Null) => Err(VerifyFailure::local(
+            "Atem needs the account in verifyKeys (account_id)",
+            anyhow!(
+                "This Astation doesn't name the account in its keys yet (verifyKeys.account_id). Update Astation, then run `atem pair verify`."
+            ),
+        )),
+        Some(serde_json::Value::String(account))
+            if crate::session_protocol::wire::is_opaque_id(account) =>
+        {
+            Ok(account.clone())
+        }
+        Some(_) => Err(VerifyFailure::local(
+            "atem refused verifyKeys: account_id isn't an account id",
+            anyhow!(
+                "Astation's keys name a malformed account (verifyKeys.account_id), so nothing was trusted."
+            ),
+        )),
+    }
+}
+
+/// `verifyAbort` reason when this host couldn't record its new encryption
+/// key's id before the reveal (host-work-v1 §11.5): nothing is revealed.
+pub(crate) const ENC_KEY_NOT_RECORDED: &str =
+    "atem couldn't record its host encryption key; nothing was revealed";
+
+/// `verifyAbort` reason when the pairing the ceremony runs under changed
+/// (`atem unpair`, a new `atem pair`) before its key was made: nothing is
+/// recorded or revealed.
+pub(crate) const PAIRING_CHANGED: &str = "the pairing changed on atem; nothing was revealed";
+
+/// The failure for a ceremony key whose id couldn't be recorded (`why`).
+pub(crate) fn not_recorded(why: String) -> VerifyFailure {
+    VerifyFailure::local(
+        ENC_KEY_NOT_RECORDED,
+        anyhow!(
+            "Couldn't record this host's new encryption key before revealing it ({why}), so nothing was revealed or trusted."
+        ),
+    )
+}
+
+/// In the ceremony, after `verifyKeys` (host-work-v1 §11.5): the host's new
+/// encryption key, its id durably recorded
+/// (`r9::host_enc::make_for_ceremony_locked`), under the pairing lock and
+/// only while the pairing the ceremony runs under (`capture`) is current.
+/// Blocking. `Err`: the ceremony aborts before the reveal.
+pub(crate) fn make_ceremony_key(
+    capture: &crate::pairing::Captured,
+    vouch: &crate::session_protocol::r9::host_enc::Vouch<'_>,
+) -> Result<crate::session_protocol::r9::host_enc::CeremonyKey, VerifyFailure> {
+    let made = capture.apply(|| {
+        Ok(
+            crate::session_protocol::r9::host_enc::make_for_ceremony_locked(
+                &capture.sources().paths.pairing,
+                vouch,
+            ),
+        )
+    });
+    match made {
+        Ok(Ok(key)) => Ok(key),
+        Ok(Err(why)) => Err(not_recorded(why)),
+        // The pairing changed (`Captured::check`): nothing was attempted.
+        Err(error) if error.to_string() == crate::pairing::CHANGED => {
+            Err(VerifyFailure::local(PAIRING_CHANGED, error))
+        }
+        // The pairing lock or record couldn't be read: nothing recorded.
+        Err(error) => Err(not_recorded(format!("{error:#}"))),
+    }
+}
+
 /// Astation's signed answer after Touch ID.
 pub(crate) struct DeviceVerifiedReply {
     pub device_verified: SignedWire,
@@ -300,35 +421,24 @@ pub(crate) struct HostPinning<'a> {
     pub host_id: &'a str,
     /// The `host_channel_key` seed this ceremony revealed.
     pub host_seed: &'a [u8; 32],
-    /// Make the host encryption key with the pin (the runtime's debug hook
-    /// turned `host.senders` on).
-    pub enc_key: bool,
-}
-
-impl<'a> HostPinning<'a> {
-    /// What a ceremony in a runtime whose hook turned on `features` pins.
-    pub(crate) fn new(
-        astation: &'a crate::memory::verification::AstationKeys,
-        host_id: &'a str,
-        host_seed: &'a [u8; 32],
-        features: crate::runtime::test_hooks::HostFeatures,
-    ) -> Self {
-        HostPinning {
-            astation,
-            host_id,
-            host_seed,
-            enc_key: features.senders,
-        }
-    }
+    /// `verifyKeys.account_id`: the account the ceremony's keys named
+    /// (host-work-v1 §11.5). A certificate naming another is refused.
+    pub account_id: &'a str,
+    /// The host encryption key this ceremony made, recorded and revealed
+    /// (host-work-v1 §11.5): kept as `pairing/host_enc_key` with the pin.
+    pub enc_key: &'a crate::session_protocol::r9::host_enc::CeremonyKey,
 }
 
 /// Applies Astation's `deviceVerified` only while the pairing the
 /// verification started under is current, under the pairing lock: a
 /// certificate that arrives after `atem unpair` (or a new `atem pair`) is
-/// dropped and nothing is pinned. First the device list it carries is
-/// verified (r9 §R9.2: the whole chain, this host's `add_host` signed by the
-/// verified Astation, a genesis never frozen here) and pinned with the host
-/// channel key; then `complete_verification`; if that fails, the pin is
+/// dropped and nothing is pinned. A certificate naming another account
+/// than `verifyKeys` did is refused (host-work-v1 §11.5). Then the device
+/// list it carries is verified (r9 §R9.2: the whole chain, this host's
+/// `add_host` signed by the verified Astation, a genesis never frozen here;
+/// ending at that `add_host` or at the revealed key's `host_enc_key` right
+/// after it) and pinned with the host channel key and the ceremony's
+/// encryption key; then `complete_verification`; if that fails, the pin is
 /// taken back. `agent` must not be a `BoundAgent` (the lock is already held).
 pub(crate) fn apply_device_verified(
     capture: &crate::pairing::Captured,
@@ -351,6 +461,14 @@ pub(crate) fn apply_device_verified(
             &reply.device_verified,
         )?;
         let account = crate::memory::statements::DeviceVerified::parse(&fields)?.account;
+        // host-work-v1 §11.5: the account `verifyKeys` named, whose device
+        // list the host's encryption key was vouched for.
+        if account != host.account_id {
+            bail!(
+                "Astation's certificate names another account ({account}) than its keys did ({})",
+                host.account_id
+            );
+        }
         let host_pub = ed25519_dalek::SigningKey::from_bytes(host.host_seed)
             .verifying_key()
             .to_bytes();
@@ -361,6 +479,8 @@ pub(crate) fn apply_device_verified(
             host_id: host.host_id,
             host_trust_gen,
             host_pub,
+            enc_pub: *host.enc_key.enc_pub(),
+            enc_sig: *host.enc_key.enc_sig(),
         };
         let log = pin::verify_pairing_log(reply.membership.as_ref(), &inputs, pairing, &host_now())
             .map_err(|e| anyhow!("{e}"))?;
@@ -496,32 +616,88 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
-    /// The host encryption key is made with the pin only when the
-    /// runtime's debug hook turned `host.senders` on (with
-    /// `host.delegated`); never with the hook off, as on main.
+    /// `verifyKeys.account_id` (host-work-v1 §11.5) is required and an
+    /// opaque id (R9.1: 1–128 bytes of `[A-Za-z0-9._:-]`); anything else
+    /// fails the ceremony with a short `verifyAbort` reason.
     #[test]
-    fn the_pin_makes_the_host_encryption_key_only_with_host_senders() {
-        use crate::runtime::test_hooks::HostFeatures;
-        let astation = crate::memory::verification::AstationKeys {
-            sign_pub: vec![4; 65],
-            enc_pub: [5; 32],
-            recovery_sign_pub: [6; 32],
-            nonce_s: [7; 32],
-            genesis_hash: [8; 32],
-        };
-        for (hook, enc_key) in [
-            ("", false),
-            ("host.delegated", false),
-            ("host.delegated,host.alerts", false),
-            ("host.senders", false),
-            ("host.delegated,host.senders", true),
-            ("host.delegated,host.alerts,host.senders", true),
-        ] {
-            let features = HostFeatures::parse(hook).unwrap();
-            let pinning = HostPinning::new(&astation, "host-1", &[9; 32], features);
-            assert_eq!(pinning.enc_key, enc_key, "{hook:?}");
-            assert_eq!(pinning.host_id, "host-1");
+    fn the_verify_keys_account_is_required_and_read_strictly() {
+        use serde_json::json;
+        for good in ["acct-test-1", "a", "A.b_c:d-9", &"a".repeat(128)] {
+            assert_eq!(
+                verify_keys_account(Some(&json!(good))).unwrap(),
+                good,
+                "{good}"
+            );
         }
+        let missing = verify_keys_account(None).unwrap_err();
+        assert_eq!(
+            missing.abort_reason(),
+            Some("Atem needs the account in verifyKeys (account_id)")
+        );
+        assert!(
+            missing.error().to_string().contains("Update Astation"),
+            "{}",
+            missing.error()
+        );
+        for bad in [
+            json!(""),
+            json!("acct op"),
+            json!("acct/op"),
+            json!("é"),
+            json!("a".repeat(129)),
+            json!(7),
+            json!(["acct"]),
+            json!({"id": "acct"}),
+            json!(true),
+        ] {
+            let refused = verify_keys_account(Some(&bad)).unwrap_err();
+            assert_eq!(
+                refused.abort_reason(),
+                Some("atem refused verifyKeys: account_id isn't an account id"),
+                "{bad}"
+            );
+        }
+    }
+
+    /// host-work-v1 §11.5: the ceremony's key is made only while the
+    /// pairing the ceremony runs under is current. One changed meanwhile
+    /// (`atem unpair`, a new `atem pair`) aborts with its own reason and
+    /// records nothing; a record that can't be written aborts with
+    /// "couldn't record"; else the key is made and its id recorded.
+    #[test]
+    fn the_ceremony_key_needs_the_pairing_it_started_under() {
+        let vouch = |seed: &'static [u8; 32]| crate::session_protocol::r9::host_enc::Vouch {
+            account_id: "acct",
+            genesis_hash: &atem_client::encoding::Hash32([8; 32]),
+            host_id: "host-1",
+            host_trust_gen: 2,
+            host_seed: seed,
+        };
+        // The pairing changed: its own reason, nothing recorded.
+        let dir = tempfile::tempdir().unwrap();
+        let capture = crate::pairing::tests::bound_profile(dir.path(), "astation-1");
+        let src = capture.sources().clone();
+        crate::pairing::unpair(&src).unwrap();
+        let failure = make_ceremony_key(&capture, &vouch(&[9; 32])).unwrap_err();
+        assert_eq!(failure.abort_reason(), Some(PAIRING_CHANGED));
+        assert_eq!(failure.error().to_string(), crate::pairing::CHANGED);
+        assert!(
+            !src.paths.pairing.host_enc_generated.exists(),
+            "nothing recorded"
+        );
+        // The record can't be written: "couldn't record".
+        let dir = tempfile::tempdir().unwrap();
+        let capture = crate::pairing::tests::bound_profile(dir.path(), "astation-1");
+        let pairing = capture.sources().paths.pairing.clone();
+        std::fs::create_dir_all(pairing.host_enc_generated.join("in-the-way")).unwrap();
+        let failure = make_ceremony_key(&capture, &vouch(&[9; 32])).unwrap_err();
+        assert_eq!(failure.abort_reason(), Some(ENC_KEY_NOT_RECORDED));
+        std::fs::remove_dir_all(&pairing.host_enc_generated).unwrap();
+        // Current: made, its id recorded.
+        let key = make_ceremony_key(&capture, &vouch(&[9; 32])).unwrap();
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&pairing.host_enc_generated).unwrap()).unwrap();
+        assert_eq!(record["kids"], serde_json::json!([key.enc_kid()]));
     }
 
     /// A terminal with keys typed before the prompt (`pending`) and keys
@@ -898,6 +1074,19 @@ mod tests {
                 let before = crate::pairing::capture(&src).unwrap();
                 crate::pairing::bind_new(&src, &before, "astation-1").unwrap();
             }
+            // The key this ceremony recorded and revealed (host-work-v1
+            // §11.5) before the certificate came.
+            let enc_key = crate::session_protocol::r9::host_enc::make_for_ceremony_locked(
+                &src.paths.pairing,
+                &crate::session_protocol::r9::host_enc::Vouch {
+                    account_id: "acct",
+                    genesis_hash: &atem_client::encoding::Hash32([8; 32]),
+                    host_id: "host-1",
+                    host_trust_gen: 2,
+                    host_seed: &[9; 32],
+                },
+            )
+            .unwrap();
             let before = crate::status::tests::snapshot(dir.path());
             let reply = DeviceVerifiedReply {
                 device_verified: wire(),
@@ -917,7 +1106,8 @@ mod tests {
                 astation: &astation,
                 host_id: "host-1",
                 host_seed: &[9; 32],
-                enc_key: true,
+                account_id: "acct",
+                enc_key: &enc_key,
             };
             let error = apply_device_verified(
                 &capture,
@@ -933,6 +1123,7 @@ mod tests {
             assert_eq!(crate::status::tests::snapshot(dir.path()), before);
             assert!(!src.paths.cred.trust.exists());
             assert!(!src.paths.pairing.membership.exists(), "nothing pinned");
+            assert!(!src.paths.pairing.host_enc_key.exists(), "no key kept");
         }
     }
 }

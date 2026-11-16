@@ -2002,6 +2002,9 @@ document calls the key `enc_key`.
   durably before the ceremony hands the key out, as it does before `host_enc_key_get` returns one (above).
 - **The fields** are proposed in host-work-v1 §11.5 ("The host encryption key in the ceremony"), with the one
   confirmation that covers both entries (session-v1 R9.6 rule 4).
+- **Built on the host**, in every build, since the reveal requires the key (host-work-v1 §11.5, "Built on the
+  host"): the account read from `verifyKeys`, the key made and its id recorded before the reveal, the key kept with
+  the pin, and entries taken ending at the `add_host` or at the revealed key's `host_enc_key` right after it.
 
 ### II.4.2 The envelope object
 

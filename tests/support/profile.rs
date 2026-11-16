@@ -22,7 +22,14 @@ pub fn agent_sock(run: &Path) -> PathBuf {
 /// `trust_gen`, with the session `session-1`/`token-1`.
 pub fn write_pairing(config: &Path, astation_id: &str, trust_gen: u64) {
     let paths = ProfilePaths::in_dir(config).pairing;
-    std::fs::create_dir_all(paths.record.parent().unwrap()).unwrap();
+    // Private (0700), as Atem makes it: the device list's writes refuse
+    // any other `pairing/` (the ceremony's record of its encryption key).
+    let dir = paths.record.parent().unwrap();
+    paths::create_private_dir(dir).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     std::fs::write(&paths.trust_gen, format!("{trust_gen}\n")).unwrap();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -198,6 +198,12 @@ impl Handshake {
             .to_bytes()
     }
 
+    /// The host channel key's seed: it vouches for the host's new
+    /// encryption key (`enc_sig`, host-work-v1 §11.5) before the reveal.
+    pub fn host_channel_seed(&self) -> &[u8; 32] {
+        &self.host_channel_seed
+    }
+
     pub fn reveal(&self) -> Reveal {
         Reveal {
             device_pub: self.keys.device_pub(),

@@ -461,6 +461,14 @@ pub enum AstationMessage {
         nonce: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         genesis_hash: Option<String>,
+        /// host-work-v1 §11.5: the account whose device list `genesis_hash`
+        /// names, which the host's `enc_sig` binds before the reveal. Taken
+        /// as any JSON value so that a missing or malformed one fails the
+        /// ceremony (`verifyAbort`, no compatibility) instead of dropping
+        /// the whole message unread (`pair_verify::verify_keys_account`
+        /// reads it).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_id: Option<serde_json::Value>,
     },
 
     /// Atem → Astation: the keys and nonce behind the commitment.
@@ -473,6 +481,11 @@ pub enum AstationMessage {
         unlock_auth_pub: String,
         host_channel_pub: String,
         nonce: String,
+        /// host-work-v1 §11.5: this host's new encryption key, vouched for
+        /// by the new `host_channel_key`. Outside the commitment (`enc_sig`
+        /// binds it to `host_channel_pub`, which the commitment covers);
+        /// required.
+        host_enc_key: crate::pair_verify::RevealHostEncKey,
     },
 
     /// Astation → Atem: after Touch ID, the signed device certificate, the
@@ -5383,6 +5396,39 @@ mod tests {
         assert_eq!(json, r#"{"type":"verifyCommit","data":{"device_id":"d","commitment":"c","host_trust_gen":3}}"#);
         // As Astation must read it (§R9.2).
         assert_eq!(atem_client::ceremony::verify_commit_host_trust_gen(json.as_bytes()), Ok(3));
+    }
+
+    /// host-work-v1 §11.5: `verifyKeys.account_id` is taken whatever its
+    /// JSON type, so a malformed one reaches the ceremony (which refuses
+    /// it, `pair_verify::verify_keys_account`) instead of the whole message
+    /// being dropped unread; a missing or `null` one reads as none.
+    #[test]
+    fn verify_keys_carries_its_account_whatever_its_type() {
+        let keys = |account: &str| {
+            format!(
+                r#"{{"type":"verifyKeys","data":{{"sign_pub":"s","enc_pub":"e","recovery_sign_pub":"r","nonce":"n","genesis_hash":"g"{account}}}}}"#
+            )
+        };
+        for (field, expected) in [
+            (r#","account_id":"acct-test-1""#, Some(serde_json::json!("acct-test-1"))),
+            (r#","account_id":7"#, Some(serde_json::json!(7))),
+            (r#","account_id":["a"]"#, Some(serde_json::json!(["a"]))),
+            (r#","account_id":null"#, None),
+            ("", None),
+        ] {
+            let parsed: AstationMessage = serde_json::from_str(&keys(field)).unwrap();
+            let AstationMessage::VerifyKeys { account_id, .. } = parsed else { panic!("{field}") };
+            assert_eq!(account_id, expected, "{field}");
+        }
+        let sent = AstationMessage::VerifyKeys {
+            sign_pub: "s".into(),
+            enc_pub: "e".into(),
+            recovery_sign_pub: "r".into(),
+            nonce: "n".into(),
+            genesis_hash: Some("g".into()),
+            account_id: Some(serde_json::json!("acct-test-1")),
+        };
+        assert_eq!(serde_json::to_string(&sent).unwrap(), keys(r#","account_id":"acct-test-1""#));
     }
 
     #[test]

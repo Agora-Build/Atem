@@ -1,7 +1,8 @@
 //! The host encryption key on the host (delegated host-work design II.4.1;
-//! `host_enc`): made with the pin and at a start, kept, replaced at a new
-//! trust generation, deleted by `atem unpair`; its record of key ids; and
-//! the recipient helper.
+//! `host_enc`): made in the verification ceremony and kept with the pin
+//! (host-work-v1 §11.5), made at a start when missing, kept, replaced at a
+//! new trust generation, deleted by `atem unpair`; its record of key ids;
+//! and the recipient helper.
 use super::host_enc::{self, HostEncKey};
 use crate::paths::PairingPaths;
 use crate::profile::Sources;
@@ -104,72 +105,164 @@ fn record_of(generation: u64, kids: &[&str]) -> Value {
     json!({"v": 1, "host_trust_gen": generation, "kids": kids})
 }
 
-/// Made with the pin when a pairing is verified (its trust generation),
-/// its id recorded; `atem pair verify` pins the next generation with a new
-/// `host_channel_key`, and with it a new key, the record now of that
-/// generation only.
+/// A verification ceremony's key (host-work-v1 §11.5) for `generation`,
+/// vouched for by `seed` (the ceremony's `host_channel_key`).
+fn ceremony_key(
+    pairing: &PairingPaths,
+    log: &TestLog,
+    generation: u64,
+    seed: &str,
+) -> Result<host_enc::CeremonyKey, String> {
+    host_enc::make_for_ceremony_locked(
+        pairing,
+        &host_enc::Vouch {
+            account_id: ACCOUNT,
+            genesis_hash: &log.genesis_hash(),
+            host_id: HOST,
+            host_trust_gen: generation,
+            host_seed: &secret(seed),
+        },
+    )
+}
+
+/// host-work-v1 §11.5: a ceremony's key, made after `verifyKeys` and before
+/// the reveal: its `enc_sig` verifies with the ceremony's new host channel
+/// key for the account and genesis `verifyKeys` named (what Astation
+/// checks), and its id is durably in the record of its generation before
+/// anything hands it out; no key file yet (only the pin keeps it). A
+/// second key in the same generation is added to the record; one of the
+/// next generation replaces the record. A record that can't be written
+/// makes no key, and the record stays as it was.
 #[test]
-fn made_with_the_pin_and_anew_at_each_trust_generation() {
+fn a_ceremonys_key_is_vouched_for_and_recorded_before_the_reveal() {
+    let (_dir, src) = profile();
+    let p = &src.paths.pairing;
+    let log = log_at(1, "enc host");
+    let first = ceremony_key(p, &log, 2, "enc host 2").unwrap();
+    assert_eq!(first.host_id(), HOST);
+    assert_eq!(first.host_trust_gen(), 2);
+    atem_client::membership::verify_host_enc_sig(
+        &PublicKey::new(
+            Alg::Ed25519,
+            &ed25519_dalek::SigningKey::from_bytes(&secret("enc host 2"))
+                .verifying_key()
+                .to_bytes(),
+        )
+        .unwrap(),
+        ACCOUNT,
+        &log.genesis_hash(),
+        HOST,
+        2,
+        first.enc_pub(),
+        first.enc_sig(),
+    )
+    .expect("enc_sig by the ceremony's host channel key");
+    let first_kid = kid_of(&atem_client::encoding::b64u(first.enc_pub()));
+    assert_eq!(first.enc_kid(), first_kid);
+    assert_eq!(record(p), Some(record_of(2, &[&first_kid])));
+    assert!(!p.host_enc_key.exists(), "the key file only at the pin");
+    // Another in the same generation is added; the next generation's
+    // replaces the record.
+    let second = ceremony_key(p, &log, 2, "enc host 2").unwrap();
+    assert_ne!(second.enc_pub(), first.enc_pub());
+    assert_eq!(
+        record(p),
+        Some(record_of(2, &[&first_kid, &second.enc_kid()]))
+    );
+    let third = ceremony_key(p, &log, 3, "enc host 3").unwrap();
+    assert_eq!(record(p), Some(record_of(3, &[&third.enc_kid()])));
+    // A record write that fails: no key, the record unchanged.
+    for step in [Step::TempWrite, Step::TempFsync, Step::Rename] {
+        host_enc::CEREMONY_FAULT.with(|f| {
+            f.set(Some(Injected {
+                file: DlFile::HostEncGenerated,
+                step,
+            }))
+        });
+        let error = ceremony_key(p, &log, 4, "enc host 4").unwrap_err();
+        assert!(
+            error.starts_with("cannot record its id"),
+            "{step:?}: {error}"
+        );
+        assert_eq!(
+            record(p),
+            Some(record_of(3, &[&third.enc_kid()])),
+            "{step:?}"
+        );
+    }
+    assert!(!p.host_enc_key.exists());
+}
+
+/// A ceremony's key pinned with the list (`atem pair` and `atem pair
+/// verify`; host-work-v1 §11.5): `pin_at_pairing_locked` for `log` at
+/// `generation`, vouched for by `seed`.
+fn pin_with_key(
+    p: &PairingPaths,
+    log: &TestLog,
+    generation: u64,
+    seed: &str,
+) -> host_enc::CeremonyKey {
+    let key = ceremony_key(p, log, generation, seed).unwrap();
+    pin_at_pairing_locked(p, &log.log, HOST, generation, &secret(seed), &key).unwrap();
+    key
+}
+
+/// Kept with the pin when a pairing is verified (host-work-v1 §11.5): the
+/// key the ceremony made, recorded and revealed, for its trust generation,
+/// its id still recorded; `atem pair verify` pins the next generation with
+/// a new `host_channel_key`, and with it its own new key, the record now of
+/// that generation only.
+#[test]
+fn the_ceremonys_key_is_kept_with_the_pin_at_each_trust_generation() {
     let (_dir, src) = profile();
     let p = &src.paths.pairing;
     let mut log = log_at(1, "enc host 1");
-    pin_at_pairing_locked(p, &log.log, HOST, 1, &secret("enc host 1"), true).unwrap();
-    let (generation, first) = key_of(p).expect("made with the pin");
+    let first = pin_with_key(p, &log, 1, "enc host 1");
+    let (generation, kept) = key_of(p).expect("kept with the pin");
     assert_eq!(generation, 1);
-    assert_eq!(record(p), Some(record_of(1, &[&kid_of(&first)])));
+    assert_eq!(kept, atem_client::encoding::b64u(first.enc_pub()));
+    assert_eq!(record(p), Some(record_of(1, &[&first.enc_kid()])));
     // `atem pair verify`: the next generation's add_host, a new channel key.
     log.add_host(HOST, 2, &secret("enc host 2"));
-    pin_at_pairing_locked(p, &log.log, HOST, 2, &secret("enc host 2"), true).unwrap();
-    let (generation, second) = key_of(p).expect("made with the new pin");
+    let second = pin_with_key(p, &log, 2, "enc host 2");
+    let (generation, kept) = key_of(p).expect("kept with the new pin");
     assert_eq!(generation, 2);
-    assert_ne!(second, first, "a new key at a new trust generation");
-    assert_eq!(record(p), Some(record_of(2, &[&kid_of(&second)])));
-}
-
-/// With the hook off a pin makes no key (as on main), and a pin removes
-/// the key and record an earlier one left.
-#[test]
-fn the_hook_off_makes_none_and_a_new_pin_removes_an_earlier_key() {
-    let (_dir, src) = profile();
-    let p = &src.paths.pairing;
-    let mut log = log_at(1, "enc host 1");
-    pin_at_pairing_locked(p, &log.log, HOST, 1, &secret("enc host 1"), false).unwrap();
-    assert!(!p.host_enc_key.exists() && !p.host_enc_generated.exists());
-    pin_at_pairing_locked(p, &log.log, HOST, 1, &secret("enc host 1"), true).unwrap();
-    assert!(key_of(p).is_some());
-    log.add_host(HOST, 2, &secret("enc host 2"));
-    pin_at_pairing_locked(p, &log.log, HOST, 2, &secret("enc host 2"), false).unwrap();
-    assert!(
-        !p.host_enc_key.exists(),
-        "the earlier generation's key went"
+    assert_eq!(kept, atem_client::encoding::b64u(second.enc_pub()));
+    assert_ne!(
+        second.enc_pub(),
+        first.enc_pub(),
+        "a new key at a new generation"
     );
-    assert!(!p.host_enc_generated.exists(), "with its record");
+    assert_eq!(record(p), Some(record_of(2, &[&second.enc_kid()])));
 }
 
-/// A pin whose key can't be written still pins (the key is the hook's;
-/// the next start makes it), and leaves the id it recorded.
+/// host-work-v1 §11.5: a ceremony whose entries end at the `add_host` (the
+/// signing gate closed, or the key entry's append failed) keeps its key all
+/// the same; `host_enc_key_get` then hands out that same key, with the same
+/// `enc_sig` as the reveal, for a manager to sign its entry.
 #[test]
-fn a_pin_whose_key_write_fails_still_pins() {
+fn the_kept_key_is_the_one_handed_out_later() {
     let (_dir, src) = profile();
     let p = &src.paths.pairing;
-    let log = log_at(1, "enc host 1");
-    host_enc::PIN_FAULT.with(|f| {
-        f.set(Some(Injected {
-            file: DlFile::HostEncKey,
-            step: Step::TempWrite,
-        }))
-    });
-    pin_at_pairing_locked(p, &log.log, HOST, 1, &secret("enc host 1"), true).unwrap();
-    assert!(p.membership.exists(), "pinned");
-    assert!(!p.host_enc_key.exists());
-    let kids = record(p).unwrap()["kids"].as_array().unwrap().len();
-    assert_eq!(kids, 1, "the id went first");
-    let lines = host_enc::ensure(p, &journal_of(p), 1);
-    let (_, made) = key_of(p).expect("made at the next start");
-    assert_eq!(lines.len(), 1, "{lines:?}");
-    let ids = record(p).unwrap()["kids"].clone();
-    assert_eq!(ids.as_array().unwrap().len(), 2, "{ids}");
-    assert_eq!(ids[1], kid_of(&made));
+    let log = log_at(3, "enc host 3");
+    let key = pin_with_key(p, &log, 3, "enc host 3");
+    assert!(log.log.host_enc_key(HOST).is_none(), "no key entry yet");
+    // The runtime's start finds it kept: nothing made.
+    assert!(host_enc::ensure(p, &journal_of(p), 3).is_empty());
+    let mut store = Store::new(p, &journal_of(p));
+    let (handed, enc_sig, line) = host_enc::hand_out(
+        &mut store,
+        p,
+        &log.log,
+        &super::HostKey::new(&secret("enc host 3")),
+        HOST,
+        3,
+    )
+    .unwrap();
+    assert_eq!(handed.enc_pub(), key.enc_pub(), "the same key");
+    assert_eq!(enc_sig, key.enc_sig(), "the same binding");
+    assert_eq!(line, None, "its id was recorded already");
+    assert_eq!(record(p), Some(record_of(3, &[&key.enc_kid()])));
 }
 
 /// `atem unpair` deletes the key and its record with `host_channel_key`.
@@ -181,7 +274,7 @@ fn unpair_deletes_the_key_and_its_record() {
     let p = &src.paths.pairing;
     let generation = captured.state.host_trust_gen;
     let log = log_at(generation, "enc host");
-    pin_at_pairing_locked(p, &log.log, HOST, generation, &secret("enc host"), true).unwrap();
+    pin_with_key(p, &log, generation, "enc host");
     assert!(key_of(p).is_some() && record(p).is_some());
     crate::pairing::unpair(&src).unwrap();
     assert!(!p.host_channel_key.exists());
@@ -193,18 +286,22 @@ fn unpair_deletes_the_key_and_its_record() {
 }
 
 /// A pin taken back (a verification that failed after its pin) takes the
-/// key made with it and its record too.
+/// key kept with it; the record of its id stays, since the reveal handed
+/// the key out (host-work-v1 §11.5). It grants nothing without the list.
 #[test]
-fn a_pin_taken_back_takes_the_key_with_it() {
+fn a_pin_taken_back_takes_the_key_and_keeps_its_record() {
     let (_dir, src) = profile();
     let p = &src.paths.pairing;
     let log = log_at(1, "enc host 1");
-    pin_at_pairing_locked(p, &log.log, HOST, 1, &secret("enc host 1"), true).unwrap();
-    assert!(p.host_enc_key.exists() && p.host_enc_generated.exists());
+    let key = pin_with_key(p, &log, 1, "enc host 1");
+    assert!(p.host_enc_key.exists());
     crate::session_protocol::membership::pairing::unpin_locked(p);
     assert!(!p.membership.exists());
     assert!(!p.host_enc_key.exists(), "the key went with the pin");
-    assert!(!p.host_enc_generated.exists(), "its record too");
+    assert_eq!(record(p), Some(record_of(1, &[&key.enc_kid()])));
+    assert!(!crate::session_protocol::membership::has_device_list_files(
+        p
+    ));
 }
 
 /// Each of `atem unpair`'s two removals takes the key and its record on its
@@ -217,7 +314,7 @@ fn each_unpair_removal_takes_the_key_on_its_own() {
         let (_dir, src) = profile();
         let p = &src.paths.pairing;
         let log = log_at(1, "enc host 1");
-        pin_at_pairing_locked(p, &log.log, HOST, 1, &secret("enc host 1"), true).unwrap();
+        pin_with_key(p, &log, 1, "enc host 1");
         assert!(p.host_enc_key.exists() && p.host_enc_generated.exists());
         match removal {
             "forget_on_unpair" => forget_on_unpair(p).unwrap(),
@@ -231,8 +328,8 @@ fn each_unpair_removal_takes_the_key_on_its_own() {
 /// What an older build's `atem unpair` leaves (it doesn't know the two
 /// files): a stray encryption key and record without the list grant
 /// nothing, so they are no device-list leftover. The list opens as none
-/// (r8 not refused for them), nothing counts them, and the next pin or
-/// `atem unpair` removes them.
+/// (r8 not refused for them), nothing counts them, `atem unpair` removes
+/// them and the next pin replaces them with its ceremony's.
 #[test]
 fn stray_key_files_without_the_list_are_no_leftover_and_go_at_the_next_pin_or_unpair() {
     struct NoFences;
@@ -272,11 +369,15 @@ fn stray_key_files_without_the_list_are_no_leftover_and_go_at_the_next_pin_or_un
     // unpair_removes_a_host_encryption_key_an_older_unpair_left`).
     crate::pairing::unpair(&src).unwrap();
     assert!(!p.host_enc_key.exists() && !p.host_enc_generated.exists());
-    // So does the next pin, with the hook off.
+    // The next pin replaces them with its ceremony's key and record.
     older_unpair(p);
     let log = log_at(2, "enc host 2");
-    pin_at_pairing_locked(p, &log.log, HOST, 2, &secret("enc host 2"), false).unwrap();
-    assert!(!p.host_enc_key.exists() && !p.host_enc_generated.exists());
+    let key = pin_with_key(p, &log, 2, "enc host 2");
+    assert_eq!(
+        key_of(p),
+        Some((2, atem_client::encoding::b64u(key.enc_pub())))
+    );
+    assert_eq!(record(p), Some(record_of(2, &[&key.enc_kid()])));
 }
 
 /// At a start on a pinned host that has none (paired before the key

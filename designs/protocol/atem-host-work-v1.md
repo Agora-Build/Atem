@@ -3430,9 +3430,11 @@ and for the ceremony's fields. Each is **agreed with Astation 2026-11-16**.
 **Built in the shared core:** the mailbox calls' readers and builders,
 `object_hash` and `heads`' mailbox head behind explicit feature handling
 ("The mailbox calls"), the status forms and the selector task id, and
-`result_id` with both of its checks; `select`'s channel rule. Nothing else in
-them is built (the hosts' mailbox client and outbox, the Station's side,
-`select`'s `launch`, the ceremony's fields). The status forms and the
+`result_id` with both of its checks; `select`'s channel rule. **Built on the
+host:** the ceremony's fields ("The host encryption key in the ceremony",
+below). Nothing else in them is built (the hosts' mailbox client and
+outbox, the Station's side, `select`'s `launch`, Astation's side of the
+ceremony). The status forms and the
 sending host's `result_id` check have their shared vectors in
 `fixtures/r9-vectors-host-envelope.json`; the mailbox calls' shared vectors
 come with a later change.
@@ -3976,6 +3978,49 @@ R9.2's ("Pairing (ceremony changes)"):
 - **What stays:** R9.2's rules for the entry, and `host_enc_key_get`, for
   rotation, for hosts paired before this change, and for the two cases
   above with no key entry.
+
+**Built on the host** (Atem's side; Astation builds its own). In every
+build, not behind the debug hook: the reveal carries the key, which
+Astation requires, so a build without it couldn't pair.
+- **`verifyKeys.account_id`** is read strictly: missing, `null` or not an
+  opaque id (R9.1) aborts the ceremony before the reveal
+  (`pair_verify::verify_keys_account`). A `deviceVerified` whose signed
+  certificate names another account is refused before anything is pinned.
+- **The key, the record, the reveal.** After `verifyKeys` (and the frozen
+  device lists' check), under the pairing the ceremony runs in, the host
+  makes the key for the `verifyCommit`'s trust generation, signs `enc_sig`
+  with the new `host_channel_key` through the shared core's
+  `sign_host_enc_key`, and writes the key's id to the `generated` record
+  (fsync, rename, directory fsync) before the reveal goes
+  (`r9::host_enc::make_for_ceremony_locked`). A record that can't be
+  written aborts the ceremony with nothing revealed, as does a pairing
+  changed meanwhile (`atem unpair`, a new `atem pair`), with its own
+  reason. The private key stays in memory until the pin.
+- **At the pin** the key is kept as `pairing/host_enc_key`, written before
+  the device list itself (`r9::host_enc::keep_at_pin`): a key that can't be
+  kept fails the pin, as any other pin write does. The record stays. Atem
+  takes entries ending at its `add_host`, or at the `host_enc_key` at the
+  `add_host`'s `seq` + 1 naming exactly the revealed key, its generation
+  and its `enc_sig` (with or without `retire_previous`, which changes
+  nothing right after the `add_host`); anything else fails the
+  verification. Ending at the `add_host`, `host_enc_key_get` later answers
+  the same key with the same `enc_sig`.
+- **Failures.** An aborted or failed ceremony pins nothing and keeps the
+  record (the key's id was handed out); a pin taken back removes the key
+  and keeps the record. The next ceremony, in the next trust generation,
+  makes a new key and replaces the record with its generation's.
+- **Tests:** `pair_verify` and `runtime/ops_tests.rs` (the account
+  required, the reveal's object and `enc_sig` as Astation checks them, no
+  reveal while the record write is held, a record that can't be written, a
+  pairing changed meanwhile, another account refused by that check alone,
+  `deviceVerified` with and without the key entry, an entry for another
+  key, an aborted ceremony and the next one),
+  `membership/pairing_tests.rs` (where the entries may end, the key kept
+  with the pin or failing it), `r9/host_enc_tests.rs`, and
+  `tests/astation_op_binary.rs` (through the real binary, Astation's side
+  signed as it signs it, `tests/support/astation.rs` `Ceremony`: a full
+  `atem pair verify` with and without the key entry, a record that can't be
+  written aborting with no reveal, another account refused).
 
 ### 11.6 Delegated lifecycle (built behind a debug-only hook; not advertised)
 

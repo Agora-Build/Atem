@@ -167,6 +167,30 @@ impl TestLog {
         self.append(MAC, Action::AddHost { host })
     }
 
+    /// A host's `host_enc_key` entry (II.4.1), signed by the Mac, as
+    /// Astation appends the one a verification ceremony revealed right after
+    /// its `add_host` (host-work-v1 §11.5): the reveal's `enc_key` and
+    /// `enc_sig`, copied unchanged, no `retire_previous`.
+    pub fn host_enc_key_entry(
+        &mut self,
+        host_id: &str,
+        host_trust_gen: u64,
+        enc_pub: &[u8; 32],
+        enc_sig: &[u8],
+    ) -> Value {
+        let enc_key = PublicKey::new(Alg::X25519, enc_pub).unwrap();
+        let action = atem_client::membership::host_enc_key(
+            host_id,
+            host_trust_gen,
+            &enc_key,
+            enc_sig,
+            false,
+            now_wall(),
+        )
+        .unwrap();
+        self.append(MAC, action)
+    }
+
     /// A native device with these roles (P-256 auth key, X25519 enc key).
     pub fn add_native(&mut self, device: &str, roles: &[&str]) -> Value {
         let s = secret(&format!("{device} auth"));
@@ -516,6 +540,70 @@ impl TestLog {
         );
         body
     }
+}
+
+/// Astation's checks of a `verifyReveal`'s `host_enc_key` (host-work-v1
+/// §11.5), on the reveal's `data`: exactly `{host_id, host_trust_gen,
+/// enc_key{alg:"x25519", pub}, enc_sig}`, `host_id` and `host_trust_gen` the
+/// `verifyCommit`'s, and `enc_sig` verifying with the reveal's
+/// `host_channel_pub` for the account and genesis `verifyKeys` named
+/// (`verify_host_enc_sig`). The key's public half and `enc_sig`, or why
+/// Astation would refuse the reveal (`verifyAbort`).
+pub fn reveal_host_enc_key(
+    reveal: &Value,
+    account_id: &str,
+    genesis_hash: &Hash32,
+    host_id: &str,
+    host_trust_gen: u64,
+) -> Result<([u8; 32], [u8; 64]), String> {
+    use atem_client::encoding::b64u_decode;
+    let object = reveal
+        .get("host_enc_key")
+        .and_then(Value::as_object)
+        .ok_or("no host_enc_key")?;
+    let mut fields: Vec<&str> = object.keys().map(String::as_str).collect();
+    fields.sort_unstable();
+    if fields != ["enc_key", "enc_sig", "host_id", "host_trust_gen"] {
+        return Err(format!("fields {fields:?}"));
+    }
+    if object["host_id"] != host_id {
+        return Err("another host_id than the verifyCommit's".into());
+    }
+    if object["host_trust_gen"] != host_trust_gen {
+        return Err("another host_trust_gen than the verifyCommit's".into());
+    }
+    let enc_key = object["enc_key"].as_object().ok_or("enc_key")?;
+    if enc_key.len() != 2 || enc_key.get("alg").and_then(Value::as_str) != Some("x25519") {
+        return Err("enc_key isn't {alg:\"x25519\", pub}".into());
+    }
+    let enc_pub: [u8; 32] = enc_key
+        .get("pub")
+        .and_then(Value::as_str)
+        .and_then(|p| b64u_decode(p).ok())
+        .and_then(|p| p.try_into().ok())
+        .ok_or("enc_key.pub isn't 32 bytes of base64url")?;
+    let enc_sig: [u8; 64] = object["enc_sig"]
+        .as_str()
+        .and_then(|s| b64u_decode(s).ok())
+        .and_then(|s| s.try_into().ok())
+        .ok_or("enc_sig isn't 64 bytes of base64url")?;
+    let host_pub: [u8; 32] = reveal
+        .get("host_channel_pub")
+        .and_then(Value::as_str)
+        .and_then(|p| b64u_decode(p).ok())
+        .and_then(|p| p.try_into().ok())
+        .ok_or("host_channel_pub")?;
+    atem_client::membership::verify_host_enc_sig(
+        &PublicKey::new(Alg::Ed25519, &host_pub).unwrap(),
+        account_id,
+        genesis_hash,
+        host_id,
+        host_trust_gen,
+        &enc_pub,
+        &enc_sig,
+    )
+    .map_err(|e| format!("enc_sig doesn't verify ({e})"))?;
+    Ok((enc_pub, enc_sig))
 }
 
 /// `b64u` of a host channel key's public half.

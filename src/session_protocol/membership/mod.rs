@@ -112,11 +112,13 @@ const LEFTOVERS: [DlFile; 9] = [
     DlFile::HostPolicyPending,
     DlFile::Applied,
 ];
-/// Files removed with a device list (every pin, a pin taken back, `atem
-/// unpair`, its leftovers' removal) that are no leftover: the host
-/// encryption key and its record (`r9::host_enc`) grant nothing without the
-/// list, so ones left behind (by a build that doesn't know them) don't fail
-/// the list's start closed and count as no device-list file.
+/// Files removed with a device list (`atem unpair`, its leftovers' removal;
+/// a pin replaces them with its ceremony's, a pin taken back removes the
+/// key and keeps the record of the id its reveal handed out) that are no
+/// leftover: the host encryption key and its record (`r9::host_enc`) grant
+/// nothing without the list, so ones left behind (by a build that doesn't
+/// know them, or an aborted ceremony's record) don't fail the list's start
+/// closed and count as no device-list file.
 pub(super) const DELETE_ONLY: [DlFile; 2] = [DlFile::HostEncKey, DlFile::HostEncGenerated];
 /// A device-list write fault is recorded: `membership.fault` or its mirror
 /// in the journal's directory, in any state.
@@ -678,18 +680,25 @@ impl MembershipHost {
     ) -> Result<(), String> {
         let store = Store::new(pairing, journal_dir);
         let _lock = store.lock().map_err(|e| e.to_string())?;
-        Self::pin_locked(pairing, journal_dir, pin, m, host_seed)
+        Self::pin_locked(pairing, journal_dir, pin, m, host_seed, None).map(|_| ())
     }
 
     /// [`MembershipHost::pin`] for a caller already holding
-    /// `trust_gen.lock` (the pairing ceremony's apply).
+    /// `trust_gen.lock` (the pairing ceremony's apply). With `enc_key`
+    /// (every ceremony's, host-work-v1 §11.5) the host encryption key the
+    /// ceremony made and revealed is kept with the list, written before it
+    /// (`r9::host_enc::keep_at_pin`): the record of its id, written before
+    /// the reveal, stays (rebuilt if it was lost meanwhile). Without one
+    /// (tests) the key and its record go like every other earlier file.
+    /// What happened to the key, as runtime.log lines.
     pub fn pin_locked(
         pairing: &PairingPaths,
         journal_dir: &Path,
         pin: &HostPin,
         m: &Membership,
         host_seed: &[u8; 32],
-    ) -> Result<(), String> {
+        enc_key: Option<&crate::session_protocol::r9::host_enc::CeremonyKey>,
+    ) -> Result<Vec<String>, String> {
         let mut store = Store::new(pairing, journal_dir);
         #[cfg(test)]
         if let Some(injected) = PIN_FAULT.with(|f| f.take()) {
@@ -699,6 +708,9 @@ impl MembershipHost {
         // (a leftover without the list) until the next pin or unpair.
         store.remove(DlFile::State).map_err(|e| e.to_string())?;
         for file in LEFTOVERS.into_iter().chain(DELETE_ONLY) {
+            if file == DlFile::HostEncGenerated && enc_key.is_some() {
+                continue;
+            }
             store.remove(file).map_err(|e| e.to_string())?;
         }
         // An earlier list's deferral names nothing of this one (and is
@@ -707,6 +719,11 @@ impl MembershipHost {
         store
             .replace(DlFile::HostChannelKey, &host_key_bytes(host_seed))
             .map_err(|e| e.to_string())?;
+        let lines = match enc_key {
+            Some(key) => crate::session_protocol::r9::host_enc::keep_at_pin(&mut store, key)
+                .map_err(|e| format!("cannot keep the host encryption key: {e}"))?,
+            None => Vec::new(),
+        };
         let applied = Applied {
             head: m.head(),
             frozen: m.frozen().is_some(),
@@ -726,7 +743,8 @@ impl MembershipHost {
         // leftover that fails closed.
         store
             .replace(DlFile::State, &state_bytes(m, pin, None))
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        Ok(lines)
     }
 
     /// Opens the device list at a runtime start (§R9.3 "Crash recovery"),
