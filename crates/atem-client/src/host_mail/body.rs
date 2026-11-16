@@ -18,7 +18,7 @@ use crate::host_principal::host_principal;
 use crate::membership::Head;
 use crate::membership::entry::id_ok;
 use crate::session::host_work::{ContextSnapshot, ReplyState, ResultReply};
-use crate::session::messages::{Message, RecipientReceipt, recipients_valid};
+use crate::session::messages::{Message, RecipientReceipt, status_recipients_valid};
 use crate::session::wire::{is_uuid_v4, is_uuid_v5};
 use crate::signed::SealedPart;
 use crate::signed::SignedObject;
@@ -534,7 +534,9 @@ impl EnvelopePlain {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResultPlain {
     /// This host's receipts for the message's recipients (host-work-v1 §5
-    /// "Publish"), at acceptance and at each later change of a task's state.
+    /// "Publish"), at acceptance and at each later change of a task's state;
+    /// a `select` recipient's as `no_match` or `resolved` (host-work-v1
+    /// §11.5, "Status forms of a selector's resolution").
     Status {
         message_id: String,
         recipients: Vec<RecipientReceipt>,
@@ -552,7 +554,7 @@ impl ResultPlain {
             ResultPlain::Status {
                 message_id,
                 recipients,
-            } => is_uuid_v4(message_id) && recipients_valid(recipients),
+            } => is_uuid_v4(message_id) && status_recipients_valid(recipients),
             ResultPlain::Refusal { object_id, refused } => {
                 is_uuid_v4(object_id) && REFUSAL_CODES.contains(&refused.as_str())
             }
@@ -1004,6 +1006,42 @@ mod tests {
             format!(r#"{{"kind":"status","object_id":"{ID}","refused":"invalid_request"}}"#)
                 .as_bytes()
         );
+    }
+
+    #[test]
+    fn a_status_carries_a_selectors_resolution_or_no_match() {
+        // host-work-v1 §11.5's two examples, as the host seals them (jcs,
+        // `result` omitted while null).
+        let resolved = r#"{"kind":"status","message_id":"3f1e2d4c-5b6a-4978-8a9b-0c1d2e3f4a5b","recipients":[{"delivery":{"state":"resolved","tasks":[{"detail":"waiting for a ready agent","receipt_id":"79404b10-9aa1-4764-b3a2-b76e12f0af8c","state":"queued","task_id":"80160896-4fcd-5e6e-adac-98bac5497321"}]},"recipient_id":"7c6b5a49-3827-4e16-9d05-f4e3d2c1b0a9"}]}"#;
+        let no_match = r#"{"kind":"status","message_id":"3f1e2d4c-5b6a-4978-8a9b-0c1d2e3f4a5b","recipients":[{"delivery":{"state":"no_match"},"recipient_id":"7c6b5a49-3827-4e16-9d05-f4e3d2c1b0a9"}]}"#;
+        for text in [resolved, no_match] {
+            let plain = ResultPlain::parse(text.as_bytes()).unwrap();
+            assert_eq!(&plain.to_bytes().unwrap()[..], text.as_bytes());
+        }
+        let ResultPlain::Status { recipients, .. } =
+            ResultPlain::parse(resolved.as_bytes()).unwrap()
+        else {
+            panic!("a status")
+        };
+        let Delivery::Resolved { tasks } = &recipients[0].delivery else {
+            panic!("resolved")
+        };
+        assert_eq!(tasks[0].task_id, "80160896-4fcd-5e6e-adac-98bac5497321");
+        assert_eq!(tasks[0].result, None);
+        // A resolution with no task, or one whose task is the recipient's
+        // own id, isn't a status.
+        for bad in [
+            no_match.replace(
+                r#"{"state":"no_match"}"#,
+                r#"{"state":"resolved","tasks":[]}"#,
+            ),
+            resolved.replace(
+                "80160896-4fcd-5e6e-adac-98bac5497321",
+                "7c6b5a49-3827-4e16-9d05-f4e3d2c1b0a9",
+            ),
+        ] {
+            assert!(ResultPlain::parse(bad.as_bytes()).is_err(), "{bad}");
+        }
     }
 
     #[test]

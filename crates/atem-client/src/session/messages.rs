@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use super::host_work::{
     self, ContextKind, ContextSnapshot, HostTarget, WorkState, WorkStatus, WorkTask,
 };
-use super::wire::{Target, is_digest, is_opaque_id, is_session_id, is_uuid_v4};
+use super::wire::{Target, is_digest, is_opaque_id, is_session_id, is_uuid_v4, is_uuid_v5};
 use crate::canonical::MAX_SAFE_INTEGER;
 use crate::host_principal::parse_host_principal;
 
@@ -301,6 +301,18 @@ pub enum Delivery {
     Refused { code: String },
     /// Progress is the ordinary task receipt, independently per recipient.
     Work { work: WorkProgress },
+    /// A `select` recipient whose selectors matched no agent the host would
+    /// take the sender's work for; final for that message (host-work-v1
+    /// §11.5, "Status forms"). Only in a host's status object
+    /// ([`status_recipients_valid`]), never in a channel receipt. A struct
+    /// variant with no fields, so its reader refuses any field beside
+    /// `state`.
+    NoMatch {},
+    /// A `select` recipient's fixed resolution: one `work` receipt per task
+    /// it made, in its fixed order, each named by its selector task id
+    /// ([`super::select::selector_task_id`], a UUID v5), never the
+    /// recipient's id. Only in a host's status object.
+    Resolved { tasks: Vec<WorkProgress> },
 }
 
 /// Aggregate receipts carry immutable references, not a copy of each result.
@@ -342,9 +354,14 @@ impl From<&WorkStatus> for WorkProgress {
 }
 
 impl WorkProgress {
+    /// A recipient's own task's receipt: its task id is a UUID v4.
     fn valid(&self) -> bool {
-        is_uuid_v4(&self.task_id)
-            && is_uuid_v4(&self.receipt_id)
+        is_uuid_v4(&self.task_id) && self.valid_progress()
+    }
+
+    /// Everything but the task id's form.
+    fn valid_progress(&self) -> bool {
+        is_uuid_v4(&self.receipt_id)
             && self.detail.len() <= 1024
             && self.result.as_ref().is_none_or(|r| {
                 is_opaque_id(&r.id)
@@ -372,10 +389,27 @@ pub struct MessageReceipt {
     pub recipients: Vec<RecipientReceipt>,
 }
 
-/// This host's recipients' receipts (a message receipt's, or a status
-/// object's, delegated host-work II.4.4): one to `MAX_RECIPIENTS`, distinct
-/// recipient ids, each delivery one this host can send.
+/// This host's recipients' receipts in a channel's message receipt: one to
+/// `MAX_RECIPIENTS`, distinct recipient ids, each delivery one this host can
+/// send there. A selector's status forms (`no_match`, `resolved`) are never
+/// among them: a channel carries no `select` (host-work-v1 §11.5).
 pub fn recipients_valid(recipients: &[RecipientReceipt]) -> bool {
+    receipts_valid(recipients, false)
+}
+
+/// The recipients' receipts of a host's status object (delegated host-work
+/// II.4.4): as [`recipients_valid`], and a `select` recipient's status forms
+/// too (host-work-v1 §11.5, "Status forms of a selector's resolution"):
+/// `no_match`, or `resolved` with 1 to [`super::select::MAX_AGENTS`] tasks,
+/// each a valid `work` receipt of a distinct selector task (a UUID v5, never
+/// the recipient's id). Whether there are at most the recipient's `budget`
+/// tasks, and the same ones in the same order in a later status, is the
+/// sending host's to check against its message and outbox row.
+pub fn status_recipients_valid(recipients: &[RecipientReceipt]) -> bool {
+    receipts_valid(recipients, true)
+}
+
+fn receipts_valid(recipients: &[RecipientReceipt], status: bool) -> bool {
     let mut ids = BTreeSet::new();
     recipients.len() <= MAX_RECIPIENTS
         && !recipients.is_empty()
@@ -388,6 +422,17 @@ pub fn recipients_valid(recipients: &[RecipientReceipt]) -> bool {
                         matches!(code.as_str(), "forbidden" | "stale_target")
                     }
                     Delivery::Work { work } => work.task_id == r.recipient_id && work.valid(),
+                    Delivery::NoMatch {} => status,
+                    Delivery::Resolved { tasks } => {
+                        let mut task_ids = BTreeSet::new();
+                        status
+                            && (1..=super::select::MAX_AGENTS as usize).contains(&tasks.len())
+                            && tasks.iter().all(|t| {
+                                is_uuid_v5(&t.task_id)
+                                    && task_ids.insert(&t.task_id)
+                                    && t.valid_progress()
+                            })
+                    }
                 }
         })
 }
@@ -1045,6 +1090,117 @@ mod tests {
             1,
         );
         assert!(Request::decode(wire.as_bytes()).is_err());
+    }
+
+    /// A §5 `work` receipt of a selector task (a UUID v5 id).
+    fn selector_task(n: u8) -> WorkProgress {
+        WorkProgress {
+            task_id: super::super::select::selector_task_id(
+                "3f1e2d4c-5b6a-4978-8a9b-0c1d2e3f4a5b",
+                "7c6b5a49-3827-4e16-9d05-f4e3d2c1b0a9",
+                &format!("ses-ab23cd45ef{n:02}"),
+            ),
+            receipt_id: new_id(),
+            state: WorkState::Queued,
+            detail: "waiting for a ready agent".into(),
+            result: None,
+        }
+    }
+
+    #[test]
+    fn a_selectors_status_forms_are_taken_only_in_a_status_object() {
+        // host-work-v1 §11.5, "Status forms of a selector's resolution".
+        let recipient = "7c6b5a49-3827-4e16-9d05-f4e3d2c1b0a9";
+        let no_match = RecipientReceipt {
+            recipient_id: recipient.into(),
+            delivery: Delivery::NoMatch {},
+        };
+        assert_eq!(
+            serde_json::to_value(&no_match).unwrap(),
+            serde_json::json!({"recipient_id": recipient, "delivery": {"state": "no_match"}})
+        );
+        let resolved = |tasks: Vec<WorkProgress>| RecipientReceipt {
+            recipient_id: recipient.into(),
+            delivery: Delivery::Resolved { tasks },
+        };
+        let two = resolved(vec![selector_task(1), selector_task(2)]);
+        let wire = serde_json::to_value(&two).unwrap();
+        assert_eq!(wire["delivery"]["state"], "resolved");
+        assert_eq!(
+            wire["delivery"]["tasks"][1]["task_id"],
+            selector_task(2).task_id
+        );
+        assert_eq!(
+            serde_json::from_value::<RecipientReceipt>(wire).unwrap(),
+            two
+        );
+        // In a status object: both forms, beside the others.
+        for form in [no_match.clone(), two.clone()] {
+            assert!(
+                status_recipients_valid(std::slice::from_ref(&form)),
+                "{form:?}"
+            );
+            // Never in a channel receipt.
+            assert!(!recipients_valid(std::slice::from_ref(&form)), "{form:?}");
+            let receipt = MessageReceipt {
+                message_id: new_id(),
+                digest: host_work::digest(b"message"),
+                sender: "member:phone".into(),
+                recipients: vec![form],
+            };
+            assert!(!receipt.valid());
+        }
+        let stored = RecipientReceipt {
+            recipient_id: new_id(),
+            delivery: Delivery::Stored,
+        };
+        assert!(status_recipients_valid(&[stored.clone(), two.clone()]));
+        assert!(recipients_valid(std::slice::from_ref(&stored)));
+        // `resolved` holds 1 to 32 tasks, each a selector task (UUID v5,
+        // never the recipient's id) with a valid work receipt, each once.
+        let full = resolved((0..32).map(selector_task).collect());
+        assert!(status_recipients_valid(&[full]));
+        let mut v4 = selector_task(1);
+        v4.task_id = recipient.into();
+        let mut bad_detail = selector_task(1);
+        bad_detail.detail = "x".repeat(1025);
+        let mut completed_without_result = selector_task(1);
+        completed_without_result.state = WorkState::Completed;
+        for (name, tasks) in [
+            ("no tasks", vec![]),
+            ("33 tasks", (0..33).map(selector_task).collect()),
+            ("a task twice", vec![selector_task(1), selector_task(1)]),
+            ("the recipient's own id", vec![v4]),
+            ("a work receipt that isn't valid", vec![bad_detail]),
+            ("completed with no result", vec![completed_without_result]),
+        ] {
+            assert!(!status_recipients_valid(&[resolved(tasks)]), "{name}");
+        }
+        // A `work` receipt still names its recipient's own task.
+        let mut work = selector_task(1);
+        let other = RecipientReceipt {
+            recipient_id: recipient.into(),
+            delivery: Delivery::Work { work: work.clone() },
+        };
+        assert!(!status_recipients_valid(&[other]));
+        work.task_id = recipient.into();
+        let own = RecipientReceipt {
+            recipient_id: recipient.into(),
+            delivery: Delivery::Work { work },
+        };
+        assert!(status_recipients_valid(std::slice::from_ref(&own)));
+        assert!(recipients_valid(&[own]));
+        // Exactly their fields.
+        for extra in [
+            serde_json::json!({"state": "no_match", "tasks": []}),
+            serde_json::json!({"state": "resolved", "tasks": [], "budget": 1}),
+            serde_json::json!({"state": "resolved"}),
+        ] {
+            assert!(
+                serde_json::from_value::<Delivery>(extra.clone()).is_err(),
+                "{extra}"
+            );
+        }
     }
 
     #[test]
