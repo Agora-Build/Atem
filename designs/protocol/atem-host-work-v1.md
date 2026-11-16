@@ -31,8 +31,8 @@ local UUIDv5 task references and `result` context snapshots. Remote admission
 still requires the contract below. Cross-instance selector/result support waits for
 the stage-2 agreement ([../delegated-host-work.md](../delegated-host-work.md), II.1).
 **Amended by owner decision, 2026-11-15:** stage 2 isn't used between Atem
-hosts, so it waits for host senders' agreement instead (§11.5, proposed
-2026-11-15; design II.6).
+hosts, so it comes with host senders instead (§11.5, agreed with Astation
+2026-11-16; design II.6).
 
 ## 1. Features and transport
 
@@ -3046,8 +3046,8 @@ through the receiving host's mailbox on the Station (design II.4.2 to
 II.4.4, III.1): an **`atem-envelope`** from the sending host (a request, a
 cancel or a complete) and an **`atem-result`** back from the host that ran
 the work (a status, a refusal or a result). They belong to `host.senders`,
-which no host advertises in this version: nothing sends, fetches or accepts
-them yet. Types: `atem_client::host_mail` (the builders `seal_envelope` and
+which no release build advertises (a debug build lists it only behind the
+debug-only hook): nothing sends, fetches or accepts them yet. Types: `atem_client::host_mail` (the builders `seal_envelope` and
 `seal_result`, the receiver's `open_envelope` and the sending host's
 `accept_result`); bindings: host role only (feature `host`,
 [atem-client-bindings.md](atem-client-bindings.md)); vectors:
