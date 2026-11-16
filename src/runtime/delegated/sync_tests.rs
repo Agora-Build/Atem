@@ -1874,6 +1874,128 @@ fn the_gate_stays_closed_until_the_new_links_heads_and_full_read() {
     assert!(!rig.feeds.never_read());
 }
 
+/// Item 15 (#120) across a re-authentication: while Astation authenticates
+/// the live link again its Station link is down (the bridge's
+/// `r9_app_link` names no generation), and the host's identity moves then,
+/// here its trust generation alone (the same account, device, genesis and
+/// key). The move counts against the link's last socket, so the same socket
+/// coming back (a new link generation on it) is still the old identity's
+/// association, never relabelled the new one's: the call retired at the
+/// drop is drained when its page comes, the socket's `heads` and the pass
+/// ask nothing, the gate stays closed, and the socket is the one to
+/// reconnect. A new socket reads the feed from 0 under the new identity,
+/// and only that read opens the gate.
+#[test]
+fn an_identity_change_while_astation_reauthenticates_is_never_relabelled() {
+    let mut rig = rig();
+    assert!(!rig.sync.on_identity(identity(&rig.log, 1)));
+    let (cover, hold) = rig.opened();
+    let release = rig.record(FEED, ControlAction::Release);
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    let continuation = rig.last();
+    // Astation authenticates the link again: the link is down meanwhile.
+    rig.sync.on_link(None);
+    assert_eq!(rig.sync.dump()["in_flight"], Value::Null, "retired");
+    assert_eq!(rig.sync.closed(), Some(Closed::NoLink));
+    // The identity moves in the window.
+    rig.new_identity();
+    assert!(rig.sync.on_identity(identity(&rig.log, 2)), "moved");
+    assert!(!rig.sync.on_identity(identity(&rig.log, 2)), "once");
+    assert_eq!(
+        rig.sync.moved_socket(),
+        Some(SOCKET),
+        "the link's last socket"
+    );
+    assert_eq!(rig.sync.dump()["identity_moves"], 1);
+    rig.pass(SEC);
+    // Astation answered: the same socket, a new link generation.
+    rig.sync.on_link(Some(&link(2, ORIGIN)));
+    assert_eq!(rig.sync.moved_socket(), Some(SOCKET));
+    assert_eq!(rig.sync.closed(), Some(Closed::IdentityMoved));
+    let drained = rig.drained();
+    let synced = rig.answer(&continuation, 3, &[(3, &release)]);
+    assert!(synced.applied.is_empty());
+    assert_eq!(synced.next, None);
+    assert_eq!(rig.drained(), drained + 1);
+    assert_eq!(rig.sync.dump()["faults"], 0);
+    assert!(
+        rig.feeds.never_read(),
+        "the new identity's store took nothing"
+    );
+    rig.pass(2 * SEC);
+    assert!(
+        rig.heads(FEED, 3).is_empty(),
+        "nothing asked on that socket"
+    );
+    assert!(rig.pass(2 * SEC).is_empty());
+    assert_eq!(rig.sync.closed(), Some(Closed::IdentityMoved));
+    assert!(!rig.open(&native()));
+    // A new socket: the new identity's association.
+    rig.sync.on_link(Some(&link_on(3, 2, ORIGIN)));
+    assert_eq!(rig.sync.moved_socket(), None);
+    assert_eq!(rig.sync.closed(), Some(Closed::NoHeads));
+    rig.pass(2 * SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 0)]);
+    let from_0 = rig.last();
+    assert_ne!(from_0.request_id, continuation.request_id);
+    rig.answer(&from_0, 3, &[(1, &cover), (2, &hold), (3, &release)]);
+    assert_eq!(rig.cursor(), Some((FEED.to_string(), 3)));
+    assert!(rig.open(&native()), "{:?}", rig.sync.closed());
+    assert_eq!(rig.sync.dump()["identity_moves"], 1);
+}
+
+/// The same window with no identity change: Astation authenticating the
+/// link again keeps the socket's association. Nothing is marked moved or
+/// to reconnect; the new generation asks the feed again from the committed
+/// cursor, with a fresh id, and its read opens the gate.
+#[test]
+fn a_reauthentication_with_no_identity_change_keeps_the_association() {
+    let mut rig = rig();
+    rig.sync.on_identity(identity(&rig.log, 1));
+    let (_cover, _hold) = rig.opened();
+    let release = rig.record(FEED, ControlAction::Release);
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    let continuation = rig.last();
+    rig.sync.on_link(None);
+    assert!(!rig.sync.on_identity(identity(&rig.log, 1)));
+    assert_eq!(rig.sync.moved_socket(), None);
+    rig.pass(SEC);
+    rig.sync.on_link(Some(&link(2, ORIGIN)));
+    assert_eq!(rig.sync.moved_socket(), None);
+    assert_eq!(rig.sync.closed(), Some(Closed::NoHeads));
+    rig.pass(2 * SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    let again = rig.last();
+    assert_ne!(again.request_id, continuation.request_id);
+    rig.answer(&again, 3, &[(3, &release)]);
+    assert_eq!(rig.cursor(), Some((FEED.to_string(), 3)));
+    assert!(rig.open(&native()), "{:?}", rig.sync.closed());
+    assert_eq!(rig.sync.dump()["identity_moves"], 0);
+}
+
+/// A link that drops for good while the identity moves: the move counts
+/// against the socket that dropped, never the next one, which is
+/// authenticated under the new identity (no reconnect asked for it) and
+/// reads the feed from 0.
+#[test]
+fn an_identity_change_while_the_link_is_down_never_marks_the_next_socket() {
+    let mut rig = rig();
+    rig.sync.on_identity(identity(&rig.log, 1));
+    let (cover, hold) = rig.opened();
+    rig.sync.on_link(None);
+    rig.new_identity();
+    rig.sync.on_identity(identity(&rig.log, 2));
+    rig.sync.on_link(Some(&link_on(2, 2, ORIGIN)));
+    assert_eq!(rig.sync.moved_socket(), None);
+    assert_eq!(rig.sync.closed(), Some(Closed::NoHeads));
+    rig.pass(2 * SEC);
+    assert_eq!(rig.heads(FEED, 2), [sync_call(FEED, 0)]);
+    rig.page(FEED, 2, &[(1, &cover), (2, &hold)]);
+    assert!(rig.open(&native()), "{:?}", rig.sync.closed());
+}
+
 /// Ruling C1b-a (Astation's "a reset between call and result"): the feed
 /// goes back under the same id while a continuation is in flight, and the
 /// call's own answer says so: its `head` below its echoed `after`, with no

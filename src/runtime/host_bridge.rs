@@ -2224,19 +2224,22 @@ impl HostBridge {
         // §11.4 "An identity change" (`host.delegated` only: the Station
         // link is there only then): the host's identity moved while its link
         // was up (a re-verify on the live link, this pass's re-pin
-        // included): that socket is reconnected once, so the next link is
-        // authenticated, and proves its route, under the new identity. On a
-        // local link its route proof (design I.5.8) answers nothing more on
-        // that socket meanwhile, and one that found another identity on its
-        // socket itself (moved while the Station link was down) is
-        // reconnected the same way.
+        // included), or while Astation authenticated the link again (its
+        // Station link down until Astation answers, on the same socket):
+        // that socket is reconnected once, after the re-authentication, so
+        // the next link is authenticated, and proves its route, under the
+        // new identity. Only the App's socket now: one already gone needs
+        // nothing. On a local link its route proof (design I.5.8) answers
+        // nothing more on that socket meanwhile, and one that found another
+        // identity on its socket itself is reconnected the same way.
         self.station_identity();
+        let socket = app.astation_client.socket_id();
         let moved = self
             .station
             .as_ref()
-            .and_then(|station| station.feed.moved_socket());
-        let socket = app.astation_client.socket_id();
-        if moved == Some(socket) {
+            .and_then(|station| station.feed.moved_socket())
+            .filter(|moved| *moved == socket);
+        if moved.is_some() {
             app.astation_client.retire_local_route();
         }
         let retired = app.astation_client.local_route_retired().then_some(socket);
