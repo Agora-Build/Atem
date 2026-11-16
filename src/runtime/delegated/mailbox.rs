@@ -50,13 +50,19 @@
 //!   (`request_id`, `mailbox_id` and `position`) is freed for the bridge to
 //!   remove; one unanswered for 35 s goes again with a fresh id; a
 //!   `mailbox_done_refused` retires every live done and none goes again on
-//!   that link generation. Owed dones survive a restart in the store.
+//!   that link generation. Owed dones survive a restart in the store. While
+//!   more than [`MAX_OWED_DONES`] are owed, no page is asked.
+//! - **A rewind** (ruling R31): an object the store left on the Station for
+//!   want of room is read again once room frees: the store's cursor is
+//!   rewound to just before it, the live call retired and the re-read asked
+//!   at once ([`MailboxClient::cursor_rewound`]).
 //! - **An identity change** on the live link (§11.4): every live mailbox
 //!   call retired, nothing more synced or marked done on that socket.
 //! - **The gate's mailbox part** (design II.5; [`MailboxClient::open`]):
 //!   the link up, a mailbox announced on this generation and read up to its
-//!   head, no refusal, fault or reset waiting, and the inbox drained (the
-//!   requests, cancels and completes committed but not yet admitted).
+//!   head, no refusal, fault or reset waiting, no object left on the
+//!   Station for want of room, and the inbox drained (the requests, cancels
+//!   and completes committed but not yet admitted).
 //!   Pending objects don't hold it. Only host senders wait for it.
 use super::fetch::{HEADS_PACE_MS, REFUSAL_BACKOFF_MS, STALL_PAUSE_MS};
 use super::station::StationLink;
@@ -77,8 +83,15 @@ pub struct Observed {
     pub cursor: Option<(String, u64)>,
     pub inbox: u64,
     /// The dones owed to the cursor's mailbox (positions, the first 64),
-    /// each written with its page's commit.
+    /// each written with its page's commit, and how many in all.
     pub owed: Vec<u64>,
+    pub owed_count: u64,
+    /// An object was left on the Station for want of room (ruling R31):
+    /// not committed yet, so the gate's mailbox part stays closed.
+    pub skipped: bool,
+    /// Room freed since: the store's cursor is to be rewound to just before
+    /// it (`mailbox_store::rewind_if_room`).
+    pub rewind_due: bool,
 }
 
 /// What a page is to the live call ([`MailboxClient::on_page`]).
@@ -145,6 +158,12 @@ struct DoneAsk {
 /// §11.4's refusal lines, for the mailbox's two calls (rule 8).
 const REFUSED_SYNC: &str = "the Station refused this host's mailbox_sync (forbidden); retrying";
 const REFUSED_DONE: &str = "the Station refused this host's mailbox_done (forbidden); retrying";
+
+/// While more dones than this are owed, no page is asked (review O5): a
+/// Station that serves pages but never answers dones can't grow them
+/// without end. An honest Station drains 8 a round trip against at most
+/// one object a page.
+pub const MAX_OWED_DONES: u64 = 256;
 
 /// The most dones live per link generation (rule 8).
 pub const MAX_LIVE_DONES: usize = 8;
@@ -458,6 +477,21 @@ impl MailboxClient {
         }
     }
 
+    /// Room freed since an object was left on the Station: the store's
+    /// cursor is due to be rewound to it (ruling R31).
+    pub fn rewind_due(&self) -> bool {
+        self.observed.as_ref().is_some_and(|o| o.rewind_due)
+    }
+
+    /// The store's cursor was rewound to re-read an object left on the
+    /// Station for want of room (ruling R31; the bridge observed it since):
+    /// the live call is retired and the re-read asked at once.
+    pub fn cursor_rewound(&mut self) {
+        self.retire_live();
+        self.stalled_at = None;
+        self.ask(false);
+    }
+
     /// The calls to send now, marked sent: the live sync if it wasn't yet,
     /// and a done for each owed position not live (at most
     /// [`MAX_LIVE_DONES`] live), only in the mailbox this link generation's
@@ -568,6 +602,11 @@ impl MailboxClient {
                 read.unwrap_or(0),
                 announced.head
             ));
+        }
+        if observed.skipped {
+            return Some(
+                "a mailbox object waits on the Station for room in this host's inbox".into(),
+            );
         }
         if observed.inbox > 0 {
             return Some(format!(
@@ -764,6 +803,10 @@ impl MailboxClient {
             self.refused_at = None;
         }
         if !(self.behind() || self.resync.is_some()) {
+            return;
+        }
+        // Too many dones owed: none more until they are answered (O5).
+        if observed.owed_count > MAX_OWED_DONES {
             return;
         }
         if paced {

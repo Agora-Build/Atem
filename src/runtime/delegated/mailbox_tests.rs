@@ -57,6 +57,9 @@ fn observed(cursor: Option<(&str, u64)>) -> Observed {
         cursor: cursor.map(|(id, at)| (id.to_string(), at)),
         inbox: 0,
         owed: Vec::new(),
+        owed_count: 0,
+        skipped: false,
+        rewind_due: false,
     }
 }
 
@@ -283,8 +286,10 @@ fn the_gate_part_follows_the_read() {
 
 /// The dones owed `owed` (positions), as the store holds them.
 fn owing(c: &mut MailboxClient, cursor: (&str, u64), owed: impl IntoIterator<Item = u64>) {
+    let owed: Vec<u64> = owed.into_iter().collect();
     c.observe(Some(Observed {
-        owed: owed.into_iter().collect(),
+        owed_count: owed.len() as u64,
+        owed,
         ..observed(Some(cursor))
     }));
 }
@@ -456,4 +461,51 @@ fn mailbox_faults_and_refusals_are_hourly_alerts() {
         lines[0].contains("1 more since the last such line"),
         "{lines:?}"
     );
+}
+
+/// Ruling R31: an object left on the Station for want of room keeps the
+/// gate's mailbox part closed (not yet committed); once the store rewinds
+/// its cursor to just before it, the live call is retired and the re-read
+/// asked at once from there.
+#[test]
+fn a_rewind_rereads_from_the_skipped_position() {
+    let mut c = client(10 * SEC, Some((MAILBOX, 5)));
+    c.on_heads(head(MAILBOX, 6));
+    let live = sent(&mut c).unwrap();
+    c.observe(Some(Observed {
+        skipped: true,
+        ..observed(Some((MAILBOX, 5)))
+    }));
+    c.on_heads(head(MAILBOX, 5));
+    assert!(!c.open(), "a skipped object isn't committed");
+    assert!(c.closed().unwrap().contains("room"), "{:?}", c.closed());
+    c.observe(Some(observed(Some((MAILBOX, 2)))));
+    c.cursor_rewound();
+    let call = sent(&mut c).expect("asked at once");
+    assert_eq!(call.after, 2);
+    assert_eq!(c.on_page(Ok(page(&live, 6, 6))), PageCheck::Drained);
+}
+
+/// Review O5: while more than [`MAX_OWED_DONES`] dones are owed, no page is
+/// asked (the dones still go); at or below it, pages are asked again.
+#[test]
+fn many_owed_dones_hold_the_sync() {
+    let mut c = client(10 * SEC, Some((MAILBOX, 300)));
+    let over = MAX_OWED_DONES + 1;
+    c.observe(Some(Observed {
+        owed: (1..=64).collect(),
+        owed_count: over,
+        ..observed(Some((MAILBOX, 300)))
+    }));
+    c.on_heads(head(MAILBOX, 400));
+    let out = c.take_outgoing();
+    assert!(out.sync.is_empty(), "held");
+    assert_eq!(out.dones.len(), MAX_LIVE_DONES);
+    c.observe(Some(Observed {
+        owed: (9..=64).collect(),
+        owed_count: MAX_OWED_DONES,
+        ..observed(Some((MAILBOX, 300)))
+    }));
+    c.tick(12 * SEC);
+    assert_eq!(c.take_outgoing().sync.len(), 1);
 }

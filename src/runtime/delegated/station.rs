@@ -695,6 +695,9 @@ mod tests {
             cursor: None,
             inbox: 0,
             owed: Vec::new(),
+            owed_count: 0,
+            skipped: false,
+            rewind_due: false,
         };
         s.mailbox.observe(Some(observed(1)));
         s.mailbox.tick(10_000);
