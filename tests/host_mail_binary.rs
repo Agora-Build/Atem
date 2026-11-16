@@ -498,10 +498,24 @@ impl Rig {
             .collect()
     }
 
-    /// Every object the store decided into a row (the inbox, the refusals,
-    /// the kept results).
-    fn decided_rows(&self) -> u64 {
-        self.count("mailbox_inbox") + self.count("mailbox_refused") + self.count("mailbox_results")
+    /// Whether the store holds `row`: an object's own row, by its id in the
+    /// inbox or the kept results, or by its evidence in the refusals.
+    fn holds(&self, row: &Row) -> bool {
+        let (sql, key) = match row {
+            Row::Inbox(id) => ("SELECT count(*) FROM mailbox_inbox WHERE object_id=?1", id),
+            Row::Result(id) => (
+                "SELECT count(*) FROM mailbox_results WHERE object_id=?1",
+                id,
+            ),
+            Row::Refused(evidence) => (
+                "SELECT count(*) FROM mailbox_refused WHERE evidence=?1",
+                evidence,
+            ),
+        };
+        self.db()
+            .query_row(sql, [key], |r| r.get::<_, i64>(0))
+            .unwrap_or(0)
+            == 1
     }
 
     /// Admission takes every inbox row (it isn't built: the test does what
@@ -603,6 +617,25 @@ impl Drop for Rig {
             let _ = child.wait();
         }
     }
+}
+
+/// The row an object's decision leaves in the store.
+#[derive(Debug)]
+enum Row {
+    /// An opened request, cancel or complete: its body's `id`.
+    Inbox(String),
+    /// A kept result: its body's `id`.
+    Result(String),
+    /// A refusal: its evidence (the `object_hash`, hex).
+    Refused(String),
+}
+
+/// An object's body `id`.
+fn id_of(object: &atem_client::SignedObject) -> String {
+    atem_client::host_mail::MailBody::from_object(object)
+        .unwrap()
+        .1
+        .id
 }
 
 fn is_sync(call: &MailboxToStation) -> bool {
@@ -837,17 +870,20 @@ fn reads_its_mailbox_to_the_head_on_relay_local_and_routed_links() {
         let to = rig.receiver(1);
         let head = rig.log.log.head();
         let request = rig.sender.request(&to, head, "Review the contract");
-        let request_id = atem_client::host_mail::MailBody::from_object(&request)
-            .unwrap()
-            .1
-            .id;
+        let request_id = id_of(&request);
         let other_key = Receiver::other(OTHER_HOST, 1, "other enc");
-        for object in [
-            &request,
-            &rig.sender.forged(&to, head),
-            &rig.sender.result(&to, head),
-            &rig.sender.sealed_to(&to, &other_key, head),
-        ] {
+        let forged = rig.sender.forged(&to, head);
+        let result = rig.sender.result(&to, head);
+        let sealed_to = rig.sender.sealed_to(&to, &other_key, head);
+        let evidence = |o| atem_client::host_mail::object_hash(o).to_hex();
+        // Each position's object, and the row its decision leaves.
+        let rows = [
+            Row::Inbox(request_id.clone()),
+            Row::Refused(evidence(&forged)),
+            Row::Result(id_of(&result)),
+            Row::Refused(evidence(&sealed_to)),
+        ];
+        for object in [&request, &forged, &result, &sealed_to] {
             rig.put(object);
         }
         rig.put_elsewhere(&rig.sender.request(&other_key, head, "Not for this host"));
@@ -869,9 +905,10 @@ fn reads_its_mailbox_to_the_head_on_relay_local_and_routed_links() {
                 "{via:?}: cursor {at}, done {}",
                 call.position
             );
+            let row = &rows[call.position as usize - 1];
             assert!(
-                rig.decided_rows() >= call.position,
-                "{via:?}: the row of position {}",
+                rig.holds(row),
+                "{via:?}: position {}'s {row:?}",
                 call.position
             );
             assert!(
