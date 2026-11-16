@@ -3340,12 +3340,13 @@ def mailbox_id_of(seed, account_id, genesis, host_id, host_trust_gen, n):
 
 class MailStation:
     """A Station's mailboxes for one device list, written here from §11.5's
-    rules: one mailbox per receiving (host, generation), positions in store
-    order; puts from a current host with its own objects to a current host,
-    times, the key (calling host, id) by object hash, quotas per sending
-    host, receiving host and account in objects and compact bytes; pages of
-    one object with a scan boundary over removed positions; done and sync on
-    the caller's own mailbox only; expiry by the clock; resets."""
+    rules: one mailbox per receiving (host, generation), minted by a store,
+    positions in store order; puts from a current host with its own objects
+    to a current host, times, the key (calling host, id) by object hash,
+    quotas per sending host, receiving host and account in objects and in
+    bytes as received; pages of one object with a scan boundary over removed
+    positions; done and sync from a current host on its own mailbox only;
+    expiry by the clock; resets."""
 
     def __init__(self, data, scenario):
         link = data["link"]

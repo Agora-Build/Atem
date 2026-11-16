@@ -2910,7 +2910,7 @@
         }
       ],
       "name": "quota_in_encoded_bytes",
-      "note": "a sending host's quota of twice o1's encoded size (its compact JSON): the third object of the same size is refused",
+      "note": "a sending host's quota of twice o1's encoded size (its bytes as received, its compact JSON here): the third object of the same size is refused",
       "quotas": {
         "account": {
           "bytes": 1073741824,

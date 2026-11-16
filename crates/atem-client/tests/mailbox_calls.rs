@@ -2021,7 +2021,7 @@ fn scenarios(objects: &Objects) -> Vec<Value> {
         objects,
         4,
         "quota_in_encoded_bytes",
-        "a sending host's quota of twice o1's encoded size (its compact JSON): the third object of the same size is refused",
+        "a sending host's quota of twice o1's encoded size (its bytes as received, its compact JSON here): the third object of the same size is refused",
         Quotas {
             sender: Quota {
                 objects: 100,
