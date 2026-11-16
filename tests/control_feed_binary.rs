@@ -4516,7 +4516,9 @@ const IDENTITY_IGNORED: &str = "host_challenge ignored: this host's identity cha
     ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
 )]
 fn through_astations_local_proxy_the_host_proves_itself_to_a_station_that_requires_it() {
-    use atem_client::host_route::{HostRouteRefusal, verify_host_route_message};
+    use atem_client::host_route::{
+        HostRouteRefusal, RouteKind, verify_host_route_message, verify_host_route_message_as,
+    };
     let mut rig = Rig::full(Via::Local);
     let old_link = rig.link();
     let atem_id = rig.atem_id();
@@ -4528,6 +4530,20 @@ fn through_astations_local_proxy_the_host_proves_itself_to_a_station_that_requir
     let old_head = rig.log.log.head();
     let route = old_proof.verdict.clone().expect("the Station verified it");
     assert_eq!((route.host_id.as_str(), route.head), (HOST, old_head));
+    // A proxy proof: the relay's verifier refuses it, so whoever holds the
+    // host's local link can't route a relay connection as this host with it.
+    assert_eq!(
+        verify_host_route_message(
+            &rig.log.log,
+            old_proof.message.as_bytes(),
+            &old_proof.nonce.unwrap(),
+            ASTATION,
+            &atem_id,
+        )
+        .map(|_| ()),
+        Err(HostRouteRefusal::Malformed("type")),
+        "never a relay route"
+    );
     assert!(rig.station().sent().is_empty(), "no call before the proof");
     assert!(!rig.gate_open());
     // Only then the calls: the feed read to its head, the gate open.
@@ -4578,7 +4594,8 @@ fn through_astations_local_proxy_the_host_proves_itself_to_a_station_that_requir
         Ok(old_head.seq + 1)
     );
     assert_eq!(
-        verify_host_route_message(
+        verify_host_route_message_as(
+            RouteKind::Proxy,
             &rig.log.log,
             old_proof.message.as_bytes(),
             &old_proof.nonce.unwrap(),

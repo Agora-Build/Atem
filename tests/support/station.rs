@@ -59,7 +59,8 @@
 //!   delegated host-work design I.5.8, "Which host is calling": session-v1
 //!   R9.7b's challenge, carried through Astation's local `:8080` proxy
 //!   unchanged). It challenges a link it hasn't served, verifies the host's
-//!   `host_route` with the shared verifier against its own device list,
+//!   `host_route` with the shared verifier of the proxy kind (a forwarded
+//!   proof is never a relay route) against its own device list,
 //!   answers the verdict, and only then serves the link's calls and
 //!   announces its `heads` there; until then every call gets its typed
 //!   refusal. Off (the default) it needs no proof, as before.
@@ -85,7 +86,7 @@ use atem_client::control::{
 };
 use atem_client::encoding::Hash32;
 use atem_client::host_route::{
-    HostChallenge, HostRoute, HostRouteRefusal, RelayReply, verify_host_route_message,
+    HostChallenge, HostRoute, HostRouteRefusal, RelayReply, RouteKind, verify_host_route_message_as,
 };
 use atem_client::membership::{Head, Membership};
 use atem_client::{KeyProvider, SignedObject, SoftwareKeys};
@@ -845,7 +846,8 @@ impl FakeStation {
     fn on_proof(&mut self, link: u64, message: String) {
         let nonce = self.challenges.remove(&link);
         let verdict = match (&self.proof, nonce) {
-            (Some(rule), Some(nonce)) => verify_host_route_message(
+            (Some(rule), Some(nonce)) => verify_host_route_message_as(
+                RouteKind::Proxy,
                 &self.own.membership,
                 message.as_bytes(),
                 &nonce,

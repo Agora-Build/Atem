@@ -1854,6 +1854,7 @@ Planned:
 | `atem-push-hint` | `atem-push-hint-v1` | the host's `host_channel_key` (R9.9; the open and resolved approval hints, and the planned `outcome_unknown` kind, which has the same label and seal domain `atem-push-seal-v1`) |
 | `atem-seen` | `atem-seen-v1` | the host's `host_channel_key` (R9.9) |
 | `atem-host-route` | `atem-host-route-v1` | the host's `host_channel_key` (R9.7b) |
+| `atem-host-route-proxy` (proposed, for Astation's agreement) | `atem-host-route-proxy-v1` | the host's `host_channel_key` (R9.7b, "Through Astation's `:8080` proxy": the host route proof's fields, its own kind, never a relay route) |
 | (`enc_sig` inside a `host_enc_key` entry; planned, R9.2 "Host senders and projects") | `atem-host-enc-key-v1` over fields, never a body: `enc([label, account_id, genesis_hash, host_id, u64(host_trust_gen), enc_pub])` | the host's `host_channel_key` (its newest `add_host`'s `host_key`) |
 | `atem-host-work-control` (control records; planned, host-work-v1 §11.1) | `atem-host-work-control-v1` | the principal's own key (a service: an `auth_key` it had in the list, the one the body's `principal_key` names; the Station that hosts the integration holds it), any action; or a native member holding `manage` at the verifier's head (`member:<device_id>`), `revoke` and `interrupt_running` only. A host's key signs none |
 | `atem-envelope` (a host sender's request, cancel or complete; planned, host-work-v1 §11.5) | `atem-envelope-v1`; its sealed part's HPKE `info` begins with the seal label `atem-envelope-seal-v1` | the sending host's `host_channel_key` (its newest `add_host`'s `host_key`) |
@@ -3672,43 +3673,71 @@ the debug-only hook `host.delegated`, which no release build turns on).
 On Astation's local link, Astation's proxy forwards the selected
 Station's `host_challenge{nonce, room}`, the host's `host_route{proof}`
 and the Station's verdict unchanged; a native login or session proof is
-never promoted into host authority. The host answers with the proof its
-relay link gives, made by the same code for the same inputs: `room` the
-relay room (the pairing's Astation id; a challenge naming another room is
-ignored, one runtime.log line) and `atem_id` its own, signed at its
-device list's head on the same conditions (a pinned list that can serve).
-Its rules are a local link's:
+never promoted into host authority.
 
+- **A proof of its own kind** (**proposed, for Astation's agreement**).
+  The host answers through the same code and for the same inputs as its
+  relay link (`room` the relay room, the pairing's Astation id, a
+  challenge naming another room ignored with one runtime.log line;
+  `atem_id` its own; signed at its device list's head on the same
+  conditions: a pinned list that can serve), but with a proof of the
+  **proxy kind**: a signed object of type `atem-host-route-proxy`, exactly
+  the fields of the relay proof's body above, signed by the
+  `host_channel_key` over `enc(["atem-host-route-proxy-v1", jcs(body)])`.
+  The kinds are domain separated: the relay's verifier refuses a proxy
+  proof (`malformed`, its type) and the proxy verifier
+  (`atem_client::host_route::verify_host_route_message_as(RouteKind::Proxy,
+  …)`) refuses a relay proof; a body relabelled to the other kind keeps no
+  valid signature (`bad_signature`). The Station accepts a proxy proof
+  only on Astation's native-bound forwarding connection (the one bound to
+  the selected Station, the paired native session and the local socket
+  generation), never as a relay route. Why: Atem doesn't authenticate its
+  peer on the local link (Astation's `authenticated` reply carries no
+  proof, the Session host's limits), so whoever holds the host's local
+  link can have it sign a proof for a nonce of its choosing; of the proxy
+  kind, such a proof never routes a relay connection as this host, and
+  using it needs a Station connection that already carries the account's
+  native session. Vectors: `r9-vectors-host-route`'s `proxy`.
 - **After Astation's authentication only.** The local link answers once
   Astation (the paired Astation, the room the proof is made for)
-  authenticated it (`auth_required`, then the saved session's proof
-  accepted); never before, never while Astation authenticates it again,
-  judged in order with Astation's messages on the link (the host's client
-  answers it, not the link's reader, so a challenge forwarded right after
-  Astation's reply is judged after that reply).
+  authenticated it (`auth_required`, then its proof accepted: the saved
+  session's, or on loopback the local bootstrap proof); never before,
+  never while Astation authenticates it again, judged in order with
+  Astation's messages on the link (the host's client answers it, not the
+  link's reader, so a challenge forwarded right after Astation's reply is
+  judged after that reply). One that comes before or meanwhile is ignored
+  with one runtime.log line (`host_challenge ignored: Astation hasn't
+  authenticated this local link`), within the link's bound of 8 lines per
+  socket. A local link another Astation authenticated (the loopback
+  bootstrap proof names any Astation id) answers none.
 - **Once per authenticated link generation.** A re-authentication on the
   same socket is a new generation and answers a fresh challenge; a second
   challenge in one generation is ignored, as on the relay. A verdict counts
   only for the proof of the link's current generation, once.
-- **The verdict.** `host_route_ok` establishes the Station's association
-  for the Station calls on that link (host-work-v1 §11.4) and nothing
-  else: the link stays an Astation-authenticated local link, never routed
-  (runtime.log: `host_route ok at head N through Astation's local link`).
-  `host_route_refused` keeps the link, which is owner-present Astation's
-  (runtime.log: `host_route refused through Astation's local link:
-  <code>; the link stays, and the Station refuses its calls`); the Station
-  refuses that link's calls as it refuses any caller it can't tie to a
-  host, so the host's revocation gate for that Station stays closed, and
-  `atem status`'s `Control feeds:` line shows the Station's refusal (on
-  the relay a refused proof closes the link, and the line says there is no
-  Station link; neither names the proof).
-- **An identity change** (host-work-v1 §11.4): once the host's identity
-  changed on the live link (a re-verify, a new trust generation, account
-  or genesis), nothing more is answered on that socket, whatever its later
-  authentication; a challenge under another route identity than the
-  socket's (account, genesis, host or `host_channel_key`) is refused the
-  same way. The host reconnects that link as §11.4 says, and the new socket
-  answers the next challenge under the new identity.
+- **The verdict is informational on the host:** it changes nothing there
+  but a runtime.log line. `host_route_ok` is the Station's association for
+  the Station calls on that link (host-work-v1 §11.4): the link stays an
+  Astation-authenticated local link, never routed (`host_route ok at head
+  N through Astation's local link`). `host_route_refused` keeps the link,
+  which is owner-present Astation's (`host_route refused through
+  Astation's local link: <code>; the link stays, and the Station refuses
+  its calls`); the Station refuses that link's calls as it refuses any
+  caller it can't tie to a host, so the host's revocation gate for that
+  Station stays closed, and `atem status`'s `Control feeds:` line shows
+  the Station's refusal (on the relay a refused proof closes the link, and
+  the line says there is no Station link; neither names the proof).
+- **An identity change** (host-work-v1 §11.4). A change the host's
+  identity rules see while the link is up (a re-verify, a new trust
+  generation, account or genesis) retires the socket's proof: nothing
+  more is answered on that socket, whatever its later authentication.
+  The route also checks its own identity (account, genesis, host and
+  `host_channel_key`) at each challenge and each re-authentication, and
+  one that moved retires it the same way. Either way the host reconnects
+  that link as §11.4 says, and the new socket answers under the new
+  identity. **Open (before activation):** a trust-generation-only change
+  (no new key) while Astation re-authenticates the link isn't caught yet,
+  on a local or a relay link: the identity rules forget the socket while
+  its Station link is down.
 
 With the hook off a local link ignores the challenge, as before (one
 runtime.log line per link).

@@ -426,21 +426,60 @@ fn a_reverify_on_a_live_local_link_retires_its_route_proof_and_reconnects() {
 }
 
 /// A local route that found another route identity on its socket itself
-/// (the device list's identity moved while the Station link was down, e.g.
-/// during a re-authentication) has the App reconnect that socket, as the
-/// bridge's own identity rules do.
+/// (here: bound to one `host_channel_key`, a challenge under another; the
+/// bridge's own identity rules saw no move, as when the device list's
+/// identity moves while the Station link is down during a
+/// re-authentication) has the App reconnect that socket, as the bridge's
+/// rules do.
 #[test]
 fn a_local_route_retired_by_another_identity_reconnects_its_socket() {
+    use crate::session_protocol::membership::r9log::{TestLog, secret};
+    use crate::session_protocol::r9::route::{self, RouteIdentity, RouteState};
     local_test(async |root| {
         let mut rig = LocalRig::new(root).await;
         let start = host_now().wall_ms;
         let os = ManualOs::at(start);
         rv_covered(&mut rig, root, &os, start);
         rv_link(&mut rig, 7, 41);
+        let mut log = TestLog::genesis("acct-rv", &secret("rv astation"));
+        log.add_host("host-rv", 1, &secret("rv host 1"));
+        let state = |log: &TestLog, seed: &str| RouteState::Ready {
+            id: RouteIdentity {
+                account_id: "acct-rv".into(),
+                genesis_hash: log.log.genesis_hash(),
+                host_id: "host-rv".into(),
+                head: log.log.head(),
+                chain: std::sync::Arc::new(log.log.entries().iter().map(|e| e.hash()).collect()),
+            },
+            key: std::sync::Arc::new(crate::session_protocol::r9::HostKey::new(&secret(seed))),
+        };
         let handle = rig.app.host_route.clone();
-        rig.app.astation_client.local_route_for_test(handle, "room");
-        rig.app.astation_client.retire_local_route();
+        // Bound at its authentication to the first key, then a challenge
+        // under a re-verify's new key.
+        route::set(&handle, state(&log, "rv host 1"));
+        rig.app
+            .astation_client
+            .local_route_for_test(handle.clone(), "room");
+        log.add_host("host-rv", 2, &secret("rv host 2"));
+        route::set(&handle, state(&log, "rv host 2"));
+        let challenge = atem_client::host_route::HostChallenge::new("room")
+            .to_json()
+            .to_string();
+        assert_eq!(
+            rig.app.astation_client.local_route_message(&challenge),
+            None
+        );
+        assert!(
+            rig.app.astation_client.local_route_retired(),
+            "found itself"
+        );
+        assert_eq!(rig.app.identity_reconnect, None);
         passes(&mut rig, 1);
+        assert_eq!(
+            rig.bridge.station.as_ref().unwrap().feed.moved_socket(),
+            None,
+            "the bridge's rules saw no move"
+        );
         assert_eq!(
             rig.app.identity_reconnect.map(|(_, socket)| socket),
             Some(41)

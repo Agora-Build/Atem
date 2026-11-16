@@ -143,14 +143,17 @@ impl App {
     /// A `host_challenge` or a verdict the Station sent through Astation's
     /// local link (`host.delegated` on; design I.5.8, "Which host is
     /// calling"): answered or checked by the link's route, in order with
-    /// Astation's messages, only while Astation has authenticated the link.
-    /// A verdict changes nothing here: an ok is the Station's association
-    /// for the link's calls (the link stays Astation's, never routed); a
-    /// refusal keeps the link, which is owner-present Astation's (the
-    /// route's runtime.log line says so), and the Station refuses the
-    /// link's calls as it does today, so its gate stays closed.
+    /// Astation's messages, only while Astation has authenticated the link
+    /// (otherwise ignored, with the route's runtime.log line). A verdict is
+    /// informational on the host: it changes nothing but that line. An ok
+    /// is the Station's association for the link's calls (the link stays
+    /// Astation's, never routed); a refusal keeps the link, which is
+    /// owner-present Astation's, and the Station refuses the link's calls
+    /// as it does today, so its gate stays closed.
     pub(super) fn local_route_message(&mut self, text: &str) {
         if !self.astation_connected || self.astation_reauth.is_some() {
+            // Not authenticated now: ignored, with the route's line.
+            self.astation_client.local_route_ignored(text);
             return;
         }
         let _ = self.astation_client.local_route_message(text);

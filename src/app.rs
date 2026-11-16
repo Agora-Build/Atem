@@ -1058,7 +1058,10 @@ mod tests {
     fn the_runtimes_local_link_answers_the_stations_challenge_only_with_the_hook() {
         use crate::session_protocol::membership::r9log::{TestLog, secret};
         use crate::session_protocol::r9::route::{self, RouteIdentity, RouteState};
-        use atem_client::host_route::{HostChallenge, verify_host_route_message};
+        use atem_client::host_route::{
+            HostChallenge, HostRouteRefusal, RouteKind, verify_host_route_message,
+            verify_host_route_message_as,
+        };
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message as WsMessage;
         const ASTATION: &str = "astation-local-route";
@@ -1163,7 +1166,19 @@ mod tests {
             let (routes, challenge) = routes;
             if hook {
                 assert_eq!(routes.len(), 1, "{routes:?}");
-                let route = verify_host_route_message(
+                assert_eq!(
+                    verify_host_route_message(
+                        &log.log,
+                        routes[0].as_bytes(),
+                        &challenge.nonce,
+                        ASTATION,
+                        ATEM_ID,
+                    ),
+                    Err(HostRouteRefusal::Malformed("type")),
+                    "a proxy proof: never a relay route"
+                );
+                let route = verify_host_route_message_as(
+                    RouteKind::Proxy,
                     &log.log,
                     routes[0].as_bytes(),
                     &challenge.nonce,

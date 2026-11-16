@@ -853,6 +853,16 @@ impl AstationClient {
         route.on_reply(text)
     }
 
+    /// A `host_challenge` or a verdict the Station sent through Astation's
+    /// local link before (or while) Astation authenticated it: ignored by
+    /// the link's route with a runtime.log line within its bound, never
+    /// answered.
+    pub(crate) fn local_route_ignored(&mut self, text: &str) {
+        if let Some(route) = self.local_route.as_mut() {
+            route.ignore(text);
+        }
+    }
+
     /// The host's identity changed on this socket (host-work-v1 §11.4): its
     /// local route answers nothing more.
     pub(crate) fn retire_local_route(&mut self) {
@@ -1157,6 +1167,12 @@ impl AstationClient {
             .await
             .ok_or_else(|| anyhow!("Connection closed before auth_required"))?;
         self.authenticate_after_challenge(auth_required, false).await
+    }
+
+    /// The runtime.log lines the local route wrote on this socket.
+    #[cfg(test)]
+    pub(crate) fn local_route_lines_for_test(&self) -> u32 {
+        self.local_route.as_ref().map_or(0, crate::session_protocol::r9::route::LinkRoute::lines)
     }
 
     /// Pretend this socket is a local link Astation authenticated, with a
@@ -2170,6 +2186,12 @@ impl AstationClient {
     /// `save` allows).
     async fn wait_for_auth_response(&mut self, astation_id: &str, save: GrantSave) -> Result<Option<AuthResponse>> {
         while let Some(msg) = self.recv_message_async().await {
+            // A Station's message through Astation's proxy before Astation
+            // accepted this link: ignored, with a line (design I.5.8).
+            if let AstationMessage::LocalRoute(text) = &msg {
+                self.local_route_ignored(text);
+                continue;
+            }
             // §R9.7b: the relay's verdict on this link's proof (its reader
             // checked it) counts after `auth_required` too: recorded, and an
             // `ok` ends the wait when it hands the authentication over.
@@ -2211,6 +2233,12 @@ impl AstationClient {
         while let Some(msg) = self.recv_message_async().await {
             if predicate(&msg) {
                 return Some(msg);
+            }
+            // Only the authentication waits use this: a Station's message
+            // through Astation's proxy before Astation accepted the link is
+            // ignored, with a line (design I.5.8).
+            if let AstationMessage::LocalRoute(text) = &msg {
+                self.local_route_ignored(text);
             }
         }
         None
@@ -3279,9 +3307,15 @@ mod tests {
     }
 
     fn auth_required_text(astation_id: &str, challenge: &str) -> String {
+        auth_required_over(astation_id, challenge, "lan")
+    }
+
+    /// Astation's `auth_required` over `transport` (`loopback`: answered
+    /// with the local bootstrap proof, which any Astation id may ask for).
+    fn auth_required_over(astation_id: &str, challenge: &str, transport: &str) -> String {
         serde_json::json!({"type": "statusUpdate", "data": {"status": "auth_required",
             "data": {"astation_id": astation_id, "challenge": challenge,
-                     "transport": "lan", "protocol": "2"}}})
+                     "transport": transport, "protocol": "2"}}})
         .to_string()
     }
 
@@ -3369,7 +3403,8 @@ mod tests {
         use crate::session_protocol::membership::r9log::{TestLog, secret};
         use crate::session_protocol::r9::route::{self, RouteResult};
         use atem_client::host_route::{
-            HostChallenge, HostRouteRefusal, RelayReply, verify_host_route_message,
+            HostChallenge, HostRouteRefusal, RelayReply, RouteKind, verify_host_route_message,
+            verify_host_route_message_as,
         };
         let mut log = TestLog::genesis("acct-1", &secret("ws astation"));
         log.add_host("host-1", 1, &secret("ws host"));
@@ -3410,11 +3445,29 @@ mod tests {
         ])
         .await;
         client.connect_without_pairing(&url).await.unwrap();
+        // The challenge before Astation's `auth_required`, taken by the
+        // connect path's wait: ignored with a runtime.log line.
+        assert_eq!(client.local_route_lines_for_test(), 1, "the early one logged");
         let (verdicts, _) = play_app(&mut client, &server).await;
         let routes = server.await.unwrap();
         assert_eq!(routes.len(), 2, "{routes:?}");
         for (route, challenge) in routes.iter().zip([&first, &fresh]) {
-            let verified = verify_host_route_message(
+            // A proxy proof: the relay's verifier refuses it, so whoever
+            // holds the host's local link can't route a relay connection as
+            // this host with it (the H-P review's finding 1).
+            assert_eq!(
+                verify_host_route_message(
+                    &log.log,
+                    route.as_bytes(),
+                    &challenge.nonce,
+                    "mac-local",
+                    "hosta-0000000-1a2b3c4d",
+                ),
+                Err(HostRouteRefusal::Malformed("type")),
+                "never a relay route"
+            );
+            let verified = verify_host_route_message_as(
+                RouteKind::Proxy,
                 &log.log,
                 route.as_bytes(),
                 &challenge.nonce,
@@ -3458,6 +3511,42 @@ mod tests {
                 .any(|m| matches!(m, AstationMessage::LocalRoute(_) | AstationMessage::Relay(_))),
             "never passed on"
         );
+    }
+
+    /// The local route answers only for the paired Astation (the room it is
+    /// made for): a local link that another Astation authenticated (here
+    /// over the loopback bootstrap proof, which names any Astation id, so
+    /// the link authenticates fine) gives no proof for the pairing's room.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_local_link_another_astation_authenticated_gives_no_proof() {
+        use crate::session_protocol::membership::r9log::{TestLog, secret};
+        use crate::session_protocol::r9::route;
+        let mut log = TestLog::genesis("acct-1", &secret("ws astation"));
+        log.add_host("host-1", 1, &secret("ws host"));
+        let handle = route::new_handle();
+        route::set(&handle, route_ready(&log, "ws host"));
+        let state = tempfile::tempdir().unwrap();
+        let _profile = crate::test_profile::use_dir(state.path());
+        let mut client = local_client(state.path()).with_local_host_route(handle, "mac-local");
+        with_bootstrap_token(state.path(), &mut client);
+        let challenge = || {
+            atem_client::host_route::HostChallenge::new("mac-local")
+                .to_json()
+                .to_string()
+        };
+        let (url, server) = proxying_astation(vec![
+            Step::Send(auth_required_over("mac-other", &"a".repeat(64), "loopback")),
+            Step::Auth,
+            Step::Send(authenticated_text()),
+            Step::Send(challenge()),
+            Step::Send(challenge()),
+        ])
+        .await;
+        client.connect_without_pairing(&url).await.unwrap();
+        assert_eq!(client.connected_astation_id(), Some("mac-other"), "authenticated");
+        play_app(&mut client, &server).await;
+        assert_eq!(server.await.unwrap(), Vec::<String>::new(), "no proof");
     }
 
     /// host-work-v1 §11.4 "An identity change" on a local link: once the

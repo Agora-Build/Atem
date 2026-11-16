@@ -34,6 +34,13 @@ impl App {
         if self.astation_reauth.is_none() {
             return false;
         }
+        // A Station's message through Astation's proxy while Astation
+        // authenticates the local link again: ignored, with the route's
+        // runtime.log line (design I.5.8).
+        if let AstationMessage::LocalRoute(text) = message {
+            self.astation_client.local_route_ignored(text);
+            return true;
+        }
         // A routed link (§R9.7b) is authenticated with the connect path's
         // semantics; meanwhile its r9 traffic goes on (not consumed here).
         if self.astation_routed {
@@ -996,14 +1003,28 @@ mod tests {
     async fn a_local_link_answers_the_stations_challenge_per_authentication_and_keeps_a_refusal() {
         use crate::session_protocol::membership::r9log::{TestLog, secret};
         use atem_client::host_route::{
-            HostChallenge, HostRouteRefusal, RelayReply, verify_host_route_message,
+            HostChallenge, HostRouteRefusal, RelayReply, RouteKind, verify_host_route_message,
+            verify_host_route_message_as,
         };
         let mut log = TestLog::genesis("acct-1", &secret("reauth astation"));
         log.add_host("host-1", 1, &secret("reauth host"));
         let (mut app, mut peer) = connected_app_with(Some(route_ready(&log))).await;
         let link = app.astation_link_gen;
+        // A proxy proof, which the relay's verifier refuses.
         let verified = |route: &str, challenge: &HostChallenge| {
-            verify_host_route_message(
+            assert_eq!(
+                verify_host_route_message(
+                    &log.log,
+                    route.as_bytes(),
+                    &challenge.nonce,
+                    ASTATION,
+                    ATEM_ID,
+                ),
+                Err(HostRouteRefusal::Malformed("type")),
+                "never a relay route"
+            );
+            verify_host_route_message_as(
+                RouteKind::Proxy,
                 &log.log,
                 route.as_bytes(),
                 &challenge.nonce,
@@ -1026,12 +1047,18 @@ mod tests {
             .send(auth_required(ASTATION, &"c".repeat(64)))
             .unwrap();
         next_auth(&mut app, &mut peer).await;
+        let lines = app.astation_client.local_route_lines_for_test();
         peer.raw
             .send(HostChallenge::new(ASTATION).to_json().to_string())
             .unwrap();
         assert!(
             routes(&pump(&mut app, &mut peer).await).is_empty(),
             "re-authenticating"
+        );
+        assert_eq!(
+            app.astation_client.local_route_lines_for_test(),
+            lines + 1,
+            "ignored with a runtime.log line"
         );
         peer.send
             .send(status("authenticated", &[("method", "session_proof")]))
