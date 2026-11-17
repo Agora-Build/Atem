@@ -542,7 +542,7 @@ impl HostBridge {
             // A host notice: the account's `message` op (II.2.3).
             Destination::Host => {
                 if shared_ops(list, &me, sender).contains(&ProjectOp::Message) {
-                    Delivery::Stored
+                    Delivery::Stored {}
                 } else {
                     forbidden()
                 }
@@ -551,7 +551,7 @@ impl HostBridge {
                 route_id,
                 route_revision,
             } => match at(route_id, *route_revision) {
-                Some(route) if permits(route, HostOp::Notice) => Delivery::Stored,
+                Some(route) if permits(route, HostOp::Notice) => Delivery::Stored {},
                 _ => forbidden(),
             },
             Destination::Agent {

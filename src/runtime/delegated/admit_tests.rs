@@ -456,7 +456,7 @@ fn select_resolves_to_no_match_or_forbidden() {
                 code: "forbidden".into()
             }
         );
-        assert_eq!(receipts[1].delivery, Delivery::Stored);
+        assert_eq!(receipts[1].delivery, Delivery::Stored {});
         for m in [&none, &not_consented, &narrowed] {
             assert!(ad_tasks(&rig, m).is_empty());
         }
@@ -1139,7 +1139,7 @@ fn a_status_committed_before_a_crash_is_put_after_it() {
         mb_heads(&mut rig, MB_MAILBOX, 0);
         let put = sp_out(&mut rig);
         assert_eq!(put.len(), 1);
-        assert_eq!(put[0].object.to_json().to_string().into_bytes(), committed);
+        assert_eq!(put[0].object().to_json().to_string().into_bytes(), committed);
         sp_stored(&mut rig, &put[0]);
         assert_eq!(ad_statuses(&rig)[0].0, "done");
     });
