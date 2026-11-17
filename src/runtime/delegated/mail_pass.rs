@@ -403,7 +403,11 @@ impl HostBridge {
         let Some((store, _)) = self.mail_store() else {
             return;
         };
-        if let Err(error) = mailbox_store::prune(store, now_ms) {
+        // Admission's early stops past their expiry too: their request can
+        // no longer come (review M1: here, never under an anchor).
+        let pruned = mailbox_store::prune(store, now_ms)
+            .and_then(|_| crate::runtime::delegated::admit::prune_stops(&store.db, now_ms));
+        if let Err(error) = pruned {
             log_limited(&UNPRUNED, || {
                 format!("atem runtime: host senders' mailbox records not pruned ({error:#})")
             });

@@ -920,12 +920,14 @@ fn a_stop_before_its_request_is_kept_and_applied_at_admission() {
                 .unwrap()
                 .is_empty()
         );
-        // Past its expiry on `D`: dropped, the request's task queues.
+        // Past its expiry on `D`: dropped by the minute prune, the
+        // request's task queues.
         let late = ad_message(&rig, vec![agent(&rig)]);
         ad_inbox_stop(&rig, &late.recipients[0].recipient_id, false, now + 60_000);
         ad_admit(&mut rig);
         sp_d(&rig, now + 60_000);
-        ad_admit(&mut rig);
+        rig.bridge.work.mail_pruned_at = None;
+        mb_tick(&mut rig, &mut host, 1_000);
         assert!(
             admit::stops(&rig.bridge.work.store.as_ref().unwrap().db)
                 .unwrap()
@@ -1174,5 +1176,66 @@ fn without_host_senders_nothing_is_admitted() {
             )
             .unwrap();
         assert!(!made);
+    });
+}
+
+/// The delegated clock takes an unsynchronized forward step (two minutes
+/// past its last reading): a forward jump's anchor is pending (or, with
+/// `synced`, the OS syncs at that reading and the anchor goes).
+fn ad_anchor(rig: &mut LocalRig, os: &ManualOs, synced: bool) {
+    let tick = |rig: &mut LocalRig| {
+        let work = &mut rig.bridge.work;
+        work.clock
+            .as_mut()
+            .unwrap()
+            .tick(work.store.as_ref().unwrap());
+    };
+    tick(rig);
+    {
+        let mut r = os.0.lock().unwrap();
+        if synced {
+            r.synced = crate::runtime::host_clock::os::Synced::Yes;
+        } else {
+            r.synced = crate::runtime::host_clock::os::Synced::No;
+            r.wall_ms += 120_000;
+        }
+    }
+    tick(rig);
+    assert_eq!(rig.bridge.work.clock.as_ref().unwrap().anchored(), !synced);
+}
+
+/// Review M1: early stops are pruned only by the mailbox's minute prune,
+/// never while a forward jump's anchor is pending (`D` may still come back
+/// down, and the stop's request still come): admission keeps a stop past
+/// its expiry on `D` meanwhile, and one arriving then is kept too, not
+/// dropped as expired. Once the anchor goes, the minute prune drops both.
+#[test]
+fn early_stops_are_never_pruned_under_a_clock_anchor() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        let now = host_now().wall_ms;
+        let db = |rig: &LocalRig| admit::stops(&rig.bridge.work.store.as_ref().unwrap().db);
+        ad_inbox_stop(&rig, &uuid::Uuid::new_v4().to_string(), false, now + 60_000);
+        ad_admit(&mut rig);
+        assert_eq!(db(&rig).unwrap().len(), 1);
+        // `D` past the stop's expiry under an anchor: nothing pruned, and a
+        // stop arriving past its expiry is kept.
+        ad_anchor(&mut rig, &os, false);
+        sp_d(&rig, now + 3 * 60_000);
+        ad_inbox_stop(&rig, &uuid::Uuid::new_v4().to_string(), false, now + 60_000);
+        ad_admit(&mut rig);
+        rig.bridge.work.mail_pruned_at = None;
+        mb_tick(&mut rig, &mut host, 1_000);
+        assert_eq!(db(&rig).unwrap().len(), 2, "held under the anchor");
+        assert_eq!(ad_inbox_rows(&rig), 0);
+        // The anchor gone: the minute prune drops them.
+        ad_anchor(&mut rig, &os, true);
+        ad_admit(&mut rig);
+        assert_eq!(db(&rig).unwrap().len(), 2, "admission prunes nothing");
+        rig.bridge.work.mail_pruned_at = None;
+        mb_tick(&mut rig, &mut host, 1_000);
+        assert!(db(&rig).unwrap().is_empty());
     });
 }

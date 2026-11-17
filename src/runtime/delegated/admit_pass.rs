@@ -65,6 +65,9 @@ struct Signing {
     me: HostRef,
     account: String,
     now_d: u64,
+    /// A forward jump's anchor is pending: `D` may still come back down,
+    /// so nothing is judged expired on it (review M1).
+    anchored: bool,
 }
 
 impl Signing {
@@ -195,6 +198,11 @@ impl HostBridge {
             },
             account: host.account_id,
             now_d,
+            anchored: self
+                .work
+                .clock
+                .as_ref()
+                .is_some_and(crate::runtime::host_clock::HostClock::anchored),
         })
     }
 
@@ -233,7 +241,6 @@ impl HostBridge {
         let Some(store) = self.outbox_store() else {
             return Ok(false);
         };
-        admit::prune_stops(&store.db, signing.now_d)?;
         // II.4.4: an authenticated object refused at check 5 or 6 is
         // reported to its sender, `invalid_request`, its mark cleared in
         // the transaction that enqueues the status.
@@ -810,7 +817,7 @@ impl HostBridge {
         let list = &signing.list;
         let sends = may_send(list, sender, row.signed_seq);
         let Some(mut task) = store.work(task_id)? else {
-            if !sends || row.expires_at <= signing.now_d {
+            if !sends || row.expires_at <= signing.now_d && !signing.anchored {
                 return Ok(true);
             }
             let kind = if result.is_some() {
