@@ -31,7 +31,7 @@ cargo test --test host_work_binary -- --test-threads=1 # Opt-in remote launch + 
 cargo test --test collab_binary          # Local agent collaboration: real runtime/workers, fake agent children, temp profiles
 cargo test --test delegated_binary -- --test-threads=1 # Delegated host work behind the debug hooks (VII.A 1, 2, 5-7, 9, 11-15, 17, 19-21): offline senders, expiry, v1 senders, local tasks, pause and resume, a revoke (or removal, narrowing, route change) at dispatch and while `accepted` (never both), SIGKILL at each crash point, the unresolved limits, launches at the spawn boundary, a record against a live attempt, a freeze at the start, a LAN native, the clock set back, a deferred entry from the host's own fetch, the owner's `atem task list --unknown`/`atem task resolve` (refused inside an agent session; hook off too), a turn interrupted at its deadline and `work_interrupt` over the sender's channel (both also while hosting is paused); a fake Station (tests/support/station.rs)
 cargo test --test host_mail_binary      # Host senders' mailbox on the receiving host behind the debug hooks (`host.delegated,host.senders`), against the fake Station's mailbox: read to the head (inbox, refusal and results rows), each done only after its commit, SIGKILL between commit and done, resets (a new and the same `mailbox_id`), lost and late answers, waiting objects and the pending overflow, the gate's mailbox part (a results flood leaves it open), an identity change on the live link, relay/local/routed links, hook off; admission (VII.B 23, 28, 30, 31, 35, 37): a host sender's request run on the fake agent with its statuses back in the sending host's mailbox, a cancel waiting while the host is down, SIGKILL after an admission's commit, a readmit refusing what was signed before it, a revoke carried by a native, a resend admitted once, `per_workflow`
-cargo test --test host_senders_binary -- --test-threads=1 # Two real hosts as host senders behind the debug hooks: A and B, each a runtime on its own profile (a pinned list giving each an encryption key and a shared project) with a fake agent and a fake Station of its own, one Station between them (`Courier`): A's message run on B and its reply delivered to A's agent as data, `atem message complete` from the delivered result's last line, `atem message cancel` of a task queued on B, a launch on message on B, a lost `mailbox_stored` on either side, SIGKILL of B after an admission's commit, a revoke of A on B's list, B's `per_workflow` across hosts, hook off
+cargo test --test host_senders_binary -- --test-threads=1 # Two real hosts as host senders behind the debug hooks: A and B, each a runtime on its own profile (a pinned list giving each an encryption key and a shared project) with a fake agent and a fake Station of its own, one Station between them (`Courier`): A's message run on B and its reply delivered to A's agent as data, `atem message complete` from the delivered result's last line (and one held while B's turn still runs), `atem message cancel` of a task queued on B, a launch on message on B, a lost `mailbox_stored` on either side, SIGKILL of B after an admission's commit, a revoke of A on B's list, B's `per_workflow` across hosts, hook off
 cargo test --test control_feed_binary -- --test-threads=1 # The host's Station calls behind the debug hooks (VII.A 3, 4, 10, 16, 18): its own device-list fetch and the control-feed sync against a fake Station on local, relay and routed links: the gate, resets and restores, correlation, refusals, Station faults, the 256 KiB drop, the records' effects and acknowledgments (the reference ledger counts each effect once), revokes with and without interrupt, a revoke while offline, kills during the sync, a relay switch, a Station clock a year ahead, services refused while the control state is unchecked, a hold's session-v1 fence (release, crash and reload), hook off (~3 min serially)
 ATEM_REAL_AGENTS=1 cargo test --test approvals_real_agents -- --ignored --nocapture --test-threads=1 # Approvals with the REAL claude/codex CLIs (real API calls; export only the needed variables, e.g. OSS_API_KEY / ANTHROPIC_AUTH_TOKEN, never a whole credentials file; each agent gets only its own; Codex runs --profile oss)
 cargo test -p atem-core -p atem-core-ffi # Token library + C ABI tests (workspace members)
@@ -92,7 +92,7 @@ src/
 │   ├── host_work_bridge.rs # host launch/query and directed-work scheduling over normal receipts; config/authority rechecks (a changed authority or route approval fails the task), no takeover, explicit results
 │   ├── host_clock/      #   the delegated lifecycle's clock (host-work-v1 §11.6): os.rs (boot-time counter, boot id, machine, time namespace, sync report), state.rs (sans-I/O `wall_hw`, floor, anchor, mark, guards), mod.rs (`HostClock`: the store's `clock` row, `atem status` line, `ATEM_TEST_HOST_CLOCK` readings in debug builds); *_tests.rs
 │   │                    #   built only with `host.delegated` on or delegated tasks in the store (otherwise inert: no row, line or status); real-OS checks: `scripts/clock-real-os.py`, `.github/workflows/clock-real-os.yml`
-│   ├── delegated/       #   delegated host work (design Part I; host-work-v1 §11.1, §11.4, §11.6; step 4), behind the debug-only hook (`ATEM_TEST_HOST_FEATURES`, read once by a debug build's runtime from its own environment; release builds compile it out: no feature advertised, no Station call):
+│   ├── delegated/       #   delegated host work (design Part I, step 4, and Atem's side of Part II, host senders; host-work-v1 §11.1, §11.4 to §11.6), behind the debug-only hook (`ATEM_TEST_HOST_FEATURES`, read once by a debug build's runtime from its own environment; release builds compile it out: no feature advertised, no Station call):
 │   │   ├── mod.rs       #     who is delegated (`classify`: a native member, a service a feed covers), the admission record (`Admission`), the `host.delegated`/`host.alerts` ops while their feature is off (`request`: `busy`, as before the hook)
 │   │   ├── alerts.rs    #     owner alerts (I.4.6, §11.3): one per unresolved delegated `outcome_unknown`, raised and ended with the task's state in `save_work`'s transaction (`alerts`, `alert_seq`), its reason the receipt's (`agent exited`, `outcome could not be established`, `write interrupted`; a delegated unknown outcome keeps it as its `detail` while a reply publishes or is refused, `apply_reply`), `alert_page` by `seq`, the 32-on-host note, `over_capacity` (64 per sender, 256 per host), `alert_changes` for the push hints (`HintWatch`, in memory: the alerts raised in this run of the store and the hinted ones that ended; read only after a raise or an end)
 │   │   ├── attempts.rs  #     attempts (I.6.4): a fresh id committed before each submit, one live, at most 8 counted, `attempt_end` maps every session-host answer to an end
@@ -131,7 +131,7 @@ src/
 │   │   ├── recovery.rs  #     (`impl HostBridge`) the start's recovery in I.6.2's order (identity, session journal, intents, reconcile by attempt per I.6.3, routes, deadlines on a fresh `D`, gates closed); `RecoveryStep` is its log
 │   │   ├── owner.rs     #     (`impl HostBridge`) the owner's own commands (§11.6 "On the host", open question 2; the server lets only the owner's terminal run them, a correctness guard on the same-user socket, not a security boundary): `atem task list --unknown` (the unresolved alerts: task, session, sender, reason, when) and `atem task resolve` (`resolve` with `resolved.by` `local`, any delegated `outcome_unknown`, a revoked sender's too, whether or not the hook is on; `done` captures one Memory/vault snapshot as `message reply` does and the runtime publishes it off the pass, resolving nothing if its client went away (a runtime.log line); a resolved task asked again publishes nothing), `atem status`'s `Delegated:` count (only while `host.delegated` is on, a delegated task is open or one is unresolved)
 │   │   ├── resolve.rs   #     `work_resolve` (I.4.6, §11.2): an unresolved delegated `outcome_unknown` becomes `failed` (its detail byte for byte) or `completed`, with `resolved{by, at}`, its alert ended, in one `BEGIN IMMEDIATE` transaction; the same resolution again returns the recorded status, another is `request_id_reused`. Unresolved, such a task never expires: at its deadline it stops holding its session (`deadline passed; outcome unknown`, `WorkRecord::deadline_passed`, no `work_waits` row), no reply moves it any more (a delegated task's reply deadline is compared on `D`: `expired`), and it drops its payloads a day later, alert kept; `resolved` reaches the wire only with `host.delegated` on
-│   │   └── *_tests.rs   #     (test-only) the start check; the feed store, the sync (heads, resets, pacing, correlation, refusals) and the acknowledgments' book; the dispatch, the lifecycle, the recovery, the alerts (and their push hints), the resolutions and the owner's commands, the interrupt intents, `work_interrupt`, launches, the records' effects (a revoke's fence lost to a crash included), a hold's session-v1 fence (hold_fence_tests.rs), a re-verify on the live link (reverify_tests.rs), host senders' tasks and the device list's entries, crash replay and native interrupts about host senders (host_effects_tests.rs) and the feed pass in the bridge (in-process workers, the delegated clock on a manual OS)
+│   │   └── *_tests.rs   #     (test-only) the start check; the feed store, the sync (heads, resets, pacing, correlation, refusals) and the acknowledgments' book; the dispatch, the lifecycle, the recovery, the alerts (and their push hints), the resolutions and the owner's commands, the interrupt intents, `work_interrupt`, launches, the records' effects (a revoke's fence lost to a crash included), a hold's session-v1 fence (hold_fence_tests.rs), a re-verify on the live link (reverify_tests.rs), host senders' tasks and the device list's entries, crash replay and native interrupts about host senders (host_effects_tests.rs), host senders' mailbox (mailbox_tests.rs, mailbox_store_tests.rs, mail_pass_tests.rs), admission (admit_tests.rs), launches on message (host_launch_tests.rs), sends and puts (send_plan_tests.rs, send_pass_tests.rs, remote_send_tests.rs, outbox_tests.rs, puts_tests.rs), the results back (results_tests.rs) and stops across hosts (remote_stops_tests.rs), and the feed pass in the bridge (in-process workers, the delegated clock on a manual OS)
 │   ├── collab.rs        #   local selectors, fixed resolutions, durable outbox/message counters/scoped status; collab_results.rs stores narrow return grants and one reply per task (`reply_query` reads it)
 │   ├── collab_context.rs #  publish/read-back exact Memory/Vault snapshots before delivery (background jobs with durable retries)
 │   ├── collab_bridge.rs #   internal attachment, sending/replying/completing, workflow inheritance, pauses, correlated results, return grants that end early (the task goes on; the reply is kept, not delivered) and automatic status reports
@@ -262,7 +262,7 @@ tests/                   # binary tests on temp HOME/XDG_RUNTIME_DIR (never the 
 ├── delegated_binary.rs   # delegated host work in the real runtime behind the debug hooks (VII.A 1, 2, 5, 6, 7, 9, 11 to 15, 17, 19, 20, 21; the owner's `atem task` commands, `work_interrupt` over a channel; with `host.senders`, the host encryption key made at start and handed to a manager): `ATEM_TEST_HOST_FEATURES`, the host clock, broker faults (`hold_host_work` lets the start check act first; the crash points and `hold_crash` for test 7), the state dump, the device-list carriage hook and a fake Station (its control feed, `cover`, `hold`, `release` and `revoke` records, synced by the host: the gates open as with a real Station)
 ├── control_feed_binary.rs # the host's Station calls in the real runtime behind the debug hooks (VII.A 3, 4, 10, 16, 18): its own device-list fetch and the control-feed sync against the fake Station on local, relay and routed links, the gate, resets, a restore from backup and a rollback across a crash, correlation (same-cursor retries, re-authentication mid-read, a routed upgrade, mismatched echoes, late refusals), refusals, the relay bound, the records' effects and acknowledgments (the reference ledger), services `busy` while unchecked and `revoked` across restarts, a hold's session-v1 fence (its live channel, a new `hello`, queued and direct input, the release, a crash before the fence), revokes with and without interrupt (routed, offline, killed during the sync), a relay switch, the host's route proof through Astation's local proxy to a fake Station that requires it (`FakeStation::require_proof`: a proxy-kind proof verified with the shared verifier, which the relay's verifier refuses, then the feed read and the gate open; a re-verify retires it and the new socket proves itself again; a refused proof keeps the link), hook off
 ├── host_mail_binary.rs   # host senders' mailbox on the receiving host in the real runtime behind the debug hooks (host-work-v1 §11.5): read to the head on relay, local and routed links (an opened request, a forged object and one sealed to another key refused, a result kept), each `mailbox_done` checked against the store when it reaches the Station, a SIGKILL at `crash_after_mailbox_commit` (the owed done sent once after the restart), resets with a new and the same `mailbox_id` (done only what is read again), lost done answers and a late page, a waiting object of a newer sender generation and the pending overflow, the gate's mailbox part (a results flood leaves it open, a request left on the Station closes it), an identity change on the live link (no done under the new identity), hook off (`heads.mailbox` refused, no table; release builds too); the fake mailbox's put rules (the runtime's own puts stored too); admission (admission and the results back held, `hold_admission` and `hold_results`, in the mailbox's own tests): a host sender's request through the mailbox run on the fake agent with its statuses back in the sending host's mailbox and its `complete`, a `cancel` put while the host is down applied before its task starts, a SIGKILL at `crash_after_admission_commit` (nothing applied twice, the status put once), a request opened before a revoke and a readmit refused at admission, a `host_sender_revoke` the Station withholds carried by the Mac's channel, a resend admitted once and a bad time reported, `per_workflow`; the results back: a reply sent back to its host sender as a result the sending host's check takes (a lost `mailbox_stored`, put again, stored once), and as the sending host a reply from the other host delivered as data and shown by `atem message status`, or kept as data from a host revoked meanwhile
-├── host_senders_binary.rs # two real hosts as host senders behind the debug hooks (design Part II; host-work-v1 §11.5): A and B, each a runtime on its own profile with a fake agent and its own fake Station, one Station between them (`Courier`): a message run on B, its reply delivered to A as data and `atem message status` at each step, `atem message complete` from the delivered result's last line (the reply named), `atem message cancel` of a task queued on B, a launch on message on B, a lost `mailbox_stored` on either side, SIGKILL of B after an admission's commit with its done owed, a revoke of A on B's list (unstarted tasks cancelled, later envelopes refused), B's `per_workflow` across hosts, hook off on both (release builds too)
+├── host_senders_binary.rs # two real hosts as host senders behind the debug hooks (design Part II; host-work-v1 §11.5): A and B, each a runtime on its own profile with a fake agent and its own fake Station, one Station between them (`Courier`): a message run on B, its reply delivered to A as data and `atem message status` at each step, `atem message complete` from the delivered result's last line (the reply named; one made while B's turn still runs held until B's task awaits its result), `atem message cancel` of a task queued on B, a launch on message on B, a lost `mailbox_stored` on either side, SIGKILL of B after an admission's commit with its done owed, a revoke of A on B's list (unstarted tasks cancelled, later envelopes refused), B's `per_workflow` across hosts, hook off on both (release builds too)
 ├── station_route_binary.rs # the selected Station (station-route-v1) in the real runtime, and the fake Station's own tests (the shared builders only, pages within the bounds, other accounts, resets with snapshots)
 ├── runtime_binary.rs, worker_binary.rs, agent_launch_binary.rs, terminal_ui_binary.rs, astation_op_binary.rs, cred_agent_binary.rs, runtime_build_binary.rs
 └── support/             # Sandbox: temp profile, `atem` in a PTY, cleanup of what it started; astation.rs: fake Astation peer + verified pairing profile; r9.rs/r9log.rs: a pinned, signed test device list and r9 clients; station.rs: a fake Station (heads, feeds, the device-list fetch, typed refusals, the reference ack ledger, and when told a route proof required on each link, checked with the shared verifier of the proxy kind; host senders' mailboxes: puts with rule 1 and 3's checks, idempotency and quotas (per sender, mailbox and account, on the bytes as received), pages with `through`, dones, resets, lost answers; `Courier`: two fakes as one Station for two real hosts) speaking only the shared builders; sender.rs: a sending host that seals envelopes and results with the shared core (valid, forged, for another recipient, of a newer generation) and puts them through the fake Station; host_clock.rs: the debug host clock a test moves; delegated.rs: what `delegated_binary` and `control_feed_binary` share (an encrypted r9 client of the host, `Dev`; tasks and how the host's store holds them; the fake agent's turns; the hosting `runtime.toml`)
@@ -285,12 +285,12 @@ designs/                      # Design only: current design and planned work (RE
 ├── README.md                 # Index: current design, planned work
 ├── protocol/                 # README.md (the protocols and how atem-session evolved, where the fixtures run), atem-session-v1.md (the wire contract, r9 appendix), atem-client-bindings.md (r9 binding/effect contract), atem-host-work-v1.md (remote launch, directed work, messages, attachments/mark), station-route-v1.md (the selected Station), fixtures/ (shared with Astation)
 ├── agent-runtime.md          # `atem runtime` broker + `atem worker`s: sessions, leases, receipts, the local protocol, operations through the runtime
-├── agent-collaboration.md    # local collaboration (stage 1); stages 2-3 point to delegated-host-work.md
-├── delegated-host-work.md    # Agreed 2026-11-08: delegated host work and host-to-host senders (stages 2-3 of collaboration). Built: its prompt framing (III.2, with stage 1) and step 4, Part I's host side, behind the debug-only hook `ATEM_TEST_HOST_FEATURES` and advertised by no release build; the rest planned; delegated-host-work-flows.html is its diagram
+├── agent-collaboration.md    # local collaboration (stage 1); its cross-instance parts (host senders, built behind the debug-only hook) point to delegated-host-work.md
+├── delegated-host-work.md    # Agreed 2026-11-08 (amended 2026-11-15): delegated host work (Part I) and host senders (Part II; stage 2 isn't used between Atem hosts). Built: its prompt framing (III.2, with stage 1), and behind the debug-only hook `ATEM_TEST_HOST_FEATURES` (advertised by no release build) step 4, Part I's host side, and Atem's side of Part II; activation and Astation's side planned; VII.B maps the joint tests onto Atem's; delegated-host-work-flows.html is its diagram
 ├── shared-terminal.md        # Shared terminal (terminal-v1): canonical-screen frames, credit, keys, limits
 ├── agent-chat-host.md        # Agent chat (chat-v1): adapters, Claude hooks + transcript, Codex, approvals, status
 ├── agent-chat-api.md         # Developer guide for chat clients
-├── agent-hosting.md          # Remote launch (runtime.toml profiles/routes), messages, notices, directed work, Chisel/mark; planned: OS service, durable Station delivery
+├── agent-hosting.md          # Remote launch (runtime.toml profiles/routes), messages, notices, directed work, Chisel/mark; §14: a dev host for delegated work and host senders; planned: OS service, durable Station delivery
 ├── astation-connection.md    # How Atem reaches Astation: local then relay, authentication, token-free pairing, relay only, routed links, Stations
 ├── account-trust.md          # r9 account trust: the signed device list, recovery, the Recovery Kit
 ├── e2e-encryption.md         # E2E encryption: memory, skills, vault (atem side built) + credentials (`atem cred get`, planned)
@@ -344,8 +344,9 @@ Native members can store notices without execution consent; scoped services
 need non-control `message`. Agent deliveries still need the route's
 notify/prompt consent. Envelope, recipient decisions and queued tasks commit
 together. Progress stays on the original message/task receipt; there is no
-`runtime inbox` command. Not implemented: a Station durable outbox, offline
-origin proofs and direct Atem host senders.
+`runtime inbox` command. Not implemented: a Station durable outbox and
+offline origin proofs for channel senders; Atem host senders are built only
+behind the debug-only hook ("Host senders" below).
 
 **Delegated host work** (step 4 of `designs/delegated-host-work.md`, Part I;
 wire host-work-v1 §11 and session-v1 R9.14; `runtime/delegated/`,
@@ -405,113 +406,60 @@ while Astation authenticates the link again, 2026-11-16, #120 comment
 6929176743). `atem status` adds `Clock:`,
 `Control feeds:` and `Delegated:` lines. A dev host for the joint check
 turns it on as `designs/agent-hosting.md` §14 says (a debug build, the hook
-in the `env.sh` that runs `atem runtime` directly). Host senders (stage 3)
-start behind the same hook: `host.senders` (ignored without
-`host.delegated`) is listed in the welcome with hosting on. With it the
-host has its host encryption key (design II.4.1,
-`session_protocol/r9/host_enc.rs`): `pairing/host_enc_key`, X25519, one per
-trust generation, made with the device list's pin (`atem pair`, `atem pair
-verify`) and at a start on a pinned host that has none, and the record of
-the key ids it made (`pairing/host_enc_generated`, durable before a key is
-handed out, rebuilt from the key held when lost). `host_enc_key_get`
-(session-v1 R9.14 item 8) answers a native member holding `manage` at the
-head (checked at each request, as the host policy is; anyone else
-`forbidden`) with `host_enc_key{re, host_id, host_trust_gen, enc_key,
-enc_sig}`: the key held for the welcome's generation and `enc_sig` by
-`host_channel_key` (the shared core's `sign_host_enc_key`), its id written
-to the record first; no key, or a record write that fails, is `busy`
-`host encryption key unavailable`, nothing handed out, and nothing is made
-for a request. `host_enc::recipient` is the receiver's view of this host
-for host senders' mail (its pairing's id and generation, never the device
-list's). And the receiving host knows what a host sender
-(`host:<host_id>`, another Atem host of the account) may do
-(`runtime/delegated/host_senders.rs`): it is delegated while it is a
-current host of the device list, authorized as a sender, never v1; a
-route's `principals` take `project:<name>` (the hosts of that signed
-project, this host among them) and `host:<host_id>` (without the hook, and
-in release builds, the file doesn't load, with the message every principal
-the file doesn't know gets); both locks are needed (the route's consent and a project's ops: a
-task `message`, `notify` and `prompt`, a launch on message also `launch`, a
-notice `message`); the start check refuses its task once its sender is
-revoked, removed, or added again since (`cancelled`, `sender revoked`; a
-newer key changes nothing, a readmit admits only work after it) or no
-longer covered (`failed`, `sender's authorization narrowed`). The device
-list's `host_sender_revoke`, `remove_host` and project entries reach its
-unstarted tasks (and a revoke's `interrupt_running` its started ones) in
-one transaction with host-work's applied device-list `seq`, so a crash
-between an entry and its effects is replayed at the next pass or start; and
-`control_records` serves a native manager's later `interrupt_running` about
-a host principal (only its tasks admitted before that revoke; its result
-goes on the channel only, never acknowledged to the Station unless the
-Station's feed delivers it too, which adopts a copy still `pending`; served while
-hosting is paused, as `work_interrupt` is, from a channel welcomed with
-`host.senders`). Project
-entries are judged once per catch-up against the committed head (Atem's
-reading, host-work-v1 §11.6). The receiving host's mailbox client is built
-behind the hook (`runtime/delegated/mailbox.rs`, `mailbox_store.rs`,
-`mail_pass.rs`; host-work-v1 §11.5, "On the receiving host"): `heads.mailbox`,
-the sync over the Station link, each object decided and committed with the
-cursor and its owed done before the done goes, resets, and host senders'
-gate's mailbox part (open once the head is read and the inbox drained).
-Admission of what the mailbox opened is built behind the hook too
-(`runtime/delegated/admit.rs`, `admit_pass.rs`; host-work-v1 §11.5, "On the
-receiving host"): while hosting runs, gate open or not, each inbox row is
-decided in one transaction with the status owed to its sender, which the
-put engine puts until stored (a row that keeps failing is settled `busy`
-after 8 tries, never holding the gate for good): a request deduplicated
-against the message records (never deleted) and recorded refusals (a
-resend gets its status or refusal again), one already expired refused
-`busy`, its sender's standing checked again, each recipient for this host judged with the
-sender's permit (a `select` expanded once over the agents of consenting
-routes into tasks named by their selector task id, `resolved`, `no_match`
-or `refused{forbidden}`), the limits (`busy`), its tasks delegated as the
-host sender's; a sender's `cancel` and `complete` of its own current task
-(a cancel withdraws an attempt waiting `accepted`; one not reached is
-answered `busy` or `forbidden` by its own id; one opened before its
-request kept as an early stop, a 33rd waiting in the inbox holding only
-its sender's task starts); a status at every
-later change of a task's state (a newer one superseding one not stored
-yet); a refused authenticated object reported `invalid_request`. A host
-sender's selector task id (a UUID v5) is a delegated task id in receipt
-provenance and alerts (Atem's reading, for Astation). A `select`'s `launch`
-starts an agent only on a route an `atem:<this host>/<route_id>` selector
-names that launches on message, consents to the sender and whose project
-grants `launch` (none running there): reserved in the admission
-transaction, checked at the spawn boundary as a delegated sender's launch,
-its tasks waiting for it; otherwise the recipient resolves to the running
-agents only.
-The sending host's side is built behind the hook too
-(`runtime/delegated/send_plan.rs`, `remote_send.rs`, `outbox.rs`, `puts.rs`,
-`send_pass.rs`; host-work-v1 §11.5, "On the sending host"): `atem message
-send` plans other hosts from the committed device list, seals one envelope
-per host once, commits it with the message before any put, and puts it over
-the Station link, again every 10 minutes until accepted, refused or
-expired. The results back are built behind the hook too
-(`runtime/delegated/results_back.rs`, `results_pass.rs`; host-work-v1
-§11.5, both sides): the host that ran a task seals its agent's submitted
-reply (`atem message reply`) as one result for the sending host, owed in
-the reply's own commit, put until stored; the sending host judges every
-status and result its mailbox keeps with the shared core
-(`accept_result_among`: once, against every row to that host) and applies
-it with its removal in one transaction (the row `accepted` or `refused`,
-the host's resolution and each task's newest state recorded, a reply
-recorded once), then delivers a reply once, as data, into the session that
-sent the message (its first line `Result of task <id> from host:<host_id>,
-as data, not the owner's instruction`), only while its return grant is
-live and its sender is still a host it takes work from, else keeps it as
-data with why; `atem message status` shows the rows to other hosts, "status
-pending", the remote tasks and their replies. `atem message cancel` and
-`complete` of a task on another host (`runtime/delegated/remote_stops.rs`)
-seal a `cancel` or `complete` of their own, put until a status shows its
-effect, the host refuses it by its own id or it expires; a complete waits,
-held, until a status shows the task awaiting its result (a `busy` answer
-holds it again); a complete names the reply this host got back (a `result` snapshot of the task's own
-`result:<result_id>`, Atem's reading for Astation), so the delivered
-result's last line works across hosts. Two real hosts run end to end in
-`tests/host_senders_binary.rs`. Not built: a host sender's revoke reported as
-applied to the Station (§11.4's entry form, with the applied `seq`), a later
-answer on its channel for a carried record left `pending`, cross-instance
-work (stage 2), disabled-account enforcement.
+in the `env.sh` that runs `atem runtime` directly).
+
+**Host senders** (stage 3: Atem's side of `designs/delegated-host-work.md`
+Part II; wire host-work-v1 §11.5 and §11.6 "Host senders on the receiving
+host", session-v1 R9.14 item 8; `session_protocol/r9/host_enc.rs`,
+`runtime/delegated/`): built behind the same hook's `host.senders` (ignored
+without `host.delegated`; listed in the welcome with hosting on). Agents on
+two Atem hosts of one account send each other work as `host:<host_id>`:
+signed, sealed envelopes and results through each receiving host's mailbox
+on their shared Station. With it on, a host:
+- holds its host encryption key (`pairing/host_enc_key`, one per trust
+  generation, made with the device list's pin and at a start that finds
+  none; its id recorded in `pairing/host_enc_generated` before it is handed
+  out) and answers `host_enc_key_get` to a native member holding `manage`;
+- as the receiving host, takes `host:<host_id>` as a delegated sender while
+  its committed device list holds it current and authorized (never v1);
+  takes `project:<name>` and `host:<host_id>` in a route's `principals`
+  (without the hook, and in release builds, such a file doesn't load); needs
+  both locks (the route's consent and a signed project's ops) at admission
+  and in the start check; applies the device list's `host_sender_revoke`,
+  `remove_host` and project entries to its tasks with host-work's applied
+  device-list `seq` (replayed after a crash) and serves a native's later
+  `interrupt_running` about a host principal (`control_records`); syncs its
+  own mailbox over the Station link (`heads.mailbox`; each page committed
+  with the cursor and its owed dones before a done goes; resets;
+  back-pressure that leaves what doesn't fit on the Station), host senders'
+  gate gaining the mailbox part; admits what the mailbox opened (requests,
+  a `select` expanded into selector tasks and its `launch` starting an
+  agent, `cancel` and `complete`); and sends a status at every change of a
+  task's state and one result per task's submitted reply;
+- as the sending host, plans `atem message send`'s other hosts from its
+  committed device list (`project:` fan-out, `atem:<atem_id>[/<route_id>]`;
+  a host without a current key or a covering project refused by name or
+  skipped with why), seals one envelope per host and commits it with the
+  message before any put, then puts it until accepted, refused or expired;
+  judges every status and result with the shared core and delivers a reply
+  once, as data, into the session that sent (only while its return grant is
+  live and the other host is still one it takes work from); `atem message
+  status` shows the rows to other hosts; `atem message cancel` and
+  `complete` of a task on another host seal a stop of their own (a complete
+  held until that host's status shows the task awaiting its result, naming
+  the reply it sent back).
+
+Two real hosts run end to end in `tests/host_senders_binary.rs`, one real
+receiving host in `tests/host_mail_binary.rs`; a dev host sets it up as
+`designs/agent-hosting.md` §14 says ("Host senders on a dev host"). The
+readings still waiting for Astation are listed in host-work-v1 §11.5
+("Readings waiting for Astation"). Not built: a Station's side of the
+mailbox and the native app's part (Astation's; the five device-list actions
+are signed only behind the signing gate); the host encryption key in the
+verification ceremony (draft PR #176, held); a host sender's revoke reported
+to the Station as applied, and a later answer on its channel for a carried
+record left `pending`; the directory; disabled-account enforcement. Station
+integrations aren't used between Atem hosts (owner decision 2026-11-15).
 
 **Local agent collaboration** (stage 1, released in v0.8.5; `designs/agent-collaboration.md`):
 `atem agent tag add|remove|list` and `atem message send|reply` identify the
@@ -639,9 +587,9 @@ messages) and `directory [SELECTOR]` inspect the local runtime. `host.select`,
 local `result` snapshots, the `local` sender and the local-only
 `from_session`/`reply_to` are never admitted from remote channels.
 Cross-instance delivery is built only behind the debug-only hook, as host
-senders (see "Delegated host work" above: sends, admission, statuses and
-results back, the remote rows in `message status`; `designs/delegated-host-work.md`
-Part II).
+senders (see "Host senders" above: sends, admission, statuses and results
+back, the remote rows in `message status`, `cancel` and `complete` across
+hosts; `designs/delegated-host-work.md` Part II).
 
 **TUI State Machine** (`app.rs`): bare `atem` is a menu and a client of `atem runtime`; it opens no Astation connection (the runtime owns the machine's one link). Enum-based mode switching via `AppMode`:
 - `MainMenu` - Navigation between features
