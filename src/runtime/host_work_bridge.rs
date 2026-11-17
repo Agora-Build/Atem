@@ -1768,6 +1768,7 @@ impl HostBridge {
                 let mut record = WorkRecord {
                     delegated: None,
                     deadline_passed: false,
+                    cancel_id: None,
                     attachment_owner: attachment_owner(&a),
                     principal,
                     control_gen: self.host.control_gen(&a.name()),
@@ -2137,6 +2138,7 @@ impl HostBridge {
                 let mut record = WorkRecord {
                     delegated: None,
                     deadline_passed: false,
+                    cancel_id: None,
                     attachment_owner: attachment_owner(a),
                     principal: a.name(),
                     control_gen: self.host.control_gen(&a.name()),
@@ -3573,6 +3575,7 @@ principals = ["local"]
         let record = WorkRecord {
             delegated: None,
             deadline_passed: false,
+            cancel_id: None,
             principal: principal.into(),
             attachment_owner: String::new(),
             control_gen,
@@ -4103,6 +4106,7 @@ principals = ["local"]
             let record = WorkRecord {
                 delegated: None,
                 deadline_passed: false,
+                cancel_id: None,
                 principal: "member:owner".into(),
                 attachment_owner: String::new(),
                 control_gen: 0,
@@ -5810,6 +5814,7 @@ launch = "on_message"
             let record = WorkRecord {
                 delegated: None,
                 deadline_passed: false,
+                cancel_id: None,
                 principal: "local".into(),
                 attachment_owner: Sender::Local.owner(),
                 control_gen,
@@ -6575,6 +6580,7 @@ launch = "on_message"
                     .enqueue(&WorkRecord {
                         delegated: None,
                         deadline_passed: false,
+                        cancel_id: None,
                         principal: "browser:b".into(),
                         attachment_owner: String::new(),
                         control_gen: 2,

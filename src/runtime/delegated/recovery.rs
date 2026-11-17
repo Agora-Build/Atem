@@ -239,7 +239,8 @@ impl HostBridge {
 
     /// Where an unstarted task stands at the reconciliation: the event
     /// that settles it now (a revoked or removed sender, a frozen, held or
-    /// faulted list, a narrowed grant), else `queued` (its waits are the
+    /// faulted list, a narrowed grant, its host sender's cancel), else
+    /// `queued` (its waits are the
     /// dispatch's; a route change and the deadline are later steps). With
     /// `host.delegated` off: `blocked`, `host.delegated is off`.
     fn unstarted_state(&self, r: &WorkRecord) -> (WorkState, &'static str) {
@@ -250,7 +251,11 @@ impl HostBridge {
             StartTask::of(r).and_then(|task| may_start(&self.start_view(), &task, None).err());
         match event {
             Some(
-                e @ (Event::AuthorityChanged | Event::Removed | Event::Revoked | Event::Narrowed),
+                e @ (Event::AuthorityChanged
+                | Event::Removed
+                | Event::Revoked
+                | Event::Narrowed
+                | Event::Cancelled),
             ) => e.outcome(),
             _ => (WorkState::Queued, WAITING_FOR_A_READY_AGENT),
         }

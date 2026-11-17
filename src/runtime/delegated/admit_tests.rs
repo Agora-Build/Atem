@@ -1493,6 +1493,149 @@ fn a_cancel_withdraws_an_attempt_waiting_accepted() {
     });
 }
 
+/// Review N1: a cancel that reached a task whose attempt waits `accepted`
+/// is durable. The runtime killed after the admission's commit, before
+/// the withdrawal (its followup gone with the process), the start's
+/// recovery withdraws the attempt and the task ends `cancelled`, `cancelled
+/// before submission`: it never runs.
+#[test]
+fn a_cancel_survives_a_crash_before_its_withdrawal() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut host = sp_host(&mut rig, root, &os);
+        ad_deliver(&mut rig, &mut host, &[]);
+        host_running(&mut rig, &host.s, "AD_N1_RUNNING", start).await;
+        let accepted = host_task(&mut rig, &host.s, "AD_N1_CRASH", start + HOUR);
+        blocked(&mut rig, &accepted, BEHIND).await;
+        attempt_behind_the_turn(&mut rig, &accepted, "AD_N1_CRASH");
+        hold_host_work(&mut rig);
+        // The withdrawal waits (as before a recovery), and goes with the
+        // process.
+        rig.bridge.work.recovered = false;
+        ad_inbox_stop(&rig, &accepted, false, start + HOUR);
+        ad_admit(&mut rig);
+        assert_eq!(ad_inbox_rows(&rig), 0, "the cancel committed");
+        assert_eq!(settled(&rig, &accepted).0, WorkState::Submitting);
+        let steps = restart(&mut rig, root, &os, false, true);
+        let cancelled = (
+            WorkState::Cancelled,
+            "cancelled before submission".to_string(),
+        );
+        assert_eq!(reconciled(&steps, &accepted), Some(cancelled.clone()));
+        assert_eq!(settled(&rig, &accepted), cancelled);
+        ticks(&mut rig, 3);
+        assert!(!input(&rig).contains("AD_N1_CRASH"));
+    });
+}
+
+/// Review N1: the withdrawal lost in the run (a receipt-database fault
+/// drops it), the start check still refuses the cancelled attempt when the
+/// turn before it ends: it is withdrawn at its start, never written, and
+/// the task settles `cancelled` from that.
+#[test]
+fn a_cancel_whose_withdrawal_is_lost_is_refused_at_the_start() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut host = sp_host(&mut rig, root, &os);
+        ad_deliver(&mut rig, &mut host, &[]);
+        host_running(&mut rig, &host.s, "AD_N1_TURN", start).await;
+        let accepted = host_task(&mut rig, &host.s, "AD_N1_LOST", start + HOUR);
+        blocked(&mut rig, &accepted, BEHIND).await;
+        let attempt = attempt_behind_the_turn(&mut rig, &accepted, "AD_N1_LOST");
+        hold_host_work(&mut rig);
+        rig.bridge.work.recovered = false;
+        ad_inbox_stop(&rig, &accepted, false, start + HOUR);
+        ad_admit(&mut rig);
+        rig.bridge.work.followups.clear();
+        rig.bridge.work.recovered = true;
+        // The turn before it ends: the session host would start it now.
+        std::fs::write(rig.fake.join("complete"), "").unwrap();
+        rig.until(|r| {
+            input(r).contains("AD_N1_LOST")
+                || r.bridge
+                    .host
+                    .attempt_receipt(&attempt, &accepted)
+                    .is_some_and(|rc| rc.state != wire::ReceiptState::Accepted)
+        })
+        .await;
+        assert!(!input(&rig).contains("AD_N1_LOST"), "never written");
+        // Refused for its cancel, before anything else the check reads.
+        assert_eq!(
+            rig.bridge.start_view().refused(&attempt),
+            Some(Event::Cancelled)
+        );
+        let receipt = rig
+            .bridge
+            .host
+            .attempt_receipt(&attempt, &accepted)
+            .unwrap();
+        assert_eq!(
+            (receipt.state, receipt.detail.as_deref()),
+            (
+                wire::ReceiptState::Rejected,
+                Some(details::WITHDRAWN_BY_THE_HOST)
+            )
+        );
+        rig.bridge.work.scheduled = Instant::now();
+        rig.until(|r| settled(r, &accepted).0 == WorkState::Cancelled)
+            .await;
+        assert_eq!(
+            settled(&rig, &accepted),
+            (WorkState::Cancelled, "cancelled before submission".into())
+        );
+    });
+}
+
+/// Reviews N1 and N3: a cancel whose attempt is found started (it reached
+/// `executing` before its withdrawal) isn't reached: the task runs, and the
+/// sender gets `busy` by the cancel's own id, once.
+#[test]
+fn a_cancel_whose_attempt_started_is_answered_busy() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut host = sp_host(&mut rig, root, &os);
+        ad_deliver(&mut rig, &mut host, &[]);
+        host_running(&mut rig, &host.s, "AD_N1_FIRST", start).await;
+        let accepted = host_task(&mut rig, &host.s, "AD_N1_STARTED", start + HOUR);
+        blocked(&mut rig, &accepted, BEHIND).await;
+        attempt_behind_the_turn(&mut rig, &accepted, "AD_N1_STARTED");
+        hold_host_work(&mut rig);
+        // The cancel recorded while the start check had already let the
+        // attempt go (the record's mark only, as a start racing it).
+        let cancel = uuid::Uuid::new_v4().to_string();
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        let mut record = store.work(&accepted).unwrap().unwrap();
+        record.cancel_id = Some(cancel.clone());
+        store.save_work(&record).unwrap();
+        // Host senders' gate open for the start (this rig's passes keep no
+        // Station link).
+        rig.bridge.start_view().gates.set_mailbox(true);
+        std::fs::write(rig.fake.join("complete"), "").unwrap();
+        rig.until(|r| input(r).contains("AD_N1_STARTED")).await;
+        rig.bridge.work.scheduled = Instant::now();
+        rig.until(|r| settled(r, &accepted).0 == WorkState::Submitted)
+            .await;
+        let busy = ResultPlain::Refusal {
+            object_id: cancel.clone(),
+            refused: "busy".into(),
+        };
+        rig.until(|r| ad_statuses(r).iter().any(|(_, s)| *s == busy))
+            .await;
+        ticks(&mut rig, 3);
+        assert_eq!(
+            ad_statuses(&rig).iter().filter(|(_, s)| *s == busy).count(),
+            1
+        );
+        assert_eq!(stored_record(&rig, &accepted).cancel_id, None);
+    });
+}
+
 /// Ruling R45: the sender's resend of an admitted request, read while the
 /// mailbox's claim holds (a duplicate there, never reaching admission),
 /// marks the message's status owed again, so a status the Station lost

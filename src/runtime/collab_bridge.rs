@@ -626,6 +626,7 @@ impl HostBridge {
             store.enqueue(&WorkRecord {
                 delegated: None,
                 deadline_passed: false,
+                cancel_id: None,
                 principal: "local".into(),
                 attachment_owner: Sender::Local.owner(),
                 control_gen: grant.origin.control_gen,
@@ -1629,6 +1630,7 @@ impl HostBridge {
             let record = WorkRecord {
                 delegated: None,
                 deadline_passed: false,
+                cancel_id: None,
                 principal: "local".into(),
                 attachment_owner: Sender::Local.owner(),
                 control_gen: self.host.control_gen("local"),

@@ -637,6 +637,16 @@ pub struct WorkRecord {
     /// whose record is as before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deadline_passed: bool,
+    /// A host sender's `cancel` that reached the task while its attempt
+    /// waited `accepted` (design II.8; review N1): the cancel's object id,
+    /// written in the admission's transaction. The start check refuses the
+    /// task (`Event::Cancelled`), so the attempt's withdrawal, whoever makes
+    /// it (the admission's followup, the dispatch, the start's recovery),
+    /// settles it `cancelled`; an attempt found started instead runs, and
+    /// the cancel is answered `busy` by this id, the mark cleared. None on
+    /// every other task, whose record is as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_id: Option<String>,
 }
 
 /// What a message's task renders around its text: the message's id and
@@ -2657,6 +2667,7 @@ mod tests {
         WorkRecord {
             delegated: None,
             deadline_passed: false,
+            cancel_id: None,
             principal: "member:phone".into(),
             attachment_owner: String::new(),
             control_gen: 1,

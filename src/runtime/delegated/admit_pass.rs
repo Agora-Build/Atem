@@ -288,7 +288,19 @@ impl HostBridge {
             self.publish_mail_gate();
         }
         // A cancel's withdrawal of an attempt waiting `accepted` (ruling
-        // R46), after the commit that decided it, as a revoke's.
+        // R46), after the commit that decided it, as a revoke's; the start
+        // check refuses the attempt from now on (review N1: the record's
+        // mark covers a restart).
+        for followup in &followups {
+            if let Followup::Withdraw {
+                attempt_id,
+                then: Event::Cancelled,
+                ..
+            } = followup
+            {
+                self.start_view().cancel(attempt_id);
+            }
+        }
         if !followups.is_empty() {
             self.work.followups.extend(followups);
             self.effects_pass(cx);
@@ -905,6 +917,7 @@ impl HostBridge {
             }),
             delegated: Some(admission),
             deadline_passed: false,
+            cancel_id: None,
         })
     }
 
@@ -1000,8 +1013,14 @@ impl HostBridge {
                     // Ruling R46: an attempt that hasn't started (waiting
                     // `accepted`, or never admitted) is withdrawn after the
                     // commit, as a revoke withdraws it; the task settles
-                    // `cancelled` from that.
+                    // `cancelled` from that. Review N1: the cancel is
+                    // durable first, on the task in this transaction, so
+                    // the start check refuses it and whoever withdraws the
+                    // attempt (the followup, the dispatch, the start's
+                    // recovery) settles it `cancelled`.
                     Some(attempt) if !self.attempt_started(&attempt.attempt_id, task_id) => {
+                        task.cancel_id = Some(row.object_id.clone());
+                        store.save_work(&task)?;
                         followups.push(Followup::Withdraw {
                             task_id: task_id.to_owned(),
                             attempt_id: attempt.attempt_id,
@@ -1047,6 +1066,25 @@ impl HostBridge {
 }
 
 impl HostBridge {
+    /// Host sender `principal`'s cancel `cancel_id` of a task whose attempt
+    /// was found started (reviews N1, N3): answered `busy` by its own id
+    /// (ruling R48), enqueued in `tx`. None while this host can't sign, or
+    /// for another principal's.
+    pub(super) fn cancel_unreached(
+        &self,
+        tx: &Transaction,
+        principal: &str,
+        cancel_id: &str,
+    ) -> anyhow::Result<()> {
+        let Some(sender) = parse_host_principal(principal) else {
+            return Ok(());
+        };
+        let Some(signing) = self.signing() else {
+            return Ok(());
+        };
+        signing.refusal(tx, sender, cancel_id, "busy")
+    }
+
     /// Whether attempt `attempt_id` of `task_id` started: its receipt
     /// `executing` or past it (design I.6.4).
     fn attempt_started(&self, attempt_id: &str, task_id: &str) -> bool {
