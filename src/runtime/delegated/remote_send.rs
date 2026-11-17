@@ -96,12 +96,11 @@ pub fn prepare(store: &Store) -> Result<()> {
     Ok(())
 }
 
-/// A send's part for other hosts, fixed at the send: whether a selector
-/// can reach this host's agents too, and the host-sender Message's
-/// `select` recipients (one per planned host).
+/// A send's part for other hosts, fixed at the send: the host-sender
+/// Message's `select` recipients (one per planned host), and the hosts a
+/// fan-out skipped.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemotePart {
-    pub local: bool,
     pub recipients: Vec<Recipient>,
     /// The hosts a `project:` fan-out skipped, and why (ruling R40): rows
     /// of their own, never put.
@@ -114,7 +113,6 @@ impl RemotePart {
     /// recipient id per host.
     pub fn of(plan: &Plan, account: &str) -> RemotePart {
         RemotePart {
-            local: plan.local.is_some(),
             recipients: plan
                 .remote
                 .iter()

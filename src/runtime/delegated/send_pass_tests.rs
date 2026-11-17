@@ -81,8 +81,8 @@ fn sp_engine(rig: &LocalRig, message: &str) -> (i64, String, Vec<u8>) {
 }
 
 /// The stage-1 outbox row of `message`: its state, detail and the local
-/// message's `select` budget.
-fn sp_local(rig: &LocalRig, message: &str) -> (String, String, u32) {
+/// part's `select` budget (none: no local part).
+fn sp_record(rig: &LocalRig, message: &str) -> (String, String, Option<u32>) {
     let (state, detail, envelope): (String, String, String) = rig
         .bridge
         .work
@@ -97,10 +97,17 @@ fn sp_local(rig: &LocalRig, message: &str) -> (String, String, u32) {
         )
         .unwrap();
     let envelope: Message = serde_json::from_str(&envelope).unwrap();
-    let Destination::Select { budget, .. } = &envelope.recipients[0].destination else {
-        panic!("not a select");
-    };
-    (state, detail, *budget)
+    let budget = envelope.recipients.first().map(|r| match &r.destination {
+        Destination::Select { budget, .. } => *budget,
+        _ => panic!("not a select"),
+    });
+    (state, detail, budget)
+}
+
+/// [`sp_record`] of a message with a local part.
+fn sp_local(rig: &LocalRig, message: &str) -> (String, String, u32) {
+    let (state, detail, budget) = sp_record(rig, message);
+    (state, detail, budget.expect("a local part"))
 }
 
 /// A send of `to` that lives an hour.
@@ -158,11 +165,12 @@ fn a_send_to_another_host_commits_its_sealed_envelope_before_any_put() {
                 launch: false,
             }
         );
+        // No local part (ruling R42): the message's record only.
         assert_eq!(
-            sp_local(&rig, &id),
-            ("accepted".into(), "no local agent addressed".into(), 1)
+            sp_record(&rig, &id),
+            ("accepted".into(), "to other hosts only".into(), None)
         );
-        // Nothing was received here.
+        assert_eq!(rows(&rig, "messages"), 0, "nothing received here");
         let workflow = message.workflow_id;
         assert_eq!(counted(&rig, &format!("send:{workflow}")), 1);
         assert_eq!(counted(&rig, &format!("receive:{workflow}")), 0);
@@ -240,7 +248,10 @@ fn a_context_send_seals_its_frozen_context() {
             panic!("not a request");
         };
         assert_eq!(message.context, [frozen]);
-        assert_eq!(sp_local(&rig, &id).0, "accepted");
+        assert_eq!(
+            sp_record(&rig, &id),
+            ("accepted".into(), "to other hosts only".into(), None)
+        );
     });
 }
 
@@ -892,5 +903,48 @@ fn a_fan_out_skips_a_host_without_a_key_and_says_why() {
             ]
         );
         assert_eq!(sp_local(&rig, &id).2, 16);
+    });
+}
+
+/// A send to other hosts only counts once at the sender, as stage 1 counts
+/// a send (`per_hour`, `per_workflow`), and splits the 32 agents across
+/// those hosts only (ruling R42).
+#[test]
+fn a_send_to_other_hosts_only_counts_once_toward_the_limits() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let _host = sp_host(&mut rig, root, &os);
+        rig.bridge.work.config.collab.per_hour = 1;
+        let id = sp_send(&mut rig, &["atem:host-b"]).unwrap();
+        assert_eq!(sp_record(&rig, &id).2, None);
+        assert_eq!(
+            sp_send(&mut rig, &["atem:host-b"]).unwrap_err().to_string(),
+            "limit: 1 messages per hour"
+        );
+        assert_eq!(rows(&rig, "remote_deliveries"), 1);
+    });
+}
+
+/// A publication of a send to other hosts only, completing with
+/// `host.senders` off now, is refused whole: it has no other part.
+#[test]
+fn a_remote_only_publication_with_host_senders_off_is_refused() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let _host = sp_host(&mut rig, root, &os);
+        let id = sp_context_send(&mut rig, root, &["atem:host-b"]);
+        rig.bridge.features = HostFeatures::parse("host.delegated").unwrap();
+        sp_publish(&mut rig, &id).await;
+        rig.until(|r| sp_outbox(r, &id).0 != "publishing").await;
+        assert_eq!(
+            sp_outbox(&rig, &id),
+            ("refused".into(), "host senders are off on this host".into())
+        );
+        assert_eq!(
+            sp_rows(&rig, &id),
+            [("host-b".into(), "refused".into(), None)]
+        );
     });
 }

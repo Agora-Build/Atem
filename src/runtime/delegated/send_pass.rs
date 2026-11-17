@@ -72,7 +72,7 @@ impl HostBridge {
         atem_id: &str,
         to: &[String],
         launch: bool,
-    ) -> Result<Option<(u32, RemotePart)>> {
+    ) -> Result<Option<(Option<u32>, RemotePart)>> {
         if !self.senders_on() {
             return Ok(None);
         }
@@ -106,10 +106,69 @@ impl HostBridge {
                 "host senders' outbox unavailable (the control feeds aren't loaded); see `atem status`"
             );
         }
-        Ok(Some((
-            plan.local.unwrap_or(1),
-            RemotePart::of(&plan, &host.account_id),
-        )))
+        Ok(Some((plan.local, RemotePart::of(&plan, &host.account_id))))
+    }
+
+    /// Accepts a send to other hosts only (ruling R42; `message` has no
+    /// local part): its record, counted once at the sender as stage 1
+    /// counts a send, its origin, and its envelopes sealed and enqueued, in
+    /// one transaction. With `host.senders` off now it is refused whole
+    /// ([`SENDERS_OFF`]): it has no other part.
+    pub(super) fn remote_only_accept(
+        &mut self,
+        atem_id: &str,
+        message: &Message,
+        origin: &crate::runtime::collab::results::Origin,
+        part: Option<&RemotePart>,
+    ) -> Result<()> {
+        let (Some(part), Some(from)) = (part, message.from_session.as_deref()) else {
+            bail!("invalid message content");
+        };
+        if !self.senders_on() {
+            bail!(SENDERS_OFF);
+        }
+        if let Some(problem) = self.collab_content_problem(message) {
+            bail!("{problem}");
+        }
+        let store = self.work.store.as_ref().unwrap();
+        let tx = store.db.unchecked_transaction()?;
+        let (known, accepted): (bool, bool) = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM outbox WHERE message_id=?1),
+                EXISTS(SELECT 1 FROM outbox WHERE message_id=?1 AND state='accepted')",
+            [&message.message_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if accepted {
+            return Ok(());
+        }
+        if !known
+            && crate::runtime::host_work::open_records(&tx, "outbox")?
+                >= crate::runtime::host_work::MAX_RECORDS
+        {
+            bail!("outbox capacity reached");
+        }
+        crate::runtime::collab::count_send(
+            &tx,
+            &self.work.config.collab,
+            from,
+            &message.workflow_id,
+            message.created_at,
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO origins(message_id,record) VALUES(?1,?2)",
+            rusqlite::params![message.message_id, serde_json::to_string(origin)?],
+        )?;
+        self.remote_seal(&tx, atem_id, message, part)?;
+        crate::runtime::collab::persist(&tx, message, &[])?;
+        tx.commit()?;
+        // Debug builds: the runtime is killed here, the message and its
+        // envelopes committed, none put yet.
+        #[cfg(not(test))]
+        crate::runtime::test_hooks::crash_point(
+            "crash_after_outbox_commit",
+            "after a message's envelopes to other hosts were committed, before any put",
+        );
+        Ok(())
     }
 
     /// The envelopes of `message` (accepted, its context frozen) to `part`'s

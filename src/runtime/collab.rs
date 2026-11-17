@@ -548,14 +548,12 @@ pub(super) fn publication_state(
     Ok(())
 }
 
-/// The message's local part (`local`: a selector could reach this host's
-/// agents; a send to other hosts only has a nominal one, which matches
-/// nothing) accepted with its resolution.
+/// The message accepted with its local part's resolution; a send to other
+/// hosts only (host senders) has no local part (no recipient here).
 pub(super) fn persist(
     tx: &Transaction<'_>,
     message: &Message,
     resolution: &[ResolvedTask],
-    local: bool,
 ) -> Result<()> {
     tx.execute(
         "INSERT INTO outbox(message_id,envelope,state,detail,next_try_ms,created_ms)
@@ -564,8 +562,8 @@ pub(super) fn persist(
         params![
             message.message_id,
             serde_json::to_string(message)?,
-            if !local {
-                "no local agent addressed"
+            if message.recipients.is_empty() {
+                "to other hosts only"
             } else if resolution.is_empty() {
                 "no_match"
             } else {

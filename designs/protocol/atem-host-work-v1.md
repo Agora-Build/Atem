@@ -3604,9 +3604,11 @@ exactly as without this section):
   this host too. This host sends only while its own list shows it a current
   host at its trust generation, `authorized`. The local part keeps stage
   1's path with its share of the 32 agents (local first, then each host by
-  `host_id`, equal shares, the remainder one each to the first); a send to
-  other hosts only keeps stage 1's message record with a nominal local part
-  that addresses no agent and counts nothing as received.
+  `host_id`, equal shares, the remainder one each to the first). A send to
+  other hosts only has no local part: its 32 agents are split across those
+  hosts, and its record is stage 1's message record with no recipient here
+  ("to other hosts only"), counted once at the sender as stage 1 counts a
+  send (`per_hour`, `per_workflow`), nothing counted as received.
 - One delivery row per target host, `publishing` → `ready` → `sent` →
   `accepted` | `refused` | `expired`, committed with the message in the
   transaction that accepts it (stage 1's): the envelope sealed once to the

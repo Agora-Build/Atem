@@ -113,6 +113,7 @@ fn publication_refused(detail: &str) -> bool {
             | collab_context::VAULT_NEEDS_E2E
             | collab_context::VAULT_CREDENTIAL
     ) || collab::TASK_PROBLEMS.contains(&detail)
+        || detail == super::delegated_send_pass::SENDERS_OFF
         || detail.starts_with("ambiguous vault reference")
         || detail.starts_with("limit:")
 }
@@ -1275,7 +1276,7 @@ impl HostBridge {
 
     /// Why a task made from this message could never be dispatched. The
     /// target is a placeholder: only the content decides.
-    fn collab_content_problem(&self, message: &Message) -> Option<&'static str> {
+    pub(super) fn collab_content_problem(&self, message: &Message) -> Option<&'static str> {
         let host = self.work_host();
         let target = wire::Target {
             account_id: host.account_id.clone(),
@@ -1463,10 +1464,11 @@ impl HostBridge {
                 "use --launch with atem:<atem_id>/<route_id>; the route must allow launch = on_message"
             );
         }
-        // One budget of 32 across the local part and the other hosts'.
+        // One budget of 32 across the local part and the other hosts'; a
+        // send to other hosts only has no local part.
         let (budget, remote) = match remote {
             Some((budget, part)) => (budget, Some(part)),
-            None => (MAX_AGENTS, None),
+            None => (Some(MAX_AGENTS), None),
         };
         let origin = sessions
             .get(from)
@@ -1483,15 +1485,18 @@ impl HostBridge {
             from_session: Some(from.to_string()),
             created_at: now,
             expires_at: now.saturating_add(request.expires_ms),
-            recipients: vec![Recipient {
-                recipient_id: uuid::Uuid::new_v4().to_string(),
-                host: self.work_host(),
-                destination: Destination::Select {
-                    selectors: request.to.clone(),
-                    budget,
-                    launch: false,
-                },
-            }],
+            recipients: budget
+                .map(|budget| Recipient {
+                    recipient_id: uuid::Uuid::new_v4().to_string(),
+                    host: self.work_host(),
+                    destination: Destination::Select {
+                        selectors: request.to.clone(),
+                        budget,
+                        launch: false,
+                    },
+                })
+                .into_iter()
+                .collect(),
             text: request.text,
             context: vec![],
             mark: None,
@@ -1500,7 +1505,13 @@ impl HostBridge {
         if probe.text.trim().is_empty() && !specs.is_empty() {
             probe.text = "pending context".into();
         }
-        if !probe.valid_local() {
+        // Each part valid: the local one (if any) as stage 1's, the other
+        // hosts' as a host sender's Message.
+        let host_id = self.work_host().atem_device_id;
+        let remote_valid = remote.as_ref().is_none_or(|part| {
+            part.recipients.is_empty() || part.message(&probe, &host_id).valid_from_host(&host_id)
+        });
+        if !(probe.recipients.is_empty() || probe.valid_local()) || !remote_valid {
             bail!("invalid message content");
         }
         // What is known now (a memory's text) must already fit a task; a
@@ -1559,6 +1570,10 @@ impl HostBridge {
         // Replies are result rows (`collab_reply`), never messages.
         if message.kind != MessageKind::Request {
             bail!("invalid message content");
+        }
+        // A send to other hosts only: no local part.
+        if message.recipients.is_empty() {
+            return self.remote_only_accept(atem_id, message, origin, remote);
         }
         if let Some(old) = self
             .work
@@ -1662,15 +1677,12 @@ impl HostBridge {
                     &message.workflow_id,
                     message.created_at,
                 )?;
-                // A send to other hosts only receives nothing here.
-                if remote.is_none_or(|part| part.local) {
-                    collab::count_received(
-                        tx,
-                        &self.work.config.collab,
-                        &message.workflow_id,
-                        message.created_at,
-                    )?;
-                }
+                collab::count_received(
+                    tx,
+                    &self.work.config.collab,
+                    &message.workflow_id,
+                    message.created_at,
+                )?;
                 tx.execute(
                     "INSERT INTO origins(message_id,record) VALUES(?1,?2)",
                     rusqlite::params![message.message_id, serde_json::to_string(origin)?],
@@ -1699,7 +1711,7 @@ impl HostBridge {
                 if let Some(part) = remote {
                     self.remote_seal(tx, atem_id, message, part)?;
                 }
-                collab::persist(tx, message, resolved, remote.is_none_or(|p| p.local))
+                collab::persist(tx, message, resolved)
             })?;
         // Debug builds: the runtime is killed here, the message and its
         // envelopes committed, none put yet.
