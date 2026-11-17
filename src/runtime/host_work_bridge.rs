@@ -1299,7 +1299,7 @@ impl HostBridge {
         // Host senders' mail the mailbox committed (with `host.senders`):
         // every inbox row decided, gate open or not, before anything of
         // this pass is dispatched.
-        self.admit_mail(cx.sessions);
+        self.admit_mail(cx);
         if Instant::now() >= self.work.scheduled {
             self.work.scheduled = Instant::now() + Duration::from_millis(100);
             let inputs = self.work_inputs(cx.sessions);

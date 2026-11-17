@@ -3698,12 +3698,15 @@ exactly as without this section):
     message frame.
   - **`cancel` and `complete`** (design II.7). The sender's own task,
     admitted at its current generation and epoch, from a sender that may
-    send now: a cancel finds it `queued` or `blocked` and cancels it
-    (`cancelled before submission`); a complete finds it `awaiting_result`
-    with a project still covering a task and completes it with the
-    snapshot, as `work_complete` does. Otherwise it isn't reached (one
-    whose attempt waits `accepted` is `submitting`, so not reached either:
-    Atem's reading). Either way the message's current status goes, and one
+    send now: a cancel reaches it while it hasn't started (design II.8):
+    `queued` or `blocked` it is cancelled at once (`cancelled before
+    submission`), and one whose attempt waits `accepted` has the attempt
+    withdrawn after the commit, as a revoke withdraws it, the task settling
+    `cancelled` from that (or running on, when the withdrawal finds it
+    started); a complete finds it `awaiting_result` with a project still
+    covering a task and completes it with the snapshot, as `work_complete`
+    does. Otherwise it isn't reached. Either way the message's current
+    status goes, and one
     not reached is also answered by its own id (**Atem's reading, for
     Astation:** design II.8's "`busy` in the status", which a task's `work`
     receipt can't carry, so that the sending host stops resending it):

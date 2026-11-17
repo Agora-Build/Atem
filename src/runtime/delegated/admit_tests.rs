@@ -239,7 +239,10 @@ fn ad_snapshot() -> hw::ContextSnapshot {
 
 /// One admission pass.
 fn ad_admit(rig: &mut LocalRig) {
-    rig.bridge.admit_mail(&rig.sessions);
+    rig.bridge.admit_mail(&mut Cx {
+        client: &rig.app.astation_client,
+        sessions: &mut rig.sessions,
+    });
 }
 
 /// The inbox's rows now.
@@ -1389,5 +1392,54 @@ fn a_row_that_cant_be_decided_is_settled_after_bounded_tries() {
         mb_tick(&mut rig, &mut host, 0);
         assert_eq!(mb_store(&rig).inbox, 0, "the gate's inbox part drained");
         db(&rig, "DROP TRIGGER ad_block");
+    });
+}
+
+/// Ruling R46 (design II.8: a sender's cancel reaches every unstarted
+/// task): B's cancel of its task whose attempt waits `accepted` behind a
+/// running turn withdraws the attempt, as a revoke does, after the
+/// admission's commit; the task ends `cancelled`, `cancelled before
+/// submission`, and never runs. Its cancel of the running task isn't
+/// reached (`busy`).
+#[test]
+fn a_cancel_withdraws_an_attempt_waiting_accepted() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut host = sp_host(&mut rig, root, &os);
+        // The mailbox read to its head: host senders' gate opens.
+        ad_deliver(&mut rig, &mut host, &[]);
+        let running = host_running(&mut rig, &host.s, "AD_RUNNING", start).await;
+        let accepted = host_task(&mut rig, &host.s, "AD_ACCEPTED", start + HOUR);
+        blocked(&mut rig, &accepted, BEHIND).await;
+        let attempt = attempt_behind_the_turn(&mut rig, &accepted, "AD_ACCEPTED");
+        hold_host_work(&mut rig);
+        ad_inbox_stop(&rig, &accepted, false, start + HOUR);
+        let busy = ad_inbox_stop(&rig, &running, false, start + HOUR);
+        ad_admit(&mut rig);
+        assert_eq!(
+            settled(&rig, &accepted),
+            (WorkState::Cancelled, "cancelled before submission".into())
+        );
+        let receipt = rig
+            .bridge
+            .host
+            .attempt_receipt(&attempt, &accepted)
+            .unwrap();
+        assert_eq!(
+            (receipt.state, receipt.detail.as_deref()),
+            (
+                wire::ReceiptState::Rejected,
+                Some(details::WITHDRAWN_BY_THE_HOST)
+            )
+        );
+        assert_eq!(settled(&rig, &running).0, WorkState::Submitted);
+        assert!(ad_statuses(&rig).iter().any(|(_, s)| *s
+            == ResultPlain::Refusal {
+                object_id: busy.clone(),
+                refused: "busy".into()
+            }));
+        assert!(!input(&rig).contains("AD_ACCEPTED"));
     });
 }

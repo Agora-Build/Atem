@@ -52,6 +52,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// An unstarted task past its deadline: host-work v1's text (§4), the one
 /// delegated tasks keep (§11.6 adds none for it).
 pub const EXPIRED_BEFORE_SUBMISSION: &str = "expired before submission";
+/// A task its sender cancelled before it started (host-work-v1 §4,
+/// `work_cancel`; a host sender's `cancel`, design II.7).
+pub const CANCELLED_BEFORE_SUBMISSION: &str = "cancelled before submission";
 
 /// A task that waits for its (next) attempt: host-work v1's text (§4).
 pub const WAITING_FOR_A_READY_AGENT: &str = "waiting for a ready agent";
@@ -81,6 +84,9 @@ pub enum Event {
     Halted,
     /// The deadline passed on the delegated clock.
     Expired,
+    /// A host sender's own `cancel` (design II.7, II.8): an unstarted task
+    /// cancelled, a live attempt withdrawn first.
+    Cancelled,
 }
 
 impl Event {
@@ -97,6 +103,7 @@ impl Event {
             Event::ScopePending => (WorkState::Blocked, details::WAITING_FOR_UNLOCK),
             Event::Halted => (WorkState::Blocked, details::JOURNAL_HALTED),
             Event::Expired => (WorkState::Expired, EXPIRED_BEFORE_SUBMISSION),
+            Event::Cancelled => (WorkState::Cancelled, CANCELLED_BEFORE_SUBMISSION),
         }
     }
 

@@ -30,10 +30,13 @@
 //!   gets none: the record keeps the state for the owner.
 use super::*;
 use crate::runtime::delegated::admit::{self, InboxRow};
+use crate::runtime::delegated::attempts::{AttemptEnd, SessionAnswer, attempt_end};
+use crate::runtime::delegated::effects::Followup;
 use crate::runtime::delegated::host_senders::{
     HostOp, HostSender, host_sender_permits, host_standing, host_task_covered,
 };
 use crate::runtime::delegated::outbox::{self, Policy};
+use crate::runtime::delegated::start::{CANCELLED_BEFORE_SUBMISSION, Event};
 use crate::runtime::host_work::MessageRecord;
 use crate::session_protocol::r9::HostKey;
 use atem_client::host_mail::{EnvelopePlain, HostRef, MailFields, ResultPlain};
@@ -234,14 +237,14 @@ impl HostBridge {
     /// then every inbox row decided (the module docs). The gate's mailbox
     /// part follows the inbox as it now stands. Debug builds: held while a
     /// test says (`<pty faults>/hold_admission`).
-    pub(super) fn admit_mail(&mut self, sessions: &BTreeMap<SessionId, BrokerSession>) {
+    pub(super) fn admit_mail(&mut self, cx: &mut Cx) {
         if !self.senders_on() || crate::runtime::test_hooks::admission_held() {
             return;
         }
         let Some(signing) = self.signing() else {
             return;
         };
-        let (mut decided, failed) = match self.admit_with(&signing, sessions) {
+        let (mut decided, failed, followups) = match self.admit_with(&signing, cx.sessions) {
             Ok(done) => done,
             Err(error) => {
                 super::delegated_mail_pass::log_limited(&UNADMITTED, || {
@@ -274,6 +277,12 @@ impl HostBridge {
             self.mail_observe();
             self.publish_mail_gate();
         }
+        // A cancel's withdrawal of an attempt waiting `accepted` (ruling
+        // R46), after the commit that decided it, as a revoke's.
+        if !followups.is_empty() {
+            self.work.followups.extend(followups);
+            self.effects_pass(cx);
+        }
     }
 
     /// Every report and inbox row decided, each on its own: whether a row
@@ -283,10 +292,11 @@ impl HostBridge {
         &self,
         signing: &Signing,
         sessions: &BTreeMap<SessionId, BrokerSession>,
-    ) -> anyhow::Result<(bool, Vec<Failed>)> {
+    ) -> anyhow::Result<(bool, Vec<Failed>, Vec<Followup>)> {
         let Some(store) = self.outbox_store() else {
-            return Ok((false, Vec::new()));
+            return Ok((false, Vec::new(), Vec::new()));
         };
+        let mut followups = Vec::new();
         let mut failed = Vec::new();
         // II.4.4: an authenticated object refused at check 5 or 6 is
         // reported to its sender, `invalid_request`, its mark cleared in
@@ -318,7 +328,10 @@ impl HostBridge {
             // closed) until it is settled; the rows after it are decided all
             // the same.
             match self.admit_row(store, signing, &row, sessions) {
-                Ok(taken) => decided |= taken,
+                Ok((taken, after)) => {
+                    decided |= taken;
+                    followups.extend(after);
+                }
                 Err(error) => {
                     super::delegated_mail_pass::log_limited(&UNADMITTED, || {
                         format!(
@@ -330,7 +343,7 @@ impl HostBridge {
                 }
             }
         }
-        Ok((decided, failed))
+        Ok((decided, failed, followups))
     }
 
     /// A row that failed `tries` times settled, as an unreadable task
@@ -393,19 +406,26 @@ impl HostBridge {
         signing: &Signing,
         row: &InboxRow,
         sessions: &BTreeMap<SessionId, BrokerSession>,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<(bool, Vec<Followup>)> {
         let tx = store.immediate()?;
+        let mut followups = Vec::new();
         let decided = match &row.plain {
             Some(EnvelopePlain::Request { message }) => {
                 self.admit_request(&tx, store, signing, row, message, sessions)?;
                 true
             }
             Some(EnvelopePlain::Cancel { task_id }) => {
-                self.admit_stop(&tx, store, signing, row, task_id, None)?
+                self.admit_stop(&tx, store, signing, row, task_id, None, &mut followups)?
             }
-            Some(EnvelopePlain::Complete { task_id, result }) => {
-                self.admit_stop(&tx, store, signing, row, task_id, Some(result))?
-            }
+            Some(EnvelopePlain::Complete { task_id, result }) => self.admit_stop(
+                &tx,
+                store,
+                signing,
+                row,
+                task_id,
+                Some(result),
+                &mut followups,
+            )?,
             // Its bytes no longer read (a stricter reader than the one that
             // wrote it): nothing to decide.
             None => true,
@@ -414,11 +434,11 @@ impl HostBridge {
             // A stop waiting for room among its sender's early stops: held,
             // holding only that sender's task starts (ruling R47).
             if row.held {
-                return Ok(false);
+                return Ok((false, Vec::new()));
             }
             admit::hold_row(&tx, row.n)?;
             tx.commit()?;
-            return Ok(true);
+            return Ok((true, Vec::new()));
         }
         admit::take_row(&tx, row.n)?;
         tx.commit()?;
@@ -431,7 +451,7 @@ impl HostBridge {
                 "after a host sender's request was admitted, before its status was put",
             );
         }
-        Ok(true)
+        Ok((true, followups))
     }
 
     /// The statuses owed (a host sender's task changed state: [`admit`]'s
@@ -600,8 +620,7 @@ impl HostBridge {
             for kind in admit::take_stops(tx, sender, &task.task.task_id)? {
                 if kind == "cancel" {
                     task.status.state = WorkState::Cancelled;
-                    task.status.detail =
-                        super::delegated_requests::CANCELLED_BEFORE_SUBMISSION.into();
+                    task.status.detail = CANCELLED_BEFORE_SUBMISSION.into();
                 }
             }
         }
@@ -931,6 +950,7 @@ impl HostBridge {
     /// - No such task yet: an early stop until its expiry (dropped once
     ///   expired, or when its sender may not send now).
     /// - Another sender's task: nothing, and no status.
+    #[allow(clippy::too_many_arguments)]
     fn admit_stop(
         &self,
         tx: &Transaction,
@@ -939,6 +959,7 @@ impl HostBridge {
         row: &InboxRow,
         task_id: &str,
         result: Option<&hw::ContextSnapshot>,
+        followups: &mut Vec<Followup>,
     ) -> anyhow::Result<bool> {
         let sender = row.sender_host.as_str();
         let list = &signing.list;
@@ -974,16 +995,28 @@ impl HostBridge {
         let unreached = match current {
             None => Some("forbidden"),
             Some((host_id, admitted)) => match result {
-                None if matches!(task.status.state, WorkState::Queued | WorkState::Blocked)
-                    && store.live_attempt(task_id)?.is_none() =>
-                {
-                    task.status.state = WorkState::Cancelled;
-                    task.status.detail =
-                        super::delegated_requests::CANCELLED_BEFORE_SUBMISSION.into();
-                    store.save_work(&task)?;
-                    None
-                }
-                None => Some("busy"),
+                None => match store.live_attempt(task_id)? {
+                    // Ruling R46: an attempt that hasn't started (waiting
+                    // `accepted`, or never admitted) is withdrawn after the
+                    // commit, as a revoke withdraws it; the task settles
+                    // `cancelled` from that.
+                    Some(attempt) if !self.attempt_started(&attempt.attempt_id, task_id) => {
+                        followups.push(Followup::Withdraw {
+                            task_id: task_id.to_owned(),
+                            attempt_id: attempt.attempt_id,
+                            then: Event::Cancelled,
+                        });
+                        None
+                    }
+                    Some(_) => Some("busy"),
+                    None if matches!(task.status.state, WorkState::Queued | WorkState::Blocked) => {
+                        task.status.state = WorkState::Cancelled;
+                        task.status.detail = CANCELLED_BEFORE_SUBMISSION.into();
+                        store.save_work(&task)?;
+                        None
+                    }
+                    None => Some("busy"),
+                },
                 Some(result) if task.status.state == WorkState::AwaitingResult => {
                     if host_task_covered(list, &me, host_id, admitted, HostOp::Task).is_ok() {
                         task.status.state = WorkState::Completed;
@@ -1009,6 +1042,21 @@ impl HostBridge {
             signing.refusal(tx, sender, &row.object_id, code)?;
         }
         Ok(true)
+    }
+}
+
+impl HostBridge {
+    /// Whether attempt `attempt_id` of `task_id` started: its receipt
+    /// `executing` or past it (design I.6.4).
+    fn attempt_started(&self, attempt_id: &str, task_id: &str) -> bool {
+        self.host
+            .attempt_receipt(attempt_id, task_id)
+            .is_some_and(|rc| {
+                attempt_end(
+                    SessionAnswer::Receipt(rc.state, rc.detail.as_deref()),
+                    false,
+                ) == Some(AttemptEnd::Started)
+            })
     }
 }
 
