@@ -3628,7 +3628,7 @@ def check_mailbox_calls(file, data, report, context):
 
 # The two kinds of host route proof (session-v1 R9.7b): their body `type` and
 # signing label. The proxy kind (a Station's challenge through Astation's
-# `:8080`) is proposed, for Astation's agreement.
+# `:8080`) is agreed with Astation (2026-11-16, #174 comment 6919776085).
 ROUTE_KINDS = {
     "relay": ("atem-host-route", "atem-host-route-v1"),
     "proxy": ("atem-host-route-proxy", "atem-host-route-proxy-v1"),

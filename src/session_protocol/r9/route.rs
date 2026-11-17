@@ -23,7 +23,7 @@
 //! "Which host is calling"; `host.delegated` only, [`Carrier::Local`]). It
 //! is answered through the same code, for the same room and `atem_id` as
 //! the relay link, with a proof of the proxy kind (`atem-host-route-proxy`,
-//! [`RouteKind::Proxy`]; proposed, for Astation's agreement), which no
+//! [`RouteKind::Proxy`]; agreed with Astation 2026-11-16, #174), which no
 //! relay verifier takes for a route: Atem doesn't authenticate its local
 //! peer, so whoever holds the local link may get a proof for a nonce it
 //! chose, and must not route a relay connection as this host with it. The

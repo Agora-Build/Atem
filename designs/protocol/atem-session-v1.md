@@ -1853,7 +1853,7 @@ Planned:
 | `atem-push-hint` | `atem-push-hint-v1` | the host's `host_channel_key` (R9.9; the open and resolved approval hints, and the planned `outcome_unknown` kind, which has the same label and seal domain `atem-push-seal-v1`) |
 | `atem-seen` | `atem-seen-v1` | the host's `host_channel_key` (R9.9) |
 | `atem-host-route` | `atem-host-route-v1` | the host's `host_channel_key` (R9.7b) |
-| `atem-host-route-proxy` (proposed, for Astation's agreement) | `atem-host-route-proxy-v1` | the host's `host_channel_key` (R9.7b, "Through Astation's `:8080` proxy": the host route proof's fields, its own kind, never a relay route) |
+| `atem-host-route-proxy` (agreed with Astation 2026-11-16, #174 comment 6919776085) | `atem-host-route-proxy-v1` | the host's `host_channel_key` (R9.7b, "Through Astation's `:8080` proxy": the host route proof's fields, its own kind, never a relay route) |
 | (`enc_sig` inside a `host_enc_key` entry; planned, R9.2 "Host senders and projects") | `atem-host-enc-key-v1` over fields, never a body: `enc([label, account_id, genesis_hash, host_id, u64(host_trust_gen), enc_pub])` | the host's `host_channel_key` (its newest `add_host`'s `host_key`) |
 | `atem-host-work-control` (control records; planned, host-work-v1 §11.1) | `atem-host-work-control-v1` | the principal's own key (a service: an `auth_key` it had in the list, the one the body's `principal_key` names; the Station that hosts the integration holds it), any action; or a native member holding `manage` at the verifier's head (`member:<device_id>`), `revoke` and `interrupt_running` only. A host's key signs none |
 | `atem-envelope` (a host sender's request, cancel or complete; planned, host-work-v1 §11.5) | `atem-envelope-v1`; its sealed part's HPKE `info` begins with the seal label `atem-envelope-seal-v1` | the sending host's `host_channel_key` (its newest `add_host`'s `host_key`) |
@@ -3672,7 +3672,7 @@ Station's `host_challenge{nonce, room}`, the host's `host_route{proof}`
 and the Station's verdict unchanged; a native login or session proof is
 never promoted into host authority.
 
-- **A proof of its own kind** (**proposed, for Astation's agreement**).
+- **A proof of its own kind** (**agreed with Astation 2026-11-16, #174 comment 6919776085**).
   The host answers through the same code and for the same inputs as its
   relay link (`room` the relay room, the pairing's Astation id, a
   challenge naming another room ignored with one runtime.log line;
