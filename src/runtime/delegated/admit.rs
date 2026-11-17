@@ -13,10 +13,13 @@
 //!   back-pressure as ruling R31's). Its request's admission takes it
 //!   ([`take_stops`]) in its own transaction.
 //! - **Whole refusals** (`mail_refusals`): a request admission refused as a
-//!   whole (the sender, the message id, its digest and the code), kept for
-//!   good beside the host-work message records, which are never deleted
-//!   either: a resend is judged against both ([`refusal`]), never only
-//!   against the mailbox's claims, which are pruned.
+//!   whole (the sender, the message id, its digest and the code), kept
+//!   beside the host-work message records, which are never deleted: a
+//!   resend is judged against both ([`refusal`]), never only against the
+//!   mailbox's claims, which are pruned. Kept a margin past the message's
+//!   expiry, at most [`MAX_REFUSALS_PER_SENDER`] per sender (review L11).
+//!   A copy the mailbox reads as a duplicate marks it owed again
+//!   ([`resend_status`]), as an admitted message's status is.
 //! - **Status owed** (`mail_status_owed`): a host sender's message whose
 //!   status is to go to it. A trigger on `work` marks it in the statement
 //!   that changes the state of one of its tasks (a host sender's: its
@@ -53,7 +56,9 @@ const TABLES: &str = "
     CREATE TABLE IF NOT EXISTS mail_refusals (
         sender_host TEXT NOT NULL, message_id TEXT NOT NULL, digest TEXT NOT NULL,
         code TEXT NOT NULL, at_ms INTEGER NOT NULL, keep_until INTEGER NOT NULL,
+        owed INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(sender_host, message_id)) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS mail_refusals_owed ON mail_refusals(sender_host) WHERE owed=1;
     CREATE INDEX IF NOT EXISTS mail_refusals_keep ON mail_refusals(keep_until);
     CREATE INDEX IF NOT EXISTS mail_refusals_sender ON mail_refusals(sender_host, at_ms);
     CREATE TABLE IF NOT EXISTS mail_status_owed (message_id TEXT PRIMARY KEY) WITHOUT ROWID;
@@ -333,8 +338,9 @@ pub fn sent(tx: &Transaction, message_id: &str, n: i64) -> Result<()> {
 /// `sender_host`'s resend of its request `message_id`, read as a duplicate
 /// by the mailbox (ruling R45): the admitted message's status is owed
 /// again, so one the Station lost goes again (superseding keeps one
-/// waiting). Nothing for a message not admitted from that sender, or in a
-/// store without admission's tables.
+/// waiting), and so is a whole refusal recorded for it ([`owed_refusals`]).
+/// Nothing for a message neither admitted nor refused from that sender, or
+/// in a store without admission's tables.
 pub fn resend_status(tx: &Transaction, sender_host: &str, message_id: &str) -> Result<()> {
     let made: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='mail_status_owed')",
@@ -351,7 +357,30 @@ pub fn resend_status(tx: &Transaction, sender_host: &str, message_id: &str) -> R
                 atem_client::host_principal::host_principal(sender_host)
             ],
         )?;
+        tx.execute(
+            "UPDATE mail_refusals SET owed=1 WHERE sender_host=?1 AND message_id=?2",
+            [sender_host, message_id],
+        )?;
     }
+    Ok(())
+}
+
+/// The whole refusals owed again to their sender (a resend read as a
+/// duplicate): `(sender host, message id, code)`, at most `limit`.
+pub fn owed_refusals(db: &Connection, limit: usize) -> Result<Vec<(String, String, String)>> {
+    let mut q = db
+        .prepare("SELECT sender_host, message_id, code FROM mail_refusals WHERE owed=1 LIMIT ?1")?;
+    let rows = q.query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// The whole refusal of `sender_host`'s `message_id` no longer owed (sent
+/// again, or it can't go), in `tx`.
+pub fn refusal_sent(tx: &Transaction, sender_host: &str, message_id: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE mail_refusals SET owed=0 WHERE sender_host=?1 AND message_id=?2",
+        [sender_host, message_id],
+    )?;
     Ok(())
 }
 

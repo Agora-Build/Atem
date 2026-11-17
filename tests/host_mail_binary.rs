@@ -2355,8 +2355,9 @@ fn a_resend_is_admitted_once_and_a_bad_time_is_reported() {
 
 /// VII.B 37: `per_workflow` on this host bounds a host sender's messages
 /// per workflow: with one allowed, the second message of a workflow is
-/// refused `busy`, recorded (its resend gets `busy` again), and nothing of
-/// it is stored.
+/// refused `busy`, recorded, and nothing of it is stored. Its resend (the
+/// same object, stored again once the first copy was done) gets `busy`
+/// again from the recorded refusal: the Station may have lost the first.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
@@ -2371,12 +2372,20 @@ fn per_workflow_bounds_a_host_senders_messages() {
     second.workflow_id = first.workflow_id.clone();
     rig.put(&rig.sender.request_of(&to, rig.log.log.head(), &first));
     rig.within("the first admitted", || rig.has_message(&first.message_id));
-    rig.put(&rig.sender.request_of(&to, rig.log.log.head(), &second));
-    rig.until_status("busy", |s| {
-        *s == ResultPlain::Refusal {
-            object_id: second.message_id.clone(),
-            refused: "busy".into(),
-        }
+    let request = rig.sender.request_of(&to, rig.log.log.head(), &second);
+    rig.put(&request);
+    let busy = ResultPlain::Refusal {
+        object_id: second.message_id.clone(),
+        refused: "busy".into(),
+    };
+    rig.until_status("busy", |s| *s == busy);
+    assert!(!rig.has_message(&second.message_id));
+    rig.within("marked done", || {
+        rig.station().mailbox_positions().is_empty()
+    });
+    rig.put(&request);
+    rig.within("its resend refused busy again", || {
+        rig.statuses().iter().filter(|s| **s == busy).count() == 2
     });
     assert!(!rig.has_message(&second.message_id));
 }

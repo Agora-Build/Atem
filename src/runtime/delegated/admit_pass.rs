@@ -471,9 +471,10 @@ impl HostBridge {
     /// The statuses owed (a host sender's task changed state: [`admit`]'s
     /// trigger), each sealed with its message's current state and enqueued,
     /// the mark cleared, in one transaction; at most
-    /// [`STATUSES_PER_PASS`] a pass. With `host.senders` on, while hosting
-    /// runs or is paused (a device-list entry's effects change tasks then
-    /// too). Kept owed while this host can't sign.
+    /// [`STATUSES_PER_PASS`] a pass; then the whole refusals a resend asked
+    /// again. With `host.senders` on, while hosting runs or is paused (a
+    /// device-list entry's effects change tasks then too). Kept owed while
+    /// this host can't sign.
     pub(super) fn mail_statuses(&mut self) {
         if !self.senders_on() || crate::runtime::test_hooks::admission_held() {
             return;
@@ -514,6 +515,32 @@ impl HostBridge {
                 });
                 let dropped = store.immediate().and_then(|tx| {
                     admit::clear(&tx, &message_id)?;
+                    Ok(tx.commit()?)
+                });
+                if dropped.is_err() {
+                    return;
+                }
+            }
+        }
+        // Whole refusals a resend asked again (ruling R45's, for a refused
+        // request): each sent again in its own transaction.
+        let Ok(refusals) = admit::owed_refusals(&store.db, STATUSES_PER_PASS) else {
+            return;
+        };
+        for (sender, message_id, code) in refusals {
+            let sent = store.immediate().and_then(|tx| {
+                signing.refusal(&tx, &sender, &message_id, &code)?;
+                admit::refusal_sent(&tx, &sender, &message_id)?;
+                Ok(tx.commit()?)
+            });
+            if let Err(error) = sent {
+                super::delegated_mail_pass::log_limited(&UNSEALED, || {
+                    format!(
+                        "atem runtime: message {message_id}'s refusal not sent again to its host sender ({error:#})"
+                    )
+                });
+                let dropped = store.immediate().and_then(|tx| {
+                    admit::refusal_sent(&tx, &sender, &message_id)?;
                     Ok(tx.commit()?)
                 });
                 if dropped.is_err() {
