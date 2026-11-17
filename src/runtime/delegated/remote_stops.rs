@@ -21,8 +21,10 @@
 //!   before any put. A complete's result names the reply this host got
 //!   back ([`results_back::naming`], frozen at the command), and a delivery
 //!   of that reply still queued is cancelled in that transaction, as stage
-//!   1's completion does. A stop of the task that still stands is not sent
-//!   again; the command says what happened ([`StopOutcome`]).
+//!   1's completion does; should the complete end without its effect, the
+//!   delivery says so, with why (`results_back.rs`, review N4). A stop of
+//!   the task that still stands is not sent again; the command says what
+//!   happened ([`StopOutcome`]).
 //! - **A complete waits for its task** (ruling R50): while the newest
 //!   status shows the task before `awaiting_result` (its turn may still
 //!   run, and the host completes only a task awaiting its result), the
@@ -147,22 +149,25 @@ impl HostBridge {
         if let Some(result) = &result {
             remote_send::hold_result(&tx, &task, result)?;
         }
-        // Completed: the reply isn't delivered from now on (stage 1's).
+        // Completed: the reply isn't delivered from now on (stage 1's), its
+        // row kept with why; after an earlier complete that ended without
+        // its effect, this one's words again (review N4).
         if stop == Stop::Complete
-            && let Some(mut delivery) = task
-                .work_id
-                .as_deref()
-                .map(|id| store.work(id))
-                .transpose()?
-                .flatten()
-            && matches!(
+            && let Some(work_id) = task.work_id.as_deref()
+            && let Some(mut delivery) = store.work(work_id)?
+            && (matches!(
                 delivery.status.state,
                 WorkState::Queued | WorkState::Blocked
-            )
+            ) || delivery.status.state == WorkState::Cancelled
+                && delivery
+                    .status
+                    .detail
+                    .starts_with(results_back::COMPLETE_ENDED_PREFIX))
         {
             delivery.status.state = WorkState::Cancelled;
-            delivery.status.detail = collab_bridge::COMPLETED_BY_SENDER.into();
+            delivery.status.detail = crate::runtime::collab::COMPLETED_BY_SENDER.into();
             store.save_work(&delivery)?;
+            results_back::completed_by_sender(&tx, work_id)?;
         }
         tx.commit()?;
         said(if held {

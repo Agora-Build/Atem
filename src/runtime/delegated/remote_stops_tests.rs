@@ -738,3 +738,106 @@ fn rs_object(rig: &LocalRig, message: &str) -> String {
         )
         .unwrap()
 }
+
+/// Review N4: a held complete ends the reply's queued delivery at the
+/// command, as a sent one does (its sender completed the task); dropped
+/// later, the delivery says so and why, never that the task was completed.
+#[test]
+fn a_dropped_complete_says_why_the_reply_wasnt_delivered() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        rig.bridge.work.config.routes[0].results = true;
+        sp_d(&rig, host_now().wall_ms);
+        let (m, r) = rb_send(&mut rig);
+        let task = rb_task_id(&m, &r);
+        let at = host_now().wall_ms;
+        let status = rs_status(&rig, &host, at, (&m, &r, &task), WorkState::Submitted);
+        let result = rb_from_b(&rig, &host, at, &rb_reply(&task, "RS_HELD"));
+        rb_receive(&mut rig, &mut host, &[status, result]);
+        let delivery = rb_delivery(&m, &task);
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        let mut queued = store.work(&delivery).unwrap().unwrap();
+        queued.status.state = WorkState::Blocked;
+        store.save_work(&queued).unwrap();
+        assert_eq!(
+            rig.bridge
+                .collab_complete(None, &task, &rig.sessions)
+                .unwrap(),
+            rs_said(StopOutcome::Queued)
+        );
+        let completed = "not delivered: its task was completed by its sender";
+        let detail = |rig: &LocalRig| {
+            let store = rig.bridge.work.store.as_ref().unwrap();
+            let task = store.work(&delivery).unwrap().unwrap();
+            (task.status.state, task.status.detail)
+        };
+        assert_eq!(detail(&rig), (WorkState::Cancelled, completed.to_string()));
+        rb_pass(&mut rig);
+        assert_eq!(rb_delivered(&mut rig, &m), (false, completed.to_string()));
+        // B's status: the task expired. The held complete is dropped, and
+        // the delivery says why.
+        let ended = rs_status(&rig, &host, at + 1, (&m, &r, &task), WorkState::Expired);
+        rb_receive(&mut rig, &mut host, &[ended]);
+        let dropped = "not delivered: its sender's complete was dropped (not sent: the host's status shows the task expired)";
+        assert_eq!(detail(&rig), (WorkState::Cancelled, dropped.to_string()));
+        assert_eq!(rb_delivered(&mut rig, &m), (false, dropped.to_string()));
+    });
+}
+
+/// Review N4: a complete the host refuses by its own id didn't complete the
+/// task either, so the delivery it ended says so; a complete that goes
+/// again ends it as completed by its sender once more.
+#[test]
+fn a_refused_complete_says_why_until_one_goes_again() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        rig.bridge.work.config.routes[0].results = true;
+        sp_d(&rig, host_now().wall_ms);
+        let (m, r) = rb_send(&mut rig);
+        let task = rb_task_id(&m, &r);
+        let at = host_now().wall_ms;
+        let status = rs_status(&rig, &host, at, (&m, &r, &task), WorkState::AwaitingResult);
+        let result = rb_from_b(&rig, &host, at, &rb_reply(&task, "RS_REFUSED"));
+        rb_receive(&mut rig, &mut host, &[status, result]);
+        let delivery = rb_delivery(&m, &task);
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        let mut queued = store.work(&delivery).unwrap().unwrap();
+        queued.status.state = WorkState::Blocked;
+        store.save_work(&queued).unwrap();
+        assert_eq!(
+            rig.bridge
+                .collab_complete(None, &task, &rig.sessions)
+                .unwrap(),
+            rs_said(StopOutcome::Sent)
+        );
+        let refusal = ResultPlain::Refusal {
+            object_id: rs_object(&rig, &m),
+            refused: "forbidden".into(),
+        };
+        let object = rb_from_b(&rig, &host, at, &refusal);
+        rb_receive(&mut rig, &mut host, &[object]);
+        let refused =
+            "not delivered: its sender's complete was refused (refused by the host (forbidden))";
+        let detail = |rig: &LocalRig| {
+            let store = rig.bridge.work.store.as_ref().unwrap();
+            store.work(&delivery).unwrap().unwrap().status.detail
+        };
+        assert_eq!(detail(&rig), refused);
+        assert_eq!(rb_delivered(&mut rig, &m), (false, refused.to_string()));
+        // The sender completes it again: it goes, and the delivery is
+        // ended by that complete.
+        assert_eq!(
+            rig.bridge
+                .collab_complete(None, &task, &rig.sessions)
+                .unwrap(),
+            rs_said(StopOutcome::Sent)
+        );
+        let completed = "not delivered: its task was completed by its sender";
+        assert_eq!(detail(&rig), completed);
+        assert_eq!(rb_delivered(&mut rig, &m), (false, completed.to_string()));
+    });
+}

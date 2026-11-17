@@ -52,6 +52,43 @@ pub const GRANT_EXPIRED: &str = "reply kept, not delivered: its return grant exp
 pub const TASK_ENDED: &str = "reply kept, not delivered: its task ended";
 /// A reply kept: no current project lists both hosts (design II.4.4).
 pub const NOT_GRANTED: &str = "result not delivered: sender no longer granted";
+/// A reply's delivery its sender's complete ended
+/// ([`crate::runtime::collab::COMPLETED_BY_SENDER`]) once that complete
+/// ended without its effect (review N4): this, then how and why
+/// (`complete_ended`).
+pub const COMPLETE_ENDED_PREFIX: &str = "not delivered: its sender's complete was ";
+
+/// A `complete` row that ends without its effect (`dropped`, `expired`,
+/// `refused`) leaves the reply delivery it ended saying so, with why,
+/// never that its sender completed the task (review N4): the delivery
+/// task's detail and the row's, in the statement that ends it, whichever
+/// path ends it (a status, a `busy` answer, a refusal, the Station, the
+/// message's expiry). A complete that goes again puts the words back
+/// (`remote_stops.rs`).
+fn complete_ended() -> String {
+    let note = format!(
+        "'{}' || CASE NEW.state WHEN 'dropped' THEN 'dropped'
+            WHEN 'expired' THEN 'never accepted' ELSE 'refused' END
+            || ' (' || NEW.detail || ')'",
+        COMPLETE_ENDED_PREFIX.replace('\'', "''")
+    );
+    let completed = crate::runtime::collab::COMPLETED_BY_SENDER.replace('\'', "''");
+    format!(
+        "CREATE TRIGGER IF NOT EXISTS remote_complete_ended AFTER UPDATE OF state
+        ON remote_deliveries
+        WHEN NEW.kind='complete' AND NEW.state IN ('dropped', 'expired', 'refused')
+            AND OLD.state IN ('held', 'due', 'ready', 'sent') BEGIN
+            UPDATE work SET record=json_set(record, '$.status.detail', {note})
+            WHERE id IN (SELECT work_id FROM remote_tasks WHERE message_id=NEW.message_id
+                    AND host_id=NEW.host_id AND task_id=NEW.task_id)
+                AND state='cancelled' AND json_valid(record)
+                AND json_extract(record, '$.status.detail')='{completed}';
+            UPDATE remote_tasks SET delivery_detail={note}
+            WHERE message_id=NEW.message_id AND host_id=NEW.host_id AND task_id=NEW.task_id
+                AND delivery='kept' AND delivery_detail='{completed}';
+        END;"
+    )
+}
 
 /// The tables and the trigger (made by [`prepare`], only with
 /// `host.senders`). Additive, as every host-work table.
@@ -95,6 +132,26 @@ const TABLES: &str = "
 /// The tables in `store`, made if missing.
 pub fn prepare(store: &Store) -> Result<()> {
     store.db.execute_batch(TABLES)?;
+    store.db.execute_batch(&complete_ended())?;
+    Ok(())
+}
+
+/// The reply delivery `work_id` ended by its sender's complete, in `tx`:
+/// its row `kept` with stage 1's words, as the delivery task says them
+/// ([`crate::runtime::collab::COMPLETED_BY_SENDER`]); also when an earlier
+/// complete had ended it and then ended without its effect
+/// ([`COMPLETE_ENDED_PREFIX`]).
+pub fn completed_by_sender(tx: &Transaction, work_id: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE remote_tasks SET delivery='kept', delivery_detail=?2
+        WHERE work_id=?1 AND (delivery='queued'
+            OR delivery='kept' AND substr(delivery_detail, 1, length(?3))=?3)",
+        params![
+            work_id,
+            crate::runtime::collab::COMPLETED_BY_SENDER,
+            COMPLETE_ENDED_PREFIX
+        ],
+    )?;
     Ok(())
 }
 

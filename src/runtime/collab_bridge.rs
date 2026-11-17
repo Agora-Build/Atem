@@ -809,7 +809,7 @@ impl HostBridge {
             )
         {
             delivery.status.state = WorkState::Cancelled;
-            delivery.status.detail = COMPLETED_BY_SENDER.into();
+            delivery.status.detail = collab::COMPLETED_BY_SENDER.into();
             store.save_work(&delivery)?;
         }
         tx.commit()?;
@@ -1973,9 +1973,6 @@ impl HostBridge {
         written.map(|()| None)
     }
 }
-
-/// A delivery still queued when its task's sender completed the task.
-pub(super) const COMPLETED_BY_SENDER: &str = "not delivered: its task was completed by its sender";
 
 /// The task one recipient of a local request gets: the sender's text and
 /// context. Who sent it and how to answer (`Frame::Message`) are rendered

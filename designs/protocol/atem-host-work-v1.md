@@ -4069,8 +4069,14 @@ exactly as without this section):
   got back ("A `complete` naming the reply" above), and a delivery of that
   reply still queued is cancelled in that transaction (`not delivered: its
   task was completed by its sender`), as stage 1's completion ends its
-  return grant. So the delivered result's last line, `atem message
-  complete <task id>`, completes the task on the host that ran it.
+  return grant. Should that complete end without its effect (dropped,
+  expired or refused, as above), the delivery says so instead, with why
+  (`not delivered: its sender's complete was dropped (not sent: the
+  host's status shows the task expired)`; `never accepted`, `refused`), in
+  the statement that ends the complete; a complete that goes again puts
+  the first words back. So the delivered result's last line, `atem
+  message complete <task id>`, completes the task on the host that ran
+  it.
 
 The receiving host's mailbox on the Station (design II.4.3): a sending host
 puts objects over its own link, and the receiving host syncs its own mailbox

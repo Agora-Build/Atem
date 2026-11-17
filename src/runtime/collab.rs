@@ -263,6 +263,9 @@ pub(super) fn check_send(
     count_send(&tx, config, from, workflow, now)
 }
 
+/// A delivery still queued when its task's sender completed the task.
+pub const COMPLETED_BY_SENDER: &str = "not delivered: its task was completed by its sender";
+
 const TASK_TOO_LARGE: &str = "the prompt with its context is over 32 KiB";
 const TASK_CONTROL_CHARACTERS: &str = "context has control characters";
 const TASK_TOO_MANY_SNAPSHOTS: &str = "at most 8 context snapshots";
