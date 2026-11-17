@@ -385,7 +385,8 @@ impl HostBridge {
     }
 
     /// One inbox row decided in its own transaction, removed with its
-    /// decision (a stop waiting for room stays): whether it was taken.
+    /// decision (a stop waiting for room stays, held): whether the inbox
+    /// changed (a row taken, or newly held).
     fn admit_row(
         &self,
         store: &Store,
@@ -410,7 +411,14 @@ impl HostBridge {
             None => true,
         };
         if !decided {
-            return Ok(false);
+            // A stop waiting for room among its sender's early stops: held,
+            // holding only that sender's task starts (ruling R47).
+            if row.held {
+                return Ok(false);
+            }
+            admit::hold_row(&tx, row.n)?;
+            tx.commit()?;
+            return Ok(true);
         }
         admit::take_row(&tx, row.n)?;
         tx.commit()?;

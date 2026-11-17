@@ -447,7 +447,10 @@ impl HostBridge {
             eprintln!("{line}");
         }
         let open = station.mailbox.open();
-        self.start_view().gates.set_mailbox(open);
+        let held = station.mailbox.held();
+        let mut view = self.start_view();
+        view.gates.set_mailbox(open);
+        view.gates.set_mailbox_held(held);
     }
 
     /// `atem status`'s mailbox part, on the `Control feeds:` line (with

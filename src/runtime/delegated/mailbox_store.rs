@@ -185,7 +185,8 @@ const TABLES: &str = "
     CREATE TABLE IF NOT EXISTS mailbox_inbox (
         n INTEGER PRIMARY KEY, sender_host TEXT NOT NULL, object_id TEXT NOT NULL,
         kind TEXT NOT NULL, plain BLOB NOT NULL, object_hash TEXT NOT NULL,
-        at_ms INTEGER NOT NULL, expires_at INTEGER, signed_seq INTEGER);
+        at_ms INTEGER NOT NULL, expires_at INTEGER, signed_seq INTEGER,
+        held INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS mailbox_refused (
         n INTEGER PRIMARY KEY, evidence TEXT NOT NULL UNIQUE, reason TEXT NOT NULL,
         sender_host TEXT, object_id TEXT, report INTEGER NOT NULL, bytes BLOB,
@@ -232,7 +233,7 @@ const TABLES: &str = "
 /// is kept until its expiry; the sender's standing is checked again at
 /// admission); a row written before them has neither, and admission refuses
 /// it (it can't tell when it was signed).
-const NEW_COLUMNS: [(&str, &str, &str); 10] = [
+const NEW_COLUMNS: [(&str, &str, &str); 11] = [
     ("mailbox_cursor", "skip_at", "INTEGER"),
     ("mailbox_cursor", "skip_freed", "INTEGER NOT NULL DEFAULT 0"),
     ("mailbox_cursor", "freed", "INTEGER NOT NULL DEFAULT 0"),
@@ -243,6 +244,7 @@ const NEW_COLUMNS: [(&str, &str, &str); 10] = [
     ("mailbox_pending", "no_room", "INTEGER NOT NULL DEFAULT 0"),
     ("mailbox_inbox", "expires_at", "INTEGER"),
     ("mailbox_inbox", "signed_seq", "INTEGER"),
+    ("mailbox_inbox", "held", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 /// The mailbox's tables in `store`, made if missing (a table of an earlier
@@ -316,9 +318,20 @@ fn own_cursor(db: &rusqlite::Connection, identity: &HostIdentity) -> Result<Opti
 /// The store as the mailbox client observes it for `identity`.
 pub fn read(store: &Store, identity: &HostIdentity) -> Result<Observed> {
     let cursor = own_cursor(&store.db, identity)?;
+    // Rows admission holds (ruling R47) hold their own sender's task starts
+    // only, not the gate.
     let inbox = store
         .db
-        .query_row("SELECT count(*) FROM mailbox_inbox", [], |r| r.get(0))?;
+        .query_row("SELECT count(*) FROM mailbox_inbox WHERE held=0", [], |r| {
+            r.get(0)
+        })?;
+    let held = {
+        let mut q = store
+            .db
+            .prepare("SELECT DISTINCT sender_host FROM mailbox_inbox WHERE held=1")?;
+        q.query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
     let (skipped, rewind_due, skip_expires, skipped_inbox, read_to) = store
         .db
         .query_row(
@@ -355,6 +368,7 @@ pub fn read(store: &Store, identity: &HostIdentity) -> Result<Observed> {
         )?,
         rewind_due,
         skip_expires,
+        held,
     })
 }
 

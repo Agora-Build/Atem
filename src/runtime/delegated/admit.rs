@@ -82,13 +82,16 @@ pub struct InboxRow {
     /// before the inbox kept them.
     pub expires_at: u64,
     pub signed_seq: u64,
+    /// Held (ruling R47): a stop waiting for room among its sender's early
+    /// stops.
+    pub held: bool,
 }
 
 /// The inbox's first `limit` rows, in mailbox order.
 pub fn inbox(db: &Connection, limit: usize) -> Result<Vec<InboxRow>> {
     let mut q = db.prepare(
         "SELECT n, sender_host, object_id, plain, coalesce(expires_at, 0),
-            coalesce(signed_seq, 0) FROM mailbox_inbox ORDER BY n LIMIT ?1",
+            coalesce(signed_seq, 0), held FROM mailbox_inbox ORDER BY n LIMIT ?1",
     )?;
     let rows = q.query_map([limit as i64], |r| {
         Ok(InboxRow {
@@ -98,6 +101,7 @@ pub fn inbox(db: &Connection, limit: usize) -> Result<Vec<InboxRow>> {
             plain: EnvelopePlain::parse(&r.get::<_, Vec<u8>>(3)?).ok(),
             expires_at: r.get(4)?,
             signed_seq: r.get(5)?,
+            held: r.get(6)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -106,6 +110,13 @@ pub fn inbox(db: &Connection, limit: usize) -> Result<Vec<InboxRow>> {
 /// Inbox row `n` taken: decided. Whether it was still there.
 pub fn take_row(tx: &Transaction, n: i64) -> Result<bool> {
     Ok(tx.execute("DELETE FROM mailbox_inbox WHERE n=?1", [n])? == 1)
+}
+
+/// Inbox row `n` held (ruling R47): a stop waiting for room, holding its
+/// own sender's task starts only.
+pub fn hold_row(tx: &Transaction, n: i64) -> Result<()> {
+    tx.execute("UPDATE mailbox_inbox SET held=1 WHERE n=?1", [n])?;
+    Ok(())
 }
 
 /// `row`, a `cancel` or `complete` (`kind`) of `task_id` opened before its

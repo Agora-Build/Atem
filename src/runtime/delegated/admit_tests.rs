@@ -296,6 +296,20 @@ fn ad_resolved(receipt: &RecipientReceipt) -> &[WorkProgress] {
     }
 }
 
+/// Whether host sender `host_id`'s tasks may start as far as host
+/// senders' gate goes (its Station's part stood in open).
+fn ad_gate_for(rig: &LocalRig, host_id: &str) -> bool {
+    use crate::runtime::delegated::gate::GateView;
+    rig.bridge.start_view().gates.open_for(
+        &DelegatedSender::Host {
+            host_id: host_id.into(),
+            generation: 1,
+            epoch: 1,
+        },
+        Some(ORIGIN),
+    )
+}
+
 /// The tasks of `message` on this host.
 fn ad_tasks(rig: &LocalRig, message: &Message) -> Vec<WorkRecord> {
     let db = &rig.bridge.work.store.as_ref().unwrap().db;
@@ -952,7 +966,9 @@ fn a_stop_before_its_request_is_kept_and_applied_at_admission() {
         );
         assert_eq!(ad_inbox_rows(&rig), 1, "the 33rd waits");
         mb_tick(&mut rig, &mut host, 0);
-        assert!(!mb_gate(&rig), "a waiting stop holds the gate");
+        // Ruling R47: it holds its own sender's task starts only.
+        assert!(!mb_gate(&rig), "B's tasks wait for its stop");
+        assert!(ad_gate_for(&rig, "host-c"), "another sender's don't");
         // Its request: admitted, and the stop waiting in the inbox finds its
         // task at the next pass, queued, and cancels it.
         ad_inbox_request(&rig, &last);
