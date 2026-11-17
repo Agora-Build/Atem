@@ -290,6 +290,15 @@ impl HostBridge {
         }
         admit::take_row(&tx, row.n)?;
         tx.commit()?;
+        // Debug builds: the runtime is killed here, a request's admission
+        // and its status committed, nothing put yet.
+        #[cfg(not(test))]
+        if matches!(row.plain, Some(EnvelopePlain::Request { .. })) {
+            crate::runtime::test_hooks::crash_point(
+                "crash_after_admission_commit",
+                "after a host sender's request was admitted, before its status was put",
+            );
+        }
         Ok(true)
     }
 

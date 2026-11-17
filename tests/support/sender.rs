@@ -12,17 +12,22 @@
 //! recipient (addressed to another host, or naming the receiver but sealed
 //! to another key), and, made for a later trust generation of the sender
 //! (its re-verified `add_host`), objects of a newer sender generation.
+//! With an encryption key of its own ([`SenderHost::with_enc`], its
+//! `host_enc_key` entry signed into the test's list), it opens the status
+//! objects a receiving host sends back ([`SenderHost::open`]).
 
 use super::r9log::{TestLog, secret};
 use super::station::FakeStation;
 use atem_client::encoding::{Hash32, b64u_decode};
 use atem_client::host_mail::mailbox::{MailboxPut, MailboxToHost, PutRefusal};
 use atem_client::host_mail::{
-    EnvelopePlain, HostRef, MailFields, ResultPlain, seal_envelope, seal_result,
+    EnvelopePlain, HostRef, MailFields, ResultPlain, VerifiedMail, seal_envelope, seal_result,
+    unseal_result,
 };
 use atem_client::host_principal::host_principal;
 use atem_client::membership::Head;
-use atem_client::session::host_work::HostTarget;
+use atem_client::membership::entry::Action;
+use atem_client::session::host_work::{ContextSnapshot, HostTarget};
 use atem_client::session::messages::{Destination, Message, MessageKind, Recipient};
 use atem_client::{Alg, KeyId, KeyProvider, PublicKey, SignedObject, SoftwareKeys};
 use std::path::Path;
@@ -108,6 +113,119 @@ impl SenderHost {
 
     fn key() -> KeyId {
         KeyId::new("host_key")
+    }
+
+    fn enc() -> KeyId {
+        KeyId::new("enc_key")
+    }
+
+    /// With an encryption key (X25519, from `seed`): what its `host_enc_key`
+    /// entry names ([`SenderHost::enc_key_action`]) and statuses are sealed
+    /// to.
+    pub fn with_enc(mut self, seed: &[u8; 32]) -> SenderHost {
+        self.keys.insert_x25519(Self::enc(), seed);
+        self
+    }
+
+    /// Its `host_enc_key` entry's action (its `enc_sig` by its `host_key`),
+    /// for a native manager to sign into the list.
+    pub fn enc_key_action(&self) -> Action {
+        let enc_key = self.keys.public_key(&Self::enc()).unwrap();
+        let sig = atem_client::membership::sign_host_enc_key(
+            &self.keys,
+            &Self::key(),
+            &self.account,
+            &self.genesis,
+            &self.host_id,
+            self.host_trust_gen,
+            enc_key.as_32().unwrap(),
+        )
+        .unwrap();
+        atem_client::membership::host_enc_key(
+            &self.host_id,
+            self.host_trust_gen,
+            &enc_key,
+            &sig,
+            false,
+            0,
+        )
+        .unwrap()
+    }
+
+    /// A Message of this host's to `to`, one `select` recipient
+    /// (`selectors`, `budget`), `text`: fresh ids, made a second ago,
+    /// alive an hour.
+    pub fn message(&self, to: &Receiver, selectors: &[&str], budget: u32, text: &str) -> Message {
+        let now = now_ms();
+        Message {
+            message_id: uuid(),
+            workflow_id: uuid(),
+            sender: host_principal(&self.host_id),
+            kind: MessageKind::Request,
+            reply_to: None,
+            from_session: None,
+            created_at: now - 1_000,
+            expires_at: now + LIFE_MS,
+            recipients: vec![Recipient {
+                recipient_id: uuid(),
+                host: HostTarget {
+                    account_id: self.account.clone(),
+                    atem_device_id: to.host_id.clone(),
+                    host_trust_gen: to.host_trust_gen,
+                },
+                destination: Destination::Select {
+                    selectors: selectors.iter().map(|s| s.to_string()).collect(),
+                    budget,
+                    launch: false,
+                },
+            }],
+            text: text.to_owned(),
+            context: vec![],
+            mark: None,
+        }
+    }
+
+    /// `message` (this host's) as a request to `to`, signed at `signed_at`:
+    /// the body's id and times are the Message's.
+    pub fn request_of(&self, to: &Receiver, signed_at: Head, message: &Message) -> SignedObject {
+        let mut fields = self.fields(to, signed_at);
+        fields.id = message.message_id.clone();
+        fields.created_at = message.created_at;
+        fields.expires_at = message.expires_at;
+        let plain = EnvelopePlain::Request {
+            message: message.clone(),
+        };
+        self.seal(&fields, &plain, to)
+    }
+
+    /// A `cancel` of task `task_id`, or with `result` its `complete`, to
+    /// `to`.
+    pub fn stop(
+        &self,
+        to: &Receiver,
+        signed_at: Head,
+        task_id: &str,
+        result: Option<ContextSnapshot>,
+    ) -> SignedObject {
+        let fields = self.fields(to, signed_at);
+        let plain = match result {
+            Some(result) => EnvelopePlain::Complete {
+                task_id: task_id.to_owned(),
+                result,
+            },
+            None => EnvelopePlain::Cancel {
+                task_id: task_id.to_owned(),
+            },
+        };
+        self.seal(&fields, &plain, to)
+    }
+
+    /// A result object a receiving host sent back to this host, verified
+    /// with `from` (that host's `host_key`) and opened with this host's
+    /// encryption key ([`SenderHost::with_enc`]).
+    pub fn open(&self, object: &SignedObject, from: &PublicKey) -> ResultPlain {
+        let verified = VerifiedMail::verify(object, from).expect("signed by the receiving host");
+        unseal_result(&self.keys, &Self::enc(), &verified).expect("sealed to this host")
     }
 
     /// An object's body fields to `to`, signed at `signed_at` (a head that
