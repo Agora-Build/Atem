@@ -5,9 +5,11 @@
 //! ([`prepare`]), so a store of a host without it is main's.
 //!
 //! - **The cursor** (`mailbox_cursor`, one row): the mailbox read, its
-//!   last position processed, the lowest position left on the Station for
-//!   want of room (below), and the host identity it belongs to (account,
-//!   device, trust generation and the device list's genesis). A new
+//!   last position processed and the furthest one ever read in it
+//!   (`read_to`: a rewind lowers the cursor, never this), the lowest
+//!   position left on the Station for want of room (below), and the host
+//!   identity it belongs to (account, device, trust generation and the
+//!   device list's genesis). A new
 //!   identity's store is a new file (host-work's store is moved aside), so
 //!   it starts empty; a row of another identity in this store doesn't load
 //!   ([`read`]: fail closed) and owes nothing.
@@ -52,8 +54,12 @@
 //!   when the last of them expires); once room has freed since (an inbox
 //!   row or a kept result gone), or `D` passed that expiry (the Station has
 //!   dropped them), the cursor is rewound durably to just before it
-//!   ([`rewind_if_room`]) and it is read again. Until then it isn't
-//!   committed: the gate's mailbox part stays closed.
+//!   ([`rewind_if_room`]) and it is read again. A request, cancel or
+//!   complete left there isn't committed: the gate's mailbox part stays
+//!   closed until a read after the rewind passes its position (the highest
+//!   such position this read left there, `skip_inbox_now`, folded at the
+//!   rewind into the highest awaiting the re-read, `skip_inbox`); a result
+//!   left there holds no gate (ruling R35: results start no work).
 //! - **Bounded** ([`Limits`], [`prune`]): refusals keep their bytes within
 //!   a budget (unauthenticated first, then unreported, the oldest first;
 //!   the evidence hash stays) and unauthenticated refusal rows within a
@@ -66,13 +72,16 @@
 //!   judged again after the device list advances or its expiry passes
 //!   ([`rejudge_pending`]); decided, it owes a done only at a position of
 //!   the mailbox read now: a reset detaches it from its old one. One that
-//!   decides to open with no room for it keeps waiting, and is judged
-//!   again once room frees ([`freed`] moves).
+//!   decides to open with no room for it keeps waiting, marked (`no_room`:
+//!   it holds the gate's mailbox part, as a request, cancel or complete
+//!   left on the Station does; ruling R39: only one waiting for a newer
+//!   sender generation holds none), and is judged again once room frees
+//!   ([`freed`] moves).
 //! - **A reset** ([`mark_reset`], rule 7): marked durably before anything
 //!   is asked for it, as the cursor itself (the announced mailbox at
-//!   position 0), the dones owed to the old mailbox dropped, every waiting
-//!   object detached from its position and any position left on the
-//!   Station forgotten, in one transaction. A start finds it and reads on
+//!   position 0, nothing read in it yet), the dones owed to the old mailbox
+//!   dropped, every waiting object detached from its position and any
+//!   position left on the Station forgotten, in one transaction. A start finds it and reads on
 //!   from there; the gate's mailbox part stays closed until the read
 //!   reaches the announced head.
 //! - **An object that can't be decided now** (the key provider failed):
@@ -164,7 +173,8 @@ const TABLES: &str = "
         one INTEGER PRIMARY KEY CHECK (one = 1), identity TEXT NOT NULL,
         mailbox_id TEXT NOT NULL, cursor INTEGER NOT NULL, skip_at INTEGER,
         skip_freed INTEGER NOT NULL DEFAULT 0, freed INTEGER NOT NULL DEFAULT 0,
-        skip_expires INTEGER) WITHOUT ROWID;
+        skip_expires INTEGER, skip_inbox INTEGER, read_to INTEGER NOT NULL DEFAULT 0,
+        skip_inbox_now INTEGER) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS mailbox_dones (
         mailbox_id TEXT NOT NULL, position INTEGER NOT NULL,
         PRIMARY KEY(mailbox_id, position)) WITHOUT ROWID;
@@ -205,7 +215,7 @@ const TABLES: &str = "
     CREATE TABLE IF NOT EXISTS mailbox_pending (
         object_hash TEXT PRIMARY KEY, host_id TEXT NOT NULL, host_trust_gen INTEGER NOT NULL,
         mailbox_id TEXT NOT NULL, position INTEGER NOT NULL, expires_at INTEGER NOT NULL,
-        bytes BLOB NOT NULL) WITHOUT ROWID;
+        bytes BLOB NOT NULL, no_room INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS mailbox_results (
         object_hash TEXT PRIMARY KEY, sender_host TEXT NOT NULL, object_id TEXT NOT NULL,
         mailbox_id TEXT NOT NULL, position INTEGER NOT NULL, bytes BLOB NOT NULL,
@@ -215,31 +225,33 @@ const TABLES: &str = "
         UPDATE mailbox_cursor SET freed=freed+1 WHERE one=1;
     END;";
 
-/// The columns `mailbox_cursor` gained after its first shape (review P5: a
-/// store made by an earlier build of this mailbox gets them when its
-/// tables are made).
-const CURSOR_COLUMNS: [(&str, &str); 4] = [
-    ("skip_at", "INTEGER"),
-    ("skip_freed", "INTEGER NOT NULL DEFAULT 0"),
-    ("freed", "INTEGER NOT NULL DEFAULT 0"),
-    ("skip_expires", "INTEGER"),
+/// The columns the mailbox's tables gained after their first shape
+/// (review P5: a store made by an earlier build of this mailbox gets them
+/// when its tables are made): `(table, column, kind)`.
+const NEW_COLUMNS: [(&str, &str, &str); 8] = [
+    ("mailbox_cursor", "skip_at", "INTEGER"),
+    ("mailbox_cursor", "skip_freed", "INTEGER NOT NULL DEFAULT 0"),
+    ("mailbox_cursor", "freed", "INTEGER NOT NULL DEFAULT 0"),
+    ("mailbox_cursor", "skip_expires", "INTEGER"),
+    ("mailbox_cursor", "skip_inbox", "INTEGER"),
+    ("mailbox_cursor", "read_to", "INTEGER NOT NULL DEFAULT 0"),
+    ("mailbox_cursor", "skip_inbox_now", "INTEGER"),
+    ("mailbox_pending", "no_room", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
-/// The mailbox's tables in `store`, made if missing (a cursor table of an
-/// earlier shape gets its new columns first).
+/// The mailbox's tables in `store`, made if missing (a table of an earlier
+/// shape gets its new columns first).
 pub fn prepare(store: &Store) -> Result<()> {
     let tx = store.immediate()?;
-    for (column, kind) in CURSOR_COLUMNS {
-        let (table, present): (bool, bool) = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='mailbox_cursor'),
-                EXISTS(SELECT 1 FROM pragma_table_info('mailbox_cursor') WHERE name=?1)",
-            [column],
+    for (table, column, kind) in NEW_COLUMNS {
+        let (made, present): (bool, bool) = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1),
+                EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+            [table, column],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        if table && !present {
-            tx.execute_batch(&format!(
-                "ALTER TABLE mailbox_cursor ADD COLUMN {column} {kind}"
-            ))?;
+        if made && !present {
+            tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
         }
     }
     tx.execute_batch(TABLES)?;
@@ -301,17 +313,18 @@ pub fn read(store: &Store, identity: &HostIdentity) -> Result<Observed> {
     let inbox = store
         .db
         .query_row("SELECT count(*) FROM mailbox_inbox", [], |r| r.get(0))?;
-    let (skipped, rewind_due, skip_expires) = store
+    let (skipped, rewind_due, skip_expires, skipped_inbox, read_to) = store
         .db
         .query_row(
             "SELECT skip_at IS NOT NULL, skip_at IS NOT NULL AND freed > skip_freed,
-                CASE WHEN skip_at IS NOT NULL THEN skip_expires END
+                CASE WHEN skip_at IS NOT NULL THEN skip_expires END,
+                skip_inbox IS NOT NULL OR skip_inbox_now IS NOT NULL, max(cursor, read_to)
             FROM mailbox_cursor WHERE one=1",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?
-        .unwrap_or((false, false, None));
+        .unwrap_or((false, false, None, false, 0));
     let owed_count = match &cursor {
         Some((mailbox_id, _)) => store.db.query_row(
             "SELECT count(*) FROM mailbox_dones WHERE mailbox_id=?1",
@@ -327,16 +340,30 @@ pub fn read(store: &Store, identity: &HostIdentity) -> Result<Observed> {
         owed: owed_dones(store, identity)?,
         owed_count,
         skipped,
+        skipped_inbox,
+        read_to,
+        waiting_for_room: store.db.query_row(
+            "SELECT count(*) FROM mailbox_pending WHERE no_room=1",
+            [],
+            |r| r.get(0),
+        )?,
         rewind_due,
         skip_expires,
     })
 }
 
+/// The cursor at `at` of `mailbox_id`, and the furthest position read in
+/// it (`read_to`, ruling R35: a rewind lowers the cursor, never this; a
+/// reset sets it to 0, [`mark_reset`]). SQLite reads every right-hand side
+/// on the row as it was.
 fn set_cursor(tx: &Transaction, identity: &HostIdentity, mailbox_id: &str, at: u64) -> Result<()> {
     tx.execute(
-        "INSERT INTO mailbox_cursor(one, identity, mailbox_id, cursor) VALUES(1, ?1, ?2, ?3)
+        "INSERT INTO mailbox_cursor(one, identity, mailbox_id, cursor, read_to)
+        VALUES(1, ?1, ?2, ?3, ?3)
         ON CONFLICT(one) DO UPDATE SET identity=excluded.identity,
-            mailbox_id=excluded.mailbox_id, cursor=excluded.cursor",
+            mailbox_id=excluded.mailbox_id, cursor=excluded.cursor,
+            read_to=CASE WHEN mailbox_id=excluded.mailbox_id
+                THEN max(read_to, excluded.cursor) ELSE excluded.cursor END",
         params![identity_text(identity), mailbox_id, at],
     )?;
     Ok(())
@@ -353,7 +380,8 @@ pub fn mark_reset(store: &Store, identity: &HostIdentity, mailbox_id: &str) -> R
     own_cursor(&tx, identity)?;
     set_cursor(&tx, identity, mailbox_id, 0)?;
     tx.execute(
-        "UPDATE mailbox_cursor SET skip_at=NULL, skip_expires=NULL WHERE one=1",
+        "UPDATE mailbox_cursor SET skip_at=NULL, skip_expires=NULL, skip_inbox=NULL,
+            skip_inbox_now=NULL, read_to=0 WHERE one=1",
         [],
     )?;
     tx.execute("DELETE FROM mailbox_dones", [])?;
@@ -373,9 +401,14 @@ pub fn mark_reset(store: &Store, identity: &HostIdentity, mailbox_id: &str) -> R
 pub fn rewind_if_room(store: &Store, identity: &HostIdentity, now_ms: u64) -> Result<bool> {
     let tx = store.immediate()?;
     own_cursor(&tx, identity)?;
+    // The requests, cancels and completes this read left there now await
+    // the re-read (review finding 1): folded into those awaiting it.
     let rewound = tx.execute(
         "UPDATE mailbox_cursor SET cursor=min(cursor, skip_at - 1), skip_at=NULL,
-            skip_expires=NULL
+            skip_expires=NULL,
+            skip_inbox=CASE WHEN skip_inbox_now IS NULL THEN skip_inbox
+                ELSE max(coalesce(skip_inbox, 0), skip_inbox_now) END,
+            skip_inbox_now=NULL
         WHERE one=1 AND skip_at IS NOT NULL
             AND (freed > skip_freed OR skip_expires <= ?1)",
         [now_ms],
@@ -516,8 +549,10 @@ pub fn commit_page(
     }
     let mut decided = Vec::new();
     // The lowest position left on the Station, and when the last of them
-    // expires.
+    // expires; the highest of them that is a request, cancel or complete
+    // (ruling R35: only those hold the gate).
     let mut skipped: Option<(u64, u64)> = None;
+    let mut skipped_inbox: Option<u64> = None;
     for entry in &page.objects {
         let Some(cx) = decide else {
             return Ok(Commit::Undecided);
@@ -530,21 +565,48 @@ pub fn commit_page(
             Decision::Skipped => {
                 // Never past the longest life after now (as `keep_until`).
                 let longest = decide.map_or(0, |cx| cx.now_ms.saturating_add(LONGEST_LIFE_MS));
-                let expires = entry
+                let mail = entry
                     .parse_object()
                     .ok()
-                    .and_then(|o| MailBody::from_object(&o).ok())
+                    .and_then(|o| MailBody::from_object(&o).ok());
+                let expires = mail
+                    .as_ref()
                     .map_or(longest, |(_, body)| body.expires_at.min(longest));
                 skipped = Some(match skipped {
                     None => (entry.position, expires),
                     Some((at, until)) => (at.min(entry.position), until.max(expires)),
                 });
+                // Only an envelope is ever skipped for want of inbox room;
+                // a result for want of the results' room.
+                if mail.is_some_and(|(kind, _)| kind == MailKind::Envelope) {
+                    skipped_inbox = skipped_inbox.max(Some(entry.position));
+                }
             }
             _ => owe_done(&tx, &page.mailbox_id, entry.position)?,
         }
         decided.push(decision);
     }
     set_cursor(&tx, identity, &page.mailbox_id, page.through)?;
+    // Ruling R35: a request, cancel or complete left on the Station holds
+    // the gate until a read after a rewind covers its position again. Two
+    // kinds (review finding 1): those an earlier read left there, awaiting
+    // this re-read (`skip_inbox`, the highest of them: a page covering it
+    // re-read them all; a later page of the same read only moves on), and
+    // those this read leaves there (`skip_inbox_now`), which only the next
+    // rewind folds into the first, so a re-read leaving one there again
+    // never loses it to a higher one read since.
+    tx.execute(
+        "UPDATE mailbox_cursor SET skip_inbox=NULL
+        WHERE one=1 AND skip_inbox > ?1 AND skip_inbox <= ?2",
+        [page.after, page.through],
+    )?;
+    if let Some(at) = skipped_inbox {
+        tx.execute(
+            "UPDATE mailbox_cursor SET skip_inbox_now=max(coalesce(skip_inbox_now, 0), ?1)
+            WHERE one=1",
+            [at],
+        )?;
+    }
     if let Some((at, expires)) = skipped {
         // The lowest position left on the Station; the room freed so far
         // when the first of them was left (review P2: a later skip keeps
@@ -612,8 +674,19 @@ pub fn rejudge_pending(
                         continue;
                     }
                     match record(&tx, cx, &object, &bytes, verdict, &mailbox_id, position)? {
-                        // No room for it: it keeps waiting (never done).
-                        None | Some(Decision::Skipped) => continue,
+                        None => continue,
+                        // No room for it: it keeps waiting (never done), and
+                        // holds the gate's mailbox part as a request, cancel
+                        // or complete left on the Station does (review
+                        // finding 2, ruling R39; only waiting for a newer
+                        // sender generation holds none).
+                        Some(Decision::Skipped) => {
+                            tx.execute(
+                                "UPDATE mailbox_pending SET no_room=1 WHERE object_hash=?1",
+                                [&hash],
+                            )?;
+                            continue;
+                        }
                         Some(decision) => decision,
                     }
                 }

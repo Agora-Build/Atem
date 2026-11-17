@@ -1314,6 +1314,11 @@ fn an_older_cursor_table_gets_its_new_columns() {
         .execute_batch(
             "CREATE TABLE mailbox_cursor (one INTEGER PRIMARY KEY CHECK (one = 1),
                 identity TEXT NOT NULL, mailbox_id TEXT NOT NULL, cursor INTEGER NOT NULL)
+                WITHOUT ROWID;
+            CREATE TABLE mailbox_pending (
+                object_hash TEXT PRIMARY KEY, host_id TEXT NOT NULL,
+                host_trust_gen INTEGER NOT NULL, mailbox_id TEXT NOT NULL,
+                position INTEGER NOT NULL, expires_at INTEGER NOT NULL, bytes BLOB NOT NULL)
                 WITHOUT ROWID;",
         )
         .unwrap();
@@ -1324,6 +1329,10 @@ fn an_older_cursor_table_gets_its_new_columns() {
     let observed = read(&store, &identity(1)).unwrap();
     assert_eq!(observed.cursor, Some((MAILBOX.into(), 4)));
     assert!(!observed.skipped);
+    assert_eq!(
+        observed.waiting_for_room, 0,
+        "the waiting table's new column"
+    );
 }
 
 /// Review P6: a result already expired on `D` can never be delivered
@@ -1357,4 +1366,256 @@ fn an_expired_result_is_done_as_expired_never_skipped() {
     );
     assert_eq!(b.owed(), [1, 2], "both done: neither is read again");
     assert_eq!(b.count("mailbox_results"), 0);
+}
+
+/// Ruling R35: a result left on the Station for want of room holds no gate
+/// (a result starts no work: host senders' tasks never wait for one); a
+/// request, cancel or complete left there does, until a read after the
+/// rewind passes its position (a later page of the first read doesn't: it
+/// only moves on). Through the rewind's re-read the mailbox stays read to
+/// the furthest position reached (`read_to`), so a re-read never closes the
+/// gate on its own; a reset forgets both.
+#[test]
+fn only_a_skipped_request_cancel_or_complete_holds_the_gate() {
+    let mail = Mail::new();
+    let mut b = Box::new();
+    let cx = DecideCx {
+        limits: Limits {
+            results_per_sender: 1,
+            inbox_per_sender: 1,
+            ..Limits::default()
+        },
+        ..mail.cx()
+    };
+    assert_eq!(
+        decided(b.put_with(&cx, &result_from(&mail, "host-b").to_json())),
+        Decision::Result
+    );
+    let second = result_from(&mail, "host-b");
+    assert_eq!(
+        decided(b.put_with(&cx, &second.to_json())),
+        Decision::Skipped
+    );
+    let observed = read(&b.store, &identity(1)).unwrap();
+    assert!(observed.skipped, "left on the Station");
+    assert!(!observed.skipped_inbox, "a result holds no gate");
+    assert_eq!(
+        decided(b.put_with(&cx, &mail.cancel().to_json())),
+        Decision::Opened
+    );
+    let fourth = mail.cancel();
+    assert_eq!(
+        decided(b.put_with(&cx, &fourth.to_json())),
+        Decision::Skipped
+    );
+    assert!(read(&b.store, &identity(1)).unwrap().skipped_inbox);
+    // A later page of the first read only moves on: it still waits there.
+    decided(b.put_with(&cx, &serde_json::json!("junk")));
+    let observed = read(&b.store, &identity(1)).unwrap();
+    assert!(observed.skipped_inbox, "position 4 not read again");
+    assert_eq!(
+        (observed.cursor, observed.read_to),
+        (Some((MAILBOX.into(), 5)), 5)
+    );
+    // Admission takes the opened cancel: room frees, the cursor rewinds to
+    // just before the lowest skipped position (the result's, 2).
+    b.store.db.execute("DELETE FROM mailbox_inbox", []).unwrap();
+    assert!(rewind_if_room(&b.store, &identity(1), cx.now_ms).unwrap());
+    let observed = read(&b.store, &identity(1)).unwrap();
+    assert_eq!(
+        (observed.cursor, observed.read_to),
+        (Some((MAILBOX.into(), 1)), 5),
+        "read to 5 still"
+    );
+    assert!(observed.skipped_inbox, "not read again yet");
+    // The re-read: the result left again (still no room for it), the
+    // opened cancel gone from the Station (done), then the fourth opens.
+    b.at = 1;
+    assert_eq!(
+        decided(b.put_with(&cx, &second.to_json())),
+        Decision::Skipped
+    );
+    let observed = read(&b.store, &identity(1)).unwrap();
+    assert!(observed.skipped && observed.skipped_inbox);
+    commit_page(
+        &b.store,
+        &identity(1),
+        &page(MAILBOX, 2, 5, 3, vec![]),
+        Some(&cx),
+    )
+    .unwrap();
+    b.at = 3;
+    assert_eq!(
+        decided(b.put_with(&cx, &fourth.to_json())),
+        Decision::Opened
+    );
+    let observed = read(&b.store, &identity(1)).unwrap();
+    assert!(!observed.skipped_inbox, "read again past it");
+    assert!(observed.skipped, "the result still waits there");
+    assert_eq!(
+        (observed.cursor, observed.read_to),
+        (Some((MAILBOX.into(), 4)), 5)
+    );
+    // A reset forgets both.
+    decided(b.put_with(&cx, &mail.cancel().to_json()));
+    assert!(read(&b.store, &identity(1)).unwrap().skipped_inbox);
+    mark_reset(&b.store, &identity(1), MAILBOX_2).unwrap();
+    let observed = read(&b.store, &identity(1)).unwrap();
+    assert!(!observed.skipped_inbox);
+    assert_eq!(
+        (observed.cursor, observed.read_to),
+        (Some((MAILBOX_2.into(), 0)), 0)
+    );
+}
+
+/// Review finding 1 (ruling R35): a request, cancel or complete left on the
+/// Station keeps holding the gate through a re-read of several pages. A's
+/// cancel (position 3) and B's (7) are left there, each sender's share full;
+/// room frees for B only, and the re-read leaves A's again (position 3) and
+/// opens B's (7): A's still waits there. Admission drains everything and the
+/// cursor rewinds again: until a page covers position 3 once more, it still
+/// holds the gate.
+#[test]
+fn a_skip_left_again_on_a_reread_still_holds_the_gate() {
+    let mut mail = Mail::new();
+    mail.log.add_host("host-c", 1, &secret("mail host c"));
+    let b = Box::new();
+    let cx = DecideCx {
+        limits: Limits {
+            inbox_per_sender: 1,
+            ..Limits::default()
+        },
+        ..mail.cx()
+    };
+    let from_c = || {
+        let mut c = SoftwareKeys::new();
+        c.insert_ed25519(KeyId::new("host-c"), &secret("mail host c"));
+        let fields = mail.fields("host-c", mail.log.log.head(), now_ms() + HOUR);
+        seal_envelope(
+            &c,
+            &KeyId::new("host-c"),
+            &fields,
+            &EnvelopePlain::Cancel { task_id: uuid() },
+            &mail.enc_pub,
+        )
+        .unwrap()
+    };
+    // One page: `after` to `through`, the object at `through` if any.
+    let read_page = |b: &Box, after: u64, through: u64, object: Option<&SignedObject>| {
+        let objects = object
+            .map(|o| vec![entry(through, &o.to_json().to_string())])
+            .unwrap_or_default();
+        let page = page(MAILBOX, after, 7, through, objects);
+        match commit_page(&b.store, &identity(1), &page, Some(&cx)).unwrap() {
+            Commit::Committed(c) => c.decided.into_iter().next(),
+            other => panic!("not committed: {other:?}"),
+        }
+    };
+    let held = |b: &Box| read(&b.store, &identity(1)).unwrap().skipped_inbox;
+    // Each sender's share full.
+    assert_eq!(
+        read_page(&b, 0, 1, Some(&mail.cancel())),
+        Some(Decision::Opened)
+    );
+    assert_eq!(read_page(&b, 1, 2, Some(&from_c())), Some(Decision::Opened));
+    // 1. The first read leaves A's cancel (3) and B's (7) on the Station.
+    let a = mail.cancel();
+    let c = from_c();
+    assert_eq!(read_page(&b, 2, 3, Some(&a)), Some(Decision::Skipped));
+    assert_eq!(read_page(&b, 3, 7, Some(&c)), Some(Decision::Skipped));
+    assert!(held(&b));
+    // 2. Admission takes B's row: the rewind to just before 3.
+    b.store
+        .db
+        .execute("DELETE FROM mailbox_inbox WHERE sender_host='host-c'", [])
+        .unwrap();
+    assert!(rewind_if_room(&b.store, &identity(1), cx.now_ms).unwrap());
+    assert_eq!(
+        read(&b.store, &identity(1)).unwrap().cursor,
+        Some((MAILBOX.into(), 2))
+    );
+    // 3. The re-read leaves A's again; 4. B's opens.
+    assert_eq!(read_page(&b, 2, 3, Some(&a)), Some(Decision::Skipped));
+    assert_eq!(read_page(&b, 3, 7, Some(&c)), Some(Decision::Opened));
+    assert!(held(&b), "A's cancel still waits on the Station");
+    // 5. Admission drains everything: the rewind again; until a page covers
+    // position 3 once more, it holds the gate.
+    b.store.db.execute("DELETE FROM mailbox_inbox", []).unwrap();
+    assert!(rewind_if_room(&b.store, &identity(1), cx.now_ms).unwrap());
+    let observed = read(&b.store, &identity(1)).unwrap();
+    assert_eq!(
+        (observed.cursor, observed.read_to),
+        (Some((MAILBOX.into(), 2)), 7)
+    );
+    assert!(observed.skipped_inbox, "not read again yet");
+    assert_eq!(read_page(&b, 2, 3, Some(&a)), Some(Decision::Opened));
+    assert!(!held(&b), "read again: nothing waits there");
+}
+
+/// Review finding 2 (ruling R39): a waiting object that decides to open
+/// with no room in the inbox keeps waiting, never done, and holds the gate's
+/// mailbox part as a request, cancel or complete left on the Station does;
+/// one waiting for a newer list holds none. Opened once room frees, it no
+/// longer waits.
+#[test]
+fn a_waiting_object_that_opens_with_no_room_holds_the_gate() {
+    let mut mail = Mail::new();
+    let mut b = Box::new();
+    let old = mail.log.log.clone();
+    mail.log.add_host("host-c", 1, &secret("mail host c"));
+    let limits = Limits {
+        inbox: 1,
+        ..Limits::default()
+    };
+    let before = DecideCx {
+        list: &old,
+        limits,
+        ..mail.cx()
+    };
+    // B's cancel fills the inbox; C's, signed at a head the list doesn't
+    // hold yet, waits.
+    let from_b = mail.seal(&mail.fields("host-b", old.head(), now_ms() + HOUR));
+    let mut c = SoftwareKeys::new();
+    c.insert_ed25519(KeyId::new("host-c"), &secret("mail host c"));
+    let from_c = seal_envelope(
+        &c,
+        &KeyId::new("host-c"),
+        &mail.fields("host-c", mail.log.log.head(), now_ms() + HOUR),
+        &EnvelopePlain::Cancel { task_id: uuid() },
+        &mail.enc_pub,
+    )
+    .unwrap();
+    assert_eq!(
+        decided(b.put_with(&before, &from_b.to_json())),
+        Decision::Opened
+    );
+    assert_eq!(
+        decided(b.put_with(&before, &from_c.to_json())),
+        Decision::Pending
+    );
+    let observed = read(&b.store, &identity(1)).unwrap();
+    assert_eq!(observed.waiting_for_room, 0, "waiting for the list: none");
+    // The list advances: C's opens, but the inbox is full: it keeps
+    // waiting, and holds the gate.
+    let after = DecideCx {
+        limits,
+        ..mail.cx()
+    };
+    assert!(
+        rejudge_pending(&b.store, &identity(1), &after)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(b.count("mailbox_pending"), 1);
+    assert_eq!(b.owed(), [1], "never done while it waits");
+    assert_eq!(read(&b.store, &identity(1)).unwrap().waiting_for_room, 1);
+    // Admission takes B's: judged again, C's opens and waits no more.
+    b.store.db.execute("DELETE FROM mailbox_inbox", []).unwrap();
+    assert_eq!(
+        rejudge_pending(&b.store, &identity(1), &after).unwrap(),
+        [Decision::Opened]
+    );
+    let observed = read(&b.store, &identity(1)).unwrap();
+    assert_eq!((observed.waiting_for_room, observed.inbox), (0, 1));
+    assert_eq!(b.count("mailbox_pending"), 0);
 }

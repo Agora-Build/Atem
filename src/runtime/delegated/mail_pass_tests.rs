@@ -367,9 +367,11 @@ fn a_mailbox_page_that_cant_commit_commits_nothing() {
         };
         crate::runtime::delegated::mailbox_store::commit_page(store, &identity, &moved, None)
             .unwrap();
+        // (Its head the announced one: a head below the cursor would be a
+        // reset, rule 7.)
         mb_receive(
             &mut rig,
-            &mb_page(&syncs[0], 1, std::slice::from_ref(&cancel)),
+            &mb_page(&syncs[0], 5, std::slice::from_ref(&cancel)),
         );
         assert_eq!(mb_store(&rig).inbox, 0, "stale: nothing");
         assert_eq!(mb_store(&rig).cursor, Some((MB_MAILBOX.into(), 3)));
@@ -614,9 +616,10 @@ fn mb_result(rig: &LocalRig, host: &MbHost) -> Value {
 }
 
 /// Ruling R31 in the bridge: a result over the results' limits is left on
-/// the Station (no row, no done) and keeps host senders' gate closed; once
-/// room frees (the sending host's check took the kept one), the next step
-/// rewinds the cursor durably, the re-read keeps it and its done goes.
+/// the Station (no row, no done); once room frees (the sending host's check
+/// took the kept one), the next step rewinds the cursor durably, the
+/// re-read keeps it and its done goes. Ruling R35: it holds no gate, left
+/// there or read again (results start no work).
 #[test]
 fn a_result_over_the_limits_is_read_again_once_room_frees() {
     local_test(async |root| {
@@ -642,7 +645,7 @@ fn a_result_over_the_limits_is_read_again_once_room_frees() {
             (Some((MB_MAILBOX.into(), 2)), vec![1])
         );
         assert_eq!(mb_out(&mut rig), (vec![], vec![]), "no done for it");
-        assert!(!mb_gate(&rig), "not committed yet");
+        assert!(mb_gate(&rig), "a result left there holds no gate");
         rig.bridge
             .work
             .store
@@ -655,6 +658,7 @@ fn a_result_over_the_limits_is_read_again_once_room_frees() {
         let (syncs, _) = mb_out(&mut rig);
         assert_eq!(syncs.len(), 1);
         assert_eq!(syncs[0].after, 1, "read again from just before it");
+        assert!(mb_gate(&rig), "the re-read closes nothing");
         mb_receive(&mut rig, &mb_page(&syncs[0], 2, &[second]));
         let observed = mb_store(&rig);
         assert!(!observed.skipped);
@@ -783,7 +787,7 @@ fn a_waiting_object_with_no_room_is_judged_again_when_room_frees() {
 
 /// Review P4: a skip ends once its object expires: with no room ever
 /// freed, the rewind still comes once `D` passes the skipped object's
-/// expiry, and the gate's mailbox part no longer waits for it.
+/// expiry.
 #[test]
 fn a_skip_ends_in_the_bridge_once_its_object_expires() {
     local_test(async |root| {
@@ -809,9 +813,197 @@ fn a_skip_ends_in_the_bridge_once_its_object_expires() {
         assert_eq!(observed.cursor, Some((MB_MAILBOX.into(), 1)));
         let (syncs, _) = mb_out(&mut rig);
         assert_eq!(syncs[0].after, 1);
-        // The Station no longer lists it: read to the head, the gate open
-        // once the kept result goes.
+        // The Station no longer lists it: read to the head.
         mb_receive(&mut rig, &mb_page(&syncs[0], 2, &[]));
         assert!(!mb_store(&rig).skipped);
+    });
+}
+
+/// Ruling R35 in the bridge: a cancel left on the Station for want of room
+/// holds host senders' gate until it is read again: through the rewind
+/// once admission took a row, until the re-read opens it (then it waits
+/// for admission as any opened object).
+#[test]
+fn a_skipped_cancel_holds_the_gate_until_it_is_read_again() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = mb_host(&mut rig, root, &os);
+        rig.bridge.work.mail_limits.inbox = 1;
+        let admit = |rig: &LocalRig| {
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .execute("DELETE FROM mailbox_inbox", [])
+                .unwrap();
+        };
+        let head = rig.bridge.membership.as_ref().unwrap().head();
+        mb_heads(&mut rig, MB_MAILBOX, 2);
+        let (syncs, _) = mb_out(&mut rig);
+        let first = mb_cancel(&rig, &host, "host-b", &host.sender, head);
+        mb_receive(&mut rig, &mb_page(&syncs[0], 2, &[first]));
+        let (syncs, _) = mb_out(&mut rig);
+        let second = mb_cancel(&rig, &host, "host-b", &host.sender, head);
+        mb_receive(
+            &mut rig,
+            &mb_page(&syncs[0], 2, std::slice::from_ref(&second)),
+        );
+        let observed = mb_store(&rig);
+        assert!(observed.skipped_inbox);
+        assert!(!mb_gate(&rig));
+        assert!(
+            rig.bridge.mail_status().unwrap().contains("room"),
+            "{:?}",
+            rig.bridge.mail_status()
+        );
+        // Admission takes the first: the rewind, and the gate still waits.
+        admit(&rig);
+        mb_tick(&mut rig, &mut host, 1_000);
+        let (syncs, _) = mb_out(&mut rig);
+        assert_eq!(syncs[0].after, 1);
+        assert!(!mb_gate(&rig), "not read again yet");
+        mb_receive(&mut rig, &mb_page(&syncs[0], 2, &[second]));
+        let observed = mb_store(&rig);
+        assert!(!observed.skipped_inbox);
+        assert_eq!(observed.inbox, 1);
+        assert!(!mb_gate(&rig), "it waits for admission now");
+        admit(&rig);
+        mb_tick(&mut rig, &mut host, 1_000);
+        assert!(mb_gate(&rig));
+    });
+}
+
+/// Review finding 1 (ruling R35) in the bridge: A's cancel and C's are left
+/// on the Station, each sender's share full; room frees for C only, and the
+/// re-read leaves A's again and opens C's. Once admission drains the inbox
+/// and the cursor rewinds again, host senders' gate stays closed until the
+/// page for A's position commits.
+#[test]
+fn a_cancel_left_again_on_a_reread_holds_the_gate_until_read_again() {
+    use crate::session_protocol::membership::r9log::secret;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = mb_host(&mut rig, root, &os);
+        rig.bridge.work.mail_limits.inbox_per_sender = 1;
+        let entry = host.s.log.add_host("host-c", 1, &secret("host c"));
+        carry(&mut rig, &host.s.log, entry);
+        rig.bridge.sync_list_view();
+        let mut c = atem_client::SoftwareKeys::new();
+        c.insert_ed25519(atem_client::KeyId::new("host-b"), &secret("host c"));
+        let head = host.s.log.log.head();
+        let admit = |rig: &LocalRig, sender: Option<&str>| {
+            let db = &rig.bridge.work.store.as_ref().unwrap().db;
+            match sender {
+                Some(s) => db.execute("DELETE FROM mailbox_inbox WHERE sender_host=?1", [s]),
+                None => db.execute("DELETE FROM mailbox_inbox", []),
+            }
+            .unwrap();
+        };
+        // Read one page answering the live sync: the next object.
+        let page_with = |rig: &mut LocalRig, object: &Value| {
+            let (syncs, _) = mb_out(rig);
+            mb_receive(rig, &mb_page(&syncs[0], 4, std::slice::from_ref(object)));
+        };
+        mb_heads(&mut rig, MB_MAILBOX, 4);
+        let first_b = mb_cancel(&rig, &host, "host-b", &host.sender, head);
+        let first_c = mb_cancel(&rig, &host, "host-c", &c, head);
+        page_with(&mut rig, &first_b);
+        page_with(&mut rig, &first_c);
+        let a = mb_cancel(&rig, &host, "host-b", &host.sender, head);
+        let from_c = mb_cancel(&rig, &host, "host-c", &c, head);
+        page_with(&mut rig, &a);
+        page_with(&mut rig, &from_c);
+        assert!(mb_store(&rig).skipped_inbox);
+        // Room for C only: the re-read leaves A's again and opens C's.
+        admit(&rig, Some("host-c"));
+        mb_tick(&mut rig, &mut host, 1_000);
+        page_with(&mut rig, &a);
+        page_with(&mut rig, &from_c);
+        assert_eq!(mb_store(&rig).cursor, Some((MB_MAILBOX.into(), 4)));
+        assert!(!mb_gate(&rig));
+        // Admission drains the inbox: the rewind; closed until position 3
+        // is read again.
+        admit(&rig, None);
+        mb_tick(&mut rig, &mut host, 1_000);
+        let observed = mb_store(&rig);
+        assert_eq!(
+            (observed.cursor, observed.read_to, observed.inbox),
+            (Some((MB_MAILBOX.into(), 2)), 4, 0)
+        );
+        assert!(!mb_gate(&rig), "A's cancel isn't read again yet");
+        page_with(&mut rig, &a);
+        assert_eq!(mb_store(&rig).inbox, 1);
+        assert!(!mb_gate(&rig), "it waits for admission now");
+        admit(&rig, None);
+        mb_tick(&mut rig, &mut host, 1_000);
+        assert!(mb_gate(&rig));
+    });
+}
+
+/// Review finding 2 (ruling R39) in the bridge: C's waiting cancel decides
+/// to open while the inbox is full: it keeps waiting and holds host senders'
+/// gate. Admission takes B's row: until C's is judged again, the gate stays
+/// closed (a step that publishes it without judging, as an answer to a
+/// done does); judged, it opens into the inbox.
+#[test]
+fn a_waiting_object_with_no_room_holds_the_gate() {
+    use crate::session_protocol::membership::r9log::secret;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = mb_host(&mut rig, root, &os);
+        rig.bridge.work.mail_limits.inbox = 1;
+        let admit = |rig: &LocalRig| {
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .execute("DELETE FROM mailbox_inbox", [])
+                .unwrap();
+        };
+        mb_heads(&mut rig, MB_MAILBOX, 2);
+        let (syncs, _) = mb_out(&mut rig);
+        let head = rig.bridge.membership.as_ref().unwrap().head();
+        let from_b = mb_cancel(&rig, &host, "host-b", &host.sender, head);
+        mb_receive(&mut rig, &mb_page(&syncs[0], 2, &[from_b]));
+        // C signs at a head this host doesn't hold yet: it waits.
+        let entry = host.s.log.add_host("host-c", 1, &secret("host c"));
+        let mut c = atem_client::SoftwareKeys::new();
+        c.insert_ed25519(atem_client::KeyId::new("host-b"), &secret("host c"));
+        let from_c = mb_cancel(&rig, &host, "host-c", &c, host.s.log.log.head());
+        let (syncs, _) = mb_out(&mut rig);
+        mb_receive(&mut rig, &mb_page(&syncs[0], 2, &[from_c]));
+        // The list moves: C's would open, but the inbox is full.
+        carry(&mut rig, &host.s.log, entry);
+        rig.bridge.sync_list_view();
+        mb_tick(&mut rig, &mut host, 2_000);
+        assert_eq!(mb_store(&rig).waiting_for_room, 1);
+        // Admission takes B's; the gate published before C's is judged
+        // again stays closed.
+        admit(&rig);
+        rig.bridge.mail_observe();
+        rig.bridge.mail_step();
+        let observed = mb_store(&rig);
+        assert_eq!((observed.inbox, observed.waiting_for_room), (0, 1));
+        assert!(!mb_gate(&rig), "C's cancel waits for room");
+        assert!(
+            rig.bridge.mail_status().unwrap().contains("room"),
+            "{:?}",
+            rig.bridge.mail_status()
+        );
+        // Judged again: it opens, then waits for admission.
+        mb_tick(&mut rig, &mut host, 2_000);
+        let observed = mb_store(&rig);
+        assert_eq!((observed.inbox, observed.waiting_for_room), (1, 0));
+        assert!(!mb_gate(&rig));
+        admit(&rig);
+        mb_tick(&mut rig, &mut host, 2_000);
+        assert!(mb_gate(&rig));
     });
 }

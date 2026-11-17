@@ -62,7 +62,8 @@ pub struct FakeAstation {
 }
 
 /// The host's Station calls (host-work-v1 §11.4: `control_sync`,
-/// `control_ack`, `membership_fetch`; and a `host_route` answering the
+/// `control_ack`, `membership_fetch`; §11.5: `mailbox_sync`,
+/// `mailbox_done`, `mailbox_put`; and a `host_route` answering the
 /// Station's challenge on a local link) once a fake Station took them
 /// ([`FakeAstation::station_calls`]): each with its link, as the bytes Atem
 /// sent, instead of an `Event::Message`.
@@ -261,7 +262,17 @@ fn deliver(
     tap: &StationTap,
 ) {
     use atem_client::control::relay::op;
-    const CALLS: [&str; 3] = [op::CONTROL_SYNC, op::CONTROL_ACK, op::MEMBERSHIP_FETCH];
+    use atem_client::host_mail::mailbox::op as mailbox;
+    // The host's calls to its Station: §11.4's, and host senders' mailbox
+    // calls (host-work-v1 §11.5).
+    const CALLS: [&str; 6] = [
+        op::CONTROL_SYNC,
+        op::CONTROL_ACK,
+        op::MEMBERSHIP_FETCH,
+        mailbox::MAILBOX_SYNC,
+        mailbox::MAILBOX_DONE,
+        mailbox::MAILBOX_PUT,
+    ];
     let call = match &value {
         // A `host_route` past the relay's own challenge too: the proof a
         // Station's challenge got through Astation's local proxy (design

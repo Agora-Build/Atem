@@ -60,6 +60,9 @@ fn observed(cursor: Option<(&str, u64)>) -> Observed {
         owed: Vec::new(),
         owed_count: 0,
         skipped: false,
+        skipped_inbox: false,
+        read_to: cursor.map_or(0, |(_, at)| at),
+        waiting_for_room: 0,
         rewind_due: false,
         skip_expires: None,
     }
@@ -465,10 +468,10 @@ fn mailbox_faults_and_refusals_are_hourly_alerts() {
     );
 }
 
-/// Ruling R31: an object left on the Station for want of room keeps the
-/// gate's mailbox part closed (not yet committed); once the store rewinds
-/// its cursor to just before it, the live call is retired and the re-read
-/// asked at once from there.
+/// Ruling R31: a request, cancel or complete left on the Station for want
+/// of room keeps the gate's mailbox part closed (not yet committed); once
+/// the store rewinds its cursor to just before it, the live call is retired
+/// and the re-read asked at once from there.
 #[test]
 fn a_rewind_rereads_from_the_skipped_position() {
     let mut c = client(10 * SEC, Some((MAILBOX, 5)));
@@ -476,6 +479,7 @@ fn a_rewind_rereads_from_the_skipped_position() {
     let live = sent(&mut c).unwrap();
     c.observe(Some(Observed {
         skipped: true,
+        skipped_inbox: true,
         ..observed(Some((MAILBOX, 5)))
     }));
     c.on_heads(head(MAILBOX, 5));
@@ -510,4 +514,49 @@ fn many_owed_dones_hold_the_sync() {
     }));
     c.tick(12 * SEC);
     assert_eq!(c.take_outgoing().sync.len(), 1);
+}
+
+/// Ruling R35: an object left on the Station for want of room holds the
+/// gate's mailbox part only when it is a request, cancel or complete (a
+/// result starts no work). The rewind's re-read keeps the mailbox read to
+/// the furthest position read (`read_to`), so it closes nothing on its
+/// own; a page whose head is below that position is a reset (the mailbox
+/// went back), and so is such a `heads`.
+#[test]
+fn only_a_skipped_request_cancel_or_complete_holds_the_gate() {
+    let mut c = client(10 * SEC, Some((MAILBOX, 6)));
+    c.on_heads(head(MAILBOX, 6));
+    c.observe(Some(Observed {
+        skipped: true,
+        ..observed(Some((MAILBOX, 6)))
+    }));
+    assert!(c.open(), "a result left there: {:?}", c.closed());
+    c.observe(Some(Observed {
+        skipped: true,
+        skipped_inbox: true,
+        ..observed(Some((MAILBOX, 6)))
+    }));
+    assert!(c.closed().unwrap().contains("room"), "{:?}", c.closed());
+    // The rewind for a result: re-read from 2, the gate open throughout.
+    c.observe(Some(Observed {
+        read_to: 6,
+        ..observed(Some((MAILBOX, 2)))
+    }));
+    c.cursor_rewound();
+    let call = sent(&mut c).expect("asked at once");
+    assert_eq!(call.after, 2);
+    assert!(c.open(), "{:?}", c.closed());
+    // Past the furthest position read, the gate waits as ever.
+    c.on_heads(head(MAILBOX, 7));
+    assert_eq!(c.closed().as_deref(), Some("reading the mailbox (6 of 7)"));
+    // A page whose head is below it: the mailbox went back.
+    assert_eq!(c.on_page(Ok(page(&call, 5, 2))), PageCheck::Reset);
+    // And a `heads` naming such a head.
+    let mut c = client(10 * SEC, Some((MAILBOX, 2)));
+    c.observe(Some(Observed {
+        read_to: 6,
+        ..observed(Some((MAILBOX, 2)))
+    }));
+    c.on_heads(head(MAILBOX, 5));
+    assert_eq!(c.reset_due().as_deref(), Some(MAILBOX));
 }

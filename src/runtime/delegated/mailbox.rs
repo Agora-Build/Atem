@@ -27,8 +27,9 @@
 //!   unread: taken as the live call's answer) are Station faults: the gate
 //!   stays closed until a page asked after the fault reads.
 //! - **Resets** (rule 7). An announced `mailbox_id` other than the one the
-//!   host read, or a head below its cursor (in a `heads` or as a page's
-//!   head below its `after`), is a reset: nothing is asked until the bridge
+//!   host read, or a head below the furthest position it read (its cursor,
+//!   or more while a rewind's re-read runs; in a `heads` or a page), is a
+//!   reset: nothing is asked until the bridge
 //!   marks it durably ([`MailboxClient::reset_due`]: the store's cursor
 //!   rewritten to the announced mailbox at 0, the dones owed to the old one
 //!   dropped), then the mailbox is read from 0; the gate stays closed until
@@ -55,15 +56,21 @@
 //! - **A rewind** (ruling R31): an object the store left on the Station for
 //!   want of room is read again once room frees: the store's cursor is
 //!   rewound to just before it, the live call retired and the re-read asked
-//!   at once ([`MailboxClient::cursor_rewound`]).
+//!   at once ([`MailboxClient::cursor_rewound`]); the furthest position
+//!   read stays ([`Observed::read_to`]).
 //! - **An identity change** on the live link (§11.4): every live mailbox
 //!   call retired, nothing more synced or marked done on that socket.
 //! - **The gate's mailbox part** (design II.5; [`MailboxClient::open`]):
 //!   the link up, a mailbox announced on this generation and read up to its
-//!   head, no refusal, fault or reset waiting, no object left on the
-//!   Station for want of room, and the inbox drained (the requests, cancels
-//!   and completes committed but not yet admitted).
-//!   Pending objects don't hold it. Only host senders wait for it.
+//!   head (the furthest position read: a rewind's re-read closes nothing on
+//!   its own), no refusal, fault or reset waiting, no request, cancel or
+//!   complete left on the Station, or waiting in the store, for want of
+//!   room ([`Observed::waiting_for_room`]), and the inbox drained (the
+//!   requests, cancels and completes committed but not yet admitted).
+//!   Objects waiting for a newer sender generation don't hold it (ruling
+//!   R39: design II.5 exempts only those), nor do results, kept or left on
+//!   the Station (ruling R35: they start no work, and a flood of them must
+//!   not hold task admission). Only host senders wait for it.
 use super::fetch::{HEADS_PACE_MS, REFUSAL_BACKOFF_MS, STALL_PAUSE_MS};
 use super::station::StationLink;
 use super::sync::{ALERT_EVERY_MS, HostIdentity, RETIRED_KEPT, SYNC_TIMEOUT_MS};
@@ -87,8 +94,18 @@ pub struct Observed {
     pub owed: Vec<u64>,
     pub owed_count: u64,
     /// An object was left on the Station for want of room (ruling R31):
-    /// not committed yet, so the gate's mailbox part stays closed.
+    /// not committed yet.
     pub skipped: bool,
+    /// One of them is a request, cancel or complete, not read again since:
+    /// the gate's mailbox part stays closed (ruling R35: a result left there
+    /// holds no gate).
+    pub skipped_inbox: bool,
+    /// The furthest position read in the cursor's mailbox (at least the
+    /// cursor; beyond it while a rewind's re-read runs).
+    pub read_to: u64,
+    /// Waiting objects that decided to open with no room in the inbox
+    /// (review finding 2, ruling R39): they hold the gate's mailbox part.
+    pub waiting_for_room: u64,
     /// Room freed since: the store's cursor is to be rewound to just before
     /// it (`mailbox_store::rewind_if_room`).
     pub rewind_due: bool,
@@ -109,7 +126,8 @@ pub enum PageCheck {
     Drained,
     /// A Station fault (its code): nothing applies.
     Fault(&'static str),
-    /// The page's head is below its `after`: a reset, to be marked.
+    /// The page's head is below the furthest position read (the cursor, or
+    /// more while a rewind's re-read runs): a reset, to be marked.
     Reset,
     /// No link: nothing arrives.
     Nothing,
@@ -385,7 +403,18 @@ impl MailboxClient {
             self.drained += 1;
             return PageCheck::Drained;
         }
-        if page.is_reset() {
+        // Its head below the cursor, or below the furthest position read
+        // (a rewind's re-read): the mailbox went back.
+        let read_to = self
+            .observed
+            .as_ref()
+            .filter(|o| {
+                o.cursor
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == page.mailbox_id)
+            })
+            .map_or(0, |o| o.read_to);
+        if page.is_reset() || page.head < read_to {
             self.reset = true;
             return PageCheck::Reset;
         }
@@ -599,11 +628,13 @@ impl MailboxClient {
         if self.reset {
             return Some("the mailbox was reset; reading it again from position 0".into());
         }
+        // Read to the furthest position read (ruling R35: a rewind's
+        // re-read closes nothing on its own).
         let read = observed
             .cursor
             .as_ref()
             .filter(|(id, _)| *id == announced.mailbox_id)
-            .map(|(_, at)| *at);
+            .map(|(_, at)| (*at).max(observed.read_to));
         if read.is_none_or(|at| at < announced.head) {
             return Some(format!(
                 "reading the mailbox ({} of {})",
@@ -611,10 +642,20 @@ impl MailboxClient {
                 announced.head
             ));
         }
-        if observed.skipped {
+        // Only a request, cancel or complete left on the Station holds it
+        // (ruling R35): a result starts no work.
+        if observed.skipped_inbox {
             return Some(
                 "a mailbox object waits on the Station for room in this host's inbox".into(),
             );
+        }
+        // So does a waiting one that decided to open with no room (review
+        // finding 2, ruling R39).
+        if observed.waiting_for_room > 0 {
+            return Some(format!(
+                "{} waiting mailbox object(s) wait for room in this host's inbox",
+                observed.waiting_for_room
+            ));
         }
         if observed.inbox > 0 {
             return Some(format!(
@@ -753,15 +794,22 @@ impl MailboxClient {
     }
 
     /// The announcement against the store's cursor: another mailbox, or a
-    /// head below the cursor of the same one, is a reset.
+    /// head of the same one below the furthest position read (the cursor,
+    /// or more while a rewind's re-read runs), is a reset.
     fn check_reset(&mut self) {
-        let (Some(announced), Some((id, at))) = (
-            &self.announced,
-            self.observed.as_ref().and_then(|o| o.cursor.as_ref()),
-        ) else {
+        let Some(announced) = &self.announced else {
             return;
         };
-        if *id != announced.mailbox_id || announced.head < *at {
+        let Some((id, at, read_to)) = self
+            .observed
+            .as_ref()
+            .and_then(|o| o.cursor.as_ref().map(|(id, at)| (id, *at, o.read_to)))
+        else {
+            return;
+        };
+        // A head below the furthest position read (the cursor, or more
+        // while a rewind's re-read runs) is the mailbox gone back.
+        if *id != announced.mailbox_id || announced.head < at.max(read_to) {
             if !self.reset {
                 eprintln!(
                     "atem runtime: host senders' mailbox was reset; reading it again from position 0"

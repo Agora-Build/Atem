@@ -65,6 +65,45 @@
 //!   announces its `heads` there; until then every call gets its typed
 //!   refusal. Off (the default) it needs no proof, as before.
 //!
+//! Host senders' mailboxes (host-work-v1 §11.5, "The mailbox calls"),
+//! read and answered with `atem_client::host_mail::mailbox`'s readers and
+//! builders only:
+//! - One mailbox per receiving host and trust generation (rule 2), its
+//!   `mailbox_id` a UUID v4 minted with it and never reused; `heads` carry
+//!   the calling host's own only when the test says the host's welcome
+//!   lists `host.senders` ([`FakeStation::host_lists_senders`]: the
+//!   welcome is end to end, the fake can't read it), and go at once when an
+//!   object is stored there (unless silenced).
+//! - Puts ([`FakeStation::put`], from a sending host the test plays, as
+//!   over its own link): rule 1 (the object's sender is the calling host,
+//!   a current host of the account at that generation; its account and
+//!   genesis the link's), then rule 3 (the recipient a current host at that
+//!   generation; the times; idempotency on `(calling host, body.id)` by
+//!   `object_hash` while stored, `id_reused` for other bytes; the quotas,
+//!   [`MailboxQuota`] per sending host, receiving host and account, on
+//!   each object's bytes as received, or [`FakeStation::refuse_quota`]).
+//!   A put it can't read gets no answer (dropped, counted). Capacity
+//!   reserved for control objects isn't modelled.
+//! - `mailbox_sync` (rule 4): the first stored object after `after`, the
+//!   page's `through` covering every position up to the next stored one
+//!   (done or expired positions included), or to the head; a reset's form
+//!   when `after` is beyond the head. Objects expire on the Station's clock.
+//! - `mailbox_done` (rule 5): only on the receiving host's own link (its
+//!   association's mailbox); removes the object, its key freed, and is
+//!   answered the same when nothing is there.
+//! - A call naming another mailbox (another host's, or the host's own from
+//!   before a reset or under its earlier trust generation) is refused
+//!   (`mailbox_sync_refused`, `mailbox_done_refused`); so is every one while
+//!   [`FakeStation::refuse_mailbox`] says.
+//! - Switches: [`FakeStation::drop_stored`] and
+//!   [`FakeStation::drop_done_results`] (the next answers lost, their
+//!   effect kept), [`FakeStation::reset_mailbox`] (a new `mailbox_id`) and
+//!   [`FakeStation::roll_back_mailbox`] (the head back under the same id, a
+//!   Station fault); a page delivered late is a held call
+//!   ([`FakeStation::hold_mailbox`]) answered later.
+//!   [`FakeStation::store_unchecked`] stores an object with no intake check
+//!   (a Station that misroutes).
+//!
 //! What a well-behaved Station never does, for the host's defences:
 //! [`FakeStation::heads_with`] (heads naming any feeds, another origin's
 //! included), [`FakeStation::append_gap`] (positions left out, which §11.4
@@ -84,13 +123,21 @@ use atem_client::control::{
     FeedEntry, FeedHead, Heads, LinkAssociation, MembershipFetch, MembershipFetchResult,
     RefusalCode, RefusedCall, RelayError, ToStation, build_control, principal_key_of,
 };
+use atem_client::control::{HeadsWithMailbox, MailboxHead};
 use atem_client::encoding::Hash32;
+use atem_client::host_mail::MailBody;
+use atem_client::host_mail::mailbox::{
+    MailboxCallRefused, MailboxDone, MailboxDoneResult, MailboxEntry, MailboxPut,
+    MailboxPutRefused, MailboxRefusedCall, MailboxStored, MailboxSync, MailboxSyncResult,
+    MailboxToStation, PutRefusal, is_mailbox_op, object_hash,
+};
 use atem_client::host_route::{
     HostChallenge, HostRoute, HostRouteRefusal, RelayReply, RouteKind, verify_host_route_message_as,
 };
 use atem_client::membership::{Head, Membership};
 use atem_client::{KeyProvider, SignedObject, SoftwareKeys};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -135,6 +182,65 @@ impl Held {
     pub fn link(&self) -> u64 {
         self.link
     }
+
+    /// The call as the shared mailbox reader reads it (host-work-v1
+    /// §11.5).
+    pub fn mailbox(&self) -> Result<MailboxToStation, RelayError> {
+        MailboxToStation::decode(self.bytes.as_bytes())
+    }
+}
+
+/// The Station's limits on mailbox objects (design II.4.3's starting
+/// limits, whichever comes first), on the encoded bytes of each object:
+/// stored per sending host, per receiving host's mailbox and per account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MailboxQuota {
+    pub per_sender: usize,
+    pub per_sender_bytes: usize,
+    pub per_mailbox: usize,
+    pub per_mailbox_bytes: usize,
+    pub per_account: usize,
+    pub per_account_bytes: usize,
+}
+
+impl Default for MailboxQuota {
+    /// 128 objects or 32 MiB per sending host, 256 objects or 64 MiB per
+    /// receiving host, 1,024 objects or 256 MiB per account (design
+    /// II.4.3).
+    fn default() -> Self {
+        MailboxQuota {
+            per_sender: 128,
+            per_sender_bytes: 32 << 20,
+            per_mailbox: 256,
+            per_mailbox_bytes: 64 << 20,
+            per_account: 1024,
+            per_account_bytes: 256 << 20,
+        }
+    }
+}
+
+/// A receiving host's mailbox at this Station (§11.5 rule 2).
+#[derive(Debug, Clone)]
+struct Mailbox {
+    mailbox_id: String,
+    /// The last position given (0: none).
+    head: u64,
+    /// The objects stored, by position.
+    stored: BTreeMap<u64, Stored>,
+}
+
+/// An object stored in a mailbox.
+#[derive(Debug, Clone)]
+struct Stored {
+    /// Its key (rule 3): the calling host and the body's `id`.
+    sender: String,
+    id: String,
+    /// Its identity (`object_hash`).
+    hash: Hash32,
+    expires_at: u64,
+    /// The encoded bytes charged.
+    bytes: usize,
+    object: SignedObject,
 }
 
 /// A host's `host_route` on a link ([`FakeStation::require_proof`]): the
@@ -162,7 +268,9 @@ struct Account {
     genesis_hash: Hash32,
     /// The device list from its genesis (`seq` n is `entries[n - 1]`).
     entries: Vec<SignedObject>,
-    /// The same list, verified (a proof is checked against it).
+    /// The same list, verified (a proof is checked against it, and the
+    /// mailbox's puts: who is a current host; entries stored beyond it
+    /// aren't in it).
     membership: Membership,
     head: Head,
     /// How many feeds the account had here (a reset mints the next): its
@@ -303,6 +411,26 @@ pub struct FakeStation {
     challenges: std::collections::HashMap<u64, [u8; 32]>,
     proved: std::collections::HashSet<u64>,
     proofs: Vec<ProofSeen>,
+    /// The host's trust generation its links below `retired_below` are
+    /// associated with ([`FakeStation::reassociate`]): their mailbox calls
+    /// name that generation's mailbox.
+    prior_gen: u64,
+    /// Host senders' mailboxes, by receiving `(host_id, host_trust_gen)`
+    /// (§11.5 rule 2), and how many were minted (a new `mailbox_id` each).
+    mailboxes: BTreeMap<(String, u64), Mailbox>,
+    mailboxes_minted: u64,
+    /// The host's welcome lists `host.senders`: `heads` carry its mailbox.
+    senders: bool,
+    quota: MailboxQuota,
+    refuse_quota: bool,
+    /// The mailbox calls refused while on: `mailbox_sync`, `mailbox_done`.
+    refusing_mailbox: [bool; 2],
+    /// How many of the next `mailbox_stored` and `mailbox_done_result` are
+    /// lost (their effect kept).
+    drop_stored: u64,
+    drop_done_results: u64,
+    /// Puts the Station couldn't read (dropped unanswered, rule 3).
+    puts_dropped: u64,
 }
 
 impl FakeStation {
@@ -348,6 +476,16 @@ impl FakeStation {
             challenges: Default::default(),
             proved: Default::default(),
             proofs: Vec::new(),
+            prior_gen: host_trust_gen,
+            mailboxes: BTreeMap::new(),
+            mailboxes_minted: 0,
+            senders: false,
+            quota: MailboxQuota::default(),
+            refuse_quota: false,
+            refusing_mailbox: [false; 2],
+            drop_stored: 0,
+            drop_done_results: 0,
+            puts_dropped: 0,
         }
     }
 
@@ -427,7 +565,8 @@ impl FakeStation {
     /// isn't here, so serve before comparing. What reaches the fake is a
     /// text frame the fake Astation reads as JSON, or one that names a
     /// Station call (`"control_sync"`, `"control_ack"`,
-    /// `"membership_fetch"`); a binary frame never does.
+    /// `"membership_fetch"`, or a mailbox call: `"mailbox_sync"`,
+    /// `"mailbox_done"`, `"mailbox_put"`); a binary frame never does.
     pub fn sent(&self) -> Vec<String> {
         self.sent.clone()
     }
@@ -449,7 +588,11 @@ impl FakeStation {
     /// never relabelled, and its acks are refused for it from now on
     /// (`control_ack_refused`, metadata-free; [`FakeStation::ack_refusals`]
     /// says `NotTheLink`), nothing counted.
+    /// Its mailbox calls are the new identity's too (§11.5 rule 1): a link
+    /// from `from_link` on reads and marks the mailbox of the new trust
+    /// generation (a new mailbox), an older one its old generation's.
     pub fn reassociate(&mut self, host_trust_gen: u64, from_link: u64) {
+        self.prior_gen = self.host_trust_gen;
         self.host_trust_gen = host_trust_gen;
         self.retired_below = from_link;
     }
@@ -490,12 +633,12 @@ impl FakeStation {
     /// Serves `link` until the host's next call of any kind (a
     /// `control_ack` included) arrived (at most a minute) and answers it.
     pub fn next_call(&mut self, link: u64) -> Result<ToStation, RelayError> {
-        let held = self.hold_next(link, |_| true);
+        let held = self.hold_next(link, |_| true, Some(&|_: &MailboxToStation| true));
         self.answer_held(held)
     }
 
     /// Serves `link` until the host's next call that isn't a `control_ack`
-    /// arrived (at most a minute) and keeps it unanswered (in
+    /// or a mailbox call arrived (at most a minute) and keeps it unanswered (in
     /// [`FakeStation::sent`] from now): a Station slow to answer, or one
     /// whose answer the test writes itself. [`FakeStation::answer_held`]
     /// answers it later; a call never answered is one the Station never
@@ -503,22 +646,32 @@ impl FakeStation {
     /// as a Station does (an ack has no answer): [`FakeStation::hold_ack`]
     /// holds one.
     pub fn hold_call(&mut self, link: u64) -> Held {
-        self.hold_next(link, |call| !matches!(call, Ok(ToStation::ControlAck(_))))
+        self.hold_next(
+            link,
+            |call| !matches!(call, Ok(ToStation::ControlAck(_))),
+            None,
+        )
     }
 
     /// Serves `link` until the host's next `control_ack` arrived (at most
     /// a minute) and keeps it uncounted, as [`FakeStation::hold_call`]
     /// keeps a call; the calls that come first are answered as they come.
     pub fn hold_ack(&mut self, link: u64) -> Held {
-        self.hold_next(link, |call| matches!(call, Ok(ToStation::ControlAck(_))))
+        self.hold_next(
+            link,
+            |call| matches!(call, Ok(ToStation::ControlAck(_))),
+            None,
+        )
     }
 
-    /// The host's next call on `link` that `held` takes, kept unanswered;
-    /// the ones before it answered as they come.
+    /// The host's next call on `link` that `held` takes (a mailbox call
+    /// only when `mailbox` takes it), kept unanswered; the ones before it
+    /// answered as they come.
     fn hold_next(
         &mut self,
         link: u64,
         held: impl Fn(&Result<ToStation, RelayError>) -> bool,
+        mailbox: Option<&dyn Fn(&MailboxToStation) -> bool>,
     ) -> Held {
         self.attach(link);
         let deadline = Instant::now() + WAIT;
@@ -532,7 +685,14 @@ impl FakeStation {
                 self.on_proof(from, bytes);
                 continue;
             }
-            if held(&ToStation::decode(bytes.as_bytes())) {
+            let take = if mailbox_call(&bytes) {
+                mailbox.is_some_and(|take| {
+                    MailboxToStation::decode(bytes.as_bytes()).is_ok_and(|call| take(&call))
+                })
+            } else {
+                held(&ToStation::decode(bytes.as_bytes()))
+            };
+            if take {
                 self.sent.push(bytes.clone());
                 self.sent_on.push(from);
                 return Held { link: from, bytes };
@@ -694,7 +854,19 @@ impl FakeStation {
             feeds,
             membership: self.served().head,
         };
-        let heads = heads.to_json().expect("heads within the builder's bounds");
+        // The calling host's own mailbox, only for a host whose welcome
+        // lists `host.senders` (§11.5 rule 6).
+        let mailbox = self.senders.then(|| {
+            let now = self.now();
+            let mailbox = self.own_mailbox(link, now);
+            MailboxHead {
+                mailbox_id: mailbox.mailbox_id.clone(),
+                head: mailbox.head,
+            }
+        });
+        let heads = HeadsWithMailbox { heads, mailbox }
+            .to_json()
+            .expect("heads within the builder's bounds");
         self.out.send(link, heads.to_string());
         self.last_heads = Some(Instant::now());
     }
@@ -974,6 +1146,16 @@ impl FakeStation {
 
     /// Answers the host's call `bytes` (already in `sent`) on `link`.
     fn reply(&mut self, link: u64, bytes: &str) -> Result<ToStation, RelayError> {
+        // Host senders' mailbox calls (§11.5), told by their `op`: read by
+        // the shared mailbox reader (one it refuses gets no answer).
+        if mailbox_call(bytes) {
+            if let Ok(call) = MailboxToStation::decode(bytes.as_bytes())
+                && let Some(reply) = self.mailbox_reply(link, call)
+            {
+                self.out.send(link, reply);
+            }
+            return ToStation::decode(bytes.as_bytes());
+        }
         let call = ToStation::decode(bytes.as_bytes());
         // A link that hasn't proved its host, when one is required: every
         // call refused, nothing served or counted.
@@ -1092,6 +1274,506 @@ impl FakeStation {
     }
 }
 
+/// Whether `bytes` name a mailbox call by their top-level `op` (a scan to
+/// dispatch: the shared mailbox reader reads them).
+fn mailbox_call(bytes: &str) -> bool {
+    serde_json::from_str::<Value>(bytes)
+        .ok()
+        .and_then(|v| v.get("op").and_then(Value::as_str).map(is_mailbox_op))
+        .unwrap_or(false)
+}
+
+/// The length of a put's `object` as the call carried it (its exact text,
+/// whitespace and escapes included).
+fn received_object_len(bytes: &[u8]) -> Option<usize> {
+    #[derive(serde::Deserialize)]
+    struct Put<'a> {
+        #[serde(borrow)]
+        object: &'a serde_json::value::RawValue,
+    }
+    serde_json::from_slice::<Put>(bytes)
+        .ok()
+        .map(|put| put.object.get().len())
+}
+
+/// A mailbox's `mailbox_id`: the `n`th minted at `origin` for `account_id`
+/// (deterministic: a run repeats; never reused within it).
+fn mailbox_id(origin: &str, account_id: &str, n: u64) -> String {
+    uuid_v4(&[
+        "atem fake station mailbox",
+        origin,
+        account_id,
+        &n.to_string(),
+    ])
+}
+
+// ------------------------------------------- host senders' mailboxes (§11.5)
+
+impl FakeStation {
+    /// Whether the host's welcome lists `host.senders` (the test says: the
+    /// welcome is end to end): from now on `heads` carry its own mailbox
+    /// (rule 6), and go at once when an object is stored there (unless
+    /// silenced). Off (the default): `heads` exactly as §11.4 has them.
+    pub fn host_lists_senders(&mut self, on: bool) {
+        self.senders = on;
+    }
+
+    /// The Station's limits on mailbox objects from now on.
+    pub fn set_mailbox_quota(&mut self, quota: MailboxQuota) {
+        self.quota = quota;
+    }
+
+    /// While on, every put that would be stored is refused `quota`.
+    pub fn refuse_quota(&mut self, on: bool) {
+        self.refuse_quota = on;
+    }
+
+    /// While on, `call` (`mailbox_sync` or `mailbox_done`) is refused
+    /// (`mailbox_sync_refused`, `mailbox_done_refused`: `forbidden`),
+    /// nothing served or removed.
+    pub fn refuse_mailbox(&mut self, call: MailboxRefusedCall, on: bool) {
+        self.refusing_mailbox[mailbox_slot(call)] = on;
+    }
+
+    /// The next `n` `mailbox_stored` are lost: the object is stored, the
+    /// answer never sent.
+    pub fn drop_stored(&mut self, n: u64) {
+        self.drop_stored = n;
+    }
+
+    /// The next `n` `mailbox_done_result` are lost: the object is removed,
+    /// the answer never sent.
+    pub fn drop_done_results(&mut self, n: u64) {
+        self.drop_done_results = n;
+    }
+
+    /// The puts the Station couldn't read so far (dropped unanswered).
+    pub fn puts_dropped(&self) -> u64 {
+        self.puts_dropped
+    }
+
+    /// The `mailbox_id` of the host's own mailbox, as its newest link's
+    /// association names it (its current trust generation).
+    pub fn mailbox_id(&mut self) -> String {
+        let now = self.now();
+        let (host_id, generation) = (self.host_id.clone(), self.host_trust_gen);
+        self.mailbox_of(&host_id, generation, now)
+            .mailbox_id
+            .clone()
+    }
+
+    /// The host's own mailbox's head (its current trust generation).
+    pub fn mailbox_head(&mut self) -> u64 {
+        let now = self.now();
+        let (host_id, generation) = (self.host_id.clone(), self.host_trust_gen);
+        self.mailbox_of(&host_id, generation, now).head
+    }
+
+    /// The positions of the objects the host's own mailbox stores now
+    /// (its current trust generation), ascending.
+    pub fn mailbox_positions(&mut self) -> Vec<u64> {
+        let now = self.now();
+        let (host_id, generation) = (self.host_id.clone(), self.host_trust_gen);
+        self.mailbox_of(&host_id, generation, now)
+            .stored
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// The position of the object `id` (its body's) in the host's own
+    /// mailbox, while stored.
+    pub fn position_of(&mut self, id: &str) -> Option<u64> {
+        let now = self.now();
+        let (host_id, generation) = (self.host_id.clone(), self.host_trust_gen);
+        self.mailbox_of(&host_id, generation, now)
+            .stored
+            .iter()
+            .find(|(_, stored)| stored.id == id)
+            .map(|(position, _)| *position)
+    }
+
+    /// How many objects the mailbox of `host_id` in `host_trust_gen`
+    /// stores now (another receiving host's, too).
+    pub fn stored_for(&mut self, host_id: &str, host_trust_gen: u64) -> usize {
+        let now = self.now();
+        self.mailbox_of(host_id, host_trust_gen, now).stored.len()
+    }
+
+    /// `mailbox_put` from the sending host `host_id` in `host_trust_gen`
+    /// (its link's verified association; an account's host), `bytes` as
+    /// sent, read by the shared reader: the answer's bytes, as the Station
+    /// sends them on that host's link (rules 1 and 3), or none for a put it
+    /// can't read (dropped, counted) and for a lost `mailbox_stored`.
+    pub fn put(&mut self, host_id: &str, host_trust_gen: u64, bytes: &[u8]) -> Option<String> {
+        let Ok(MailboxToStation::Put(put)) = MailboxToStation::decode(bytes) else {
+            self.puts_dropped += 1;
+            return None;
+        };
+        let Ok((_, body)) = put.mail() else {
+            self.puts_dropped += 1;
+            return None;
+        };
+        let refused = |code| {
+            MailboxPutRefused {
+                request_id: put.request_id.clone(),
+                id: body.id.clone(),
+                code,
+            }
+            .to_json()
+            .expect("a put refusal")
+            .to_string()
+        };
+        // Rule 1: the object's own sender is the calling host, a current
+        // host of the account at that generation, and the link's account.
+        let own = &self.own;
+        let current = |host: &str, generation: u64| {
+            own.membership
+                .host(host)
+                .is_some_and(|h| h.host_trust_gen == generation)
+        };
+        if body.sender.host_id != host_id
+            || body.account_id != own.account_id
+            || body.genesis_hash != own.genesis_hash
+            || !current(host_id, host_trust_gen)
+            // Rule 3: the recipient is a current host at that generation.
+            || !current(&body.recipient.host_id, body.recipient.host_trust_gen)
+        {
+            return Some(refused(PutRefusal::Forbidden));
+        }
+        // The times (rule 3, Atem's reading agreed 2026-11-16): not
+        // expired, after `created_at`, at most 24 h after it.
+        let now = self.now();
+        if body.expires_at <= now
+            || body.expires_at <= body.created_at
+            || body.expires_at - body.created_at > 24 * 60 * 60 * 1000
+        {
+            return Some(refused(PutRefusal::Expired));
+        }
+        let hash = object_hash(&put.object);
+        // Its bytes as received (design II.4.3: limits on the encoded wire
+        // bytes), never a serialization of the fake's own.
+        let size = received_object_len(bytes).unwrap_or(bytes.len());
+        let recipient = (
+            body.recipient.host_id.clone(),
+            body.recipient.host_trust_gen,
+        );
+        // Idempotency (rule 3): the key `(calling host, body.id)` while
+        // stored; the same `object_hash` is stored (charged no second time).
+        let held = self
+            .mailbox_of(&recipient.0, recipient.1, now)
+            .stored
+            .values()
+            .find(|s| s.sender == host_id && s.id == body.id)
+            .map(|s| s.hash);
+        match held {
+            Some(h) if h == hash => return self.stored_answer(&put),
+            Some(_) => return Some(refused(PutRefusal::IdReused)),
+            None => {}
+        }
+        if self.refuse_quota || !self.within_quota(host_id, &recipient, size, now) {
+            return Some(refused(PutRefusal::Quota));
+        }
+        self.store_at(
+            &recipient,
+            Stored {
+                sender: host_id.to_owned(),
+                id: body.id.clone(),
+                hash,
+                expires_at: body.expires_at,
+                bytes: size,
+                object: put.object.clone(),
+            },
+        );
+        self.stored_answer(&put)
+    }
+
+    /// Stores `object` in the host's own mailbox (its current trust
+    /// generation) with no intake check, as a Station that misroutes or
+    /// skipped its checks does: its position. Its key is the body's sender
+    /// and `id`, when the body reads.
+    pub fn store_unchecked(&mut self, object: &SignedObject) -> u64 {
+        let body = MailBody::from_object(object).ok().map(|(_, body)| body);
+        let stored = Stored {
+            sender: body
+                .as_ref()
+                .map_or(String::new(), |b| b.sender.host_id.clone()),
+            id: body.as_ref().map_or(String::new(), |b| b.id.clone()),
+            hash: object_hash(object),
+            expires_at: body.map_or(u64::MAX, |b| b.expires_at),
+            bytes: object.to_json().to_string().len(),
+            object: object.clone(),
+        };
+        let recipient = (self.host_id.clone(), self.host_trust_gen);
+        self.store_at(&recipient, stored)
+    }
+
+    /// The host's own mailbox is reset (a Station restored or its store
+    /// lost, rule 2): a new `mailbox_id`, never used before; with `keep`,
+    /// the objects it still stored are stored again in the new one, in
+    /// their order, at new positions (as a restore and the senders'
+    /// resends would); then `heads` at once (unless silenced).
+    pub fn reset_mailbox(&mut self, keep: bool) {
+        let now = self.now();
+        let key = (self.host_id.clone(), self.host_trust_gen);
+        let old = self.mailbox_of(&key.0, key.1, now).clone();
+        self.mailboxes_minted += 1;
+        let mut new = Mailbox {
+            mailbox_id: mailbox_id(&self.origin, &self.own.account_id, self.mailboxes_minted),
+            head: 0,
+            stored: BTreeMap::new(),
+        };
+        if keep {
+            for stored in old.stored.into_values() {
+                new.head += 1;
+                new.stored.insert(new.head, stored);
+            }
+        }
+        self.mailboxes.insert(key, new);
+        self.mailbox_heads();
+    }
+
+    /// The host's own mailbox went back under the same `mailbox_id` (a
+    /// Station fault: a restore mints a new id, rule 2): the objects after
+    /// position `to` are gone and the next object stored gets `to + 1`
+    /// again; then `heads` at once (unless silenced).
+    pub fn roll_back_mailbox(&mut self, to: u64) {
+        let now = self.now();
+        let (host_id, generation) = (self.host_id.clone(), self.host_trust_gen);
+        let mailbox = self.mailbox_of(&host_id, generation, now);
+        mailbox.stored.retain(|position, _| *position <= to);
+        mailbox.head = to;
+        self.mailbox_heads();
+    }
+
+    /// The host's next mailbox call on `link` that `held` takes, kept
+    /// unanswered (in [`FakeStation::sent`] from now): a page or a done's
+    /// answer delivered late, when the test answers it
+    /// ([`FakeStation::answer_held`]). The calls that come first are
+    /// answered as they come (at most a minute).
+    pub fn hold_mailbox(&mut self, link: u64, held: impl Fn(&MailboxToStation) -> bool) -> Held {
+        self.hold_next(link, |_| false, Some(&held))
+    }
+
+    /// The host's mailbox calls the fake read so far (by
+    /// [`FakeStation::serve`] or a hold), with the link each came on, as
+    /// the shared mailbox reader reads them.
+    pub fn mailbox_calls(&self) -> Vec<(u64, MailboxToStation)> {
+        self.sent
+            .iter()
+            .zip(&self.sent_on)
+            .filter(|(bytes, _)| mailbox_call(bytes))
+            .map(|(bytes, on)| {
+                let call = MailboxToStation::decode(bytes.as_bytes())
+                    .expect("the host's mailbox call reads");
+                (*on, call)
+            })
+            .collect()
+    }
+
+    // ------------------------------------------------------------ inside
+
+    /// The mailbox of `host_id` in `host_trust_gen` (minted at its first
+    /// use), its expired objects gone (on the Station's clock `now`).
+    fn mailbox_of(&mut self, host_id: &str, host_trust_gen: u64, now: u64) -> &mut Mailbox {
+        let key = (host_id.to_owned(), host_trust_gen);
+        if !self.mailboxes.contains_key(&key) {
+            self.mailboxes_minted += 1;
+            let id = mailbox_id(&self.origin, &self.own.account_id, self.mailboxes_minted);
+            self.mailboxes.insert(
+                key.clone(),
+                Mailbox {
+                    mailbox_id: id,
+                    head: 0,
+                    stored: BTreeMap::new(),
+                },
+            );
+        }
+        let mailbox = self.mailboxes.get_mut(&key).expect("minted");
+        mailbox.stored.retain(|_, stored| stored.expires_at > now);
+        mailbox
+    }
+
+    /// The receiving host's own mailbox as `link`'s association names it:
+    /// its trust generation then (§11.5 rule 1).
+    fn own_mailbox(&mut self, link: u64, now: u64) -> &mut Mailbox {
+        let generation = if link < self.retired_below {
+            self.prior_gen
+        } else {
+            self.host_trust_gen
+        };
+        let host_id = self.host_id.clone();
+        self.mailbox_of(&host_id, generation, now)
+    }
+
+    /// `object` stored at the next position of the mailbox `recipient`
+    /// names; `heads` at once when it is the host's own (unless silenced).
+    fn store_at(&mut self, recipient: &(String, u64), stored: Stored) -> u64 {
+        let now = self.now();
+        let mailbox = self.mailbox_of(&recipient.0, recipient.1, now);
+        mailbox.head += 1;
+        let position = mailbox.head;
+        mailbox.stored.insert(position, stored);
+        if *recipient == (self.host_id.clone(), self.host_trust_gen) {
+            self.mailbox_heads();
+        }
+        position
+    }
+
+    /// `heads` on the served link now, for a host that reads its mailbox
+    /// (unless silenced).
+    fn mailbox_heads(&mut self) {
+        if self.senders && !self.silent {
+            self.send_heads();
+        }
+    }
+
+    /// Whether `size` more bytes from `sender` fit the quotas: its own, the
+    /// recipient's mailbox's and the account's.
+    fn within_quota(
+        &mut self,
+        sender: &str,
+        recipient: &(String, u64),
+        size: usize,
+        now: u64,
+    ) -> bool {
+        let quota = self.quota;
+        // Every mailbox's expired objects gone first.
+        let keys: Vec<(String, u64)> = self.mailboxes.keys().cloned().collect();
+        for (host, generation) in keys {
+            self.mailbox_of(&host, generation, now);
+        }
+        // Every mailbox here is the account's (the fake serves one).
+        let (mut of_sender, mut sender_bytes) = (0, 0);
+        let (mut in_account, mut account_bytes) = (0, 0);
+        for stored in self.mailboxes.values().flat_map(|m| m.stored.values()) {
+            in_account += 1;
+            account_bytes += stored.bytes;
+            if stored.sender == sender {
+                of_sender += 1;
+                sender_bytes += stored.bytes;
+            }
+        }
+        let mailbox = self.mailbox_of(&recipient.0, recipient.1, now);
+        let in_mailbox = mailbox.stored.len();
+        let mailbox_bytes: usize = mailbox.stored.values().map(|s| s.bytes).sum();
+        of_sender < quota.per_sender
+            && sender_bytes + size <= quota.per_sender_bytes
+            && in_mailbox < quota.per_mailbox
+            && mailbox_bytes + size <= quota.per_mailbox_bytes
+            && in_account < quota.per_account
+            && account_bytes + size <= quota.per_account_bytes
+    }
+
+    /// `mailbox_stored` for `put`, unless the next one is lost.
+    fn stored_answer(&mut self, put: &MailboxPut) -> Option<String> {
+        if self.drop_stored > 0 {
+            self.drop_stored -= 1;
+            return None;
+        }
+        let id = put.mail().expect("a put that reads").1.id;
+        let stored = MailboxStored {
+            request_id: put.request_id.clone(),
+            id,
+        };
+        Some(stored.to_json().expect("a stored answer").to_string())
+    }
+
+    /// The answer to the receiving host's mailbox call on `link` (none: a
+    /// lost answer, or a put on this link, which is the receiving host's).
+    fn mailbox_reply(&mut self, link: u64, call: MailboxToStation) -> Option<String> {
+        let now = self.now();
+        let refused = |call| {
+            MailboxCallRefused {
+                call,
+                code: RefusalCode::Forbidden,
+            }
+            .to_json()
+            .expect("a refusal")
+            .to_string()
+        };
+        // A link that hasn't proved its host, when one is required: refused,
+        // nothing served or removed.
+        if !self.serves(link) {
+            return match call {
+                MailboxToStation::Sync(_) => Some(refused(MailboxRefusedCall::Sync)),
+                MailboxToStation::Done(_) => Some(refused(MailboxRefusedCall::Done)),
+                MailboxToStation::Put(_) => None,
+            };
+        }
+        match call {
+            MailboxToStation::Sync(sync) => {
+                let refusing = self.refusing_mailbox[mailbox_slot(MailboxRefusedCall::Sync)];
+                let mailbox = self.own_mailbox(link, now);
+                if refusing || sync.mailbox_id != mailbox.mailbox_id {
+                    return Some(refused(MailboxRefusedCall::Sync));
+                }
+                let page = page_of(mailbox, &sync);
+                Some(page.to_json().expect("a page within the bound").to_string())
+            }
+            MailboxToStation::Done(done) => {
+                let refusing = self.refusing_mailbox[mailbox_slot(MailboxRefusedCall::Done)];
+                let mailbox = self.own_mailbox(link, now);
+                if refusing || done.mailbox_id != mailbox.mailbox_id {
+                    return Some(refused(MailboxRefusedCall::Done));
+                }
+                // Removed, its key freed; the same answer when nothing is
+                // there (rule 5).
+                mailbox.stored.remove(&done.position);
+                if self.drop_done_results > 0 {
+                    self.drop_done_results -= 1;
+                    return None;
+                }
+                Some(done_result(&done))
+            }
+            // The receiving host puts nothing in this version.
+            MailboxToStation::Put(_) => None,
+        }
+    }
+}
+
+fn mailbox_slot(call: MailboxRefusedCall) -> usize {
+    match call {
+        MailboxRefusedCall::Sync => 0,
+        MailboxRefusedCall::Done => 1,
+    }
+}
+
+fn done_result(done: &MailboxDone) -> String {
+    MailboxDoneResult {
+        request_id: done.request_id.clone(),
+        mailbox_id: done.mailbox_id.clone(),
+        position: done.position,
+    }
+    .to_json()
+    .expect("a done result")
+    .to_string()
+}
+
+/// The page answering `sync` on `mailbox` (rule 4): the first object
+/// stored after `after`, scanned through every position before the next
+/// one stored (or the head); a reset's form when `after` is beyond the
+/// head.
+fn page_of(mailbox: &Mailbox, sync: &MailboxSync) -> MailboxSyncResult {
+    let mut page = MailboxSyncResult {
+        request_id: sync.request_id.clone(),
+        mailbox_id: mailbox.mailbox_id.clone(),
+        after: sync.after,
+        head: mailbox.head,
+        through: mailbox.head,
+        objects: Vec::new(),
+    };
+    if sync.after >= mailbox.head {
+        return page;
+    }
+    let mut next = mailbox.stored.range(sync.after + 1..);
+    if let Some((position, stored)) = next.next() {
+        page.through = next.next().map_or(mailbox.head, |(after, _)| after - 1);
+        page.objects = vec![MailboxEntry::new(*position, &stored.object)];
+    }
+    page
+}
+
 /// A fake Station online, as a Station is ([`Pump::start`]): a thread
 /// answers every call of the host's newest link at once and announces
 /// `heads` (on a new link at once unless silenced, then every second of
@@ -1105,6 +1787,12 @@ pub struct Pump {
 impl Pump {
     /// `station` online from now on (the test shares it with the thread).
     pub fn start(station: std::sync::Arc<std::sync::Mutex<FakeStation>>) -> Pump {
+        Pump::every(station, Duration::from_millis(50))
+    }
+
+    /// [`Pump::start`], the calls answered every `period` (a mailbox read
+    /// object by object goes as fast as its Station answers).
+    pub fn every(station: std::sync::Arc<std::sync::Mutex<FakeStation>>, period: Duration) -> Pump {
         use std::sync::atomic::Ordering;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopped = stop.clone();
@@ -1121,7 +1809,7 @@ impl Pump {
                         last = Instant::now();
                     }
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(period);
             }
         });
         Pump {
