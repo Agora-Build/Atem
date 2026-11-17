@@ -1742,3 +1742,56 @@ fn with_the_hook_off_a_leftover_delivery_holds_no_session() {
         assert!(!input.contains("RB_LEFTOVER"));
     });
 }
+
+// ------------------------------------------------------- fix round 3
+
+/// Review R3: a store-wide fault (here the store full: no page left for
+/// the result's object, though a row can still be removed) lasting longer
+/// than the settle window never settles an owed result: it isn't the
+/// result's own failure. It stays owed, and goes once the fault clears.
+#[test]
+fn a_store_fault_longer_than_the_settle_window_loses_no_result() {
+    use super::super::delegated_admit_pass::MAX_ADMIT_FAILURES;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let _host = sp_host(&mut rig, root, &os);
+        let (_, task) = rb_task(&mut rig);
+        let id = task.task.task_id.clone();
+        // Large enough to need pages of its own (overflow pages).
+        reply(&mut rig, &id, &"x".repeat(12_000), &[]).unwrap();
+        // Full: a page limit just above the store, the room left filled.
+        let db = &rig.bridge.work.store.as_ref().unwrap().db;
+        let (pages, max): (i64, i64) = db
+            .query_row(
+                "SELECT page_count, max_page_count FROM pragma_page_count, pragma_max_page_count",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        db.execute_batch(&format!(
+            "CREATE TABLE rb_filler(b BLOB); PRAGMA max_page_count={}",
+            pages + 4
+        ))
+        .unwrap();
+        while db
+            .execute("INSERT INTO rb_filler(b) VALUES(zeroblob(64))", [])
+            .is_ok()
+        {}
+        for _ in 0..MAX_ADMIT_FAILURES + 4 {
+            rig.bridge.mail_statuses();
+        }
+        rig.bridge.clock.skip(120_000);
+        rig.bridge.mail_statuses();
+        assert!(rb_results(&rig).is_empty(), "the store is full");
+        assert_eq!(rows(&rig, "mail_result_owed"), 1, "still owed");
+        let db = &rig.bridge.work.store.as_ref().unwrap().db;
+        db.execute_batch(&format!("PRAGMA max_page_count={max}"))
+            .unwrap();
+        rig.bridge.mail_statuses();
+        let results = rb_results(&rig);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1, id);
+        assert_eq!(rows(&rig, "mail_result_owed"), 0);
+    });
+}

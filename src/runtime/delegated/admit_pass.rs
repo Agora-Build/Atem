@@ -254,6 +254,32 @@ fn may_send(list: &Membership, sender: &str, signed_seq: u64) -> Option<(u64, u6
         .filter(|(generation, epoch)| signed_seq >= *generation && signed_seq >= *epoch)
 }
 
+/// Whether `error` is a fault of the whole store rather than of one row's
+/// own (review R3): SQLite busy or locked, an I/O failure, a full disk or
+/// database, read-only, can't open, out of memory, corrupt, a locking
+/// protocol failure, not a database.
+fn store_wide(error: &anyhow::Error) -> bool {
+    use rusqlite::ErrorCode::*;
+    error
+        .downcast_ref::<rusqlite::Error>()
+        .and_then(rusqlite::Error::sqlite_error_code)
+        .is_some_and(|code| {
+            matches!(
+                code,
+                DatabaseBusy
+                    | DatabaseLocked
+                    | SystemIoFailure
+                    | DiskFull
+                    | ReadOnly
+                    | CannotOpen
+                    | OutOfMemory
+                    | DatabaseCorrupt
+                    | FileLockingProtocolFailed
+                    | NotADatabase
+            )
+        })
+}
+
 impl HostBridge {
     /// The signing of this host's status objects now, when it may sign
     /// (§11.5's sender rule: its committed list shows it a current host at
@@ -615,14 +641,17 @@ impl HostBridge {
     }
 
     /// The results owed (design II.4.4): each reply sealed for its sender
-    /// in its own transaction, at most [`STATUSES_PER_PASS`] a pass. A store
-    /// fault passes (review L5): the result stays owed and is tried again,
-    /// one that keeps failing never holding the later ones (review N4), and
-    /// settled (its mark cleared, a runtime.log line) after
-    /// [`MAX_ADMIT_FAILURES`] tries in a row and [`SETTLE_AFTER_MS`] since
-    /// its first failure on the monotonic clock, as admission's rows are.
-    /// One that can't be built (a record that doesn't read) is dropped at
-    /// once. Either way the owner still reads the reply.
+    /// in its own transaction, at most [`STATUSES_PER_PASS`] a pass. A fault
+    /// of the whole store (busy, locked, I/O, full; review R3) leaves every
+    /// one owed and is never counted: no result is lost to a fault that
+    /// isn't its own. A store error of its own (a constraint its rows hit, a
+    /// column that doesn't read) keeps it owed and tried again, one that
+    /// keeps failing never holding the later ones (review N4), and settled
+    /// (its mark cleared, a runtime.log line) after [`MAX_ADMIT_FAILURES`]
+    /// tries in a row and [`SETTLE_AFTER_MS`] since its first failure on the
+    /// monotonic clock, as admission's rows are. One that can't be built (a
+    /// record that doesn't read) is dropped at once. Either way the owner
+    /// still reads the reply.
     fn mail_results_owed(&mut self, signing: &Signing) {
         use crate::runtime::delegated::results_back;
         let now = self.clock.now();
@@ -638,6 +667,17 @@ impl HostBridge {
                     failures.remove(&task_id);
                     continue;
                 };
+                // A fault of the whole store (review R3) isn't this
+                // result's: it stays owed, uncounted, and the pass stops
+                // (every result would meet it).
+                if store_wide(&error) {
+                    super::delegated_mail_pass::log_limited(&UNSEALED, || {
+                        format!(
+                            "atem runtime: host senders' results not sent yet ({error:#}); tried again"
+                        )
+                    });
+                    break;
+                }
                 if error.downcast_ref::<rusqlite::Error>().is_some() {
                     let (tries, first) = failures.get(&task_id).copied().unwrap_or((0, now));
                     let tries = tries + 1;
