@@ -10,7 +10,7 @@
 //! retired, expired rows), the due rows handed to the link with the
 //! mailbox's calls, and the Station's answers written to the engine's
 //! rows ([`super::outbox`]). Time is the delegated clock's `D`: with no
-//! reading nothing is put or expired.
+//! reading nothing is put, expired or answered.
 //!
 //! The outbox writes only while the store is this identity's (the mailbox
 //! client's rule: the control feeds loaded for the committed device list
@@ -210,7 +210,8 @@ impl HostBridge {
     }
 
     /// The Station's answer to a put: written to its row when it answers a
-    /// live put (a write that fails leaves the row due: put again, harmless).
+    /// live put, on `D` (with no reading, or a write that fails, the row
+    /// stays due: put again, harmless).
     pub(crate) fn outbox_answer(&mut self, answer: MailboxToHost) {
         let Some(station) = self.station.as_mut() else {
             return;
@@ -225,10 +226,11 @@ impl HostBridge {
         let Answer::Row(n) = n else {
             return;
         };
-        let now = self
-            .start_view()
-            .now_d_ms
-            .unwrap_or_else(|| host_now().wall_ms);
+        // On `D` only: with no reading the row stays as it is (due again,
+        // put again: harmless).
+        let Some(now) = self.start_view().now_d_ms else {
+            return;
+        };
         let Some(place) = self.outbox_place() else {
             return;
         };

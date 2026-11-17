@@ -567,3 +567,28 @@ fn no_put_goes_before_the_links_heads() {
         assert_eq!(sp_out(&mut rig).len(), 1);
     });
 }
+
+/// The puts' times are all on `D` (review L1): an answer that comes with
+/// no reading of `D` writes nothing (no schedule from another clock); the
+/// row is due again, put again once `D` reads.
+#[test]
+fn an_answer_with_no_reading_of_d_writes_nothing() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let _host = sp_host(&mut rig, root, &os);
+        let t = host_now().wall_ms;
+        sp_d(&rig, t);
+        let id = sp_send(&mut rig, &["atem:host-b"]).unwrap();
+        let put = sp_out(&mut rig).remove(0);
+        rig.bridge.start_view().now_d_ms = None;
+        sp_stored(&mut rig, &put);
+        assert_eq!(sp_rows(&rig, &id)[0].1, "ready");
+        assert_eq!(sp_engine(&rig, &id).1, "queued");
+        assert!(sp_out(&mut rig).is_empty(), "nothing put without `D`");
+        sp_d(&rig, t);
+        let again = sp_out(&mut rig).remove(0);
+        sp_stored(&mut rig, &again);
+        assert_eq!(sp_rows(&rig, &id)[0].1, "sent");
+    });
+}
