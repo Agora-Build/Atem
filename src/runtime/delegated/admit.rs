@@ -53,6 +53,7 @@ const TABLES: &str = "
         code TEXT NOT NULL, at_ms INTEGER NOT NULL,
         PRIMARY KEY(sender_host, message_id)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS mail_status_owed (message_id TEXT PRIMARY KEY) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS mailbox_refused_report ON mailbox_refused(n) WHERE report=1;
     CREATE TABLE IF NOT EXISTS mail_status_sent (
         message_id TEXT PRIMARY KEY, outbox_n INTEGER NOT NULL) WITHOUT ROWID;
     CREATE TRIGGER IF NOT EXISTS mail_status_changed AFTER UPDATE OF state ON work

@@ -267,6 +267,9 @@ pub(super) struct State {
     /// Admission's rows and reports that failed, by key, with their tries
     /// so far (review M2: one is settled after a bound).
     admit_failures: HashMap<String, u32>,
+    /// The mailbox committed objects since admission last ran: it runs on
+    /// the next pass (review L1; else on the scheduling pass's cadence).
+    admit_due: bool,
     /// Tests: at the mailbox's crash point (after a page's commit, before
     /// its dones), the dones the store owed and the positions of the dones
     /// live then.
@@ -373,6 +376,7 @@ impl State {
             mail_pruned_at: None,
             mail_limits: Default::default(),
             admit_failures: HashMap::new(),
+            admit_due: true,
             #[cfg(test)]
             mail_crash_probe: Vec::new(),
             ack_failures: 0,
@@ -1180,11 +1184,6 @@ impl HostBridge {
                 // Host senders' later interrupts carried on channels: stops,
                 // served while paused (answered `busy` when they can't be).
                 self.control_records_pass();
-                // Their statuses owed (the device list's effects change
-                // their tasks while paused too).
-                if self.kept_here() {
-                    self.mail_statuses();
-                }
             }
             // A stop always wins: what control records' effects asked once
             // they committed is carried out while paused too.
@@ -1197,6 +1196,11 @@ impl HostBridge {
                 // dispatches nothing.
                 if identity.account_id != UNPAIRED {
                     self.paused_stops(cx);
+                }
+                // Host senders' statuses owed (the device list's effects
+                // change their tasks while paused too).
+                if self.features.delegated && self.kept_here() {
+                    self.mail_statuses();
                 }
             }
             return;
@@ -1298,8 +1302,12 @@ impl HostBridge {
         self.work_fence_launches();
         // Host senders' mail the mailbox committed (with `host.senders`):
         // every inbox row decided, gate open or not, before anything of
-        // this pass is dispatched.
-        self.admit_mail(cx);
+        // this pass is dispatched; on the pass a page committed, else on
+        // the scheduling pass's cadence (review L1).
+        if self.work.admit_due || Instant::now() >= self.work.scheduled {
+            self.work.admit_due = false;
+            self.admit_mail(cx);
+        }
         if Instant::now() >= self.work.scheduled {
             self.work.scheduled = Instant::now() + Duration::from_millis(100);
             let inputs = self.work_inputs(cx.sessions);
@@ -1327,9 +1335,9 @@ impl HostBridge {
             if passed.is_err() {
                 self.work_fail();
             }
+            // The statuses owed to host senders for their tasks' changes.
+            self.mail_statuses();
         }
-        // The statuses owed to host senders for their tasks' changes.
-        self.mail_statuses();
     }
 
     /// The inputs of the checks of waiting tasks and return grants

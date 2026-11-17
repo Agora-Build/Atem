@@ -1523,3 +1523,53 @@ fn an_early_stop_kept_before_a_readmit_no_longer_applies() {
         );
     });
 }
+
+thread_local! {
+    static AD_TRACED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn ad_traced(sql: &str) {
+    AD_TRACED.with(|t| t.borrow_mut().push(sql.to_string()));
+}
+
+/// Review L1: admission and the status pass don't run every 16 ms pass. A
+/// page the mailbox commits makes admission run on the next pass, whatever
+/// host-work's schedule; while nothing is due (the schedule held, no page
+/// committed) passes read none of admission's tables.
+#[test]
+fn admission_runs_when_due_not_every_pass() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        hold_host_work(&mut rig);
+        let message = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
+        let object = ad_request(&rig, &host, &message);
+        ad_deliver(&mut rig, &mut host, &[object]);
+        assert_eq!(ad_inbox_rows(&rig), 1);
+        ticks(&mut rig, 1);
+        assert_eq!(ad_inbox_rows(&rig), 0, "admitted on the next pass");
+        assert_eq!(ad_tasks(&rig, &message).len(), 1);
+        rig.bridge
+            .work
+            .store
+            .as_mut()
+            .unwrap()
+            .db
+            .trace(Some(ad_traced));
+        AD_TRACED.with(|t| t.borrow_mut().clear());
+        ticks(&mut rig, 3);
+        let reads: Vec<String> = AD_TRACED.with(|t| {
+            t.borrow()
+                .iter()
+                .filter(|sql| {
+                    sql.contains("FROM mailbox_inbox ORDER BY")
+                        || sql.contains("mail_status_owed")
+                        || sql.contains("WHERE report=1")
+                })
+                .cloned()
+                .collect()
+        });
+        assert!(reads.is_empty(), "{reads:?}");
+    });
+}

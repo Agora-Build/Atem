@@ -232,6 +232,10 @@ impl HostBridge {
             }
         }
         self.mail_observe();
+        // Admission takes what the page opened on the next pass.
+        if matches!(&committed, Ok(Commit::Committed(c)) if !c.decided.is_empty()) {
+            self.work.admit_due = true;
+        }
         let Some(station) = self.station.as_mut() else {
             return;
         };
@@ -364,7 +368,11 @@ impl HostBridge {
         let judged = mailbox_store::rejudge_pending(store, &identity, &cx);
         self.work.mail_rejudge_failed = judged.is_err();
         match judged {
-            Ok(_) => self.work.mail_rejudged = Some(key),
+            Ok(decided) => {
+                self.work.mail_rejudged = Some(key);
+                // Admission takes what opened on the next pass.
+                self.work.admit_due |= !decided.is_empty();
+            }
             Err(error) => log_limited(&UNJUDGED, || {
                 format!(
                     "atem runtime: host senders' waiting mailbox objects not judged again ({error:#})"
