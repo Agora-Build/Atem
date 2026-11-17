@@ -6,15 +6,27 @@
 //! context publishes, and its envelopes sealed and enqueued in the
 //! transaction that accepts the message ([`super::remote_send`]).
 //!
+//! The puts ([`super::puts`]): each pass's tick (a put unanswered for 35 s
+//! retired, expired rows), the due rows handed to the link with the
+//! mailbox's calls, and the Station's answers written to the engine's
+//! rows ([`super::outbox`]). Time is the delegated clock's `D`: with no
+//! reading nothing is put or expired.
+//!
 //! The outbox writes only while the store is this identity's (the mailbox
 //! client's rule: the control feeds loaded for the committed device list
 //! and the host's identity), and plans from the committed device list.
 use super::*;
+use crate::runtime::delegated::outbox;
+use crate::runtime::delegated::puts::{Answer, MAX_LIVE_PUTS};
 use crate::runtime::delegated::remote_send::{self, RemotePart, Sealer};
 use crate::runtime::delegated::send_plan::{self, Me};
+use crate::runtime::delegated::station::Call;
 use anyhow::{Result, anyhow, bail};
+use atem_client::host_mail::HostRef;
+use atem_client::host_mail::mailbox::MailboxToHost;
 use atem_client::session::messages::Message;
 use atem_client::session::select::{Label, Selector};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 impl HostBridge {
     /// The hook's `host.senders` (with `host.delegated`).
@@ -104,5 +116,127 @@ impl HostBridge {
             key: &key,
         };
         remote_send::commit_request(tx, &sealer, message, part)
+    }
+
+    /// The store the outbox writes (its tables made): none with the hook
+    /// off, or while it isn't this identity's.
+    fn outbox_store(&self) -> Option<&Store> {
+        let (store, identity) = self.mail_store()?;
+        (self.work.mail_prepared.as_ref() == Some(&identity.host)).then_some(store)
+    }
+
+    /// The pass's tick: a put unanswered for 35 s retired; rows past their
+    /// expiry on `D` expired, and final rows' bytes pruned once a minute.
+    pub(crate) fn outbox_tick(&mut self, now_mono: u64) {
+        if !self.senders_on() {
+            return;
+        }
+        if let Some(station) = self.station.as_mut() {
+            station.puts.tick(now_mono);
+        }
+        let Some(now) = self.start_view().now_d_ms else {
+            return;
+        };
+        let prune = self
+            .work
+            .outbox_pruned_at
+            .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(60));
+        let Some(store) = self.outbox_store() else {
+            return;
+        };
+        let written = outbox::expire(store, now).and_then(|_| {
+            if prune {
+                outbox::prune(store, now)?;
+            }
+            Ok(())
+        });
+        if prune {
+            self.work.outbox_pruned_at = Some(std::time::Instant::now());
+        }
+        if let Err(error) = written {
+            outbox_fault(error);
+        }
+    }
+
+    /// This host's puts to hand the link now: its due rows on `D`, as many
+    /// as may be live.
+    pub(crate) fn outbox_outgoing(&mut self) -> Vec<Call> {
+        if !self.senders_on() {
+            return Vec::new();
+        }
+        let Some(now) = self.start_view().now_d_ms else {
+            return Vec::new();
+        };
+        let host = self.work_host();
+        let me = HostRef {
+            host_id: host.atem_device_id,
+            host_trust_gen: host.host_trust_gen,
+        };
+        let live = match self.station.as_ref() {
+            Some(station) => station.puts.live_rows(),
+            None => return Vec::new(),
+        };
+        let due = match self
+            .outbox_store()
+            .map(|store| outbox::due(store, &me, now, &live, MAX_LIVE_PUTS))
+        {
+            Some(Ok(due)) => due,
+            Some(Err(error)) => {
+                outbox_fault(error);
+                return Vec::new();
+            }
+            None => return Vec::new(),
+        };
+        let Some(station) = self.station.as_mut() else {
+            return Vec::new();
+        };
+        station
+            .puts
+            .take(due)
+            .into_iter()
+            .map(Call::MailboxPut)
+            .collect()
+    }
+
+    /// The Station's answer to a put: written to its row when it answers a
+    /// live put (a write that fails leaves the row due: put again, harmless).
+    pub(crate) fn outbox_answer(&mut self, answer: MailboxToHost) {
+        let Some(station) = self.station.as_mut() else {
+            return;
+        };
+        let (n, code) = match &answer {
+            MailboxToHost::Stored(stored) => (station.puts.on_stored(stored), None),
+            MailboxToHost::PutRefused(refused) => {
+                (station.puts.on_refused(refused), Some(refused.code))
+            }
+            _ => return,
+        };
+        let Answer::Row(n) = n else {
+            return;
+        };
+        let now = self
+            .start_view()
+            .now_d_ms
+            .unwrap_or_else(|| host_now().wall_ms);
+        let Some(store) = self.outbox_store() else {
+            return;
+        };
+        let written = match code {
+            None => outbox::stored(store, n, now),
+            Some(code) => outbox::refused(store, n, code, now),
+        };
+        if let Err(error) = written {
+            outbox_fault(error);
+        }
+    }
+}
+
+/// A runtime.log line for an outbox write that failed: the first, then at
+/// powers of two.
+fn outbox_fault(error: anyhow::Error) {
+    static FAULTS: AtomicU64 = AtomicU64::new(0);
+    let n = FAULTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        eprintln!("atem runtime: host senders' outbox not written ({error:#}) ({n} so far)");
     }
 }

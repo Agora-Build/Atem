@@ -133,9 +133,11 @@ impl HostBridge {
                 }
                 PageCheck::Nothing
             }
-            // This host puts nothing yet: answers to puts it never made
-            // change nothing (rule 8).
-            Ok(MailboxToHost::Stored(_) | MailboxToHost::PutRefused(_)) => PageCheck::Nothing,
+            // Answers to this host's own puts (the sending host's outbox).
+            Ok(answer @ (MailboxToHost::Stored(_) | MailboxToHost::PutRefused(_))) => {
+                self.outbox_answer(answer);
+                PageCheck::Nothing
+            }
         };
         if let PageCheck::Apply(applying) = check {
             self.mail_commit(applying);
@@ -423,6 +425,8 @@ impl HostBridge {
             station.mailbox.tick(now_mono);
         }
         self.mail_step();
+        // The sending host's puts.
+        self.outbox_tick(now_mono);
     }
 
     /// The gate's mailbox part into the start view (host senders only,
@@ -459,16 +463,19 @@ impl HostBridge {
         })
     }
 
-    /// The mailbox calls to hand the link now.
+    /// The mailbox calls to hand the link now, this host's puts last.
     pub(crate) fn mail_outgoing(&mut self) -> Vec<Call> {
         let Some(station) = self.station.as_mut() else {
             return Vec::new();
         };
         let out = station.mailbox.take_outgoing();
-        out.sync
+        let mut calls: Vec<Call> = out
+            .sync
             .into_iter()
             .map(Call::MailboxSync)
             .chain(out.dones.into_iter().map(Call::MailboxDone))
-            .collect()
+            .collect();
+        calls.extend(self.outbox_outgoing());
+        calls
     }
 }

@@ -275,4 +275,4 @@ pub fn row_state(db: &rusqlite::Connection, n: i64) -> Result<Option<RowState>> 
 
 #[cfg(test)]
 #[path = "outbox_tests.rs"]
-mod tests;
+pub(crate) mod tests;

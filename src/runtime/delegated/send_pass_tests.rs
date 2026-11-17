@@ -101,9 +101,12 @@ fn sp_local(rig: &LocalRig, message: &str) -> (String, String, u32) {
     (state, detail, *budget)
 }
 
+/// A send of `to` that lives an hour.
 fn sp_send(rig: &mut LocalRig, to: &[&str]) -> anyhow::Result<String> {
+    let mut request = send_request(to);
+    request.expires_ms = HOUR;
     rig.bridge
-        .collab_send("atem-host", &rig.sid, send_request(to), &rig.sessions)
+        .collab_send("atem-host", &rig.sid, request, &rig.sessions)
 }
 
 /// A send to B: planned from the committed list, its envelope sealed to
@@ -251,5 +254,268 @@ fn with_the_hook_off_a_send_is_stage_1() {
             )
             .unwrap();
         assert!(!made);
+    });
+}
+
+/// The puts the bridge hands the link now.
+fn sp_out(rig: &mut LocalRig) -> Vec<atem_client::host_mail::mailbox::MailboxPut> {
+    use crate::runtime::delegated::station::Call;
+    rig.bridge
+        .mail_outgoing()
+        .into_iter()
+        .filter_map(|call| match call {
+            Call::MailboxPut(put) => Some(put),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The Station's `mailbox_stored` for `put`, read by the link.
+fn sp_stored(rig: &mut LocalRig, put: &atem_client::host_mail::mailbox::MailboxPut) {
+    let stored = atem_client::host_mail::mailbox::MailboxStored {
+        request_id: put.request_id.clone(),
+        id: put.mail().unwrap().1.id,
+    };
+    mb_receive(rig, &stored.to_json().unwrap().to_string());
+}
+
+/// The Station's `mailbox_put_refused` of `put` with `code`.
+fn sp_refused(
+    rig: &mut LocalRig,
+    put: &atem_client::host_mail::mailbox::MailboxPut,
+    code: atem_client::host_mail::mailbox::PutRefusal,
+) {
+    let refused = atem_client::host_mail::mailbox::MailboxPutRefused {
+        request_id: put.request_id.clone(),
+        id: put.mail().unwrap().1.id,
+        code,
+    };
+    mb_receive(rig, &refused.to_json().unwrap().to_string());
+}
+
+/// `D`, moved by the tests.
+fn sp_d(rig: &LocalRig, at: u64) {
+    rig.bridge.start_view().now_d_ms = Some(at);
+}
+
+/// A put carries exactly the sealed bytes; stored, the row is `sent` and
+/// the same bytes go again every 10 minutes (fresh ids), never sooner.
+#[test]
+fn a_put_carries_the_sealed_bytes_and_repeats_every_ten_minutes() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let _host = sp_host(&mut rig, root, &os);
+        let t = host_now().wall_ms;
+        sp_d(&rig, t);
+        let id = sp_send(&mut rig, &["atem:host-b"]).unwrap();
+        let puts = sp_out(&mut rig);
+        assert_eq!(puts.len(), 1);
+        let (_, _, bytes) = sp_engine(&rig, &id);
+        assert_eq!(puts[0].object.to_json().to_string().into_bytes(), bytes);
+        assert!(sp_out(&mut rig).is_empty(), "live");
+        sp_stored(&mut rig, &puts[0]);
+        assert_eq!(sp_rows(&rig, &id), [("host-b".into(), "sent".into(), None)]);
+        assert_eq!(sp_engine(&rig, &id).1, "stored");
+        sp_d(&rig, t + 10 * 60_000 - 1);
+        assert!(sp_out(&mut rig).is_empty());
+        sp_d(&rig, t + 10 * 60_000);
+        let again = sp_out(&mut rig);
+        assert_eq!(again.len(), 1);
+        assert_ne!(again[0].request_id, puts[0].request_id);
+        assert_eq!(again[0].object.to_json().to_string().into_bytes(), bytes);
+        sp_stored(&mut rig, &again[0]);
+        assert_eq!(sp_rows(&rig, &id)[0].1, "sent");
+        assert_eq!(sp_engine(&rig, &id).2, bytes, "never sealed again");
+    });
+}
+
+/// A put whose `mailbox_stored` is lost goes again after 35 s with a fresh
+/// id and the same bytes; the first's late answer is drained.
+#[test]
+fn a_lost_stored_is_put_again_with_the_same_bytes() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        sp_d(&rig, host_now().wall_ms);
+        let id = sp_send(&mut rig, &["atem:host-b"]).unwrap();
+        let first = sp_out(&mut rig).remove(0);
+        mb_tick(&mut rig, &mut host, 34_999);
+        assert!(sp_out(&mut rig).is_empty());
+        mb_tick(&mut rig, &mut host, 1);
+        let second = sp_out(&mut rig).remove(0);
+        assert_ne!(second.request_id, first.request_id);
+        assert_eq!(second.object, first.object);
+        sp_stored(&mut rig, &first);
+        assert_eq!(sp_rows(&rig, &id)[0].1, "ready", "drained");
+        sp_stored(&mut rig, &second);
+        assert_eq!(sp_rows(&rig, &id)[0].1, "sent");
+    });
+}
+
+/// `quota`: put again after the backoff; `forbidden` (as `id_reused` and
+/// `expired`): the row refused with the code, put no more.
+#[test]
+fn quota_is_retried_and_other_refusals_are_final() {
+    local_test(async |root| {
+        use atem_client::host_mail::mailbox::PutRefusal;
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let _host = sp_host(&mut rig, root, &os);
+        let t = host_now().wall_ms;
+        sp_d(&rig, t);
+        let id = sp_send(&mut rig, &["atem:host-b"]).unwrap();
+        let put = sp_out(&mut rig).remove(0);
+        sp_refused(&mut rig, &put, PutRefusal::Quota);
+        assert_eq!(sp_rows(&rig, &id)[0].1, "ready");
+        sp_d(&rig, t + 29_999);
+        assert!(sp_out(&mut rig).is_empty());
+        sp_d(&rig, t + 30_000);
+        let put = sp_out(&mut rig).remove(0);
+        sp_refused(&mut rig, &put, PutRefusal::Forbidden);
+        assert_eq!(
+            sp_rows(&rig, &id),
+            [("host-b".into(), "refused".into(), Some("forbidden".into()))]
+        );
+        sp_d(&rig, t + 3_600_000);
+        assert!(sp_out(&mut rig).is_empty());
+    });
+}
+
+/// A row not accepted by its object's expiry is `expired` and put no more.
+#[test]
+fn an_object_past_its_expiry_is_never_put_again() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        sp_d(&rig, host_now().wall_ms);
+        let id = sp_send(&mut rig, &["atem:host-b"]).unwrap();
+        let put = sp_out(&mut rig).remove(0);
+        sp_stored(&mut rig, &put);
+        let expires_at = put.mail().unwrap().1.expires_at;
+        sp_d(&rig, expires_at);
+        mb_tick(&mut rig, &mut host, 0);
+        assert_eq!(sp_rows(&rig, &id)[0].1, "expired");
+        assert_eq!(sp_engine(&rig, &id).1, "expired");
+        assert!(sp_out(&mut rig).is_empty());
+    });
+}
+
+/// An identity change on the live link retires the live puts: their late
+/// answers are drained and nothing more is put on that socket; a new
+/// socket puts the same bytes again.
+#[test]
+fn an_identity_change_retires_the_puts() {
+    local_test(async |root| {
+        use crate::runtime::delegated::station::LinkKind;
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let _host = sp_host(&mut rig, root, &os);
+        sp_d(&rig, host_now().wall_ms);
+        let id = sp_send(&mut rig, &["atem:host-b"]).unwrap();
+        let first = sp_out(&mut rig).remove(0);
+        let mut moved = rig.bridge.work_host();
+        moved.host_trust_gen = 2;
+        let station = rig.bridge.station.as_mut().unwrap();
+        station.on_identity(crate::runtime::delegated::sync::HostIdentity {
+            host: moved,
+            genesis: None,
+            host_key: None,
+        });
+        assert!(sp_out(&mut rig).is_empty(), "nothing on that socket");
+        sp_stored(&mut rig, &first);
+        assert_eq!(sp_rows(&rig, &id)[0].1, "ready", "drained");
+        rig.bridge.station.as_mut().unwrap().sync_link(
+            Some(2),
+            2,
+            || LinkKind::Routed,
+            || Some(ORIGIN.into()),
+        );
+        let again = sp_out(&mut rig).remove(0);
+        assert_eq!(again.object, first.object);
+    });
+}
+
+/// The engine's other policy (ruling R37): a status object, already sealed
+/// and enqueued in its caller's transaction, is put until the Station
+/// stores it (again on a new link generation while unanswered), never
+/// after.
+#[test]
+fn a_status_object_is_put_until_stored_never_after() {
+    local_test(async |root| {
+        use crate::runtime::delegated::outbox::{self, Policy};
+        use crate::runtime::delegated::station::LinkKind;
+        use crate::session_protocol::membership::r9log::secret;
+        use atem_client::KeyProvider;
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let host = sp_host(&mut rig, root, &os);
+        let t = host_now().wall_ms;
+        sp_d(&rig, t);
+        // This host's status of a message of B's, sealed to B's key.
+        let mut keys = atem_client::SoftwareKeys::new();
+        keys.insert_ed25519(atem_client::KeyId::new("host"), &secret("delegated host"));
+        keys.insert_x25519(atem_client::KeyId::new("b"), &secret("host b enc"));
+        let b_enc = keys.public_key(&atem_client::KeyId::new("b")).unwrap();
+        let list = rig.bridge.membership.as_ref().unwrap().membership();
+        let fields = atem_client::host_mail::MailFields {
+            account_id: "acct".into(),
+            genesis_hash: host.s.log.genesis_hash(),
+            sender: atem_client::host_mail::HostRef {
+                host_id: "host".into(),
+                host_trust_gen: 1,
+            },
+            recipient: atem_client::host_mail::HostRef {
+                host_id: "host-b".into(),
+                host_trust_gen: 1,
+            },
+            enc_kid: atem_client::keys::enc_kid(&b_enc).unwrap(),
+            id: uuid::Uuid::new_v4().to_string(),
+            created_at: t,
+            expires_at: t + HOUR,
+            signed_at_head: list.head(),
+        };
+        let plain = atem_client::host_mail::ResultPlain::Refusal {
+            object_id: uuid::Uuid::new_v4().to_string(),
+            refused: "invalid_request".into(),
+        };
+        let bytes = atem_client::host_mail::seal_result(
+            &keys,
+            &atem_client::KeyId::new("host"),
+            &fields,
+            &plain,
+            &b_enc,
+        )
+        .unwrap()
+        .to_json()
+        .to_string()
+        .into_bytes();
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        let tx = store.db.unchecked_transaction().unwrap();
+        let n = outbox::enqueue(&tx, &bytes, &fields.recipient, Policy::UntilStored).unwrap();
+        tx.commit().unwrap();
+        let first = sp_out(&mut rig).remove(0);
+        assert_eq!(first.object.to_json().to_string().into_bytes(), bytes);
+        // Reconnected, unanswered: put again.
+        rig.bridge.station.as_mut().unwrap().sync_link(
+            Some(2),
+            1,
+            || LinkKind::Routed,
+            || Some(ORIGIN.into()),
+        );
+        let second = sp_out(&mut rig).remove(0);
+        assert_ne!(second.request_id, first.request_id);
+        sp_stored(&mut rig, &second);
+        let state = |rig: &LocalRig| {
+            outbox::row_state(&rig.bridge.work.store.as_ref().unwrap().db, n)
+                .unwrap()
+                .unwrap()
+                .state
+        };
+        assert_eq!(state(&rig), "done");
+        sp_d(&rig, t + 30 * 60_000);
+        assert!(sp_out(&mut rig).is_empty(), "never after it was stored");
     });
 }

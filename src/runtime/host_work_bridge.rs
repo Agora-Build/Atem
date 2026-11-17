@@ -246,6 +246,8 @@ pub(super) struct State {
     /// The identity whose store has host senders' mailbox tables
     /// (`mail_observe`, with `host.senders` on).
     mail_prepared: Option<HostTarget>,
+    /// When the sending host's outbox last pruned its final rows' bytes.
+    outbox_pruned_at: Option<Instant>,
     /// The device-list head and the room freed (`mailbox_store::freed`)
     /// the mailbox's waiting objects were last judged again at
     /// (`mail_rejudge`).
@@ -359,6 +361,7 @@ impl State {
             host_applied: None,
             applied_seq: None,
             mail_prepared: None,
+            outbox_pruned_at: None,
             mail_rejudged: None,
             mail_rejudge_at: None,
             mail_rejudge_failed: false,
