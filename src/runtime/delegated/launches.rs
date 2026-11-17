@@ -326,8 +326,18 @@ impl HostBridge {
     /// reason (PR 8 review, T28 m4).
     pub(super) fn launch_failed_before_spawn(&mut self, request_id: &str, detail: &'static str) {
         // Gone: fenced when the host's identity changed.
-        if !self.work.pending.contains_key(request_id) {
+        let Some(pending) = self.work.pending.get(request_id) else {
             return;
+        };
+        // A host sender's launch on message has tasks waiting for it: they
+        // fail with this reason (review L5), kept before the launch says
+        // `failed`.
+        if pending.principal.starts_with("host:")
+            && let Some(store) = self.work.store.as_ref()
+            && crate::runtime::delegated::admit::launch_failed(&store.db, request_id, detail)
+                .is_err()
+        {
+            self.work_fail();
         }
         self.remote_launched(request_id, LaunchState::Failed);
         if self.work.error {

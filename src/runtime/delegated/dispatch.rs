@@ -568,10 +568,14 @@ impl HostBridge {
         Ok(Some(match record.status.state {
             LaunchState::Started => Ok(true),
             LaunchState::Starting => Ok(false),
-            LaunchState::Failed => Err(match self.work.refused.get(&id) {
-                Some(why) => format!("approved route launch not started: {why}"),
-                None => "approved route launch failed; check its cwd and environment".into(),
-            }),
+            LaunchState::Failed => Err(
+                match crate::runtime::delegated::admit::launch_failure(&store.db, &id)?
+                    .or_else(|| self.work.refused.get(&id).cloned())
+                {
+                    Some(why) => format!("approved route launch not started: {why}"),
+                    None => "approved route launch failed; check its cwd and environment".into(),
+                },
+            ),
             LaunchState::OutcomeUnknown => {
                 Err("launch outcome unknown; the reserved launch will not be repeated".into())
             }

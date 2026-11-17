@@ -34,7 +34,8 @@
 //!   the task and the launch's record in the admission transaction
 //!   ([`link_launch`]); the dispatch reads it ([`launch_of`]), and a later
 //!   request naming the route shares a launch still under way
-//!   ([`launches_on`]).
+//!   ([`launches_on`]); one refused at its spawn check keeps why
+//!   (`mail_launch_failed`, [`launch_failed`]) for its tasks' detail.
 //! - **The latest status** (`mail_status_sent`): per message, the put
 //!   engine's row of the status sent last. A newer one supersedes it while
 //!   the Station hasn't stored it (the engine settles it: never put again):
@@ -75,6 +76,8 @@ const TABLES: &str = "
         route_revision INTEGER NOT NULL) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS mail_launches_route
         ON mail_launches(route_id, route_revision, request_id);
+    CREATE TABLE IF NOT EXISTS mail_launch_failed (
+        request_id TEXT PRIMARY KEY, detail TEXT NOT NULL) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS mail_status_owed (message_id TEXT PRIMARY KEY) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS mailbox_refused_report ON mailbox_refused(n) WHERE report=1;
     CREATE TABLE IF NOT EXISTS mail_status_sent (
@@ -127,6 +130,36 @@ pub fn launch_of(db: &Connection, task_id: &str) -> Result<Option<String>> {
         .query_row(
             "SELECT request_id FROM mail_launches WHERE task_id=?1",
             [task_id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// The launch `request_id` failed at its spawn check with `detail` (review
+/// L5): kept for its tasks' detail (none in a store without admission's
+/// tables).
+pub fn launch_failed(db: &Connection, request_id: &str, detail: &str) -> Result<()> {
+    let made: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table'
+            AND name='mail_launch_failed')",
+        [],
+        |r| r.get(0),
+    )?;
+    if made {
+        db.execute(
+            "INSERT OR REPLACE INTO mail_launch_failed(request_id, detail) VALUES(?1, ?2)",
+            params![request_id, detail],
+        )?;
+    }
+    Ok(())
+}
+
+/// Why the launch `request_id` failed at its spawn check, if it did.
+pub fn launch_failure(db: &Connection, request_id: &str) -> Result<Option<String>> {
+    Ok(db
+        .query_row(
+            "SELECT detail FROM mail_launch_failed WHERE request_id=?1",
+            [request_id],
             |r| r.get(0),
         )
         .optional()?)

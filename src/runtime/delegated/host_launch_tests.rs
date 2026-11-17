@@ -279,3 +279,36 @@ fn a_host_senders_launch_is_checked_at_the_spawn_boundary() {
         failed_with(&rig, &id, details::SENDER_REVOKED);
     });
 }
+
+/// Review L5: a launch refused at its spawn check (here its route no longer
+/// launching on message) fails its tasks with that reason, as stage 1
+/// fails them with the launcher's (`approved route launch not started:
+/// <why>`), never the cwd and environment guess.
+#[test]
+fn a_launch_refused_at_its_spawn_check_fails_its_tasks_with_why() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let _host = hl_host(&mut rig, root, &os);
+        let message = hl_message(&rig, &["atem:host/rl"], true);
+        hl_admit(&mut rig, &message);
+        let id = rig.bridge.work.launches.back().unwrap().request_id.clone();
+        rig.bridge
+            .work
+            .config
+            .routes
+            .iter_mut()
+            .find(|r| r.id == "rl")
+            .unwrap()
+            .launch = crate::runtime::host_work::RouteLaunch::Off;
+        rig.bridge.refresh_start_view();
+        assert!(rig.bridge.take_remote_launches().is_empty());
+        failed_with(&rig, &id, details::ROUTE_CHANGED);
+        rig.until(|r| ad_tasks(r, &message)[0].status.state == WorkState::Failed)
+            .await;
+        assert_eq!(
+            ad_tasks(&rig, &message)[0].status.detail,
+            "approved route launch not started: route changed"
+        );
+    });
+}
