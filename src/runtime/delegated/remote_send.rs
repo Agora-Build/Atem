@@ -247,6 +247,34 @@ pub fn commit_request(
     Ok(())
 }
 
+/// The rows of `local` to `part`'s hosts not sealed yet, refused with
+/// `why`, in the accepting transaction `tx` (nothing is sealed).
+pub fn refuse_unsealed(
+    tx: &Transaction,
+    local: &Message,
+    part: &RemotePart,
+    why: &str,
+) -> Result<()> {
+    let id = &local.message_id;
+    for r in &part.recipients {
+        if !sealed_before(tx, id, &r.host.atem_device_id)? {
+            upsert(
+                tx,
+                id,
+                "request",
+                id,
+                r,
+                None,
+                None,
+                "refused",
+                why,
+                local.created_at,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Whether the row of `object_id` to `host_id` is past `publishing`.
 fn sealed_before(tx: &Transaction, object_id: &str, host_id: &str) -> Result<bool> {
     Ok(tx.query_row(

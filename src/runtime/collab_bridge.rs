@@ -1,4 +1,5 @@
 //! Same-runtime collaboration, using the host's ordinary receipt scheduler.
+use super::delegated_send_pass::OUTBOX_UNAVAILABLE;
 use super::*;
 use crate::runtime::collab::results::{
     self, Binding, EarlyEnd, Origin, OriginRoute, Reply, ReplyState, ResultRow, ReturnGrant,
@@ -1822,11 +1823,17 @@ impl HostBridge {
                             "UPDATE publications SET attempts=attempts+1 WHERE message_id=?1",
                             [&id],
                         )?;
+                        // The outbox's own reason, or the relay's.
+                        let retry = if detail == OUTBOX_UNAVAILABLE {
+                            OUTBOX_UNAVAILABLE
+                        } else {
+                            "relay unreachable; publication will retry"
+                        };
                         collab::publication_state(
                             store,
                             &id,
                             "publishing",
-                            "relay unreachable; publication will retry",
+                            retry,
                             now.saturating_add(delay),
                         )?;
                     }

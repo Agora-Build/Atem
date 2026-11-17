@@ -592,3 +592,108 @@ fn an_answer_with_no_reading_of_d_writes_nothing() {
         assert_eq!(sp_rows(&rig, &id)[0].1, "sent");
     });
 }
+
+/// A send to B with `memory` as context, publishing: its id.
+fn sp_context_send(rig: &mut LocalRig, root: &Path, to: &[&str]) -> String {
+    let memories = crate::memory::store::Store::open(&root.join("knowledge.db")).unwrap();
+    memories
+        .upsert_memory(&crate::memory::model::Memory {
+            id: "mem_c0ffee02".into(),
+            content: "the orders contract changed".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut request = send_request(to);
+    request.memory = vec!["mem_c0ffee02".into()];
+    request.expires_ms = HOUR;
+    rig.bridge
+        .collab_send("atem-host", &rig.sid, request, &rig.sessions)
+        .unwrap()
+}
+
+/// The publication of `id` completes with its frozen snapshot.
+async fn sp_publish(rig: &mut LocalRig, id: &str) {
+    rig.until(|r| r.bridge.work.context_jobs.contains_key(id))
+        .await;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tx.send(Ok(vec![snapshot("the orders contract changed")]))
+        .unwrap();
+    rig.bridge.work.context_jobs.insert(id.to_string(), rx);
+}
+
+fn sp_outbox(rig: &LocalRig, id: &str) -> (String, String) {
+    rig.bridge
+        .work
+        .store
+        .as_ref()
+        .unwrap()
+        .db
+        .query_row(
+            "SELECT state, detail FROM outbox WHERE message_id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+}
+
+/// A context send whose envelopes can't be sealed when its publication
+/// completes (no host key now) waits with its own reason, not the relay's
+/// (review L3).
+#[test]
+fn an_outbox_that_cant_seal_retries_with_its_own_reason() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let _host = sp_host(&mut rig, root, &os);
+        let id = sp_context_send(&mut rig, root, &["atem:host-b"]);
+        // The host key gone: no envelope can be signed.
+        let file = rig
+            .bridge
+            .pairing
+            .as_ref()
+            .unwrap()
+            .host_channel_key
+            .clone();
+        let aside = file.with_extension("aside");
+        std::fs::rename(&file, &aside).unwrap();
+        rig.bridge.host_key = None;
+        sp_publish(&mut rig, &id).await;
+        rig.until(|r| sp_outbox(r, &id).1 != "waiting for verified context publication")
+            .await;
+        assert_eq!(
+            sp_outbox(&rig, &id),
+            (
+                "publishing".into(),
+                "host senders' outbox unavailable; publication will retry".into()
+            )
+        );
+        assert_eq!(sp_rows(&rig, &id)[0].1, "publishing");
+        std::fs::rename(&aside, &file).unwrap();
+    });
+}
+
+/// A publication completing on a runtime whose `host.senders` is off now
+/// seals nothing nothing would put: its rows to other hosts are refused
+/// with why, its local part accepted (review L3).
+#[test]
+fn a_publication_with_host_senders_off_refuses_its_remote_rows() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let _host = sp_host(&mut rig, root, &os);
+        let id = sp_context_send(&mut rig, root, &["atem:atem-host", "atem:host-b"]);
+        rig.bridge.features = HostFeatures::parse("host.delegated").unwrap();
+        sp_publish(&mut rig, &id).await;
+        rig.until(|r| sp_outbox(r, &id).0 == "accepted").await;
+        let remote = crate::runtime::delegated::remote_send::rows(
+            &rig.bridge.work.store.as_ref().unwrap().db,
+            &id,
+        )
+        .unwrap();
+        assert_eq!(
+            (remote[0].state.as_str(), remote[0].detail.as_str()),
+            ("refused", "host senders are off on this host")
+        );
+        assert_eq!(rows(&rig, "mail_outbox"), 0);
+    });
+}
