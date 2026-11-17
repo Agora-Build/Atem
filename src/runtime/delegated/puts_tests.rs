@@ -35,8 +35,47 @@ fn stored(put: &MailboxPut) -> MailboxStored {
 fn client() -> PutClient {
     let mut c = PutClient::default();
     c.on_link(Some(&link(1, 1)));
+    c.on_heads(true);
     c.tick(1_000);
     c
+}
+
+/// Puts wait for the Station's association of the link (review M1): a
+/// `heads` on this link generation announcing this host's mailbox, as the
+/// mailbox's own calls do; none on a new generation or after an identity
+/// change until its own `heads`, none while the latest announces none.
+#[test]
+fn puts_wait_for_a_heads_announcing_the_mailbox() {
+    let mut c = PutClient::default();
+    c.on_link(Some(&link(1, 1)));
+    assert!(c.take(rows(0..1)).is_empty(), "no heads yet");
+    c.on_heads(false);
+    assert!(c.take(rows(0..1)).is_empty(), "no mailbox served");
+    c.on_heads(true);
+    assert_eq!(c.take(rows(0..1)).len(), 1);
+    c.on_link(Some(&link(2, 1)));
+    assert!(
+        c.take(rows(1..2)).is_empty(),
+        "a new generation waits for its heads"
+    );
+    c.on_heads(true);
+    assert_eq!(c.take(rows(1..2)).len(), 1);
+    c.on_heads(false);
+    assert!(
+        c.take(rows(2..3)).is_empty(),
+        "the latest heads announces none"
+    );
+    c.on_heads(true);
+    c.on_identity_moved();
+    c.on_heads(true);
+    assert!(c.take(rows(2..3)).is_empty(), "nothing on a moved socket");
+    c.on_link(Some(&link(3, 2)));
+    assert!(
+        c.take(rows(2..3)).is_empty(),
+        "a new socket waits for its heads"
+    );
+    c.on_heads(true);
+    assert_eq!(c.take(rows(2..3)).len(), 1);
 }
 
 /// Eight live at most, each with a fresh id and the row's exact bytes; a
@@ -106,6 +145,7 @@ fn a_new_link_or_identity_retires_the_puts() {
     let mut c = client();
     let first = c.take(rows(0..1)).remove(0);
     c.on_link(Some(&link(2, 1)));
+    c.on_heads(true);
     assert!(c.live_rows().is_empty());
     assert_eq!(c.on_stored(&stored(&first)), Answer::Drained);
     let second = c.take(rows(0..1)).remove(0);
@@ -115,11 +155,13 @@ fn a_new_link_or_identity_retires_the_puts() {
     c.on_link(Some(&link(3, 1)));
     assert!(c.take(rows(0..1)).is_empty(), "the same socket");
     c.on_link(Some(&link(4, 2)));
+    c.on_heads(true);
     assert_eq!(c.take(rows(0..1)).len(), 1);
     c.on_link(None);
     assert!(c.take(rows(0..1)).is_empty(), "no link");
     // A put never handed to the link isn't live; its id answers nothing.
     c.on_link(Some(&link(5, 3)));
+    c.on_heads(true);
     let unsent = c.take(rows(0..1)).remove(0);
     c.unsent(&unsent.request_id);
     assert!(c.live_rows().is_empty());

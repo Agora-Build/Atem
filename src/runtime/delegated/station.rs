@@ -307,6 +307,9 @@ impl Station {
             Ok((ToHost::Heads(heads), mailbox)) => {
                 self.heads += 1;
                 if self.senders {
+                    // Puts go once the Station associated the link: a
+                    // `heads` with this host's mailbox.
+                    self.puts.on_heads(mailbox.is_some());
                     self.mailbox.on_heads(mailbox);
                 }
                 // Another identity's association: nothing fetched, no head

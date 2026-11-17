@@ -5,6 +5,10 @@
 //! in ([`PutClient::take`]) and the store's writes are the bridge's
 //! (`send_pass.rs`).
 //!
+//! - Puts go only once the Station associated the link with this host
+//!   (rule 1): after a `heads` on this link generation announcing this
+//!   host's mailbox, as the mailbox's own calls wait for one; none while
+//!   the latest `heads` announces none (a Station that serves no mailbox).
 //! - At most [`MAX_LIVE_PUTS`] live per link generation, each with a fresh
 //!   lowercase UUID v4 `request_id`; a row being put isn't due again.
 //! - `mailbox_stored` and `mailbox_put_refused` apply only to a live put
@@ -57,6 +61,9 @@ pub enum Answer {
 #[derive(Debug, Default)]
 pub struct PutClient {
     link: Option<(u64, u64)>,
+    /// The latest `heads` on this link generation announced this host's
+    /// mailbox.
+    announced: bool,
     moved: bool,
     now: u64,
     live: Vec<Live>,
@@ -77,16 +84,26 @@ impl PutClient {
             return;
         }
         self.retire_all();
+        self.announced = false;
         if now.map(|(_, socket)| socket) != self.link.map(|(_, socket)| socket) {
             self.moved = false;
         }
         self.link = now;
     }
 
+    /// A `heads` on the link, announcing this host's mailbox or not.
+    /// Nothing counts on a socket whose identity moved.
+    pub fn on_heads(&mut self, mailbox: bool) {
+        if self.link.is_some() && !self.moved {
+            self.announced = mailbox;
+        }
+    }
+
     /// The host's identity changed on the live link: every live put
     /// retired, nothing more put on that socket.
     pub fn on_identity_moved(&mut self) {
         self.retire_all();
+        self.announced = false;
         self.moved = true;
     }
 
@@ -111,11 +128,12 @@ impl PutClient {
     }
 
     /// The puts of `due` to send now, live from now (none without a link,
-    /// after an identity change, or past [`MAX_LIVE_PUTS`]). A row whose
+    /// before its `heads` announced this host's mailbox, after an identity
+    /// change, or past [`MAX_LIVE_PUTS`]). A row whose
     /// bytes no longer read is skipped.
     pub fn take(&mut self, due: Vec<Due>) -> Vec<MailboxPut> {
         let mut out = Vec::new();
-        if self.link.is_none() || self.moved {
+        if self.link.is_none() || self.moved || !self.announced {
             return out;
         }
         for row in due {
@@ -218,6 +236,7 @@ impl PutClient {
             "timeouts": self.timeouts,
             "drained": self.drained,
             "unsolicited": self.unsolicited,
+            "announced": self.announced,
             "identity_moved": self.moved,
         })
     }

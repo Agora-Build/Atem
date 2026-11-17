@@ -34,6 +34,8 @@ fn sp_host(rig: &mut LocalRig, root: &Path, os: &ManualOs) -> MbHost {
         atem_client::membership::host_enc_key("host-b", 1, &enc_key, &sig, false, 0).unwrap();
     sign_and_carry(rig, &mut host.s, action);
     mb_tick(rig, &mut host, 0);
+    // The Station associated the link: its `heads` with this host's mailbox.
+    mb_heads(rig, MB_MAILBOX, 0);
     host
 }
 
@@ -433,6 +435,7 @@ fn an_identity_change_retires_the_puts() {
             || LinkKind::Routed,
             || Some(ORIGIN.into()),
         );
+        mb_heads(&mut rig, MB_MAILBOX, 0);
         let again = sp_out(&mut rig).remove(0);
         assert_eq!(again.object, first.object);
     });
@@ -498,13 +501,16 @@ fn a_status_object_is_put_until_stored_never_after() {
         tx.commit().unwrap();
         let first = sp_out(&mut rig).remove(0);
         assert_eq!(first.object.to_json().to_string().into_bytes(), bytes);
-        // Reconnected, unanswered: put again.
+        // Reconnected, unanswered: put again (once the new generation's
+        // `heads` came).
         rig.bridge.station.as_mut().unwrap().sync_link(
             Some(2),
             1,
             || LinkKind::Routed,
             || Some(ORIGIN.into()),
         );
+        assert!(sp_out(&mut rig).is_empty());
+        mb_heads(&mut rig, MB_MAILBOX, 0);
         let second = sp_out(&mut rig).remove(0);
         assert_ne!(second.request_id, first.request_id);
         sp_stored(&mut rig, &second);
@@ -517,5 +523,30 @@ fn a_status_object_is_put_until_stored_never_after() {
         assert_eq!(state(&rig), "done");
         sp_d(&rig, t + 30 * 60_000);
         assert!(sp_out(&mut rig).is_empty(), "never after it was stored");
+    });
+}
+
+/// No put goes before the Station associated the link (review M1): the
+/// first `heads` of a link generation announcing this host's mailbox; a
+/// new generation waits for its own.
+#[test]
+fn no_put_goes_before_the_links_heads() {
+    local_test(async |root| {
+        use crate::runtime::delegated::station::LinkKind;
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let _host = sp_host(&mut rig, root, &os);
+        sp_d(&rig, host_now().wall_ms);
+        rig.bridge.station.as_mut().unwrap().sync_link(
+            Some(2),
+            2,
+            || LinkKind::Routed,
+            || Some(ORIGIN.into()),
+        );
+        let id = sp_send(&mut rig, &["atem:host-b"]).unwrap();
+        assert_eq!(sp_engine(&rig, &id).1, "queued");
+        assert!(sp_out(&mut rig).is_empty(), "no heads on this generation");
+        mb_heads(&mut rig, MB_MAILBOX, 0);
+        assert_eq!(sp_out(&mut rig).len(), 1);
     });
 }
