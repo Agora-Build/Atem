@@ -4478,7 +4478,7 @@ mod tests {
         assert_eq!(message_text(&done), (String::new(), String::new()));
         assert_eq!(store.message(&done).unwrap().unwrap().receipt, receipt);
         // `atem message status` says so, and still lists the context.
-        let view = &crate::runtime::collab::views(&store, Some(&done), None).unwrap()[0];
+        let view = &crate::runtime::collab::views(&store, Some(&done), None, true).unwrap()[0];
         let result = view.tasks[0].result.as_ref().unwrap();
         assert!(result.dropped && result.text.is_empty());
         assert_eq!(result.context[0].digest, digest(b"the reply's context"));

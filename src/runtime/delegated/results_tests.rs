@@ -655,6 +655,13 @@ fn a_result_is_delivered_once_as_data_on_a_route_that_takes_results() {
             "explicit result delivered to the originating agent"
         );
         assert!(done.status.result.is_some());
+        // `atem message status` says it was delivered.
+        let view = rig.bridge.collab_status(None, Some(&m)).unwrap().remove(0);
+        let reply = view.remote[0].tasks[0].reply.clone().unwrap();
+        assert_eq!(
+            (reply.delivered, reply.delivery.as_str()),
+            (true, "delivered")
+        );
     });
 }
 
@@ -900,5 +907,97 @@ fn without_host_senders_no_result_is_judged() {
             )
             .unwrap();
         assert!(!made);
+    });
+}
+
+// ------------------------------------------------ `atem message status`
+
+/// Item 3: a message's rows to other hosts in `atem message status` (from
+/// the owner's terminal and inside the session that sent it, never in
+/// another session's view): before any status, "status pending", and a
+/// row waiting for the Station to announce this host's mailbox says so;
+/// once statuses and a result came, each task with its state and its
+/// reply, delivered or kept. Hook off: no rows.
+#[test]
+fn message_status_shows_rows_to_other_hosts_and_what_came_back() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        let now = host_now().wall_ms;
+        let (m, r) = rb_send(&mut rig);
+        let remote = |rig: &mut LocalRig, caller: Option<&SessionId>| {
+            rig.bridge.collab_status(caller, Some(&m)).unwrap()[0]
+                .remote
+                .clone()
+        };
+        let row = remote(&mut rig, None).remove(0);
+        assert_eq!(
+            (row.host_id.as_str(), row.state.as_str(), row.status_pending),
+            ("host-b", "ready", true)
+        );
+        assert_eq!(row.detail, "waiting to be put in the host's mailbox");
+        // A new link generation, before its `heads` announce the mailbox.
+        use crate::runtime::delegated::station::LinkKind;
+        rig.bridge.station.as_mut().unwrap().sync_link(
+            Some(2),
+            2,
+            || LinkKind::Routed,
+            || Some(ORIGIN.into()),
+        );
+        rig.bridge.station_identity();
+        let row = remote(&mut rig, None).remove(0);
+        assert_eq!(
+            row.detail,
+            "waiting for the Station to announce this host's mailbox"
+        );
+        mb_heads(&mut rig, MB_MAILBOX, 0);
+        let task = rb_task_id(&m, &r);
+        let objects = [
+            rb_from_b(
+                &rig,
+                &host,
+                now,
+                &rb_resolved(&m, &r, WorkState::AwaitingResult),
+            ),
+            rb_from_b(&rig, &host, now, &rb_reply(&task, "seen there")),
+        ];
+        rb_receive(&mut rig, &mut host, &objects);
+        let sid = rig.sid.clone();
+        for caller in [None, Some(&sid)] {
+            let row = remote(&mut rig, caller).remove(0);
+            assert_eq!(
+                (row.state.as_str(), row.status_pending),
+                ("accepted", false)
+            );
+            let t = &row.tasks[0];
+            assert_eq!(
+                (t.task_id.as_str(), t.state.as_str(), t.detail.as_str()),
+                (task.as_str(), "awaiting_result", "on B")
+            );
+            let reply = t.reply.as_ref().unwrap();
+            assert_eq!(
+                (
+                    reply.text.as_str(),
+                    reply.delivered,
+                    reply.delivery.as_str()
+                ),
+                (
+                    "seen there",
+                    false,
+                    crate::runtime::delegated::results_back::NO_RESULTS
+                )
+            );
+        }
+        // Another session sees none of it.
+        let other = SessionId::new();
+        assert!(
+            rig.bridge
+                .collab_status(Some(&other), Some(&m))
+                .unwrap()
+                .is_empty()
+        );
+        rig.bridge.features = HostFeatures::parse("host.delegated").unwrap();
+        assert_eq!(remote(&mut rig, None).len(), 1, "rows stay readable");
     });
 }

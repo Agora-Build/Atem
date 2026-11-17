@@ -25,13 +25,14 @@
 //!   bridge) against [`candidates`]: the rows a result from that host may
 //!   answer.
 use super::remote_send;
+use crate::runtime::collab::{RemoteReplyView, RemoteTaskView, RemoteView};
 use crate::runtime::host_work::Store;
 use anyhow::Result;
 use atem_client::host_mail::{ExpectedResult, HostRef};
 use atem_client::session::host_work::{
     ContextKind, ContextSnapshot, MAX_LIFETIME_MS, ResultReply, WorkState, digest,
 };
-use atem_client::session::messages::{Delivery, RecipientReceipt, WorkProgress};
+use atem_client::session::messages::{ContextReference, Delivery, RecipientReceipt, WorkProgress};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 /// A reply kept, never delivered: the route that sent the message takes no
@@ -509,4 +510,97 @@ pub fn prune_replies(db: &Connection, now_ms: u64) -> Result<usize> {
             AND json_extract(reply, '$.dropped') = 0",
         params![now_ms, KEEP_REPLY_MS],
     )?)
+}
+
+/// A `ready` row's detail while the link's latest `heads` hasn't announced
+/// this host's mailbox: nothing is put before it (host-work-v1 §11.5, rule
+/// 1).
+pub const WAITING_FOR_MAILBOX: &str = "waiting for the Station to announce this host's mailbox";
+
+/// Whether `db` has the sending host's tables (`host.senders` was on).
+fn made(db: &Connection) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT count(*)=2 FROM sqlite_master WHERE type='table'
+            AND name IN ('remote_tasks', 'remote_deliveries')",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+/// The delivery rows of `message_id` to other hosts and what came back
+/// (`atem message status`); none in a store without these tables.
+/// `announced`: puts may go now (else a `ready` row waits for the
+/// Station's announcement).
+pub fn views(db: &Connection, message_id: &str, announced: bool) -> Result<Vec<RemoteView>> {
+    if !made(db)? {
+        return Ok(Vec::new());
+    }
+    let mut tasks = db.prepare(
+        "SELECT t.recipient_id, t.task_id, t.state, t.detail, t.reply, t.delivery,
+            t.delivery_detail, w.state
+        FROM remote_tasks t LEFT JOIN work w ON w.id=t.work_id
+        WHERE t.message_id=?1 AND t.host_id=?2 ORDER BY t.rowid",
+    )?;
+    remote_send::rows(db, message_id)?
+        .into_iter()
+        .filter(|row| row.kind == "request")
+        .map(|row| {
+            let tasks = tasks
+                .query_map([message_id, &row.host_id], task_view)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(RemoteView {
+                status_pending: tasks.is_empty()
+                    && !matches!(row.state.as_str(), "skipped" | "refused" | "expired"),
+                detail: if row.state == "ready" && !announced {
+                    WAITING_FOR_MAILBOX.into()
+                } else {
+                    row.detail
+                },
+                host_id: row.host_id,
+                state: row.state,
+                code: row.code,
+                tasks,
+            })
+        })
+        .collect()
+}
+
+/// One row of `remote_tasks` as `atem message status` shows it: a reply
+/// that doesn't read shows as none.
+fn task_view(r: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteTaskView> {
+    let reply: Option<ResultReply> = r
+        .get::<_, Option<String>>(4)?
+        .and_then(|text| serde_json::from_str(&text).ok());
+    let delivery: Option<String> = r.get(5)?;
+    let why: Option<String> = r.get(6)?;
+    let work: Option<String> = r.get(7)?;
+    let delivered = work.as_deref() == Some("completed");
+    Ok(RemoteTaskView {
+        recipient_id: r.get(0)?,
+        task_id: r.get(1)?,
+        state: r.get(2)?,
+        detail: r.get(3)?,
+        reply: reply.map(|reply| RemoteReplyView {
+            result_id: reply.result_id,
+            text: reply.text,
+            dropped: reply.dropped,
+            context: reply
+                .context
+                .iter()
+                .map(|c| ContextReference {
+                    kind: c.kind,
+                    id: c.id.clone(),
+                    version: c.version,
+                    digest: c.digest.clone(),
+                })
+                .collect(),
+            delivered,
+            delivery: match delivery.as_deref() {
+                Some("kept") => why.unwrap_or_default(),
+                Some("queued") if delivered => "delivered".into(),
+                Some("queued") => "being delivered to the session that sent it".into(),
+                _ => "delivery pending".into(),
+            },
+        }),
+    })
 }

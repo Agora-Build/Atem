@@ -1907,7 +1907,13 @@ impl HostBridge {
         let Some(store) = self.work.store.as_ref() else {
             return Ok(vec![]);
         };
-        collab::views(store, id, caller.map(SessionId::as_str))
+        // Whether this host's puts may go (host senders): rows waiting for
+        // the Station's `heads` say so.
+        let announced = self
+            .station
+            .as_ref()
+            .is_some_and(|station| station.puts.announced());
+        collab::views(store, id, caller.map(SessionId::as_str), announced)
     }
 
     /// `atem message cancel`: inside a session (`caller`), a task of a
