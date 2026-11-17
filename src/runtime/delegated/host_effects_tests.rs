@@ -2,11 +2,11 @@
 // II.2.2, II.3.1, II.8; host-work-v1 §11.6): the rig's host with
 // `host.delegated` and `host.senders` on, its list naming this host, host
 // B and the phone, and a project `build` listing this host and B with a
-// task's ops; route `rh` consents to `project:build`. Mailbox admission
-// isn't built: a host sender's task is the phone's task rewritten as B's
-// (its admission frozen by `Admission::for_host`), as admission will store
-// it. Included beside the other delegated tests, whose helpers and imports
-// it shares.
+// task's ops; route `rh` consents to `project:build`. These tests don't
+// go through the mailbox: a host sender's task is the phone's task
+// rewritten as B's (its admission frozen by `Admission::for_host`), as
+// admission stores it. Included beside the other delegated tests, whose
+// helpers and imports it shares.
 
 use crate::runtime::delegated::DelegatedSender;
 use crate::runtime::delegated::host_senders::{self, HostOp, HostSender, host_sender_permits};

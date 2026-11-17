@@ -3091,10 +3091,11 @@ substitute chain `SUB1`–`SUB3`) and the kits in `r9-vectors-keys`
 | `native` | member of kind `native` at Atem's head; `sig_c` by its `auth_key` | `member:<device_id>` | `view`; `control` if in its roles (`manage` gives the host nothing but the host policy, R9.8a, and `host_enc_key_get`, R9.14, built behind the debug-only hook's `host.senders` and advertised by no release build) |
 | `service` | member of kind `service`, not expired, host in `scope.hosts`; `sig_c` by its `auth_key` | `service:<device_id>` | `view`; `control` if `scope.ops` has any of `prompt`, `interrupt`, `stop`, `terminal`, `approval`, `rule_revoke`; each op checked separately |
 | `browser` | grant (below) whose issuer is a native member with `control` at Atem's head; `sig_c` by the grant's `browser_key` | `browser:<grant_id>` (issuer recorded) | `view`; `control` if the grant's `ops` have a control op; never more than the issuer |
-| `host` | newest `add_host` of `host_id`; `sig_h` | — (never a client). **Planned** (delegated host work, step 3; nothing advertised): `host:<host_id>`, a sender in envelopes and route principals only | — |
+| `host` | newest `add_host` of `host_id`; `sig_h` | — (never a client). Delegated host work (step 3's shared core; a host uses it only behind the debug-only hook's `host.senders`, nothing advertised): `host:<host_id>`, a sender in envelopes and route principals only | — |
 
-**The `host:<host_id>` principal** (planned, delegated host work II.2.1;
-nothing advertised). It names a host as the signer of an envelope and in
+**The `host:<host_id>` principal** (delegated host work II.2.1; defined in
+the shared core, used by a host only behind the debug-only hook's
+`host.senders`, nothing advertised). It names a host as the signer of an envelope and in
 a route's principals, never as a client: it isn't an `atem-ch1` principal
 kind and no admission reads it. `host_id` is the `atem_device_id` of the
 host's `add_host`, with the device list's id grammar (1–128 bytes of
@@ -3608,13 +3609,15 @@ route) and push relay messages (`push_hint`, `push_seen`, `push_ack`,
 R9.9), nothing else: r8 session-family messages are dropped unanswered, no Astation
 operation (pair, pair verify, cred unlock/projects, the token refresh)
 runs on it, no `credentialSync` or encryption message is applied, no mark
-task is taken or reported. **Planned (delegated host work; changed for
-host senders; the Station calls are agreed with Astation (2026-11-11, #120
-comment 6810116314), the stage-3 mailbox calls wait for stage 3):** a routed link also carries the
+task is taken or reported. **Delegated host work, built on the host
+behind the debug-only hook (changed for host senders; the Station calls
+agreed with Astation (2026-11-11, #120 comment 6810116314), the mailbox
+calls (2026-11-16, #120 comment 6903887341)):** a routed link also carries the
 Station calls of host-work-v1 §11.4 (`control_sync`,
 `control_sync_result`, `heads`, `control_ack`, `membership_fetch`,
 `membership_fetch_result`, and the refusals `control_sync_refused`,
-`membership_fetch_refused`, `control_ack_refused`) and, in stage 3, the mailbox calls (delegated
+`membership_fetch_refused`, `control_ack_refused`) and, with
+`host.senders`, the mailbox calls of host-work-v1 §11.5 (delegated
 host-work design II.4.3), because unattended hosts are where delegated and
 host-sender work runs. The Station takes the calling host from the route
 the host proved (its verified root, host and connection binding), never
@@ -4173,8 +4176,10 @@ several `push_hint` messages (one hint, about 0.8–1.5 KiB, always fits),
 and the relay splits its acknowledgments over several `push_ack`
 messages (about 340 bytes an identity). Atem drops a larger relay
 message unread (counted in its log); what it would have acknowledged is
-resent and acknowledged again. **Planned (delegated host work, stage 3;
-owner choice 13; changed agreed meaning, needs Astation's agreement):**
+resent and acknowledged again. **Delegated host work, stage 3, built on
+the host only behind the debug-only hook's `host.senders` (owner choice
+13; changed agreed meaning, agreed with Astation (2026-11-16, #120 comment
+6903887341) with the mailbox calls' rule 9):**
 mailbox calls (design II.4.3: put, stored, sync, done) carry one object
 each and may be up to 524,288 bytes (512 KiB) as sent, so a host sender's
 Message keeps host-work-v1 §5's 240 KiB bound; the drop-unread rule

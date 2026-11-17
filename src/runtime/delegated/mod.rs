@@ -1,17 +1,17 @@
 //! Delegated host work (the delegated host-work design, Part I;
 //! host-work-v1 §11 and §11.6, session-v1 R9.14): the lifecycle a delegated
-//! sender's task has, behind `host.delegated` and `host.alerts`. Nothing of
-//! it runs unless the debug-only hook turns the features on
-//! (`test_hooks::host_features`, read once when the runtime starts: step
-//! 4's Decision 10); a release build never does.
+//! sender's task has, behind `host.delegated` and `host.alerts`, and host
+//! senders' side of it behind `host.senders`. Nothing of it runs unless the
+//! debug-only hook turns the features on (`test_hooks::host_features`,
+//! read once when the runtime starts); a release build never does.
 //!
-//! Here so far: who is delegated ([`classify`]: design I.1.3, Decision 13),
+//! Here: who is delegated ([`classify`]: design I.1.3),
 //! the admission record a delegated sender's task gets ([`Admission`],
 //! I.4.1), its attempts ([`attempts`], I.6.4), the start check and the
 //! gates ([`start`], [`gate`], I.4.3, I.5.8) and the same check of a
 //! delegated sender's launch at the spawn boundary
 //! ([`start::launch_check`], I.4.3 "Launches"), who may query, cancel or
-//! complete it ([`authority`], I.4.5, Decision 15), the interrupt intents
+//! complete it ([`authority`], I.4.5), the interrupt intents
 //! that stop its attempt at its deadline ([`intents`], I.4.4, I.5.7), which
 //! `work_interrupt` shares (§11.2; the bridge serves it), what the bridge
 //! answers the delegated ops it doesn't serve ([`request`]), the owner's
@@ -24,8 +24,13 @@
 //! tasks, in that transaction ([`effects`], I.5.5 to I.5.7), and the
 //! acknowledgments of their results to the host's Station, written there
 //! too ([`acks`], I.5.8, §11.4). Host senders (`host:<host_id>`, design
-//! Part II), behind `host.senders`, which the hook turns on only with
-//! `host.delegated`: [`host_senders`].
+//! Part II; host-work-v1 §11.5), behind `host.senders`, which the hook
+//! turns on only with `host.delegated`: who they are and what they may do
+//! ([`host_senders`]); on the receiving host the mailbox ([`mailbox`],
+//! [`mailbox_store`]) and the admission of what it opens ([`admit`]); on
+//! the sending host the plan, the delivery rows and the puts
+//! ([`send_plan`], [`remote_send`], [`outbox`], [`puts`]); and the results
+//! back on both ([`results_back`]).
 pub mod acks;
 pub mod admit;
 pub mod alerts;

@@ -1620,8 +1620,9 @@ fn an_object_over_the_pending_limits_is_marked_done() {
 /// host has read its mailbox to the announced head and every inbox row is
 /// admitted: closed with no mailbox announced, while a page is out, while
 /// an opened request waits for admission; open once admission took it
-/// (admission isn't built: the test takes the row as it will), a kept
-/// result holding none; closed again by a new object until it is read.
+/// (admission is held in these tests: the test takes the row as admission
+/// does), a kept result holding none; closed again by a new object until
+/// it is read.
 #[test]
 #[cfg_attr(
     not(debug_assertions),

@@ -2,13 +2,13 @@
 
 Status: implemented and released (Atem v0.8.2). §11 (delegated work):
 `host.delegated` and `host.alerts` are built (step 4, 2026-11-14) behind a
-debug-only hook and advertised by no release build; `host.senders` is
-planned (behind the same hook a debug build lists it with hosting on,
-answers `host_enc_key_get` and `control_records`, and judges what a host
-sender may do on the receiving host, §11.6 "Host senders on the receiving
-host"; the receiving host's mailbox client and the sending host's planning,
-sealing and puts are built, §11.5; cancel and complete across hosts, the
-status objects and results back and admission are not).
+debug-only hook and advertised by no release build, and so is Atem's side of
+`host.senders` (2026-11-17): behind the same hook a debug build lists it
+with hosting on, answers `host_enc_key_get` and `control_records`, judges
+what a host sender may do on the receiving host (§11.6 "Host senders on the
+receiving host"), and runs both hosts' sides of host senders' mail (§11.5).
+Not built: a Station's side of the mailbox, and the host encryption key in
+the verification ceremony (§11.5).
 
 This extension of atem-session r9 lets an admitted client create sessions
 through launch profiles the host owner approved, queue directed work, publish
@@ -34,7 +34,7 @@ still requires the contract below. Cross-instance selector/result support waits 
 the stage-2 agreement ([../delegated-host-work.md](../delegated-host-work.md), II.1).
 **Amended by owner decision, 2026-11-15:** stage 2 isn't used between Atem
 hosts, so it comes with host senders instead (§11.5, agreed with Astation
-2026-11-16; design II.6).
+2026-11-16; design II.6), built behind the debug-only hook of §11.
 
 ## 1. Features and transport
 
@@ -828,10 +828,12 @@ dropped.
   existing live session.
 - **Not implemented:** store-and-forward. Channel records can't be replayed on
   a new channel, so a Station can't deliver a stored envelope for its sender,
-  and dispatch needs the sender's live channel. There is no origin proof and no
-  host-to-host sender (planned: §11.5, `host.senders`). Behind the debug-only
-  hook of §11, a delegated sender's task is dispatched by the host without
-  its sender's channel (§11.6); everyone else's still needs it.
+  and dispatch needs the sender's live channel. There is no origin proof for
+  a channel sender. Behind the debug-only hook of §11, a delegated sender's
+  task is dispatched by the host without its sender's channel (§11.6), and
+  host-to-host senders (`host.senders`) send signed, sealed objects through
+  the receiving host's mailbox on the Station (§11.5); everyone else's work
+  still needs its sender's channel.
 - **Not implemented:** resolving an `outcome_unknown` task by hand (a reply
   its agent submits moves it to `awaiting_result`; otherwise it expires at
   `expires_at`), and deleting or archiving the host's records (every record
@@ -839,7 +841,7 @@ dropped.
   resolved by hand behind the debug-only hook of §11 (`work_resolve`, §11.2;
   the owner's `atem task resolve`, §11.6 "On the host").
 
-## 11. Delegated work (`host.delegated`, `host.alerts` built behind a debug-only hook; `host.senders` partly built behind it; not advertised)
+## 11. Delegated work (`host.delegated`, `host.alerts` and Atem's side of `host.senders` built behind a debug-only hook; not advertised)
 
 The delegated host-work design ([../delegated-host-work.md](../delegated-host-work.md),
 agreed revision 6b) gives tasks a lifecycle Atem owns, stops that reach
@@ -851,7 +853,7 @@ three features, defined in `atem_client::session::host_work`
 |---|---|
 | `host.delegated` | `work_interrupt`, `work_resolve` (§11.2) |
 | `host.alerts` | `alert_list` (§11.3), and the push hint of kind `outcome_unknown` (session-v1 R9.9) |
-| `host.senders` | `control_records` (session-v1 R9.3, R9.8; §11.1), `host_enc_key_get` (session-v1 R9.8, R9.14); and host senders' objects through the mailbox (§11.5), with `select` inside their envelopes (proposed, 2026-11-15) |
+| `host.senders` | `control_records` (session-v1 R9.3, R9.8; §11.1), `host_enc_key_get` (session-v1 R9.8, R9.14); and host senders' objects through the mailbox (§11.5), with `select` inside their envelopes (agreed with Astation 2026-11-16) |
 
 **No release build advertises them in this version.** `host.delegated` and
 `host.alerts` are built (step 4 of the design's order of work, 2026-11-14)
@@ -872,10 +874,12 @@ comment 6810116314)**), and a host-work request (`work_interrupt`, `work_resolve
 refuses to send `control_records` or `host_enc_key_get` to a host that
 doesn't list `host.senders` (`host feature not available`). The lifecycle
 these ops serve (§11.6) and session-v1's side of it (R9.14) are built with
-them, behind the same hook; of host senders' part, the receiving host's
-authority and the device list's effects on their tasks are built behind it
-(§11.6 "Host senders on the receiving host"), and the envelopes and the
-mailbox (§11.5 on the host) are planned.
+them, behind the same hook, and so is Atem's side of host senders: the
+receiving host's authority and the device list's effects on their tasks
+(§11.6 "Host senders on the receiving host"), and the envelopes, the
+mailbox and both hosts' sides of it (§11.5). A Station's side of the
+mailbox and the host encryption key in the verification ceremony aren't
+built (§11.5).
 
 **Contract status (2026-11-12).** Step 3 of the design's order of work
 (PRs #145 to #150, the shared-core contracts behind this section) merged on
@@ -2996,9 +3000,10 @@ Every relay message, in either direction, is at most 256 KiB as sent
 put, stored, sync, done; `heads` keeps 256 KiB, §11.5 rule 9) carry one
 object each and may be up to 512 KiB (owner choice 13, so a host sender's Message keeps
 §5's 240 KiB bound): R9.9's drop-unread rule then exempts them up to that
-bound (**changed agreed meaning, needs Astation's agreement**; session-v1
-R9.9). Their wire is proposed in §11.5 ("The mailbox calls", 2026-11-15),
-agreed with Astation 2026-11-16.
+bound (**changed agreed meaning, agreed with Astation (2026-11-16, #120
+comment 6903887341)** with the mailbox calls' rule 9; session-v1 R9.9).
+Their wire is §11.5's ("The mailbox calls"). Behind the debug-only hook,
+the host's link reader keeps that bound for the mailbox messages.
 
 #### Fixtures
 
@@ -3095,7 +3100,7 @@ control vectors, device-list entries and heads of log L, the effects each
 record's action carries, wire rule 3), and every invalid text's code. Every
 SDK package's checksum manifest lists the file.
 
-### 11.5 Envelopes and results (planned)
+### 11.5 Envelopes and results (Atem's side built behind a debug-only hook; not advertised)
 
 A **host sender** (`host:<host_id>`, delegated host-work design II.2.1)
 sends work to another host of the account as signed, sealed objects
@@ -3106,7 +3111,19 @@ the work (a status, a refusal or a result). They belong to `host.senders`,
 which no release build advertises (a debug build lists it only behind the
 debug-only hook): a host sends, fetches, judges and admits them only
 behind that hook ("The mailbox calls", "On the receiving host", "On the
-sending host"). Types: `atem_client::host_mail` (the builders `seal_envelope` and
+sending host").
+
+**What is built** (each subsection below says what of it): the objects,
+their checks, the mailbox wire and a reference mailbox in the shared core,
+with shared vectors; and, behind the debug-only hook, both hosts' sides,
+run end to end by two real hosts against a fake Station
+(`tests/host_senders_binary.rs`). **Not built:** a Station's side of the
+mailbox (Astation's), and the host encryption key in the verification
+ceremony (Atem's side is draft PR #176, held for Astation's). Atem's
+readings that still wait for Astation's agreement are listed at the end of
+this section ("Readings waiting for Astation").
+
+Types: `atem_client::host_mail` (the builders `seal_envelope` and
 `seal_result`, the receiver's `open_envelope` and the sending host's
 `accept_result`, and `accept_result_among` for a host's every row to one
 host); bindings: host role only (feature `host`,
@@ -3467,7 +3484,8 @@ resolved (its UUID v5 id). **Proposed (2026-11-15), agreed with Astation 2026-11
 stage-3 item, written with Astation. Each call carries one object and is
 bounded at 512 KiB (owner decision 2026-11-07, choice 13); R9.9's rule that
 Atem drops a larger relay message unread exempts them (design II.4.2, a
-contract change that needs agreement). **Proposed (2026-11-15), agreed with Astation 2026-11-16:** "The mailbox calls" below, where `heads` keeps the
+contract change, agreed with Astation with the mailbox calls, 2026-11-16,
+#120 comment 6903887341). **Proposed (2026-11-15), agreed with Astation 2026-11-16:** "The mailbox calls" below, where `heads` keeps the
 256 KiB bound (its rule 9).
 
 **Agreed with Astation 2026-11-16 (proposed 2026-11-15).** The owner decided on
@@ -3475,7 +3493,8 @@ contract change that needs agreement). **Proposed (2026-11-15), agreed with Asta
 mailbox stays, that the first version addresses hosts through the device
 list, and that the host's encryption key is signed in the verification
 ceremony (design status block, II.1, II.4.1, II.4.3, II.6). The five
-subsections below are concrete proposals for the two open items above, for
+subsections below, "The mailbox calls" to "The host encryption key in the
+ceremony", are concrete proposals for the two open items above, for
 the two SDK points Astation raised on 2026-11-07 (#120 comment 6701618182)
 and for the ceremony's fields. Each is **agreed with Astation 2026-11-16**.
 **Built in the shared core:** the mailbox calls' readers and builders,
@@ -3493,8 +3512,11 @@ host"). **Built on the sending host, behind the same hook:** its planning,
 sealing and puts, its reading of the statuses and results, and its
 `cancel` and `complete` of a task on another host ("On the sending host"),
 and `select`'s `launch` in the shared core. Two real hosts run end to end
-behind the hook (`tests/host_senders_binary.rs`). Nothing else in them is
-built (a Station's side, the ceremony's fields). The status forms
+behind the hook (`tests/host_senders_binary.rs`). **Not built:** a
+Station's side (Astation's; Atem's tests run against a fake Station), and
+the ceremony's fields (Atem's side is draft
+PR #176, held until Astation's native ceremony is ready, #120 comment
+6938206284). The status forms
 and the sending host's `result_id` check have their shared vectors in
 `fixtures/r9-vectors-host-envelope.json` (a result failing both the
 `result_id` check and the row's included); the mailbox calls' are
@@ -3601,31 +3623,40 @@ exactly as without this section):
   owed dones survive a restart, and none goes for another identity's state;
   while more than 256 dones are owed, no page is asked (a Station that
   never answers dones can't grow them without end);
-- **Atem's reading (for Astation's agreement):** a reset's durable mark is
-  the cursor itself, the announced mailbox at position 0, written before
+- **Atem's reading, agreed with Astation (2026-11-17, #120 comment
+  6938206284):** a reset's durable mark is the cursor itself, the announced mailbox at position 0, written before
   anything is asked for it, with the dones owed to the old mailbox dropped
   and every waiting object detached from its position: under the same
   `mailbox_id` a position may hold another object after the reset, so a
   waiting object owes a done only once the read from 0 lists it again;
-- **Atem's reading (for Astation's agreement):** a page's `head` counts as
-  the Station's announcement once the page answers the live call, so a page
-  read past the head the last `heads` named is no reset (rule 7's "a head
-  below the host's cursor" then comes only from a `heads` or a page whose
-  head is below the furthest position the host read: its cursor, or more
-  while a rewind's re-read runs); this assumes a Station, its relays
-  included, never sends a `heads` older than a page it has answered;
+- **Atem's reading, agreed with Astation (2026-11-17, #120 comment
+  6938206284), its assumption as the Station's obligation:** a page's
+  `head` counts as the Station's announcement once the page answers the
+  live call, so a page read past the head the last `heads` named is no
+  reset (rule 7's "a head below the host's cursor" then comes only from a
+  `heads` or a page whose head is below the furthest position the host
+  read: its cursor, or more while a rewind's re-read runs); this assumes a
+  Station, its relays included, never sends a `heads` older than a page it
+  has answered. Astation takes that as an obligation of the Station's,
+  across its replicas, not yet shown live: within one mailbox history it
+  serializes the `heads` and pages it delivers to a host's association, so
+  an older `heads` never follows a newer answered page, and a real reset
+  is shown as one, never masked;
 - waiting objects are judged again after each device-list advance and once
   one's expiry passes (one whose bytes no longer parse is refused
   `malformed`); an object over the pending limits is marked done with no
   verdict (rule 5);
-- an `atem-result` is never judged as an envelope: it is kept for the
-  sending host's own check (`accept_result`, design II.4.4) with its exact
-  bytes, `object_hash`, sender, id and mailbox position, committed with the
-  cursor and owing its done like any other object; a result holds no
+- an `atem-result` is never judged as an envelope (**Atem's reading,
+  agreed with Astation (2026-11-17, #120 comment 6938206284)**): it is
+  kept for the sending host's own check (`accept_result`, design II.4.4)
+  with its exact bytes, `object_hash`, sender, id and mailbox position,
+  committed with the cursor and owing its done like any other object; a
+  result holds no
   gate, kept or left on the Station for want of room (below): it starts
   no work;
-- **back-pressure, never loss (Atem's reading, for Astation's
-  agreement):** an opened request, cancel or complete waiting for
+- **back-pressure, never loss (Atem's reading, agreed with Astation
+  (2026-11-17, #120 comment 6938206284)):** an opened request, cancel or
+  complete waiting for
   admission, or a kept result, that doesn't fit is never marked done and
   never dropped. Each sender host has its own share and there is a total
   (requests, cancels and completes: 32 per sender host, 128 in all;
@@ -3653,8 +3684,9 @@ exactly as without this section):
   its own, and a head below that position is a reset (rule 7). Unlike a
   pending overflow, which a sender's resend makes safe to mark done, a
   result is never resent once stored (design II.4.4);
-- **bounded storage (Atem's reading, for Astation's agreement):** anything
-  a sender or the Station can make this host keep is bounded. Refusals keep
+- **bounded storage (Atem's reading, agreed with Astation (2026-11-17,
+  #120 comment 6938206284)):** anything a sender or the Station can make
+  this host keep is bounded. Refusals keep
   their exact bytes within 16 MiB, those not reported dropped first, oldest
   first (their evidence hash stays, so the same bytes are still a
   duplicate). Claims, refusals and kept results are pruned 24 hours after
@@ -3751,8 +3783,9 @@ exactly as without this section):
     admitted at its current generation and epoch, from a sender that may
     send now: a cancel reaches it while it hasn't started (design II.8):
     `queued` or `blocked` it is cancelled at once (`cancelled before
-    submission`), and one whose attempt waits `accepted` is marked
-    cancelled on its record in that transaction and has the attempt
+    submission`), and one whose attempt waits `accepted` (**Atem's
+    reading, for Astation:** design II.8's unstarted tasks include it) is
+    marked cancelled on its record in that transaction and has the attempt
     withdrawn after the commit, as a revoke withdraws it, the task settling
     `cancelled` from that. The mark is durable: the start check refuses the
     task before any other condition, so a crash, a receipt-database fault
@@ -3774,7 +3807,8 @@ exactly as without this section):
     narrowed since, the sender revoked, or a task admitted before a revoke
     and a readmit, or a removal and a re-add: the owner's alone). One
     whose task isn't here yet (a free between pages can open a later
-    object first) is kept as an early stop, bound to its sender at its
+    object first) is kept as an early stop (**Atem's reading, for
+    Astation**), bound to its sender at its
     current generation and epoch (after a revoke and a readmit, or a
     removal and a re-add, it no longer applies), its object and the task
     it names, until its expiry (dropped by the mailbox's minute prune,
@@ -4549,6 +4583,14 @@ none runs and the route allows it.
 
 #### The host encryption key in the ceremony (agreed with Astation 2026-11-16)
 
+**Not built on main.** Atem's side (the fields below, the key recorded
+before the reveal, the entries' check at the pin) is draft PR #176, held:
+it merges only with Astation's native ceremony, which isn't ready
+(#120 comment 6938206284), since it keeps no path for a ceremony without
+these fields (no compatibility, as below). Until then a host's key gets its entry only through
+`host_enc_key_get` and a manager's own fresh confirmation (session-v1
+R9.14 item 8).
+
 The owner decided (2026-11-15) that a host's new `host_enc_key` is signed
 inside the verification ceremony, under the same fresh confirmation that
 signs its `add_host` (design II.4.1). Proposed fields, beside session-v1
@@ -4622,6 +4664,64 @@ R9.2's ("Pairing (ceremony changes)"):
   rotation, for hosts paired before this change, and for the two cases
   above with no key entry.
 
+#### Readings waiting for Astation
+
+Atem's readings for host senders that Astation hasn't agreed yet, one line
+each: what it says, where it is written (the bullet's name in quotes), and
+the #120 comment that asked. All are behind the debug-only hook: no release
+build runs any of them. A reading Astation agreed is marked agreed where it
+is written; the latest are the receiving host's mailbox readings (a reset,
+a page's `head`, back-pressure, bounded storage, results kept unjudged),
+agreed on 2026-11-17 ([#120 comment 6938206284][c-6938206284]), and the
+wire of this section with its 512 KiB mailbox calls, agreed on 2026-11-16
+([#120 comment 6903887341][c-6903887341]).
+
+Asked in [#120 comment 6945317466][c-6945317466] (admission on the
+receiving host):
+- A host sender's selector task id (UUID v5) is a delegated task id, a change of agreed text: [On the receiving host][mailbox-calls], "A host sender's selector task id"; [§11.3](#113-alert_list-hostalerts)'s `task_id`; session-v1 R9.14 item 2 (item 1).
+- **Open point:** `work_query`, `work_resolve` and `work_interrupt` still take a UUID v4 only, so the owner reaches a host sender's selector task only with `atem task resolve` on that host. Should they take its UUID v5 too (design I.4.5)? The same bullet (item 1).
+- Whole refusals `request_id_reused` and `busy` as object refusals, and `busy` final for its message id: [On the receiving host][mailbox-calls], "A request" (items 2 and 3).
+- An unreached `cancel` or `complete` answered by its own id: [On the receiving host][mailbox-calls], "`cancel` and `complete`" (item 4).
+- A cancel reaches a task whose attempt waits `accepted`, its record marked durably first: the same bullet (item 5).
+- Early stops, kept for their request and bound to the sender's generation and epoch: the same bullet (item 6).
+- A resend of an admitted request owes its status again, refined since: only once the latest status was stored: [On the receiving host][mailbox-calls], "Status objects" (item 7).
+
+Asked in [#120 comment 6951602509][c-6951602509] (results back):
+- The delivered result's first line names the host, not a session, a change from design III.2's example (the shared framing vectors and the bindings follow once agreed): [On the sending host][mailbox-calls], "The delivery" (item 1).
+- No result that verified or may still verify is dropped: [On the sending host][mailbox-calls], "What waits, what goes" (item 2).
+- A reply is delivered only while its sender is still a host this host takes work from, at the generation and epoch its result was accepted under: the same section, "The delivery" (item 3).
+- Delivery rows, statuses and remote task ids: [On the sending host][mailbox-calls], "A status" and "Task ids" (item 4).
+- One result per task, sent only once `submitted`, never settled for a fault of the whole store: [On the receiving host][mailbox-calls], "Results back" (item 5).
+- `accept_result_among`, an addition to the shared core's API with no wire change: [On the sending host][mailbox-calls], "The results back" (item 6).
+
+Not yet asked on #120 (cancel and complete across hosts, and launch on
+message; PR #187):
+- A `complete` naming the task's own reply, a wire extension (the shared core, two host-envelope vectors and the independent checker): [the plaintexts][s-11-5], "A `complete` naming the reply".
+- Stops across hosts: their lifetime (the message's, at most 24 h), what the newest status decides, a complete held until the task awaits its result, the resends and their end: [On the sending host][mailbox-calls], "`cancel` and `complete` across hosts".
+- A status the Station loses after storing it isn't repaired until the task's state changes, bounded by the message's expiry: [On the receiving host][mailbox-calls], "Status objects".
+- A launch under way is shared only with the same sender's requests: [On the receiving host][mailbox-calls], "A `select`'s `launch`".
+- A launch that failed, or whose outcome is unknown, fails its tasks: the same bullet.
+
+Not yet asked on #120 (earlier PRs):
+- The opened object commits with the cursor as an inbox row, its resolution in admission's later transaction (PR #185): [On the receiving host][mailbox-calls], "admission".
+- The sender's standing checked again at admission against the head it signed at (PR #185): [On the receiving host][mailbox-calls], "A request".
+- The device list's effects on host senders' tasks written in host-work's own pass (PR #171): [§11.6, "Host senders on the receiving host"](#host-senders-on-the-receiving-host), "Crash safety".
+- Project entries judged once per catch-up, against the head (PR #171): the same section.
+- A record only a channel carried is reported on that channel only, never acknowledged to the Station unless the Station's feed delivers it too (PR #171): [§11.1, "Carriage"](#carriage), "Channels, as built".
+- `host_enc_key_get` records the key's id on request and answers `busy` when that write fails (PR #169): session-v1 R9.14 item 8, "The record first".
+
+Also open: how a manager asks a host for a new encryption key (a routine
+rotation, `enc_key_reused`, `retire_previous`), session-v1 R9.13 item 8
+and R9.14 item 8. Today a host makes one only at pairing, at `atem pair
+verify` and at a start that finds none.
+
+[c-6903887341]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-6903887341
+[c-6938206284]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-6938206284
+[c-6945317466]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-6945317466
+[c-6951602509]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-6951602509
+[mailbox-calls]: #the-mailbox-calls-agreed-with-astation-2026-11-16
+[s-11-5]: #115-envelopes-and-results-atems-side-built-behind-a-debug-only-hook-not-advertised
+
 ### 11.6 Delegated lifecycle (built behind a debug-only hook; not advertised)
 
 Behind `host.delegated`, a task from a **delegated sender** has a lifecycle
@@ -4633,10 +4733,10 @@ on hosts that list `host.senders`). Browser grants, services no feed
 covers and `local` keep this document's v1 lifecycle (design I.1.3).
 No release build runs any of it in this version. The host built it in step
 4 of the design's order of work (2026-11-14), with the session-v1 revision
-of R9.14, behind the debug-only hook of §11; of host senders' part, the
-receiving host's side is built behind the same hook's `host.senders`
-("Host senders on the receiving host" below), and their mail is planned
-(§11.5, stage 3). What a
+of R9.14, behind the debug-only hook of §11; host senders' part is built
+behind the same hook's `host.senders`: the receiving host's rules below
+("Host senders on the receiving host"), and their mail on both hosts
+(§11.5). What a
 client reads changes only where marked: the per-attempt `receipt_id` and
 `resolved` (§11.2), the alerts (§11.3), the receipts' `task_id` and
 `sender` (session-v1 R9.14) and the `detail` texts below. The rest is
@@ -4748,8 +4848,14 @@ rules into each host sender's task, and the start check asks them again.
   II.5; with its mailbox part), which no channel
   opens. With `host.senders` off its tasks wait, `revocations not yet
   checked` (their stops aren't read then); what settles a task still
-  settles it. No launch of a host sender exists (a host opens no
-  channel): one fails closed.
+  settles it. A host sender sends no `host_launch` (a host opens no
+  channel); its only launch is a `select`'s `launch` on message (§11.5,
+  "A `select`'s `launch`"), checked at the spawn boundary by its standing
+  at its admission's generation and epoch, the route as admitted still
+  launching on message for the profile approved then, the project's
+  `launch` op and its expiry; a launch record naming a host sender without
+  its admission's grant fails closed (`sender's authorization
+  narrowed`).
 - **The device list's effects** (design II.2.2, II.3.1, II.8). A
   `host_sender_revoke` at `seq` cancels the sender's unstarted tasks
   admitted before it (generation below `seq`), a live attempt withdrawn
