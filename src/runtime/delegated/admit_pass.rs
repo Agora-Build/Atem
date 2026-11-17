@@ -924,8 +924,10 @@ impl HostBridge {
     ///   `blocked` (no live attempt) and cancels it (`cancelled before
     ///   submission`); a complete finds it `awaiting_result` with the
     ///   project still covering a task and completes it with the result
-    ///   snapshot. Otherwise it isn't reached. Either way the message's
-    ///   current status goes to the sender.
+    ///   snapshot. Otherwise it isn't reached, and is refused by its own
+    ///   object id (ruling R48): `busy` for the task's state, `forbidden`
+    ///   when the sender has no authority over it now. Either way the
+    ///   message's current status goes to the sender.
     /// - No such task yet: an early stop until its expiry (dropped once
     ///   expired, or when its sender may not send now).
     /// - Another sender's task: nothing, and no status.
@@ -965,8 +967,13 @@ impl HostBridge {
                     && host_standing(list, host_id, Some((admitted.generation, admitted.epoch)))
                         .is_ok()
             });
-        if let Some((host_id, admitted)) = current {
-            match result {
+        // What isn't reached is answered by its own id too (ruling R48), so
+        // the sending host stops resending it: `busy` when the task's state
+        // doesn't allow it, `forbidden` when the sender has no authority
+        // over the task now.
+        let unreached = match current {
+            None => Some("forbidden"),
+            Some((host_id, admitted)) => match result {
                 None if matches!(task.status.state, WorkState::Queued | WorkState::Blocked)
                     && store.live_attempt(task_id)?.is_none() =>
                 {
@@ -974,26 +981,32 @@ impl HostBridge {
                     task.status.detail =
                         super::delegated_requests::CANCELLED_BEFORE_SUBMISSION.into();
                     store.save_work(&task)?;
+                    None
                 }
-                Some(result)
-                    if task.status.state == WorkState::AwaitingResult
-                        && host_task_covered(list, &me, host_id, admitted, HostOp::Task)
-                            .is_ok() =>
-                {
-                    task.status.state = WorkState::Completed;
-                    task.status.result = Some(result.clone());
-                    task.status.detail = crate::runtime::host_work::RESULT_PUBLISHED.into();
-                    store.save_work(&task)?;
+                None => Some("busy"),
+                Some(result) if task.status.state == WorkState::AwaitingResult => {
+                    if host_task_covered(list, &me, host_id, admitted, HostOp::Task).is_ok() {
+                        task.status.state = WorkState::Completed;
+                        task.status.result = Some(result.clone());
+                        task.status.detail = crate::runtime::host_work::RESULT_PUBLISHED.into();
+                        store.save_work(&task)?;
+                        None
+                    } else {
+                        Some("forbidden")
+                    }
                 }
-                _ => {}
-            }
-        }
+                Some(_) => Some("busy"),
+            },
+        };
         let record = match &task.message {
             Some(frame) => store.message(&frame.message_id)?,
             None => None,
         };
         if let Some(record) = record {
             signing.status(tx, store, &record)?;
+        }
+        if let Some(code) = unreached {
+            signing.refusal(tx, sender, &row.object_id, code)?;
         }
         Ok(true)
     }

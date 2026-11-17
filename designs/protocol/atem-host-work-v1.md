@@ -3703,7 +3703,16 @@ exactly as without this section):
     with a project still covering a task and completes it with the
     snapshot, as `work_complete` does. Otherwise it isn't reached (one
     whose attempt waits `accepted` is `submitting`, so not reached either:
-    Atem's reading). Either way the message's current status goes. One
+    Atem's reading). Either way the message's current status goes, and one
+    not reached is also answered by its own id (**Atem's reading, for
+    Astation:** design II.8's "`busy` in the status", which a task's `work`
+    receipt can't carry, so that the sending host stops resending it):
+    `{"kind":"status","object_id":<the cancel's or complete's id>,
+    "refused":"busy"}` when the task's state doesn't allow it (running or
+    later; a complete of a task not awaiting its result), `"forbidden"`
+    when the sender has no authority over the task now (the project
+    narrowed since, the sender revoked, or a task admitted before a revoke
+    and a readmit, or a removal and a re-add: the owner's alone). One
     whose task isn't here yet (a free between pages can open a later
     object first) is kept as an early stop, bound to its sender, its object
     and the task it names, until its expiry, at most 32 per sender (a 33rd

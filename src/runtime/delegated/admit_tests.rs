@@ -155,6 +155,18 @@ fn ad_inbox(
     signed_seq: Option<u64>,
     plain: &EnvelopePlain,
 ) {
+    ad_inbox_from(rig, AD_B, id, expires_at, signed_seq, plain);
+}
+
+/// [`ad_inbox`] of `sender`'s object.
+fn ad_inbox_from(
+    rig: &LocalRig,
+    sender: &str,
+    id: &str,
+    expires_at: u64,
+    signed_seq: Option<u64>,
+    plain: &EnvelopePlain,
+) {
     let seq = signed_seq.unwrap_or_else(|| rig.bridge.membership.as_ref().unwrap().head().seq);
     let kind = match plain {
         EnvelopePlain::Request { .. } => "request",
@@ -169,12 +181,14 @@ fn ad_inbox(
         .db
         .execute(
             "INSERT INTO mailbox_inbox(sender_host, object_id, kind, plain, object_hash, at_ms,
-                expires_at, signed_seq) VALUES('host-b', ?1, ?2, ?3, 'x', 0, ?4, ?5)",
+                expires_at, signed_seq) VALUES(?1, ?2, ?3, ?4, ?6, 0, ?5, ?7)",
             rusqlite::params![
+                sender,
                 id,
                 kind,
                 plain.to_bytes().unwrap().as_slice(),
                 expires_at,
+                format!("x-{id}"),
                 seq
             ],
         )
@@ -808,13 +822,16 @@ fn the_limits_refuse_a_request_busy() {
     });
 }
 
-/// Design II.7: B's `cancel` cancels its own queued task (`cancelled
-/// before submission`) and its `complete` completes its own task awaiting
-/// its result, with the snapshot; one that finds its task running, or
-/// not awaiting its result, isn't reached. Each enqueues the message's
-/// current status. A complete of a task admitted before a revoke (B
-/// revoked, then readmitted) isn't reached either: that task is the
-/// owner's.
+/// Design II.7, II.8: B's `cancel` cancels its own queued or blocked task
+/// (`cancelled before submission`) and its `complete` completes its own
+/// task awaiting its result, with the snapshot; each enqueues the
+/// message's current status. One that isn't reached is also answered by
+/// its own object id (ruling R48), so the sending host stops resending it:
+/// `busy` when its task's state doesn't allow it (running, or a complete
+/// of a task not awaiting its result), `forbidden` when B has no authority
+/// over the task now (the project narrowed since, B revoked, or the task
+/// admitted before a revoke and a readmit: the owner's alone). Another
+/// sender's stop changes nothing and gets no status.
 #[test]
 fn cancel_and_complete_reach_only_the_senders_current_tasks() {
     local_test(async |root| {
@@ -822,54 +839,103 @@ fn cancel_and_complete_reach_only_the_senders_current_tasks() {
         let os = ManualOs::at(host_now().wall_ms);
         let mut host = sp_host(&mut rig, root, &os);
         let expires = host_now().wall_ms + HOUR;
-        let message = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
-        ad_inbox_request(&rig, &message);
-        ad_admit(&mut rig);
-        let task = ad_tasks(&rig, &message).remove(0);
-        // Running: the cancel isn't reached.
+        let refused = |rig: &LocalRig, stop: &str, code: &str| {
+            assert!(
+                ad_statuses(rig).iter().any(|(_, s)| *s
+                    == ResultPlain::Refusal {
+                        object_id: stop.into(),
+                        refused: code.into()
+                    }),
+                "{stop} {code}"
+            );
+        };
+        let admitted = |rig: &mut LocalRig| {
+            let message = ad_message(rig, vec![ad_select(&["atem:host"], 1)]);
+            ad_inbox_request(rig, &message);
+            ad_admit(rig);
+            let task = ad_tasks(rig, &message).remove(0);
+            (message, task)
+        };
+        let (message, task) = admitted(&mut rig);
+        // Running: the cancel isn't reached, `busy`.
         ad_set_state(&rig, &task, WorkState::Submitted);
-        ad_inbox_stop(&rig, &task.task.task_id, false, expires);
+        let stop = ad_inbox_stop(&rig, &task.task.task_id, false, expires);
         ad_admit(&mut rig);
         assert_eq!(ad_one_state(&rig, &message).0, WorkState::Submitted);
-        // Queued: cancelled.
-        ad_set_state(&rig, &task, WorkState::Queued);
+        refused(&rig, &stop, "busy");
+        // Blocked: cancelled.
+        ad_set_state(&rig, &task, WorkState::Blocked);
         ad_inbox_stop(&rig, &task.task.task_id, false, expires);
         ad_admit(&mut rig);
         assert_eq!(
             ad_one_state(&rig, &message),
             (WorkState::Cancelled, "cancelled before submission".into())
         );
-        // A complete of a queued task isn't reached; awaiting, it completes.
-        let message = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
-        ad_inbox_request(&rig, &message);
+        // Another sender's stop of B's task: nothing, and no status.
+        let (message, task) = admitted(&mut rig);
+        let statuses = ad_statuses(&rig).len();
+        let other = uuid::Uuid::new_v4().to_string();
+        ad_inbox_from(
+            &rig,
+            "host-c",
+            &other,
+            expires,
+            None,
+            &EnvelopePlain::Cancel {
+                task_id: task.task.task_id.clone(),
+            },
+        );
         ad_admit(&mut rig);
-        let task = ad_tasks(&rig, &message).remove(0);
-        ad_inbox_stop(&rig, &task.task.task_id, true, expires);
+        assert_eq!(ad_inbox_rows(&rig), 0);
+        assert_eq!(ad_statuses(&rig).len(), statuses);
+        assert_eq!(ad_tasks(&rig, &message)[0].status.state, WorkState::Queued);
+        // A complete of a queued task isn't reached, `busy`; awaiting, it
+        // completes.
+        let stop = ad_inbox_stop(&rig, &task.task.task_id, true, expires);
         ad_admit(&mut rig);
         assert_eq!(ad_one_state(&rig, &message).0, WorkState::Queued);
+        refused(&rig, &stop, "busy");
         ad_set_state(&rig, &task, WorkState::AwaitingResult);
         ad_inbox_stop(&rig, &task.task.task_id, true, expires);
         ad_admit(&mut rig);
         assert_eq!(ad_one_state(&rig, &message).0, WorkState::Completed);
         let done = ad_tasks(&rig, &message).remove(0);
         assert_eq!(done.status.result, Some(ad_snapshot()));
-        // Admitted before a revoke and a readmit: the owner's alone (the
-        // device list's own effects, which would cancel the queued one, not
-        // run here).
-        let message = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
-        ad_inbox_request(&rig, &message);
+        // The project narrowed since (`host_task_covered`): `forbidden`.
+        let (narrowed, awaiting) = admitted(&mut rig);
+        ad_set_state(&rig, &awaiting, WorkState::AwaitingResult);
+        sign_and_carry(
+            &mut rig,
+            &mut host.s,
+            project_set("build", ["host", "host-b"], [ProjectOp::Message], 0).unwrap(),
+        );
+        rig.bridge.sync_list_view();
+        let stop = ad_inbox_stop(&rig, &awaiting.task.task_id, true, expires);
         ad_admit(&mut rig);
-        let task = ad_tasks(&rig, &message).remove(0);
-        ad_set_state(&rig, &task, WorkState::AwaitingResult);
-        let queued = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
-        ad_inbox_request(&rig, &queued);
-        ad_admit(&mut rig);
-        let queued_task = ad_tasks(&rig, &queued).remove(0);
+        assert_eq!(ad_one_state(&rig, &narrowed).0, WorkState::AwaitingResult);
+        refused(&rig, &stop, "forbidden");
+        sign_and_carry(
+            &mut rig,
+            &mut host.s,
+            project_set("build", ["host", "host-b"], task_ops(), 0).unwrap(),
+        );
+        rig.bridge.sync_list_view();
+        // B revoked (not readmitted): its cancel isn't reached, `forbidden`
+        // (the device list's own effects, which would cancel the queued
+        // task, don't run here).
+        let (queued, queued_task) = admitted(&mut rig);
         sign_and_carry(
             &mut rig,
             &mut host.s,
             host_sender_revoke("host-b", false, 0).unwrap(),
         );
+        rig.bridge.sync_list_view();
+        let stop = ad_inbox_stop(&rig, &queued_task.task.task_id, false, expires);
+        ad_admit(&mut rig);
+        assert_eq!(ad_one_state(&rig, &queued).0, WorkState::Queued);
+        refused(&rig, &stop, "forbidden");
+        // Readmitted: tasks admitted before the revoke are the owner's
+        // alone, `forbidden`.
         sign_and_carry(
             &mut rig,
             &mut host.s,
@@ -877,11 +943,13 @@ fn cancel_and_complete_reach_only_the_senders_current_tasks() {
         );
         rig.bridge.sync_list_view();
         mb_tick(&mut rig, &mut host, 0);
-        ad_inbox_stop(&rig, &task.task.task_id, true, expires);
-        ad_inbox_stop(&rig, &queued_task.task.task_id, false, expires);
+        let complete = ad_inbox_stop(&rig, &awaiting.task.task_id, true, expires);
+        let cancel = ad_inbox_stop(&rig, &queued_task.task.task_id, false, expires);
         ad_admit(&mut rig);
-        assert_eq!(ad_one_state(&rig, &message).0, WorkState::AwaitingResult);
+        assert_eq!(ad_one_state(&rig, &narrowed).0, WorkState::AwaitingResult);
         assert_eq!(ad_one_state(&rig, &queued).0, WorkState::Queued);
+        refused(&rig, &complete, "forbidden");
+        refused(&rig, &cancel, "forbidden");
         assert_eq!(ad_inbox_rows(&rig), 0);
     });
 }
