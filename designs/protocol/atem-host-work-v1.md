@@ -2,13 +2,13 @@
 
 Status: implemented and released (Atem v0.8.2). §11 (delegated work):
 `host.delegated` and `host.alerts` are built (step 4, 2026-11-14) behind a
-debug-only hook and advertised by no release build; `host.senders` is
-planned (behind the same hook a debug build lists it with hosting on,
-answers `host_enc_key_get` and `control_records`, and judges what a host
-sender may do on the receiving host, §11.6 "Host senders on the receiving
-host"; the receiving host's mailbox client and the sending host's planning,
-sealing and puts are built, §11.5; cancel and complete across hosts, the
-status objects and results back and admission are not).
+debug-only hook and advertised by no release build, and so is Atem's side of
+`host.senders` (2026-11-17): behind the same hook a debug build lists it
+with hosting on, answers `host_enc_key_get` and `control_records`, judges
+what a host sender may do on the receiving host (§11.6 "Host senders on the
+receiving host"), and runs both hosts' sides of host senders' mail (§11.5).
+Not built: a Station's side of the mailbox, and the host encryption key in
+the verification ceremony (§11.5).
 
 This extension of atem-session r9 lets an admitted client create sessions
 through launch profiles the host owner approved, queue directed work, publish
@@ -34,7 +34,7 @@ still requires the contract below. Cross-instance selector/result support waits 
 the stage-2 agreement ([../delegated-host-work.md](../delegated-host-work.md), II.1).
 **Amended by owner decision, 2026-11-15:** stage 2 isn't used between Atem
 hosts, so it comes with host senders instead (§11.5, agreed with Astation
-2026-11-16; design II.6).
+2026-11-16; design II.6), built behind the debug-only hook of §11.
 
 ## 1. Features and transport
 
@@ -3493,7 +3493,8 @@ contract change, agreed with Astation with the mailbox calls, 2026-11-16,
 mailbox stays, that the first version addresses hosts through the device
 list, and that the host's encryption key is signed in the verification
 ceremony (design status block, II.1, II.4.1, II.4.3, II.6). The five
-subsections below are concrete proposals for the two open items above, for
+subsections below, "The mailbox calls" to "The host encryption key in the
+ceremony", are concrete proposals for the two open items above, for
 the two SDK points Astation raised on 2026-11-07 (#120 comment 6701618182)
 and for the ceremony's fields. Each is **agreed with Astation 2026-11-16**.
 **Built in the shared core:** the mailbox calls' readers and builders,
@@ -4696,7 +4697,7 @@ Asked in [#120 comment 6951602509][c-6951602509] (results back):
 Not yet asked on #120 (cancel and complete across hosts, and launch on
 message; PR #187):
 - A `complete` naming the task's own reply, a wire extension (the shared core, two host-envelope vectors and the independent checker): [the plaintexts][s-11-5], "A `complete` naming the reply".
-- Stops across hosts: what the newest status decides, a complete held until the task awaits its result, the resends and their end: [On the sending host][mailbox-calls], "`cancel` and `complete` across hosts".
+- Stops across hosts: their lifetime (the message's, at most 24 h), what the newest status decides, a complete held until the task awaits its result, the resends and their end: [On the sending host][mailbox-calls], "`cancel` and `complete` across hosts".
 - A status the Station loses after storing it isn't repaired until the task's state changes, bounded by the message's expiry: [On the receiving host][mailbox-calls], "Status objects".
 - A launch under way is shared only with the same sender's requests: [On the receiving host][mailbox-calls], "A `select`'s `launch`".
 - A launch that failed, or whose outcome is unknown, fails its tasks: the same bullet.
