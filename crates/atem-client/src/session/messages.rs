@@ -33,8 +33,18 @@ pub enum Destination {
     /// Expanded once by the receiving host and persisted before acceptance.
     /// Only the runtime's own `local` sender (stage 1) and a host sender's
     /// envelope (delegated host work II.4.2) carry it: a channel sender's
-    /// Message with one is invalid ([`Message::valid`]).
-    Select { selectors: Vec<String>, budget: u32 },
+    /// Message with one is invalid ([`Message::valid`]). `launch`
+    /// (host-work-v1 §11.5, "`select` from host senders"): the send asked
+    /// to start an agent (`--launch`); written only as `true` (omitted when
+    /// false: one encoding per meaning), and valid only beside a selector of
+    /// the recipient naming its own host and a route,
+    /// `atem:<atem_id>/<route_id>`.
+    Select {
+        selectors: Vec<String>,
+        budget: u32,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        launch: bool,
+    },
     /// Store context for an approved project route without submitting input.
     Project {
         route_id: String,
@@ -224,8 +234,13 @@ impl Message {
                         is_opaque_id(id) && revision > 0 && revision <= MAX_SAFE_INTEGER
                     })
                     && match &r.destination {
-                        Destination::Select { selectors, budget } => {
+                        Destination::Select {
+                            selectors,
+                            budget,
+                            launch,
+                        } => {
                             super::select::valid_selectors(selectors, *budget)
+                                && (!launch || names_a_route_of(selectors, &r.host))
                         }
                         Destination::Agent { target, .. } => {
                             r.host.contains(target)
@@ -290,6 +305,18 @@ impl Message {
                 .unwrap_or_default(),
         })
     }
+}
+
+/// Whether a selector of `selectors` names `host` and a route there,
+/// `atem:<atem_id>/<route_id>` with its `atem_id` the host's: what a
+/// `select`'s `launch` needs (host-work-v1 §11.5).
+fn names_a_route_of(selectors: &[String], host: &HostTarget) -> bool {
+    selectors.iter().any(|s| {
+        matches!(s.parse(), Ok(super::select::Selector::Instance {
+            atem_id,
+            route_id: Some(_),
+        }) if atem_id == host.atem_device_id)
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -598,6 +625,7 @@ mod tests {
         let select = Destination::Select {
             selectors: vec!["tag:a".into()],
             budget: 1,
+            launch: false,
         };
         for sender in ["member:phone", "service:svc-bot"] {
             let mut alone = message();
@@ -638,6 +666,7 @@ mod tests {
         m.recipients[0].destination = Destination::Select {
             selectors: vec!["project:astation+tag:auth".into(), "atem:backend/r".into()],
             budget: 32,
+            launch: false,
         };
         let mut local = m.clone();
         local.sender = "local".into();
@@ -655,6 +684,41 @@ mod tests {
         host.recipients.push(over);
         assert!(!local.valid_local());
         assert!(!host.valid_from_host("host-a"));
+    }
+
+    /// `select`'s `launch` (host-work-v1 §11.5, "`select` from host
+    /// senders"): present only as `true`, and only beside a selector of the
+    /// recipient that names its own host and a route
+    /// (`atem:<atem_id>/<route_id>`); otherwise the Message is invalid.
+    #[test]
+    fn select_launch_needs_a_selector_naming_the_recipients_host_and_a_route() {
+        let mut m = message();
+        m.sender = "host:host-a".into();
+        let select = |selectors: &[&str], launch: bool| Destination::Select {
+            selectors: selectors.iter().map(|s| s.to_string()).collect(),
+            budget: 4,
+            launch,
+        };
+        for (selectors, ok) in [
+            (&["tag:a", "atem:backend/auth"][..], true),
+            (&["atem:backend"][..], false),
+            (&["atem:other/auth"][..], false),
+            (&["project:astation+tag:auth"][..], false),
+        ] {
+            m.recipients[0].destination = select(selectors, true);
+            assert_eq!(m.valid_from_host("host-a"), ok, "{selectors:?}");
+            m.recipients[0].destination = select(selectors, false);
+            assert!(m.valid_from_host("host-a"), "{selectors:?}");
+        }
+        // One encoding per meaning: omitted when false, `true` otherwise.
+        let plain = serde_json::to_value(select(&["atem:backend/auth"], false)).unwrap();
+        assert!(plain.get("launch").is_none(), "{plain}");
+        let launch = serde_json::to_value(select(&["atem:backend/auth"], true)).unwrap();
+        assert_eq!(launch["launch"], serde_json::json!(true));
+        assert_eq!(
+            serde_json::from_value::<Destination>(launch).unwrap(),
+            select(&["atem:backend/auth"], true)
+        );
     }
 
     /// An agent recipient of `host` for the host-sender tests.
@@ -805,11 +869,13 @@ mod tests {
         select.recipients[0].destination = Destination::Select {
             selectors: vec!["tag:a".into()],
             budget: 33,
+            launch: false,
         };
         assert!(!select.valid_from_host("host-a"));
         select.recipients[0].destination = Destination::Select {
             selectors: vec!["tag:a".into()],
             budget: 32,
+            launch: false,
         };
         assert!(
             !select.valid_from_host("host-a"),
@@ -829,6 +895,7 @@ mod tests {
         m.recipients[0].destination = Destination::Select {
             selectors: vec!["tag:a".into()],
             budget: 20,
+            launch: false,
         };
         let mut other = m.recipients[0].clone();
         other.recipient_id = new_id();
@@ -836,6 +903,7 @@ mod tests {
         other.destination = Destination::Select {
             selectors: vec!["tag:b".into()],
             budget: 13,
+            launch: false,
         };
         m.recipients.push(other);
         assert!(!m.valid_local());
@@ -849,7 +917,11 @@ mod tests {
             (vec!["tag:a".into(); 17], 1),
             (vec!["tag:a".into()], 0),
         ] {
-            m.recipients[0].destination = Destination::Select { selectors, budget };
+            m.recipients[0].destination = Destination::Select {
+                selectors,
+                budget,
+                launch: false,
+            };
             assert!(!m.valid_local());
         }
     }

@@ -40,6 +40,7 @@ pub mod intents;
 pub mod mailbox;
 pub mod mailbox_store;
 pub mod resolve;
+pub mod send_plan;
 pub mod start;
 pub mod station;
 pub mod sync;

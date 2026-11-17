@@ -1478,6 +1478,7 @@ impl HostBridge {
                 destination: Destination::Select {
                     selectors: request.to.clone(),
                     budget: MAX_AGENTS,
+                    launch: false,
                 },
             }],
             text: request.text,

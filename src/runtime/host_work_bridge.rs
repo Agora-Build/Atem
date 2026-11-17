@@ -3886,6 +3886,7 @@ principals = ["local"]
             message.recipients[0].destination = Destination::Select {
                 selectors: vec!["atem:atem-host/r".into()],
                 budget: 32,
+                launch: false,
             };
             // The sending session is no longer there.
             let mut origin = origin_of(&rig);
@@ -3969,6 +3970,7 @@ principals = ["local"]
             message.recipients[0].destination = Destination::Select {
                 selectors: vec!["atem:atem-host/r".into()],
                 budget: 32,
+                launch: false,
             };
             let mut origin = origin_of(&rig);
             origin.control_gen -= 1;
@@ -4005,6 +4007,7 @@ principals = ["local"]
             message.recipients[0].destination = Destination::Select {
                 selectors: vec!["atem:atem-host/r".into()],
                 budget: 32,
+                launch: false,
             };
             crate::runtime::collab::reserve_context(
                 rig.bridge.work.store.as_ref().unwrap(),
@@ -4787,6 +4790,7 @@ principals = ["local"]
             message.recipients[0].destination = Destination::Select {
                 selectors: vec!["tag:x".into()],
                 budget: 32,
+                launch: false,
             };
             // Both pass the shared message rules; only the task rules refuse.
             for (text, problem) in [
@@ -5035,6 +5039,7 @@ launch = "on_message"
         message.recipients[0].destination = Destination::Select {
             selectors: vec![selector.into()],
             budget: 32,
+            launch: false,
         };
         message
     }
@@ -5195,6 +5200,7 @@ launch = "on_message"
                     "atem:atem-host".into(),
                 ],
                 budget: 32,
+                launch: false,
             };
             accept(&mut rig, &message, true);
             assert_eq!(rows(&rig, "launches"), 0);
