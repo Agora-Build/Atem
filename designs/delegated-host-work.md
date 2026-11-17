@@ -2332,7 +2332,8 @@ is superseded: a host's `host_id` is its `atem_id` (above).
 ## II.7 What a host sender can do after admission
 
 **Built on the receiving host behind the debug-only hook** (host-work-v1 §11.5, "On the receiving host"): `cancel`
-and `complete` as the table says (a cancel also withdraws an attempt waiting `accepted`), each answered with the
+and `complete` as the table says (a cancel also withdraws an attempt waiting `accepted`, marked durably first so it
+never runs), each answered with the
 message's status, one not reached also by its own id (`busy`, or `forbidden` without authority over the task), and one
 opened before its request kept until its request comes. The sending host doesn't send them yet.
 

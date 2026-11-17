@@ -3673,7 +3673,10 @@ exactly as without this section):
   after the done: it is decided before any task of the sender can start).
   A row that can't be decided (a store fault, a record that doesn't read)
   skips none of the others and is tried again at later passes; after 8
-  tries it is settled, as a task record that doesn't read is: refused
+  tries in a row and at least a minute since its first failure on the
+  monotonic clock (a passing fault settles nothing; the counts are the
+  store's, none kept across another store or host identity) it is
+  settled, as a task record that doesn't read is: refused
   `busy` by its own id (a request's refusal recorded), removed, with a
   runtime.log line. A row whose plaintext no longer reads (a stricter
   reader than the one that wrote it) is refused `malformed`, reported
@@ -3723,10 +3726,16 @@ exactly as without this section):
     admitted at its current generation and epoch, from a sender that may
     send now: a cancel reaches it while it hasn't started (design II.8):
     `queued` or `blocked` it is cancelled at once (`cancelled before
-    submission`), and one whose attempt waits `accepted` has the attempt
+    submission`), and one whose attempt waits `accepted` is marked
+    cancelled on its record in that transaction and has the attempt
     withdrawn after the commit, as a revoke withdraws it, the task settling
-    `cancelled` from that (or running on, when the withdrawal finds it
-    started); a complete finds it `awaiting_result` with a project still
+    `cancelled` from that. The mark is durable: the start check refuses the
+    task before any other condition, so a crash, a receipt-database fault
+    or a halted journal before the withdrawal never lets it run (the
+    dispatch, the check at `executing` or the start's recovery withdraws
+    it then). When the attempt is found started after all, the task runs
+    and the cancel is answered `busy` by its own id, the mark cleared. A
+    complete finds it `awaiting_result` with a project still
     covering a task and completes it with the snapshot, as `work_complete`
     does. Otherwise it isn't reached. Either way the message's current
     status goes, and one
@@ -3746,9 +3755,12 @@ exactly as without this section):
     it names, until its expiry (dropped by the mailbox's minute prune,
     never under a clock anchor), at most 32 per sender (a 33rd stays in
     the inbox, holding only its own sender's task starts, until a kept one
-    goes); its request's admission applies it in its own transaction (a
-    cancel cancels the task at once, a complete finds it queued). One naming another sender's task changes
-    nothing and gets no status.
+    goes); its request's admission takes it in its own transaction: a
+    cancel cancels the task at once; a complete finds it queued, not
+    reached, `busy` by its own id; one kept before a revoke and a readmit,
+    or a removal and a re-add, no longer applies, `forbidden` by its own
+    id. One naming another sender's task changes nothing and gets no
+    status.
   - **Status objects** (design II.4.4): `seal_result` to the sender's
     current `host_enc_key`, signed with this host's `host_channel_key` at
     the committed head, alive 24 h, with a fresh `id`, and only while this
@@ -3767,7 +3779,10 @@ exactly as without this section):
     duplicate (its claim held) marks the message's status owed again, and
     a resend of a request refused whole has its recorded refusal sent
     again (**Atem's reading, for Astation:** the Station may have lost the
-    first; superseding keeps one status waiting). A refusal row marked for its
+    first; superseding keeps one status waiting). Only a new copy counts
+    as a resend: one at a position past the furthest the host ever read
+    under that mailbox id. The same copy read again after a rewind, or
+    after a reset under the same mailbox id, owes nothing. A refusal row marked for its
     sender (check 5 or 6, after the copy was shown to be the sender's) is
     reported `{"kind":"status","object_id","refused":"invalid_request"}`
     once, its mark cleared in that transaction.
