@@ -190,14 +190,15 @@ fn shared_ops(list: &Membership, me: &str, sender: &str) -> BTreeSet<ProjectOp> 
         .collect()
 }
 
-/// Whether `sender` may send now on `list` an object it signed at
-/// `signed_seq` (design II.3.1, check 3 again at admission): a current
-/// host, authorized at a generation and in a membership epoch at or before
-/// that head. A revoke and a readmit, or a removal and a re-add, since the
-/// object opened refuse it.
-fn may_send(list: &Membership, sender: &str, signed_seq: u64) -> bool {
+/// `sender`'s authorization generation and membership epoch now, when it
+/// may send on `list` an object it signed at `signed_seq` (design II.3.1,
+/// check 3 again at admission): a current host, authorized at a generation
+/// and in a membership epoch at or before that head. A revoke and a
+/// readmit, or a removal and a re-add, since the object opened refuse it.
+fn may_send(list: &Membership, sender: &str, signed_seq: u64) -> Option<(u64, u64)> {
     host_standing(list, sender, None)
-        .is_ok_and(|(generation, epoch)| signed_seq >= generation && signed_seq >= epoch)
+        .ok()
+        .filter(|(generation, epoch)| signed_seq >= *generation && signed_seq >= *epoch)
 }
 
 impl HostBridge {
@@ -559,9 +560,9 @@ impl HostBridge {
         }
         let list = &signing.list;
         // The sender's standing now, against the head it signed at.
-        if !may_send(list, sender, row.signed_seq) {
+        let Some(standing) = may_send(list, sender, row.signed_seq) else {
             return refuse("forbidden", true);
-        }
+        };
         // A host sender's Message, without attachments (checked when it
         // opened; here as the last line).
         if !message.valid_from_host(sender) {
@@ -617,7 +618,7 @@ impl HostBridge {
         // Early stops of its tasks (ruling R38): a cancel cancels it now;
         // a complete finds it queued, not reached.
         for task in &mut tasks {
-            for kind in admit::take_stops(tx, sender, &task.task.task_id)? {
+            for kind in admit::take_stops(tx, sender, &task.task.task_id, standing)? {
                 if kind == "cancel" {
                     task.status.state = WorkState::Cancelled;
                     task.status.detail = CANCELLED_BEFORE_SUBMISSION.into();
@@ -963,9 +964,13 @@ impl HostBridge {
     ) -> anyhow::Result<bool> {
         let sender = row.sender_host.as_str();
         let list = &signing.list;
-        let sends = may_send(list, sender, row.signed_seq);
+        let standing = may_send(list, sender, row.signed_seq);
+        let sends = standing.is_some();
         let Some(mut task) = store.work(task_id)? else {
-            if !sends || row.expires_at <= signing.now_d && !signing.anchored {
+            let Some(standing) = standing else {
+                return Ok(true);
+            };
+            if row.expires_at <= signing.now_d && !signing.anchored {
                 return Ok(true);
             }
             let kind = if result.is_some() {
@@ -973,7 +978,7 @@ impl HostBridge {
             } else {
                 "cancel"
             };
-            return admit::keep_stop(tx, row, task_id, kind);
+            return admit::keep_stop(tx, row, task_id, kind, standing);
         };
         if task.principal != host_principal(sender) {
             return Ok(true);

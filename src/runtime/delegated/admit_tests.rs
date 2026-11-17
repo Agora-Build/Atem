@@ -1470,3 +1470,56 @@ fn a_duplicate_of_an_admitted_request_sends_its_status_again() {
         assert_eq!(ad_tasks(&rig, &message).len(), 1, "nothing admitted twice");
     });
 }
+
+/// Review L5 (design II.7, "Interactions after a readmit"): an early stop
+/// is bound to its sender's authorization generation and membership epoch
+/// when it was kept. B revoked and readmitted since, its cancel kept before
+/// no longer applies: the task its request makes after the readmit queues.
+#[test]
+fn an_early_stop_kept_before_a_readmit_no_longer_applies() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        let host_target = ad_here(&rig);
+        let message = ad_message(
+            &rig,
+            vec![Destination::Agent {
+                route_id: "rh".into(),
+                route_revision: 1,
+                target: wire::Target {
+                    account_id: host_target.account_id.clone(),
+                    atem_device_id: host_target.atem_device_id.clone(),
+                    host_trust_gen: host_target.host_trust_gen,
+                    session_id: rig.sid.to_string(),
+                    process_gen: rig.sessions[&rig.sid].process_gen.clone(),
+                },
+            }],
+        );
+        let task_id = message.recipients[0].recipient_id.clone();
+        ad_inbox_stop(&rig, &task_id, false, host_now().wall_ms + HOUR);
+        ad_admit(&mut rig);
+        assert_eq!(
+            admit::stops(&rig.bridge.work.store.as_ref().unwrap().db)
+                .unwrap()
+                .len(),
+            1
+        );
+        for action in [
+            host_sender_revoke("host-b", false, 0).unwrap(),
+            host_sender_readmit("host-b", 0).unwrap(),
+        ] {
+            sign_and_carry(&mut rig, &mut host.s, action);
+        }
+        rig.bridge.sync_list_view();
+        ad_inbox_request(&rig, &message);
+        ad_admit(&mut rig);
+        assert_eq!(ad_tasks(&rig, &message)[0].status.state, WorkState::Queued);
+        assert!(
+            admit::stops(&rig.bridge.work.store.as_ref().unwrap().db)
+                .unwrap()
+                .is_empty(),
+            "dropped, not applied"
+        );
+    });
+}

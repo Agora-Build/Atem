@@ -44,7 +44,8 @@ pub const MAX_EARLY_STOPS: u64 = 32;
 const TABLES: &str = "
     CREATE TABLE IF NOT EXISTS mail_stops (
         sender_host TEXT NOT NULL, object_id TEXT NOT NULL, task_id TEXT NOT NULL,
-        kind TEXT NOT NULL, expires_at INTEGER NOT NULL,
+        kind TEXT NOT NULL, expires_at INTEGER NOT NULL, generation INTEGER NOT NULL,
+        epoch INTEGER NOT NULL,
         PRIMARY KEY(sender_host, object_id)) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS mail_stops_task ON mail_stops(sender_host, task_id);
     CREATE TABLE IF NOT EXISTS mail_refusals (
@@ -120,9 +121,18 @@ pub fn hold_row(tx: &Transaction, n: i64) -> Result<()> {
 }
 
 /// `row`, a `cancel` or `complete` (`kind`) of `task_id` opened before its
-/// request, kept as an early stop until its expiry; false when its sender
-/// has [`MAX_EARLY_STOPS`] already (it stays in the inbox).
-pub fn keep_stop(tx: &Transaction, row: &InboxRow, task_id: &str, kind: &str) -> Result<bool> {
+/// request, kept as an early stop until its expiry, bound to its sender's
+/// authorization generation and membership epoch now (`standing`; review
+/// L5: after a revoke and a readmit, or a removal and a re-add, it no
+/// longer applies); false when its sender has [`MAX_EARLY_STOPS`] already
+/// (it stays in the inbox).
+pub fn keep_stop(
+    tx: &Transaction,
+    row: &InboxRow,
+    task_id: &str,
+    kind: &str,
+    standing: (u64, u64),
+) -> Result<bool> {
     let kept: u64 = tx.query_row(
         "SELECT count(*) FROM mail_stops WHERE sender_host=?1",
         [&row.sender_host],
@@ -132,27 +142,39 @@ pub fn keep_stop(tx: &Transaction, row: &InboxRow, task_id: &str, kind: &str) ->
         return Ok(false);
     }
     tx.execute(
-        "INSERT OR IGNORE INTO mail_stops(sender_host, object_id, task_id, kind, expires_at)
-        VALUES(?1, ?2, ?3, ?4, ?5)",
+        "INSERT OR IGNORE INTO mail_stops(sender_host, object_id, task_id, kind, expires_at,
+            generation, epoch) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             row.sender_host,
             row.object_id,
             task_id,
             kind,
-            row.expires_at
+            row.expires_at,
+            standing.0,
+            standing.1
         ],
     )?;
     Ok(true)
 }
 
-/// The early stops of `sender_host` naming `task_id`, taken: their kinds
-/// (`cancel`, `complete`).
-pub fn take_stops(tx: &Transaction, sender_host: &str, task_id: &str) -> Result<Vec<String>> {
+/// The early stops of `sender_host` naming `task_id`, taken: the kinds
+/// (`cancel`, `complete`) of those kept at its `standing` now (generation,
+/// epoch); the others are dropped.
+pub fn take_stops(
+    tx: &Transaction,
+    sender_host: &str,
+    task_id: &str,
+    standing: (u64, u64),
+) -> Result<Vec<String>> {
     let kinds: Vec<String> = {
-        let mut q =
-            tx.prepare("SELECT kind FROM mail_stops WHERE sender_host=?1 AND task_id=?2")?;
-        q.query_map([sender_host, task_id], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?
+        let mut q = tx.prepare(
+            "SELECT kind FROM mail_stops WHERE sender_host=?1 AND task_id=?2
+            AND generation=?3 AND epoch=?4",
+        )?;
+        q.query_map(params![sender_host, task_id, standing.0, standing.1], |r| {
+            r.get(0)
+        })?
+        .collect::<rusqlite::Result<_>>()?
     };
     tx.execute(
         "DELETE FROM mail_stops WHERE sender_host=?1 AND task_id=?2",
