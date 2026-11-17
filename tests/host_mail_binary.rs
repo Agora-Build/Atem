@@ -537,7 +537,10 @@ principals = [{mac:?}, "project:{PROJECT}"]
 
     /// The inbox's rows: `(sender host, object id, kind)`, in order.
     fn inbox(&self) -> Vec<(String, String, String)> {
-        let db = self.db();
+        // Polled from the start: none while the runtime hasn't made it.
+        let Some(db) = self.store() else {
+            return Vec::new();
+        };
         let Ok(mut q) =
             db.prepare("SELECT sender_host, object_id, kind FROM mailbox_inbox ORDER BY n")
         else {
@@ -551,7 +554,9 @@ principals = [{mac:?}, "project:{PROJECT}"]
 
     /// The refusal rows: `(reason, report)`, in order.
     fn refused(&self) -> Vec<(String, bool)> {
-        let db = self.db();
+        let Some(db) = self.store() else {
+            return Vec::new();
+        };
         let Ok(mut q) = db.prepare("SELECT reason, report FROM mailbox_refused ORDER BY n") else {
             return Vec::new();
         };
