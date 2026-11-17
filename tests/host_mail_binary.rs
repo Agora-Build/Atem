@@ -615,6 +615,19 @@ principals = [{mac:?}, "project:{PROJECT}"]
             .collect()
     }
 
+    /// The ids of the objects the host's `mailbox_put`s carried so far, a
+    /// resent put's again.
+    fn put_ids(&self) -> Vec<String> {
+        self.station()
+            .mailbox_calls()
+            .into_iter()
+            .filter_map(|(_, call)| match call {
+                MailboxToStation::Put(put) => Some(put.mail().expect("its own put reads").1.id),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The positions of `mailbox_id` the host's dones named so far, in
     /// order.
     fn done_positions(&self, mailbox_id: &str) -> Vec<u64> {
@@ -2134,7 +2147,8 @@ fn a_cancel_waiting_while_the_host_is_down_is_applied_before_its_task_starts() {
 /// VII.B 31: the runtime is killed right after a request's admission
 /// committed (its task and its status), while the page's `mailbox_done`
 /// waits unanswered. Started again, the owed done goes, the status is put
-/// once, and nothing is applied twice: one message record, one task.
+/// once (counted at the Station's door: it keeps an object once however
+/// often it is put), and nothing is applied twice: one message record.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
@@ -2176,8 +2190,14 @@ fn a_kill_after_admission_applies_nothing_twice() {
     };
     assert_eq!(recipients[0].delivery, Delivery::NoMatch {});
     rig.two_passes();
-    assert_eq!(rig.statuses().len(), 1, "put once");
+    assert_eq!(rig.put_ids().len(), 1, "put once: {:?}", rig.put_ids());
+    assert_eq!(rig.statuses().len(), 1);
     assert_eq!(rig.count("messages"), 1);
+    assert_eq!(
+        rig.tasks_of(&message.message_id).len(),
+        0,
+        "no_match: no task"
+    );
     assert!(rig.inbox().is_empty());
 }
 

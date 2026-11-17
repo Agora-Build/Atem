@@ -382,7 +382,35 @@ fn a_request_is_admitted_with_its_status_in_one_commit() {
         ad_deliver(&mut rig, &mut host, &[object]);
         assert_eq!(ad_inbox_rows(&rig), 1, "opened, waiting for admission");
         assert!(!mb_gate(&rig), "the inbox holds the gate");
+        // A status that can't be written undoes the whole admission: no
+        // message, no task, the inbox row kept for the next pass.
+        let db = &rig.bridge.work.store.as_ref().unwrap().db;
+        db.execute_batch(
+            "CREATE TRIGGER t_block BEFORE INSERT ON mail_outbox BEGIN SELECT RAISE(ABORT,'blocked'); END;",
+        )
+        .unwrap();
         ad_admit(&mut rig);
+        let counts = |rig: &LocalRig| -> (i64, i64, i64) {
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .query_row(
+                    "SELECT (SELECT count(*) FROM messages),
+                        (SELECT count(*) FROM work WHERE json_extract(record,'$.principal')='host:host-b'),
+                        (SELECT count(*) FROM mailbox_inbox)",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(counts(&rig), (0, 0, 1), "nothing of it committed");
+        let db = &rig.bridge.work.store.as_ref().unwrap().db;
+        db.execute_batch("DROP TRIGGER t_block;").unwrap();
+        ad_admit(&mut rig);
+        assert_eq!(counts(&rig), (1, 1, 0), "admitted at the next try");
         let other = Store::open(&root.join("runtime")).unwrap();
         let (tasks, inbox, statuses): (i64, i64, i64) = other
             .db
