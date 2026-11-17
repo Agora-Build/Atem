@@ -35,13 +35,16 @@
 //! answers ([`Inbound::Page`] with the reader's error).
 use super::fetch::{DeviceListFetch, FetchApply};
 use super::mailbox::MailboxClient;
+use super::puts::PutClient;
 use super::start::StationFetch;
 use super::sync::FeedSync;
 use atem_client::SignedObject;
 use atem_client::control::{
     Accept, ControlSync, ControlSyncResult, Heads, MembershipFetch, RefusedCall, RelayError, ToHost,
 };
-use atem_client::host_mail::mailbox::{MailboxDone, MailboxSync, MailboxToHost, op as mailbox_op};
+use atem_client::host_mail::mailbox::{
+    MailboxDone, MailboxPut, MailboxSync, MailboxToHost, op as mailbox_op,
+};
 use atem_client::membership::Head;
 use serde_json::{Value, json};
 
@@ -119,6 +122,8 @@ pub enum Call {
     /// The host's own mailbox (host-work-v1 §11.5), with `host.senders`.
     MailboxSync(MailboxSync),
     MailboxDone(MailboxDone),
+    /// An object into another host's mailbox (the sending host's puts).
+    MailboxPut(MailboxPut),
 }
 
 impl Call {
@@ -129,6 +134,7 @@ impl Call {
             Call::Sync(sync) => sync.to_json().ok(),
             Call::MailboxSync(sync) => sync.to_json().ok(),
             Call::MailboxDone(done) => done.to_json().ok(),
+            Call::MailboxPut(put) => put.to_json().ok(),
         }
     }
 }
@@ -146,6 +152,8 @@ pub struct Station {
     senders: bool,
     /// The host's own mailbox (host senders' mail), only with `senders`.
     pub mailbox: MailboxClient,
+    /// The host's puts into other hosts' mailboxes, only with `senders`.
+    pub puts: PutClient,
     /// The host's monotonic clock at the last tick (ms).
     now: u64,
     /// `heads` read.
@@ -209,6 +217,7 @@ impl Station {
                 self.fetch = self.fetch.next_generation();
                 self.feed.on_link_down();
                 self.mailbox.on_link(None);
+                self.puts.on_link(None);
             }
             return;
         };
@@ -224,6 +233,7 @@ impl Station {
                 self.fetch = self.fetch.next_generation();
                 self.feed.on_link(self.link.as_ref());
                 self.mailbox.on_link(self.link.as_ref());
+                self.puts.on_link(self.link.as_ref());
             }
         }
     }
@@ -297,6 +307,9 @@ impl Station {
             Ok((ToHost::Heads(heads), mailbox)) => {
                 self.heads += 1;
                 if self.senders {
+                    // Puts go once the Station associated the link: a
+                    // `heads` with this host's mailbox.
+                    self.puts.on_heads(mailbox.is_some());
                     self.mailbox.on_heads(mailbox);
                 }
                 // Another identity's association: nothing fetched, no head
@@ -359,6 +372,7 @@ impl Station {
             self.fetch = self.fetch.next_generation();
             // Every live mailbox call too (host-work-v1 §11.5 rule 8).
             self.mailbox.on_identity_moved();
+            self.puts.on_identity_moved();
         }
     }
 
@@ -377,6 +391,7 @@ impl Station {
             "unread": self.unread,
             "feed": self.feed.dump(),
             "mailbox": self.senders.then(|| self.mailbox.dump()),
+            "puts": self.senders.then(|| self.puts.dump()),
         })
     }
 

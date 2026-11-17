@@ -216,6 +216,18 @@ impl HostKey {
         use atem_client::KeyProvider;
         self.keys.public_key(&self.id).ok()
     }
+
+    /// An `atem-envelope` this host signs as a host sender (delegated
+    /// host-work II.4.2): `plain` sealed to `recipient_enc`, signed by this
+    /// key (the shared core's `seal_envelope`).
+    pub fn seal_envelope(
+        &self,
+        fields: &atem_client::host_mail::MailFields,
+        plain: &atem_client::host_mail::EnvelopePlain,
+        recipient_enc: &atem_client::PublicKey,
+    ) -> atem_client::Result<atem_client::SignedObject> {
+        atem_client::host_mail::seal_envelope(&self.keys, &self.id, fields, plain, recipient_enc)
+    }
 }
 
 impl std::fmt::Debug for HostKey {

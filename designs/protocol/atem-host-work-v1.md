@@ -6,7 +6,9 @@ debug-only hook and advertised by no release build; `host.senders` is
 planned (behind the same hook a debug build lists it with hosting on,
 answers `host_enc_key_get` and `control_records`, and judges what a host
 sender may do on the receiving host, §11.6 "Host senders on the receiving
-host"; the mailbox and its envelopes are not built).
+host"; the receiving host's mailbox client and the sending host's planning,
+sealing and puts are built, §11.5; cancel and complete across hosts, the
+status objects and results back and admission are not).
 
 This extension of atem-session r9 lets an admitted client create sessions
 through launch profiles the host owner approved, queue directed work, publish
@@ -3454,10 +3456,12 @@ and for the ceremony's fields. Each is **agreed with Astation 2026-11-16**.
 ("The mailbox calls"), the status forms and the selector task id, and
 `result_id` with both of its checks; `select`'s channel rule. **Built on the
 receiving host, behind the debug-only hook:** its mailbox client ("The
-mailbox calls", "On the receiving host"). Nothing else in them is built (the
-sending host's outbox, the admission of what the mailbox delivers and the
-status objects back, the Station's side, `select`'s `launch`, the
-ceremony's fields). The status forms and the
+mailbox calls", "On the receiving host"). **Built on the sending host,
+behind the same hook:** its planning, sealing and puts ("On the sending
+host"), and `select`'s `launch` in the shared core. Nothing else in them is
+built (`cancel` and `complete` across hosts, the admission of what the
+mailbox delivers and the status objects and results back, the Station's
+side, the ceremony's fields). The status forms and the
 sending host's `result_id` check have their shared vectors in
 `fixtures/r9-vectors-host-envelope.json`; the mailbox calls' shared vectors
 come with a later change.
@@ -3471,9 +3475,8 @@ differs) and `object_hash`; a page keeps each object's exact bytes as
 received beside its value (`MailboxEntry::bytes`), the evidence of one that
 doesn't parse (check 1); `heads`' `mailbox` in `control::relay`, read
 only with `Accept { mailbox: true }` (`Heads::decode_with`,
-`ToHost::decode_with`), refused by every other reader. Not built: the
-sending host's outbox, admission on the receiving host, and the Station's
-side.
+`ToHost::decode_with`), refused by every other reader. Not built:
+admission on the receiving host and the Station's side.
 
 **On the receiving host** (built behind the debug-only hook's
 `host.senders`, which needs `host.delegated`; `runtime/delegated/mailbox.rs`,
@@ -3583,6 +3586,62 @@ exactly as without this section):
   there holds none), and every inbox row admitted (design II.5); until
   admission is built an inbox row keeps it closed. `atem status`'s
   `Control feeds:` line names this part.
+
+**On the sending host** (built behind the debug-only hook's
+`host.senders`, with `host.delegated`; `runtime/delegated/send_plan.rs`,
+`remote_send.rs`, `outbox.rs`, `puts.rs`, `send_pass.rs`; with the hook off
+`atem message send` is stage 1's):
+
+- `atem message send` plans its target hosts from this host's committed
+  device list ("`select` from host senders", "Planning"). A planned host
+  must be a current host with a current `host_enc_key` whose shared
+  projects grant `message`, `notify` and `prompt` (and `launch` for a
+  launch on message). A host an `atem:` selector names that isn't one
+  refuses the send with the reason; a `project:` fan-out skips one ("in
+  each case only hosts with a current `host_enc_key`"), and the send's
+  output and the message's record (a `skipped` row with why, never put)
+  name it. A `project:` term reaches another host only through projects that list
+  this host too. This host sends only while its own list shows it a current
+  host at its trust generation, `authorized`. The local part keeps stage
+  1's path with its share of the 32 agents (local first, then each host by
+  `host_id`, equal shares, the remainder one each to the first). A send to
+  other hosts only has no local part: its 32 agents are split across those
+  hosts, and its record is stage 1's message record with no recipient here
+  ("to other hosts only"), counted once at the sender as stage 1 counts a
+  send (`per_hour`, `per_workflow`), nothing counted as received.
+- One delivery row per target host, `publishing` → `ready` → `sent` →
+  `accepted` | `refused` | `expired`, committed with the message in the
+  transaction that accepts it (stage 1's): the envelope sealed once to the
+  host's current key, signed at the committed head, its exact bytes kept,
+  all before any put. A send with context has its rows `publishing` until
+  the context is frozen; a refused or expired publication takes them with
+  it. A row moves to `accepted` only when the receiver's status names its
+  resolution (read with the results back, not built).
+- One put engine for every object this host puts (envelopes now; the
+  receiving host's status objects and results later): already sealed bytes,
+  a target and a policy, enqueued in the caller's own transaction. An
+  envelope is put again, the same bytes, every 10 minutes until its row is
+  accepted, refused or expired; a status or result until `mailbox_stored`
+  (again on a new link generation while unanswered), never after. The
+  sending host has no signal of a reset of another host's mailbox: the
+  10-minute resend is what repairs one.
+- Answers (rule 3): `quota` puts it again after a backoff (30 s doubling to
+  10 minutes); `forbidden` is final on that link generation, and the object
+  is put again on a later one, or once this host's device list moved, until
+  it expires; `id_reused` and `expired` refuse the row with the code. A row
+  already stored stays `sent` when the Station refuses a later copy (its
+  code recorded; after `id_reused` no copy is put again, and it still
+  expires at its object's expiry): the first copy may be running on the
+  receiver; a Station `expired` there is the row's expiry. A row whose
+  bytes no longer read is `malformed`, never put again (refused if never
+  stored).
+- Rules 1 and 8: puts go only after a `heads` on the link generation that
+  announces this host's mailbox (the Station's association of the link),
+  as the mailbox's own calls; at most 8 live per link generation; a put
+  unanswered for 35 s again with a fresh id; every live put retired at a
+  new link generation or an identity change (nothing more put on that
+  socket). The schedule, expiry and answers are on the delegated clock
+  (design I.6.5): with no reading nothing is put, expired or written.
 
 The receiving host's mailbox on the Station (design II.4.3): a sending host
 puts objects over its own link, and the receiving host syncs its own mailbox

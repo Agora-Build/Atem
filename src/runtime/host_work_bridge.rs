@@ -75,6 +75,8 @@ mod delegated_launches;
 mod delegated_recovery;
 #[path = "delegated/requests.rs"]
 mod delegated_requests;
+#[path = "delegated/send_pass.rs"]
+mod delegated_send_pass;
 
 /// The local sender exists only on the broker's internal attachment.
 pub(crate) enum Sender {
@@ -244,6 +246,8 @@ pub(super) struct State {
     /// The identity whose store has host senders' mailbox tables
     /// (`mail_observe`, with `host.senders` on).
     mail_prepared: Option<HostTarget>,
+    /// When the sending host's outbox last pruned its final rows' bytes.
+    outbox_pruned_at: Option<Instant>,
     /// The device-list head and the room freed (`mailbox_store::freed`)
     /// the mailbox's waiting objects were last judged again at
     /// (`mail_rejudge`).
@@ -357,6 +361,7 @@ impl State {
             host_applied: None,
             applied_seq: None,
             mail_prepared: None,
+            outbox_pruned_at: None,
             mail_rejudged: None,
             mail_rejudge_at: None,
             mail_rejudge_failed: false,
@@ -2908,6 +2913,7 @@ mod local_tests {
         include!("delegated/reverify_tests.rs");
         include!("delegated/host_effects_tests.rs");
         include!("delegated/mail_pass_tests.rs");
+        include!("delegated/send_pass_tests.rs");
     }
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::broker::{InProcess, Launcher};
@@ -3886,6 +3892,7 @@ principals = ["local"]
             message.recipients[0].destination = Destination::Select {
                 selectors: vec!["atem:atem-host/r".into()],
                 budget: 32,
+                launch: false,
             };
             // The sending session is no longer there.
             let mut origin = origin_of(&rig);
@@ -3902,6 +3909,7 @@ principals = ["local"]
                     context: vec![ContextSpec::Vault {
                         reference: VaultRef::parse("v-context:1@1").unwrap(),
                     }],
+                    remote: None,
                 },
             )
             .unwrap();
@@ -3969,6 +3977,7 @@ principals = ["local"]
             message.recipients[0].destination = Destination::Select {
                 selectors: vec!["atem:atem-host/r".into()],
                 budget: 32,
+                launch: false,
             };
             let mut origin = origin_of(&rig);
             origin.control_gen -= 1;
@@ -3983,6 +3992,7 @@ principals = ["local"]
                     context: vec![ContextSpec::Vault {
                         reference: VaultRef::parse("v-context:1@1").unwrap(),
                     }],
+                    remote: None,
                 },
             )
             .unwrap();
@@ -4005,6 +4015,7 @@ principals = ["local"]
             message.recipients[0].destination = Destination::Select {
                 selectors: vec!["atem:atem-host/r".into()],
                 budget: 32,
+                launch: false,
             };
             crate::runtime::collab::reserve_context(
                 rig.bridge.work.store.as_ref().unwrap(),
@@ -4017,6 +4028,7 @@ principals = ["local"]
                     context: vec![ContextSpec::Vault {
                         reference: VaultRef::parse("v-context:1@1").unwrap(),
                     }],
+                    remote: None,
                 },
             )
             .unwrap();
@@ -4787,6 +4799,7 @@ principals = ["local"]
             message.recipients[0].destination = Destination::Select {
                 selectors: vec!["tag:x".into()],
                 budget: 32,
+                launch: false,
             };
             // Both pass the shared message rules; only the task rules refuse.
             for (text, problem) in [
@@ -4803,7 +4816,7 @@ principals = ["local"]
                 assert!(message.valid_local(), "{problem}");
                 let error = rig
                     .bridge
-                    .collab_accept("atem-host", &message, &origin, false, &rig.sessions)
+                    .collab_accept("atem-host", &message, &origin, false, &rig.sessions, None)
                     .unwrap_err();
                 assert_eq!(error.to_string(), problem);
                 assert_eq!(rows(&rig, "counters"), 0, "{problem}");
@@ -4812,7 +4825,7 @@ principals = ["local"]
             // The same message without the problem is accepted, and counts once.
             message.context = vec![snapshot("fits")];
             rig.bridge
-                .collab_accept("atem-host", &message, &origin, false, &rig.sessions)
+                .collab_accept("atem-host", &message, &origin, false, &rig.sessions, None)
                 .unwrap();
             assert_eq!(counted(&rig, &format!("send:{}", message.workflow_id)), 1);
             assert_eq!(
@@ -5035,6 +5048,7 @@ launch = "on_message"
         message.recipients[0].destination = Destination::Select {
             selectors: vec![selector.into()],
             budget: 32,
+            launch: false,
         };
         message
     }
@@ -5057,7 +5071,7 @@ launch = "on_message"
     fn accept(rig: &mut LocalRig, message: &Message, launch: bool) {
         let origin = origin_of(rig);
         rig.bridge
-            .collab_accept("atem-host", message, &origin, launch, &rig.sessions)
+            .collab_accept("atem-host", message, &origin, launch, &rig.sessions, None)
             .unwrap();
     }
 
@@ -5195,6 +5209,7 @@ launch = "on_message"
                     "atem:atem-host".into(),
                 ],
                 budget: 32,
+                launch: false,
             };
             accept(&mut rig, &message, true);
             assert_eq!(rows(&rig, "launches"), 0);
@@ -5232,6 +5247,7 @@ launch = "on_message"
                         context: vec![ContextSpec::Vault {
                             reference: VaultRef::parse("v-context:1@1").unwrap(),
                         }],
+                        remote: None,
                     },
                 )
                 .unwrap();
@@ -6042,7 +6058,7 @@ launch = "on_message"
             let origin = origin_of(&rig);
             let refused = rig
                 .bridge
-                .collab_accept("atem-host", &message, &origin, true, &rig.sessions)
+                .collab_accept("atem-host", &message, &origin, true, &rig.sessions, None)
                 .unwrap_err();
             assert!(
                 refused

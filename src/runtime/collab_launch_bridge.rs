@@ -28,7 +28,10 @@ impl HostBridge {
         launch: bool,
         sessions: &BTreeMap<SessionId, BrokerSession>,
     ) -> Result<Resolution> {
-        let Destination::Select { selectors, budget } = &message.recipients[0].destination else {
+        let Destination::Select {
+            selectors, budget, ..
+        } = &message.recipients[0].destination
+        else {
             bail!("invalid local destination");
         };
         let selectors: Vec<Selector> = selectors

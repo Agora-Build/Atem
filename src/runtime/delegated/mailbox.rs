@@ -255,7 +255,7 @@ enum Alert {
 
 /// A fresh `request_id` (rule 8): a lowercase UUID v4 from the operating
 /// system's CSPRNG.
-fn fresh_request_id() -> String {
+pub(crate) fn fresh_request_id() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut bytes);

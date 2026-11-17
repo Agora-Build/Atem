@@ -4326,6 +4326,7 @@ mod tests {
                 context: vec![ContextSpec::Memory {
                     memory: Box::new(memory()),
                 }],
+                remote: None,
             };
             store
                 .db
@@ -4562,6 +4563,7 @@ mod tests {
             context: vec![crate::runtime::collab_context::ContextSpec::Memory {
                 memory: Box::new(memory()),
             }],
+            remote: None,
         }
     }
 

@@ -1,4 +1,5 @@
 //! Same-runtime collaboration, using the host's ordinary receipt scheduler.
+use super::delegated_send_pass::{OUTBOX_UNAVAILABLE, SEAL_UNAVAILABLE};
 use super::*;
 use crate::runtime::collab::results::{
     self, Binding, EarlyEnd, Origin, OriginRoute, Reply, ReplyState, ResultRow, ReturnGrant,
@@ -6,6 +7,7 @@ use crate::runtime::collab::results::{
 };
 use crate::runtime::collab::{self, Candidate, DirectoryRow, MessageView, SendRequest};
 use crate::runtime::collab_context::{self, ContextSpec, VaultRef};
+use crate::runtime::delegated::remote_send::RemotePart;
 use crate::runtime::host_work::MessageRecord;
 use anyhow::{Result, anyhow, bail};
 use atem_client::session::messages::{
@@ -111,6 +113,7 @@ fn publication_refused(detail: &str) -> bool {
             | collab_context::VAULT_NEEDS_E2E
             | collab_context::VAULT_CREDENTIAL
     ) || collab::TASK_PROBLEMS.contains(&detail)
+        || detail == super::delegated_send_pass::SENDERS_OFF
         || detail.starts_with("ambiguous vault reference")
         || detail.starts_with("limit:")
 }
@@ -1273,7 +1276,7 @@ impl HostBridge {
 
     /// Why a task made from this message could never be dispatched. The
     /// target is a placeholder: only the content decides.
-    fn collab_content_problem(&self, message: &Message) -> Option<&'static str> {
+    pub(super) fn collab_content_problem(&self, message: &Message) -> Option<&'static str> {
         let host = self.work_host();
         let target = wire::Target {
             account_id: host.account_id.clone(),
@@ -1445,7 +1448,11 @@ impl HostBridge {
             &request.memory,
             &request.vault,
         )?;
-        if request.launch
+        // Other hosts (host senders, behind the debug-only hook): the plan
+        // checks `--launch` itself; without one, stage 1's rule.
+        let remote = self.remote_plan(atem_id, &request.to, request.launch)?;
+        if remote.is_none()
+            && request.launch
             && !request.to.iter().any(|s| {
                 s.parse::<Selector>().is_ok_and(|s| {
                     matches!(s,
@@ -1457,6 +1464,12 @@ impl HostBridge {
                 "use --launch with atem:<atem_id>/<route_id>; the route must allow launch = on_message"
             );
         }
+        // One budget of 32 across the local part and the other hosts'; a
+        // send to other hosts only has no local part.
+        let (budget, remote) = match remote {
+            Some((budget, part)) => (budget, Some(part)),
+            None => (Some(MAX_AGENTS), None),
+        };
         let origin = sessions
             .get(from)
             .filter(|s| s.is_live())
@@ -1472,14 +1485,18 @@ impl HostBridge {
             from_session: Some(from.to_string()),
             created_at: now,
             expires_at: now.saturating_add(request.expires_ms),
-            recipients: vec![Recipient {
-                recipient_id: uuid::Uuid::new_v4().to_string(),
-                host: self.work_host(),
-                destination: Destination::Select {
-                    selectors: request.to.clone(),
-                    budget: MAX_AGENTS,
-                },
-            }],
+            recipients: budget
+                .map(|budget| Recipient {
+                    recipient_id: uuid::Uuid::new_v4().to_string(),
+                    host: self.work_host(),
+                    destination: Destination::Select {
+                        selectors: request.to.clone(),
+                        budget,
+                        launch: false,
+                    },
+                })
+                .into_iter()
+                .collect(),
             text: request.text,
             context: vec![],
             mark: None,
@@ -1488,7 +1505,13 @@ impl HostBridge {
         if probe.text.trim().is_empty() && !specs.is_empty() {
             probe.text = "pending context".into();
         }
-        if !probe.valid_local() {
+        // Each part valid: the local one (if any) as stage 1's, the other
+        // hosts' as a host sender's Message.
+        let host_id = self.work_host().atem_device_id;
+        let remote_valid = remote.as_ref().is_none_or(|part| {
+            part.recipients.is_empty() || part.message(&probe, &host_id).valid_from_host(&host_id)
+        });
+        if !(probe.recipients.is_empty() || probe.valid_local()) || !remote_valid {
             bail!("invalid message content");
         }
         // What is known now (a memory's text) must already fit a task; a
@@ -1510,10 +1533,18 @@ impl HostBridge {
                     origin: source.clone(),
                     launch: request.launch,
                     context: specs,
+                    remote,
                 },
             )?;
         } else {
-            self.collab_accept(atem_id, &message, &source, request.launch, sessions)?;
+            self.collab_accept(
+                atem_id,
+                &message,
+                &source,
+                request.launch,
+                sessions,
+                remote.as_ref(),
+            )?;
         }
         Ok(message.message_id)
     }
@@ -1524,7 +1555,9 @@ impl HostBridge {
     /// `launch = "on_message"` and no agent start one (spec section 5). A
     /// send whose session ended while its context was published still makes
     /// its tasks, with their return grants ended from the start: their
-    /// replies are kept, never delivered.
+    /// replies are kept, never delivered. `remote`: its part for other
+    /// hosts (host senders), whose envelopes are sealed and enqueued in the
+    /// same transaction.
     pub(super) fn collab_accept(
         &mut self,
         atem_id: &str,
@@ -1532,10 +1565,15 @@ impl HostBridge {
         origin: &Origin,
         launch: bool,
         sessions: &BTreeMap<SessionId, BrokerSession>,
+        remote: Option<&RemotePart>,
     ) -> Result<()> {
         // Replies are result rows (`collab_reply`), never messages.
         if message.kind != MessageKind::Request {
             bail!("invalid message content");
+        }
+        // A send to other hosts only: no local part.
+        if message.recipients.is_empty() {
+            return self.remote_only_accept(atem_id, message, origin, remote);
         }
         if let Some(old) = self
             .work
@@ -1670,8 +1708,20 @@ impl HostBridge {
                     }
                 }
                 self.collab_reserve_launches(tx, &plan)?;
+                if let Some(part) = remote {
+                    self.remote_seal(tx, atem_id, message, part)?;
+                }
                 collab::persist(tx, message, resolved)
             })?;
+        // Debug builds: the runtime is killed here, the message and its
+        // envelopes committed, none put yet.
+        #[cfg(not(test))]
+        if remote.is_some() {
+            crate::runtime::test_hooks::crash_point(
+                "crash_after_outbox_commit",
+                "after a message's envelopes to other hosts were committed, before any put",
+            );
+        }
         self.collab_start_launches(plan, message.expires_at);
         Ok(())
     }
@@ -1769,6 +1819,7 @@ impl HostBridge {
                         &publication.origin,
                         publication.launch,
                         cx.sessions,
+                        publication.remote.as_ref(),
                     )
                 });
                 if let Err(error) = result {
@@ -1784,11 +1835,17 @@ impl HostBridge {
                             "UPDATE publications SET attempts=attempts+1 WHERE message_id=?1",
                             [&id],
                         )?;
+                        // The outbox's own reason, or the relay's.
+                        let retry = if detail == SEAL_UNAVAILABLE {
+                            OUTBOX_UNAVAILABLE
+                        } else {
+                            "relay unreachable; publication will retry"
+                        };
                         collab::publication_state(
                             store,
                             &id,
                             "publishing",
-                            "relay unreachable; publication will retry",
+                            retry,
                             now.saturating_add(delay),
                         )?;
                     }
