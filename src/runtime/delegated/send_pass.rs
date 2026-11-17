@@ -207,12 +207,22 @@ impl HostBridge {
         let Some(station) = self.station.as_mut() else {
             return Vec::new();
         };
-        station
+        let puts: Vec<Call> = station
             .puts
             .take(due)
             .into_iter()
             .map(Call::MailboxPut)
-            .collect()
+            .collect();
+        // Rows whose bytes no longer read leave the due rows (refused).
+        let unreadable = station.puts.take_unreadable();
+        if let Some(store) = self.outbox_store() {
+            for n in unreadable {
+                if let Err(error) = outbox::unreadable(store, n) {
+                    outbox_fault(error);
+                }
+            }
+        }
+        puts
     }
 
     /// Where a put goes now: the link generation and the committed

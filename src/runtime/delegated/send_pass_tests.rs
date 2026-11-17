@@ -697,3 +697,48 @@ fn a_publication_with_host_senders_off_refuses_its_remote_rows() {
         assert_eq!(rows(&rig, "mail_outbox"), 0);
     });
 }
+
+/// A row whose bytes no longer read is refused (`malformed`) and leaves
+/// the due rows, instead of taking a place every pass (review L4).
+#[test]
+fn a_row_whose_bytes_dont_read_is_refused() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let _host = sp_host(&mut rig, root, &os);
+        sp_d(&rig, host_now().wall_ms);
+        let id = sp_send(&mut rig, &["atem:host-b"]).unwrap();
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute(
+                "UPDATE mail_outbox SET bytes=x'7b7d' WHERE object_id=?1",
+                [&id],
+            )
+            .unwrap();
+        assert!(sp_out(&mut rig).is_empty());
+        assert_eq!(
+            sp_rows(&rig, &id),
+            [("host-b".into(), "refused".into(), Some("malformed".into()))]
+        );
+        let due = crate::runtime::delegated::outbox::due(
+            rig.bridge.work.store.as_ref().unwrap(),
+            &atem_client::host_mail::HostRef {
+                host_id: "host".into(),
+                host_trust_gen: 1,
+            },
+            host_now().wall_ms,
+            crate::runtime::delegated::outbox::Place {
+                link_gen: 1,
+                head_seq: 0,
+            },
+            &[],
+            8,
+        )
+        .unwrap();
+        assert!(due.is_empty());
+    });
+}

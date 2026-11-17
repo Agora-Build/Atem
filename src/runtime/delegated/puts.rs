@@ -68,6 +68,8 @@ pub struct PutClient {
     now: u64,
     live: Vec<Live>,
     retired: VecDeque<String>,
+    /// Due rows whose bytes no longer read, for the store to refuse.
+    unreadable: Vec<i64>,
     sent: u64,
     stored: u64,
     refused: u64,
@@ -129,8 +131,9 @@ impl PutClient {
 
     /// The puts of `due` to send now, live from now (none without a link,
     /// before its `heads` announced this host's mailbox, after an identity
-    /// change, or past [`MAX_LIVE_PUTS`]). A row whose
-    /// bytes no longer read is skipped.
+    /// change, or past [`MAX_LIVE_PUTS`]). A row whose bytes no longer read
+    /// isn't put: it is reported ([`PutClient::take_unreadable`]) for the
+    /// store to refuse.
     pub fn take(&mut self, due: Vec<Due>) -> Vec<MailboxPut> {
         let mut out = Vec::new();
         if self.link.is_none() || self.moved || !self.announced {
@@ -144,6 +147,7 @@ impl PutClient {
                 continue;
             }
             let Ok(object) = parse_object(&row.bytes) else {
+                self.unreadable.push(row.n);
                 continue;
             };
             let call = MailboxPut {
@@ -159,6 +163,11 @@ impl PutClient {
             out.push(call);
         }
         out
+    }
+
+    /// The rows `take` found whose bytes no longer read (taken).
+    pub fn take_unreadable(&mut self) -> Vec<i64> {
+        std::mem::take(&mut self.unreadable)
     }
 
     /// The put `request_id` wasn't handed to the link: no longer live (its

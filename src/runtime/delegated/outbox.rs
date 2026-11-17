@@ -250,6 +250,17 @@ pub fn refused(store: &Store, n: i64, code: PutRefusal, now_ms: u64, place: Plac
     Ok(())
 }
 
+/// Row `n`'s bytes no longer read as a mailbox object (a stricter reader
+/// than the one that enqueued it): refused, `malformed`, never put.
+pub fn unreadable(store: &Store, n: i64) -> Result<()> {
+    store.db.execute(
+        "UPDATE mail_outbox SET state='refused', code='malformed'
+        WHERE n=?1 AND state IN ('queued','stored')",
+        [n],
+    )?;
+    Ok(())
+}
+
 /// The owner settles row `n` in its own transaction (a repeat row's
 /// delivery accepted): put no more. Called by the results back (not built
 /// yet).

@@ -167,3 +167,17 @@ fn a_new_link_or_identity_retires_the_puts() {
     assert!(c.live_rows().is_empty());
     assert_eq!(c.on_stored(&stored(&unsent)), Answer::Unsolicited);
 }
+
+/// A due row whose bytes no longer read is never put and is reported, so
+/// the store refuses it and it leaves the due rows (review L4).
+#[test]
+fn a_row_whose_bytes_dont_read_is_reported_not_put() {
+    let mut c = client();
+    let mut due = rows(0..2);
+    due[0].bytes = b"not an object".to_vec();
+    let puts = c.take(due);
+    assert_eq!(puts.len(), 1);
+    assert_eq!(c.live_rows(), [1]);
+    assert_eq!(c.take_unreadable(), [0]);
+    assert!(c.take_unreadable().is_empty(), "taken");
+}

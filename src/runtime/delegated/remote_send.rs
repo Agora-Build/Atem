@@ -65,6 +65,8 @@ const TABLES: &str = "
                 WHEN NEW.state='expired'
                     OR state='sent' AND NEW.state='refused' AND NEW.code='expired'
                     THEN 'expired before it was accepted'
+                WHEN NEW.code='malformed' AND NEW.state='refused'
+                    THEN 'its sealed bytes no longer read; not put'
                 WHEN state='ready' AND NEW.state='refused'
                     THEN 'the Station refused it (' || NEW.code || ')'
                 WHEN (state='sent' OR NEW.state IN ('stored', 'done')) AND NEW.code IS NULL
