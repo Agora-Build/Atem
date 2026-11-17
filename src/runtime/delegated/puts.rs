@@ -20,7 +20,7 @@
 //! - A new link generation retires every live put (their rows go again on
 //!   it); an identity change on the live link retires them and nothing more
 //!   is put on that socket (§11.4, "An identity change").
-use super::outbox::Due;
+use super::outbox::{Due, Place};
 use super::station::StationLink;
 use super::sync::{RETIRED_KEPT, SYNC_TIMEOUT_MS};
 use atem_client::host_mail::mailbox::{MailboxPut, MailboxPutRefused, MailboxStored};
@@ -37,14 +37,18 @@ struct Live {
     call: MailboxPut,
     n: i64,
     sent_at: u64,
+    /// Where it went: its link generation and the committed head then.
+    place: Place,
 }
 
 /// What an answer is to the live puts ([`PutClient::on_stored`],
 /// [`PutClient::on_refused`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Answer {
-    /// It answers the live put of row `n`.
-    Row(i64),
+    /// It answers the live put of row `n`, which went at that place (a
+    /// `forbidden` is held there: a list move since the put counts, review
+    /// L-N2).
+    Row(i64, Place),
     /// A retired put's (answered, unanswered for 35 s, of an earlier link
     /// generation or identity): nothing applies.
     Drained,
@@ -134,7 +138,7 @@ impl PutClient {
     /// change, or past [`MAX_LIVE_PUTS`]). A row whose bytes no longer read
     /// isn't put: it is reported ([`PutClient::take_unreadable`]) for the
     /// store to refuse.
-    pub fn take(&mut self, due: Vec<Due>) -> Vec<MailboxPut> {
+    pub fn take(&mut self, due: Vec<Due>, place: Place) -> Vec<MailboxPut> {
         let mut out = Vec::new();
         if self.link.is_none() || self.moved || !self.announced {
             return out;
@@ -158,6 +162,7 @@ impl PutClient {
                 call: call.clone(),
                 n: row.n,
                 sent_at: self.now,
+                place,
             });
             self.sent += 1;
             out.push(call);
@@ -179,7 +184,7 @@ impl PutClient {
     /// `mailbox_stored`.
     pub fn on_stored(&mut self, stored: &MailboxStored) -> Answer {
         let answer = self.answer(&stored.request_id, |put| stored.answers(put).is_ok());
-        if matches!(answer, Answer::Row(_)) {
+        if matches!(answer, Answer::Row(..)) {
             self.stored += 1;
         }
         answer
@@ -188,7 +193,7 @@ impl PutClient {
     /// `mailbox_put_refused`.
     pub fn on_refused(&mut self, refused: &MailboxPutRefused) -> Answer {
         let answer = self.answer(&refused.request_id, |put| refused.answers(put).is_ok());
-        if matches!(answer, Answer::Row(_)) {
+        if matches!(answer, Answer::Row(..)) {
             self.refused += 1;
         }
         answer
@@ -197,9 +202,9 @@ impl PutClient {
     fn answer(&mut self, request_id: &str, answers: impl Fn(&MailboxPut) -> bool) -> Answer {
         match self.live.iter().find(|l| l.call.request_id == request_id) {
             Some(live) if answers(&live.call) => {
-                let n = live.n;
+                let (n, place) = (live.n, live.place);
                 self.retire(request_id);
-                Answer::Row(n)
+                Answer::Row(n, place)
             }
             Some(_) => {
                 self.unsolicited += 1;

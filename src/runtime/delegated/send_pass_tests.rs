@@ -949,3 +949,33 @@ fn a_remote_only_publication_with_host_senders_off_is_refused() {
         );
     });
 }
+
+/// `forbidden` is held to where its put went (review L-N2): a device-list
+/// move between the put and its answer counts as a move after it, so the
+/// object goes again at once, on the same link generation.
+#[test]
+fn a_list_move_between_a_put_and_its_forbidden_counts() {
+    local_test(async |root| {
+        use atem_client::host_mail::mailbox::PutRefusal;
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        sp_d(&rig, host_now().wall_ms);
+        let id = sp_send(&mut rig, &["atem:host-b"]).unwrap();
+        let put = sp_out(&mut rig).remove(0);
+        // The list moves while the put is out (B's new `add_host`, say).
+        sign_and_carry(
+            &mut rig,
+            &mut host.s,
+            project_set("more", ["host", "host-b"], task_ops(), 0).unwrap(),
+        );
+        sp_refused(&mut rig, &put, PutRefusal::Forbidden);
+        assert_eq!(sp_rows(&rig, &id)[0].2.as_deref(), Some("forbidden"));
+        let again = sp_out(&mut rig);
+        assert_eq!(again.len(), 1, "the move came after the put");
+        assert_eq!(again[0].object, put.object);
+        // Refused again with no move since: held.
+        sp_refused(&mut rig, &again[0], PutRefusal::Forbidden);
+        assert!(sp_out(&mut rig).is_empty());
+    });
+}

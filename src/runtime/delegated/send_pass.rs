@@ -286,7 +286,7 @@ impl HostBridge {
         };
         let puts: Vec<Call> = station
             .puts
-            .take(due)
+            .take(due, place)
             .into_iter()
             .map(Call::MailboxPut)
             .collect();
@@ -324,15 +324,13 @@ impl HostBridge {
             }
             _ => return,
         };
-        let Answer::Row(n) = n else {
+        // `place`: where the put went, not where the link is now.
+        let Answer::Row(n, place) = n else {
             return;
         };
         // On `D` only: with no reading the row stays as it is (due again,
         // put again: harmless).
         let Some(now) = self.start_view().now_d_ms else {
-            return;
-        };
-        let Some(place) = self.outbox_place() else {
             return;
         };
         let Some(store) = self.outbox_store() else {
