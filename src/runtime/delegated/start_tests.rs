@@ -1209,7 +1209,10 @@ fn a_host_senders_task_follows_its_route_and_the_own_stations_gate() {
         may_start(&host_view(&log, &["project:build"]), &bare, Some(0)),
         Err(Event::Narrowed)
     );
-    // No host sender's launch exists (a host opens no channel): fail.
+    // A host sender's launch comes only with a `select`'s `launch` (it
+    // opens no channel), on its route, launching on message, with the
+    // project's `launch` op (`HostOp::LaunchOnMessage`): a route that
+    // doesn't launch on message, or a project without `launch`, fails it.
     let launch = StartLaunch {
         admission: task.admission.clone(),
         profile: v.config.profiles[0].clone(),
@@ -1217,6 +1220,12 @@ fn a_host_senders_task_follows_its_route_and_the_own_stations_gate() {
     };
     assert_eq!(
         launch_check(&host_view(&log, &["project:build"]), &launch, 0),
+        LaunchVerdict::Fail(details::ROUTE_CHANGED)
+    );
+    let mut v = host_view(&log, &["project:build"]);
+    v.config.routes[1].launch = crate::runtime::host_work::RouteLaunch::OnMessage;
+    assert_eq!(
+        launch_check(&v, &launch, 0),
         LaunchVerdict::Fail(details::AUTHORIZATION_NARROWED)
     );
 }

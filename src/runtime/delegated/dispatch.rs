@@ -50,6 +50,8 @@ use crate::session_protocol::host::{
 pub(super) use crate::runtime::delegated::start::WAITING_FOR_A_READY_AGENT;
 /// The dispatch intent is durable (host-work v1's text).
 const DISPATCH_INTENT: &str = "dispatch intent persisted";
+/// A task waits for the session its message launched (stage 1's text).
+const LAUNCHING: &str = "launching the approved route";
 
 /// What a scheduling pass's delegated tasks share with each other.
 #[derive(Default)]
@@ -152,6 +154,13 @@ impl HostBridge {
         let Some(task) = StartTask::of(r) else {
             return Ok(());
         };
+        // A host sender's task waiting for the session its request launched
+        // (design II.6): a launch that failed, or whose outcome is unknown,
+        // fails it (it never started, so its own outcome is known).
+        let launch = self.launch_waited(r)?;
+        if let Some(Err(detail)) = &launch {
+            return self.settle_task(r, WorkState::Failed, detail);
+        }
         // Conditions 1 (the deadline) and 2 to 5. The view's lock is let go
         // before anything calls into the session host.
         let checked = may_start(&self.start_view(), &task, Some(now_d));
@@ -166,6 +175,12 @@ impl HostBridge {
                 waits.by_sender.entry(order).or_insert(detail);
             }
             return self.block(r, detail);
+        }
+        // Its launch still starting: it waits, holding the launched
+        // session (stage 1's detail).
+        if let Some(Ok(false)) = launch {
+            occupied.insert(sid);
+            return self.block(r, LAUNCHING);
         }
         // One sender's tasks keep their order behind one that lets the
         // session go (what settles a task applies to it all the same).
@@ -533,6 +548,34 @@ impl HostBridge {
         r.status.state = state;
         r.status.detail = detail.into();
         self.work.store.as_ref().unwrap().save_work(r)
+    }
+
+    /// The launch on message host sender's task `r` waits for (design
+    /// II.6), if any: `Ok(true)` started, `Ok(false)` still starting,
+    /// `Err(detail)` failed or of unknown outcome (stage 1's details).
+    fn launch_waited(&self, r: &WorkRecord) -> anyhow::Result<Option<Result<bool, String>>> {
+        if !r.principal.starts_with("host:") {
+            return Ok(None);
+        }
+        let store = self.work.store.as_ref().unwrap();
+        let Some(id) = crate::runtime::delegated::admit::launch_of(&store.db, &r.task.task_id)?
+        else {
+            return Ok(None);
+        };
+        let Some(record) = store.launch(&id)? else {
+            return Ok(Some(Err("missing reserved launch".into())));
+        };
+        Ok(Some(match record.status.state {
+            LaunchState::Started => Ok(true),
+            LaunchState::Starting => Ok(false),
+            LaunchState::Failed => Err(match self.work.refused.get(&id) {
+                Some(why) => format!("approved route launch not started: {why}"),
+                None => "approved route launch failed; check its cwd and environment".into(),
+            }),
+            LaunchState::OutcomeUnknown => {
+                Err("launch outcome unknown; the reserved launch will not be repeated".into())
+            }
+        }))
     }
 
     /// Condition 6 (design I.4.3): the session is live, with chat, `ready`,

@@ -660,9 +660,8 @@ fn launch_event(view: &StartView, launch: &StartLaunch, now_d_ms: u64) -> Result
     let adm = &launch.admission;
     // A host never opens a channel (session-v1 R9.6), so no `host_launch`
     // is a host sender's; its launch on message comes with the mailbox.
-    // One here fails closed.
     if matches!(adm.sender, DelegatedSender::Host { .. }) {
-        return Err(Event::Narrowed);
+        return host_launch_event(view, launch, now_d_ms);
     }
     let sender = in_effect(view, adm)?;
     if view.config.profile(&launch.profile.id) != Some(&launch.profile) {
@@ -692,6 +691,60 @@ fn launch_event(view: &StartView, launch: &StartLaunch, now_d_ms: u64) -> Result
         scope_pending,
         true,
     )
+}
+
+/// [`launch_check`]'s event for a host sender's launch on message (design
+/// II.6; host-work-v1 §11.5, "`select` from host senders"): what
+/// [`host_may_start`] checks of its tasks, with the project's `launch` op
+/// too (`HostOp::LaunchOnMessage`), on the route that consented at
+/// admission, still launching on message for the profile approved then. A
+/// record that names a host sender without its grant fails closed
+/// (`Narrowed`).
+fn host_launch_event(view: &StartView, launch: &StartLaunch, now_d_ms: u64) -> Result<(), Event> {
+    let adm = &launch.admission;
+    let list = usable(view)?;
+    let Some((host_id, admitted)) = adm.host_admitted() else {
+        return Err(Event::Narrowed);
+    };
+    host_standing(
+        &list.membership,
+        host_id,
+        Some((admitted.generation, admitted.epoch)),
+    )?;
+    let route = view
+        .config
+        .route(&adm.route_id)
+        .filter(|route| {
+            route.revision == adm.route_revision
+                && route.launch == crate::runtime::host_work::RouteLaunch::OnMessage
+                && route.profile_id == launch.profile.id
+                && route.principals.iter().any(|p| p == admitted.consent)
+        })
+        .ok_or(Event::RouteChanged)?;
+    if view.config.profile(&launch.profile.id) != Some(&launch.profile) {
+        return Err(Event::RouteChanged);
+    }
+    let sender = HostSender {
+        host_id,
+        admitted: Some(admitted),
+    };
+    host_sender_permits(
+        &list.membership,
+        &view.host_id,
+        &sender,
+        route,
+        HostOp::LaunchOnMessage,
+    )?;
+    if now_d_ms >= launch.expires_at {
+        return Err(Event::Expired);
+    }
+    if !view.senders {
+        if view.halted {
+            return Err(Event::Halted);
+        }
+        return Err(Event::GateClosed);
+    }
+    waits(view, list, &SenderStanding::default(), adm, false, true)
 }
 
 /// Host-work's start check in the session host (session-v1 R9.14 item 3):

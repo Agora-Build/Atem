@@ -28,6 +28,13 @@
 //!   principal `host:…`), whoever writes it; the bridge seals the message's
 //!   current status, enqueues it and clears the mark in one transaction
 //!   ([`sent`], [`clear`]).
+//! - **Launches on message** (`mail_launches`): a host sender's task that
+//!   waits for the session its request's `select` launched (design II.6),
+//!   by the launch's request id and the route it launched on, written with
+//!   the task and the launch's record in the admission transaction
+//!   ([`link_launch`]); the dispatch reads it ([`launch_of`]), and a later
+//!   request naming the route shares a launch still under way
+//!   ([`launches_on`]).
 //! - **The latest status** (`mail_status_sent`): per message, the put
 //!   engine's row of the status sent last. A newer one supersedes it while
 //!   the Station hasn't stored it (the engine settles it: never put again):
@@ -63,6 +70,11 @@ const TABLES: &str = "
     CREATE INDEX IF NOT EXISTS mail_refusals_owed ON mail_refusals(sender_host) WHERE owed=1;
     CREATE INDEX IF NOT EXISTS mail_refusals_keep ON mail_refusals(keep_until);
     CREATE INDEX IF NOT EXISTS mail_refusals_sender ON mail_refusals(sender_host, at_ms);
+    CREATE TABLE IF NOT EXISTS mail_launches (
+        task_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, route_id TEXT NOT NULL,
+        route_revision INTEGER NOT NULL) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS mail_launches_route
+        ON mail_launches(route_id, route_revision, request_id);
     CREATE TABLE IF NOT EXISTS mail_status_owed (message_id TEXT PRIMARY KEY) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS mailbox_refused_report ON mailbox_refused(n) WHERE report=1;
     CREATE TABLE IF NOT EXISTS mail_status_sent (
@@ -81,6 +93,52 @@ const TABLES: &str = "
 pub fn prepare(store: &Store) -> Result<()> {
     store.db.execute_batch(TABLES)?;
     Ok(())
+}
+
+/// Task `task_id` waits for the launch `request_id` on `route_id` at
+/// `revision`, in the admission transaction `tx`.
+pub fn link_launch(
+    tx: &Transaction,
+    task_id: &str,
+    request_id: &str,
+    route_id: &str,
+    revision: u64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO mail_launches(task_id, request_id, route_id, route_revision)
+        VALUES(?1, ?2, ?3, ?4)",
+        params![task_id, request_id, route_id, revision],
+    )?;
+    Ok(())
+}
+
+/// The launch host sender's task `task_id` waits for, if any (none in a
+/// store without admission's tables).
+pub fn launch_of(db: &Connection, task_id: &str) -> Result<Option<String>> {
+    let made: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='mail_launches')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !made {
+        return Ok(None);
+    }
+    Ok(db
+        .query_row(
+            "SELECT request_id FROM mail_launches WHERE task_id=?1",
+            [task_id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// The launches host senders' requests made on `route_id` at `revision`.
+pub fn launches_on(db: &Connection, route_id: &str, revision: u64) -> Result<Vec<String>> {
+    let mut q = db.prepare(
+        "SELECT DISTINCT request_id FROM mail_launches WHERE route_id=?1 AND route_revision=?2",
+    )?;
+    let rows = q.query_map(params![route_id, revision], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// One inbox row as admission reads it (`mailbox_store`'s seam).

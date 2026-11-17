@@ -1774,7 +1774,7 @@ impl HostBridge {
                         expires_at: *expires_at,
                         permit,
                         local_route: None,
-                        delegated: delegated.map(|d| Self::delegated_pending(d, &launch)),
+                            delegated: delegated.map(|d| Self::delegated_pending(d, &launch)),
                     },
                 );
                 self.work.launches.push_back(launch);
@@ -3015,6 +3015,7 @@ mod local_tests {
         include!("delegated/admit_tests.rs");
         include!("delegated/results_tests.rs");
         include!("delegated/remote_stops_tests.rs");
+        include!("delegated/host_launch_tests.rs");
     }
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::broker::{InProcess, Launcher};
