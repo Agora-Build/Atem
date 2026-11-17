@@ -246,6 +246,9 @@ pub(super) struct HostLaunch {
 struct Launching {
     new: Vec<HostLaunch>,
     links: Vec<(String, String, String, u64)>,
+    /// The profiles launched or shared for this request: one launch per
+    /// profile per message (stage 1's; review L6).
+    profiles: HashSet<String>,
 }
 
 /// The ops of every project in effect that lists both `sender` and this
@@ -1149,12 +1152,18 @@ impl HostBridge {
                     }
                 }
                 // A launch no task took isn't reserved (stage 1's).
-                launching.new.retain(|l| {
-                    launching
-                        .links
-                        .iter()
-                        .any(|link| link.1 == l.record.status.request_id)
-                });
+                let (taken, dropped): (Vec<_>, Vec<_>) = std::mem::take(&mut launching.new)
+                    .into_iter()
+                    .partition(|l| {
+                        launching
+                            .links
+                            .iter()
+                            .any(|link| link.1 == l.record.status.request_id)
+                    });
+                launching.new = taken;
+                for l in dropped {
+                    launching.profiles.remove(&l.record.profile_id);
+                }
                 if progress.is_empty() {
                     Delivery::NoMatch {}
                 } else {
@@ -1192,7 +1201,6 @@ impl HostBridge {
         let store = self.work.store.as_ref().unwrap();
         let mut routes: Vec<&Route> = self.work.config.routes.iter().collect();
         routes.sort_by(|a, b| a.id.cmp(&b.id));
-        let mut profiles = HashSet::new();
         for route in routes {
             let named = selectors.iter().any(|s| {
                 matches!(s, Selector::Instance { atem_id, route_id: Some(id) }
@@ -1217,20 +1225,21 @@ impl HostBridge {
                 continue;
             };
             // Under way: reserved by this request's other recipient, or by
-            // an earlier request (still starting, or started and not yet
-            // its route's agent).
+            // an earlier request of the same sender (still starting, or
+            // started and not yet its route's agent).
             let shared = launching
                 .new
                 .iter()
                 .find(|l| l.route.id == route.id)
                 .map(|l| l.record.clone())
-                .or(self.host_launch_under_way(store, route, sessions)?);
+                .or(self.host_launch_under_way(store, route, sender, sessions)?);
             if let Some(record) = shared {
+                launching.profiles.insert(record.profile_id.clone());
                 candidates.push(self.launch_candidate(route, &record, message.created_at));
                 waiting.insert(record.status.session_id, record.status.request_id);
                 continue;
             }
-            if !profiles.insert(profile.id.clone()) {
+            if !launching.profiles.insert(profile.id.clone()) {
                 continue;
             }
             let Some(admission) =
@@ -1273,26 +1282,34 @@ impl HostBridge {
         Ok(())
     }
 
-    /// A launch a host sender's earlier request made on `route` that is
-    /// still under way: not started yet (the launcher has it), or started
-    /// with its session live but not yet the route's agent (its launch
-    /// project not read yet). Its record.
+    /// A launch an earlier request of host sender `sender` made on `route`
+    /// that is still under way (review L6, as stage 1 shares one): not
+    /// started yet (the launcher has it), or started with its session live
+    /// but its launch project not read yet (not yet the route's agent).
+    /// Never another sender's: a launch carries its own sender's admission
+    /// and expiry. Its record.
     fn host_launch_under_way(
         &self,
         store: &Store,
         route: &Route,
+        sender: &str,
         sessions: &BTreeMap<SessionId, BrokerSession>,
     ) -> anyhow::Result<Option<LaunchRecord>> {
+        let principal = host_principal(sender);
         for request_id in admit::launches_on(&store.db, &route.id, route.revision)? {
             let Some(record) = store.launch(&request_id)? else {
                 continue;
             };
-            let live = SessionId::parse(&record.status.session_id)
+            if record.principal != principal {
+                continue;
+            }
+            let session = &record.status.session_id;
+            let live = SessionId::parse(session)
                 .and_then(|id| sessions.get(&id))
                 .is_some_and(|s| s.is_live() && s.process_gen == record.status.process_gen);
             let under_way = match record.status.state {
                 LaunchState::Starting => self.work.pending.contains_key(&request_id),
-                LaunchState::Started => live,
+                LaunchState::Started => live && self.projects.key_of(session).is_none(),
                 _ => false,
             };
             if under_way {

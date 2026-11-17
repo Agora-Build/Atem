@@ -312,3 +312,97 @@ fn a_launch_refused_at_its_spawn_check_fails_its_tasks_with_why() {
         );
     });
 }
+
+/// Review L6: a launch under way is shared as stage 1 shares one, and only
+/// a launch of the same sender: (a) a started launch only while its
+/// session's launch project isn't known yet; (b) one launch per profile
+/// per request, across its recipients; (c) another sender's launch is
+/// never shared (its admission and expiry are its own).
+#[test]
+fn a_launch_is_shared_only_as_stage_1_shares_one() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let _host = hl_host(&mut rig, root, &os);
+        let launches = |rig: &LocalRig| hl_launches(&rig.bridge.work.store.as_ref().unwrap().db);
+        // (c) A launch under way that another sender's request reserved.
+        let first = hl_message(&rig, &["atem:host/rl"], true);
+        hl_admit(&mut rig, &first);
+        let theirs = launches(&rig).remove(0);
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        let mut other = theirs.clone();
+        other.principal = "host:host-c".into();
+        store.save_launch(&other).unwrap();
+        let second = hl_message(&rig, &["atem:host/rl"], true);
+        let tasks = hl_admit(&mut rig, &second);
+        assert_ne!(
+            tasks[0].task.target.session_id, theirs.status.session_id,
+            "not another sender's"
+        );
+        assert_eq!(launches(&rig).len(), 2);
+        // Nothing under way from here: each part starts afresh.
+        let afresh = |rig: &mut LocalRig| {
+            rig.bridge.work.launches.clear();
+            rig.bridge.work.pending.clear();
+            let store = rig.bridge.work.store.as_ref().unwrap();
+            for mut record in launches(rig) {
+                record.status.state = LaunchState::Failed;
+                store.save_launch(&record).unwrap();
+            }
+        };
+        // (a) A started launch whose session's project is known (the rig's
+        // own session stands for it) isn't shared.
+        afresh(&mut rig);
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        let mut known = launches(&rig).remove(0);
+        known.principal = "host:host-b".into();
+        known.status.request_id = uuid::Uuid::new_v4().to_string();
+        known.status.session_id = rig.sid.to_string();
+        known.status.process_gen = rig.sessions[&rig.sid].process_gen.clone();
+        known.status.state = LaunchState::Started;
+        store
+            .db
+            .execute(
+                "INSERT INTO launches(id,record) VALUES(?1,?2)",
+                rusqlite::params![
+                    known.status.request_id,
+                    serde_json::to_string(&known).unwrap()
+                ],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO mail_launches(task_id, request_id, route_id, route_revision)
+                VALUES('t-known', ?1, 'rl', 1)",
+                [&known.status.request_id],
+            )
+            .unwrap();
+        let third = hl_message(&rig, &["atem:host/rl"], true);
+        let tasks = hl_admit(&mut rig, &third);
+        assert_ne!(tasks[0].task.target.session_id, rig.sid.to_string());
+        assert_eq!(rig.bridge.work.launches.len(), 1, "a launch of its own");
+        // (b) Two recipients naming two routes of one profile: one launch.
+        afresh(&mut rig);
+        let mut twin = rig.bridge.work.config.route("rl").unwrap().clone();
+        twin.id = "rl2".into();
+        rig.bridge.work.config.routes.push(twin);
+        let pair = ad_message(
+            &rig,
+            vec![
+                Destination::Select {
+                    selectors: vec!["atem:host/rl2".into()],
+                    budget: 1,
+                    launch: true,
+                },
+                Destination::Select {
+                    selectors: vec!["atem:host/rl".into()],
+                    budget: 1,
+                    launch: true,
+                },
+            ],
+        );
+        hl_admit(&mut rig, &pair);
+        assert_eq!(rig.bridge.work.launches.len(), 1, "one per profile");
+    });
+}
