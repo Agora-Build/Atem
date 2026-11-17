@@ -80,12 +80,6 @@ impl ContextSnapshot {
         self.kind != ContextKind::Result && self.valid_local()
     }
 
-    /// A `result`-kind snapshot that names task `task_id`'s own reply: its
-    /// id `result:<result_id(task_id)>`, otherwise valid as a local one. A
-    /// host sender's `complete` may carry one in place of a `memory` or
-    /// `vault` snapshot, to complete the task with the reply it got back
-    /// (host-work-v1 §11.5; Atem's reading, for Astation). No other
-    /// `result` snapshot leaves its host.
     /// The `result` snapshot naming task `task_id`'s own reply
     /// (host-work-v1 §11.5): id `result:<result_id>`, version 1, its text
     /// exactly `jcs({"digest", "result_id", "task_id"})` with the reply's
@@ -107,6 +101,12 @@ impl ContextSnapshot {
         }
     }
 
+    /// A `result`-kind snapshot that names task `task_id`'s own reply: its
+    /// id `result:<result_id(task_id)>`, otherwise valid as a local one. A
+    /// host sender's `complete` may carry one in place of a `memory` or
+    /// `vault` snapshot, to complete the task with the reply it got back
+    /// (host-work-v1 §11.5; Atem's reading, for Astation). No other
+    /// `result` snapshot leaves its host.
     ///
     /// Exactly the contract's naming ([`ContextSnapshot::naming_reply`]):
     /// a copy of the reply, another version, or a text that isn't the
