@@ -53,6 +53,9 @@ use std::sync::atomic::AtomicU64;
 /// Tries of a row, or a report, that can't be decided before it is settled
 /// (review M2).
 pub(super) const MAX_ADMIT_FAILURES: u32 = 8;
+/// How long, at least, a row or report has kept failing before it is
+/// settled, on the session host's monotonic clock (review N2).
+pub(super) const SETTLE_AFTER_MS: u64 = 60_000;
 /// Inbox rows decided per pass, at most (the inbox holds 128).
 const ROWS_PER_PASS: usize = 128;
 /// Statuses sealed per pass, at most (the rest next pass).
@@ -266,19 +269,22 @@ impl HostBridge {
             }
         };
         // Review M2: one that failed is tried again on the next passes; one
-        // still failing after `MAX_ADMIT_FAILURES` tries is settled, so it
-        // never holds the gate for good. A count goes once its row or
-        // report no longer fails.
+        // still failing after `MAX_ADMIT_FAILURES` tries in a row and
+        // `SETTLE_AFTER_MS` since its first failure on the monotonic clock
+        // (review N2: a passing fault, a lock held a while, settles
+        // nothing) is settled, so it never holds the gate for good. A
+        // count goes once its row or report no longer fails.
+        let now = self.clock.now();
         let mut counts = std::mem::take(&mut self.work.admit_failures);
         for failure in failed {
             let key = failure.key();
-            let tries = counts.remove(&key).unwrap_or(0) + 1;
-            if tries < MAX_ADMIT_FAILURES {
-                self.work.admit_failures.insert(key, tries);
-            } else if self.settle_failure(&signing, &failure, tries) {
-                decided = true;
+            let (tries, first) = counts.remove(&key).unwrap_or((0, now));
+            let tries = tries + 1;
+            let due = tries >= MAX_ADMIT_FAILURES && now.saturating_sub(first) >= SETTLE_AFTER_MS;
+            if !due || !self.settle_failure(&signing, &failure, tries) {
+                self.work.admit_failures.insert(key, (tries, first));
             } else {
-                self.work.admit_failures.insert(key, tries);
+                decided = true;
             }
         }
         // The gate's mailbox part as the inbox now stands, before anything

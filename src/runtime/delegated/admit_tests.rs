@@ -1378,9 +1378,11 @@ fn early_stops_are_never_pruned_under_a_clock_anchor() {
 
 /// Review M2: a row that can't be decided never wedges the gate. Each row
 /// and each report is tried on its own (one that fails skips none of the
-/// others), and one still failing after [`MAX_ADMIT_FAILURES`] tries is
-/// settled as an unreadable record is: refused `busy` to its sender by its
-/// own object id (a request also recorded), removed, one runtime.log line.
+/// others), and one still failing after [`MAX_ADMIT_FAILURES`] tries in a
+/// row and at least a minute on the monotonic clock since its first
+/// failure (review N2: a passing fault settles nothing) is settled as an
+/// unreadable record is: refused `busy` to its sender by its own object id
+/// (a request also recorded), removed, one runtime.log line.
 #[test]
 fn a_row_that_cant_be_decided_is_settled_after_bounded_tries() {
     use super::super::delegated_admit_pass::MAX_ADMIT_FAILURES;
@@ -1429,9 +1431,15 @@ fn a_row_that_cant_be_decided_is_settled_after_bounded_tries() {
         ad_admit(&mut rig);
         assert_eq!(ad_tasks(&rig, &next).len(), 1, "the next row admitted");
         assert_eq!(ad_inbox_rows(&rig), 1, "the failing cancel kept");
-        for _ in 1..MAX_ADMIT_FAILURES {
+        for _ in 1..MAX_ADMIT_FAILURES + 4 {
             ad_admit(&mut rig);
         }
+        assert_eq!(ad_inbox_rows(&rig), 1, "not within a minute");
+        rig.bridge.clock.skip(59_000);
+        ad_admit(&mut rig);
+        assert_eq!(ad_inbox_rows(&rig), 1, "not within a minute");
+        rig.bridge.clock.skip(1_000);
+        ad_admit(&mut rig);
         assert_eq!(ad_inbox_rows(&rig), 0, "settled");
         assert!(ad_statuses(&rig).iter().any(|(_, s)| *s
             == ResultPlain::Refusal {
@@ -1441,6 +1449,29 @@ fn a_row_that_cant_be_decided_is_settled_after_bounded_tries() {
         mb_tick(&mut rig, &mut host, 0);
         assert_eq!(mb_store(&rig).inbox, 0, "the gate's inbox part drained");
         db(&rig, "DROP TRIGGER ad_block");
+    });
+}
+
+/// Review N2: admission's failure counts belong to a store: a new host
+/// identity (its store moved aside, the next one's rows numbered from 1
+/// again) starts with none.
+#[test]
+fn admission_failure_counts_go_with_the_store() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let _host = sp_host(&mut rig, root, &os);
+        rig.bridge
+            .work
+            .admit_failures
+            .insert("row:1".into(), (7, 0));
+        let other = HostTarget {
+            account_id: "acct".into(),
+            atem_device_id: "host".into(),
+            host_trust_gen: 2,
+        };
+        assert!(rig.bridge.work_store_ready(&other));
+        assert!(rig.bridge.work.admit_failures.is_empty());
     });
 }
 

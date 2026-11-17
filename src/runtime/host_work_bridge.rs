@@ -264,9 +264,11 @@ pub(super) struct State {
     /// What the mailbox keeps at most (`mailbox_store::Limits`; tests lower
     /// them).
     mail_limits: crate::runtime::delegated::mailbox_store::Limits,
-    /// Admission's rows and reports that failed, by key, with their tries
-    /// so far (review M2: one is settled after a bound).
-    admit_failures: HashMap<String, u32>,
+    /// Admission's rows and reports that failed, by key: their tries in a
+    /// row so far and when the first of them failed, on the session host's
+    /// monotonic clock (reviews M2, N2: one is settled after a bound of
+    /// both). This store's: cleared when another opens.
+    admit_failures: HashMap<String, (u32, u64)>,
     /// The mailbox committed objects since admission last ran: it runs on
     /// the next pass (review L1; else on the scheduling pass's cadence).
     admit_due: bool,
@@ -610,6 +612,9 @@ impl HostBridge {
                     let prepared = !(self.features.delegated && self.work.config.enabled)
                         || FeedStore::prepare(&store).is_ok();
                     self.work.store = Some(store);
+                    // Admission's failure counts are a store's (its rows'
+                    // numbers; review N2).
+                    self.work.admit_failures.clear();
                     // Read once it opened (with the hook only: off, nothing
                     // reads it, as on main).
                     self.work.kept = (!prepared).then_some(KeptControls::Unreadable);
@@ -1461,6 +1466,9 @@ impl HostBridge {
                     clock.moved(&store);
                 }
                 self.work.store = Some(store);
+                // The new store numbers its inbox rows afresh: no failure
+                // count of the old one's carries over (review N2).
+                self.work.admit_failures.clear();
                 true
             }
             Err(_) => false,
