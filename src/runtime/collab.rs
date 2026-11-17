@@ -293,6 +293,10 @@ pub(super) enum Frame {
         task_id: String,
         from_session: String,
     },
+    /// Another host's reply to `task_id`, a task of a message this session
+    /// sent there, delivered to it as data (delegated host-work design
+    /// II.4.4): `sender` is that host's principal, `host:<host_id>`.
+    HostResult { task_id: String, sender: String },
 }
 
 /// What the agent reads for `record` (delegated host-work design III.2):
@@ -321,6 +325,11 @@ pub(super) fn task_prompt<'a>(
                 sender: "local",
                 session: from_session,
             },
+            None,
+            Some(Closing::Complete { task_id }),
+        ),
+        Some(Frame::HostResult { task_id, sender }) => (
+            Header::HostResult { task_id, sender },
             None,
             Some(Closing::Complete { task_id }),
         ),
@@ -362,10 +371,11 @@ pub(super) fn task_prompt<'a>(
         // A local task's context and a local reply's were read back by this
         // runtime itself (a memory after publishing it, a vault entry twice);
         // a remote sender's are its own claim, whose text matches the digest
-        // it gave. A delivery of another host's reply (the cross-instance
-        // return grant, not built) will need its own choice: its context is
-        // that host's snapshot, though the delivery record is `local`.
-        snapshots: if record.principal == "local" {
+        // it gave, and so are another host's reply's, though its delivery
+        // record is `local`.
+        snapshots: if record.principal == "local"
+            && !matches!(frame, Some(Frame::HostResult { .. }))
+        {
             Snapshots::ReadBack
         } else {
             Snapshots::FromSender

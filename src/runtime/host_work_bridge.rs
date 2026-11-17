@@ -77,6 +77,8 @@ mod delegated_launches;
 mod delegated_recovery;
 #[path = "delegated/requests.rs"]
 mod delegated_requests;
+#[path = "delegated/results_pass.rs"]
+mod delegated_results_pass;
 #[path = "delegated/send_pass.rs"]
 mod delegated_send_pass;
 
@@ -272,6 +274,12 @@ pub(super) struct State {
     /// The mailbox committed objects since admission last ran: it runs on
     /// the next pass (review L1; else on the scheduling pass's cadence).
     admit_due: bool,
+    /// The mailbox kept an object since the sending host's results were
+    /// last judged (or a status they wait for was recorded): judged on the
+    /// next pass (else once a minute, `results_pass`).
+    results_due: bool,
+    /// When the kept results were last judged.
+    results_drained_at: Option<Instant>,
     /// Tests: at the mailbox's crash point (after a page's commit, before
     /// its dones), the dones the store owed and the positions of the dones
     /// live then.
@@ -379,6 +387,8 @@ impl State {
             mail_limits: Default::default(),
             admit_failures: HashMap::new(),
             admit_due: true,
+            results_due: true,
+            results_drained_at: None,
             #[cfg(test)]
             mail_crash_probe: Vec::new(),
             ack_failures: 0,
@@ -1321,6 +1331,9 @@ impl HostBridge {
                 self.work.recheck_tasks = true;
                 self.work.recheck_grants = true;
             }
+            // The sending host's results back: what came back judged, the
+            // replies delivered or kept, before this pass dispatches.
+            self.results_pass(cx.sessions);
             let passed = self
                 .collab_pass(cx, self.work.recheck_grants)
                 .and_then(|looked| {
@@ -2729,6 +2742,19 @@ impl HostBridge {
         {
             r.status.state = WorkState::Completed;
             r.status.result = Some(result.snapshot());
+            r.status.detail = "explicit result delivered to the originating agent".into();
+            return Ok(());
+        }
+        // Another host's reply delivered (design II.4.4): the same.
+        if receipt.state == ReceiptState::Completed
+            && let Some(store) = self.work.store.as_ref()
+            && let Ok(Some((task_id, host_id, reply))) =
+                crate::runtime::delegated::results_back::delivery_of(&store.db, &r.task.task_id)
+        {
+            r.status.state = WorkState::Completed;
+            r.status.result = Some(crate::runtime::delegated::results_back::snapshot(
+                &task_id, &host_id, &reply,
+            ));
             r.status.detail = "explicit result delivered to the originating agent".into();
             return Ok(());
         }
