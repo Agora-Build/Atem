@@ -193,22 +193,38 @@ pub fn keep_stop(
     Ok(true)
 }
 
-/// The early stops of `sender_host` naming `task_id`, taken: the kinds
-/// (`cancel`, `complete`) of those kept at its `standing` now (generation,
-/// epoch); the others are dropped.
+/// An early stop taken at its request's admission ([`take_stops`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TakenStop {
+    /// Its own object id: what answers it when it isn't reached.
+    pub object_id: String,
+    /// `cancel` or `complete`.
+    pub kind: String,
+    /// Kept at its sender's standing now (generation, epoch); else it no
+    /// longer applies (review L5).
+    pub current: bool,
+}
+
+/// The early stops of `sender_host` naming `task_id`, taken (all of them,
+/// by object id): each with whether it still applies, so the ones that
+/// don't are answered (review N3).
 pub fn take_stops(
     tx: &Transaction,
     sender_host: &str,
     task_id: &str,
     standing: (u64, u64),
-) -> Result<Vec<String>> {
-    let kinds: Vec<String> = {
+) -> Result<Vec<TakenStop>> {
+    let stops: Vec<TakenStop> = {
         let mut q = tx.prepare(
-            "SELECT kind FROM mail_stops WHERE sender_host=?1 AND task_id=?2
-            AND generation=?3 AND epoch=?4",
+            "SELECT object_id, kind, generation=?3 AND epoch=?4 FROM mail_stops
+            WHERE sender_host=?1 AND task_id=?2 ORDER BY object_id",
         )?;
         q.query_map(params![sender_host, task_id, standing.0, standing.1], |r| {
-            r.get(0)
+            Ok(TakenStop {
+                object_id: r.get(0)?,
+                kind: r.get(1)?,
+                current: r.get(2)?,
+            })
         })?
         .collect::<rusqlite::Result<_>>()?
     };
@@ -216,7 +232,7 @@ pub fn take_stops(
         "DELETE FROM mail_stops WHERE sender_host=?1 AND task_id=?2",
         [sender_host, task_id],
     )?;
-    Ok(kinds)
+    Ok(stops)
 }
 
 /// Early stops whose object expired by `now_ms` (the delegated clock's

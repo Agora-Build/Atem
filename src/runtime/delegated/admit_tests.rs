@@ -1666,7 +1666,8 @@ fn a_duplicate_of_an_admitted_request_sends_its_status_again() {
 /// Review L5 (design II.7, "Interactions after a readmit"): an early stop
 /// is bound to its sender's authorization generation and membership epoch
 /// when it was kept. B revoked and readmitted since, its cancel kept before
-/// no longer applies: the task its request makes after the readmit queues.
+/// no longer applies: the task its request makes after the readmit queues,
+/// and the cancel is answered `forbidden` by its own id (review N3).
 #[test]
 fn an_early_stop_kept_before_a_readmit_no_longer_applies() {
     local_test(async |root| {
@@ -1689,7 +1690,7 @@ fn an_early_stop_kept_before_a_readmit_no_longer_applies() {
             }],
         );
         let task_id = message.recipients[0].recipient_id.clone();
-        ad_inbox_stop(&rig, &task_id, false, host_now().wall_ms + HOUR);
+        let stop = ad_inbox_stop(&rig, &task_id, false, host_now().wall_ms + HOUR);
         ad_admit(&mut rig);
         assert_eq!(
             admit::stops(&rig.bridge.work.store.as_ref().unwrap().db)
@@ -1712,6 +1713,69 @@ fn an_early_stop_kept_before_a_readmit_no_longer_applies() {
                 .unwrap()
                 .is_empty(),
             "dropped, not applied"
+        );
+        assert!(ad_statuses(&rig).iter().any(|(_, s)| *s
+            == ResultPlain::Refusal {
+                object_id: stop.clone(),
+                refused: "forbidden".into()
+            }));
+    });
+}
+
+/// Review N3: a `complete` opened before its request is kept as an early
+/// stop and taken at the request's admission, where its task is queued,
+/// not awaiting its result: not reached, it is answered `busy` by its own
+/// id; an early cancel of the same task is applied.
+#[test]
+fn an_early_complete_is_answered_by_its_own_id() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let _host = sp_host(&mut rig, root, &os);
+        let host_target = ad_here(&rig);
+        let message = ad_message(
+            &rig,
+            vec![Destination::Agent {
+                route_id: "rh".into(),
+                route_revision: 1,
+                target: wire::Target {
+                    account_id: host_target.account_id.clone(),
+                    atem_device_id: host_target.atem_device_id.clone(),
+                    host_trust_gen: host_target.host_trust_gen,
+                    session_id: rig.sid.to_string(),
+                    process_gen: rig.sessions[&rig.sid].process_gen.clone(),
+                },
+            }],
+        );
+        let task_id = message.recipients[0].recipient_id.clone();
+        let expires = host_now().wall_ms + HOUR;
+        let complete = ad_inbox_stop(&rig, &task_id, true, expires);
+        let cancel = ad_inbox_stop(&rig, &task_id, false, expires);
+        ad_admit(&mut rig);
+        assert_eq!(
+            admit::stops(&rig.bridge.work.store.as_ref().unwrap().db)
+                .unwrap()
+                .len(),
+            2
+        );
+        ad_inbox_request(&rig, &message);
+        ad_admit(&mut rig);
+        assert_eq!(
+            ad_tasks(&rig, &message)[0].status.state,
+            WorkState::Cancelled
+        );
+        let refusals: Vec<ResultPlain> = ad_statuses(&rig)
+            .into_iter()
+            .map(|(_, s)| s)
+            .filter(|s| matches!(s, ResultPlain::Refusal { .. }))
+            .collect();
+        assert_eq!(
+            refusals,
+            [ResultPlain::Refusal {
+                object_id: complete,
+                refused: "busy".into()
+            }],
+            "the cancel applied: no refusal of {cancel}"
         );
     });
 }

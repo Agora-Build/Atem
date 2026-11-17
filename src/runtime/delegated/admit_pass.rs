@@ -683,12 +683,23 @@ impl HostBridge {
             return Err(error);
         }
         // Early stops of its tasks (ruling R38): a cancel cancels it now;
-        // a complete finds it queued, not reached.
+        // a complete finds it queued, not reached, `busy`; one kept before
+        // a revoke and a readmit, or a removal and a re-add, no longer
+        // applies, `forbidden` (review L5). What isn't reached is answered
+        // by its own id (ruling R48, review N3).
         for task in &mut tasks {
-            for kind in admit::take_stops(tx, sender, &task.task.task_id, standing)? {
-                if kind == "cancel" {
-                    task.status.state = WorkState::Cancelled;
-                    task.status.detail = CANCELLED_BEFORE_SUBMISSION.into();
+            for stop in admit::take_stops(tx, sender, &task.task.task_id, standing)? {
+                let unreached = match (stop.current, stop.kind.as_str()) {
+                    (false, _) => Some("forbidden"),
+                    (true, "cancel") => {
+                        task.status.state = WorkState::Cancelled;
+                        task.status.detail = CANCELLED_BEFORE_SUBMISSION.into();
+                        None
+                    }
+                    (true, _) => Some("busy"),
+                };
+                if let Some(code) = unreached {
+                    signing.refusal(tx, sender, &stop.object_id, code)?;
                 }
             }
         }
