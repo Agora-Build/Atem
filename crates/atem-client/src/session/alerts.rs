@@ -495,6 +495,25 @@ mod tests {
                 "{field} {value}"
             );
         }
+        // A UUID v5 task is a host sender's selector task (host-work-v1
+        // §11.5): taken from a `host:` sender only.
+        let v5 = alert(1, 0);
+        assert!(
+            Alert {
+                task_id: "80160896-4fcd-5e6e-adac-98bac5497321".into(),
+                sender: "host:host-b".into(),
+                ..v5.clone()
+            }
+            .valid()
+        );
+        assert!(
+            !Alert {
+                task_id: "80160896-4fcd-5e6e-adac-98bac5497321".into(),
+                sender: "member:dev-phone".into(),
+                ..v5
+            }
+            .valid()
+        );
         // A reason with a Cf character (bidi controls, zero-width
         // characters) is refused, as a failed resolution's detail is.
         for reason in ["a\u{202E}b", "\u{200B}agent exited", "x\u{2066}"] {

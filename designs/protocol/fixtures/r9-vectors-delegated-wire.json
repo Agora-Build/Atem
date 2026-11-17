@@ -625,6 +625,31 @@
           "kind": "prompt",
           "op": "receipt",
           "request_id": "44444444-4444-4444-8444-000000000001",
+          "sender": "member:dev-phone",
+          "state": "executing",
+          "target": {
+            "account_id": "acct-test-1",
+            "atem_device_id": "host-a",
+            "host_trust_gen": 1,
+            "process_gen": "22222222-2222-4222-8222-222222222222",
+            "session_id": "ses-aaaaaaaaaaaa"
+          },
+          "task_id": "80160896-4fcd-5e6e-adac-98bac5497321",
+          "updated_at": 1793620800000,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "receipt_provenance_selector_task_of_a_member",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "kind": "prompt",
+          "op": "receipt",
+          "request_id": "44444444-4444-4444-8444-000000000001",
           "sender": "local",
           "state": "executing",
           "target": {
