@@ -3160,9 +3160,12 @@ mod tests {
         )
     }
 
-    /// Polls `done` for up to five seconds.
+    /// Polls `done` every 100 ms for up to 30 seconds: a fresh `atem
+    /// cred-agent` process on a loaded CI runner (the whole suite in
+    /// parallel) can take more than five to answer. It returns as soon as
+    /// `done` holds, so the bound only limits a failure.
     pub(super) fn eventually(mut done: impl FnMut() -> bool) -> bool {
-        for _ in 0..50 {
+        for _ in 0..300 {
             if done() {
                 return true;
             }
