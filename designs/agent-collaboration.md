@@ -5,7 +5,9 @@ prompt framing); sections 10 and 17 give its lifecycle, retention and
 known limits. Agents in one Atem runtime can send work and reply through the
 existing host queue. **Not implemented (planned):** cross-instance delivery,
 agents on different instances as host senders, see
-[delegated-host-work.md](delegated-host-work.md), Part II.
+[delegated-host-work.md](delegated-host-work.md), Part II. Its sending side
+(planning from the device list, sealing and the puts, section 7) is built
+behind a debug-only hook that no release build turns on.
 Security is at user authentication and authorization (section 6): a principal
 allowed to reach an agent acts through it with the local user's permissions,
 `atem message send` included, so a route that lists `local` takes work from
@@ -360,6 +362,13 @@ itself. Per target instance, a delivery row moves through
   tasks are committed there. It means delivered, not executed.
 - A new host identity fails the outbox's pending rows, with the rest of the
   database ([agent-hosting.md](agent-hosting.md) section 9).
+
+**Cross-instance (built behind the debug-only hook; host-work-v1 §11.5, "On
+the sending host"):** a host sender's delivery row holds the envelope sealed
+once for its host, committed with the message before any put; the same
+bytes go to that host's mailbox again every 10 minutes until the row is
+accepted, refused or expired (no new task, no new seal). `accepted` waits
+for the receiver's status objects, which aren't read yet.
 
 ## 8. Publish before notify
 
