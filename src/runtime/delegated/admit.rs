@@ -8,10 +8,12 @@
 //! - **Early stops** (`mail_stops`, ruling R38): a `cancel` or `complete`
 //!   opened before its request (a free between two pages can open a later
 //!   object of a sender first) is kept, bound to its sender, its own object
-//!   id and the task it names, until its object's expiry; at most
-//!   [`MAX_EARLY_STOPS`] per sender (one more stays in the inbox,
-//!   back-pressure as ruling R31's). Its request's admission takes it
-//!   ([`take_stops`]) in its own transaction.
+//!   id, the task it names and its sender's generation and epoch, until its
+//!   object's expiry (the mailbox's minute prune drops it, never under a
+//!   clock anchor: [`prune_stops`]); at most [`MAX_EARLY_STOPS`] per sender
+//!   (one more stays in the inbox, held, back-pressure as ruling R31's,
+//!   holding only its sender's task starts, ruling R47). Its request's
+//!   admission takes it ([`take_stops`]) in its own transaction.
 //! - **Whole refusals** (`mail_refusals`): a request admission refused as a
 //!   whole (the sender, the message id, its digest and the code), kept
 //!   beside the host-work message records, which are never deleted: a
