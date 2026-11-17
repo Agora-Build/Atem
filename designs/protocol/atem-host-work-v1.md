@@ -3631,11 +3631,15 @@ exactly as without this section):
   it expires; `id_reused` and `expired` refuse the row with the code. A row
   already stored stays `sent` when the Station refuses a later copy (its
   code recorded): the first copy may be running on the receiver; a Station
-  `expired` there is the row's expiry. Rule 8: at most 8 puts live per link generation, a put unanswered for 35
-  s again with a fresh id, every live put retired at a new link generation
-  or an identity change (nothing more put on that socket). The schedule and
-  expiry are on the delegated clock (design I.6.5): with no reading nothing
-  is put.
+  `expired` there is the row's expiry. A row whose bytes no longer read is
+  refused `malformed`, never put.
+- Rules 1 and 8: puts go only after a `heads` on the link generation that
+  announces this host's mailbox (the Station's association of the link),
+  as the mailbox's own calls; at most 8 live per link generation; a put
+  unanswered for 35 s again with a fresh id; every live put retired at a
+  new link generation or an identity change (nothing more put on that
+  socket). The schedule, expiry and answers are on the delegated clock
+  (design I.6.5): with no reading nothing is put, expired or written.
 
 The receiving host's mailbox on the Station (design II.4.3): a sending host
 puts objects over its own link, and the receiving host syncs its own mailbox
