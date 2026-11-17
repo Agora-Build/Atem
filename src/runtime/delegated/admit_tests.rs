@@ -1694,6 +1694,71 @@ fn a_duplicate_of_an_admitted_request_sends_its_status_again() {
     });
 }
 
+/// Review N4: ruling R45 re-owes a status only for the sender's own resend,
+/// a copy at a position beyond the furthest this host has read in the
+/// mailbox. The same copy read again after a rewind (ruling R31) or after
+/// a reset under the same mailbox id owes nothing; a resend at a new
+/// position does.
+#[test]
+fn a_reread_of_an_admitted_request_owes_no_status() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        let message = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
+        let object = ad_request(&rig, &host, &message);
+        ad_deliver(&mut rig, &mut host, std::slice::from_ref(&object));
+        ad_admit(&mut rig);
+        rig.bridge.mail_statuses();
+        assert_eq!(ad_statuses(&rig).len(), 1);
+        // A rewind: the cursor back before it, the furthest read kept.
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute_batch("UPDATE mailbox_cursor SET cursor=0")
+            .unwrap();
+        ad_deliver(&mut rig, &mut host, std::slice::from_ref(&object));
+        assert_eq!(mb_store(&rig).cursor.map(|(_, at)| at), Some(1));
+        rig.bridge.mail_statuses();
+        assert_eq!(ad_statuses(&rig).len(), 1, "a rewind's re-read owes none");
+        // A reset under the same mailbox id: read again from 0.
+        let identity = crate::runtime::delegated::sync::HostIdentity {
+            host: rig.bridge.work_host(),
+            genesis: Some(
+                rig.bridge
+                    .membership
+                    .as_ref()
+                    .unwrap()
+                    .membership()
+                    .genesis_hash(),
+            ),
+            host_key: rig
+                .bridge
+                .host_key
+                .as_ref()
+                .and_then(|key| key.public_key()),
+        };
+        crate::runtime::delegated::mailbox_store::mark_reset(
+            rig.bridge.work.store.as_ref().unwrap(),
+            &identity,
+            MB_MAILBOX,
+        )
+        .unwrap();
+        ad_deliver(&mut rig, &mut host, std::slice::from_ref(&object));
+        assert_eq!(mb_store(&rig).cursor.map(|(_, at)| at), Some(1));
+        rig.bridge.mail_statuses();
+        assert_eq!(ad_statuses(&rig).len(), 1, "a reset's re-read owes none");
+        // The sender's own resend, stored again at a new position.
+        ad_deliver(&mut rig, &mut host, &[object]);
+        assert_eq!(mb_store(&rig).cursor.map(|(_, at)| at), Some(2));
+        rig.bridge.mail_statuses();
+        assert_eq!(ad_statuses(&rig).len(), 2, "its resend's status goes again");
+    });
+}
+
 /// Review L5 (design II.7, "Interactions after a readmit"): an early stop
 /// is bound to its sender's authorization generation and membership epoch
 /// when it was kept. B revoked and readmitted since, its cancel kept before
