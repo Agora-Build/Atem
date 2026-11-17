@@ -147,6 +147,47 @@ impl Signing {
         }
     }
 
+    /// The result of `task_id` (a host sender's task) to its sender, its
+    /// reply as `reply_query` returns it once `submitted` (design II.4.4),
+    /// enqueued in `tx` and recorded sent; none owed when it can't go: the
+    /// reply isn't submitted (or no longer kept), or the sender can't
+    /// receive one (no key, no longer a current host, or another key than
+    /// the one its message came under). The owner still reads the reply.
+    fn result(&self, tx: &Transaction, store: &Store, task_id: &str) -> anyhow::Result<()> {
+        use crate::runtime::collab::results::{self, ReplyState};
+        use crate::runtime::delegated::results_back;
+        let reply = results::load(tx, task_id)?
+            .filter(|row| row.state == ReplyState::Submitted && !row.reply.dropped);
+        let task = store.work(task_id)?;
+        let record = task
+            .as_ref()
+            .and_then(|t| t.message.as_ref())
+            .map(|frame| store.message(&frame.message_id))
+            .transpose()?
+            .flatten();
+        let (Some(reply), Some(task), Some(record)) = (reply, task, record) else {
+            return results_back::clear_result(tx, task_id);
+        };
+        let plain = ResultPlain::Result {
+            task_id: task_id.to_owned(),
+            reply: reply.wire(),
+        };
+        let sealed = parse_host_principal(&task.principal)
+            .filter(|sender| {
+                self.list.host(sender).is_some_and(|h| {
+                    record.sender_key == json!(host_principal_key(&h.host_key).to_hex())
+                })
+            })
+            .and_then(|sender| self.seal(sender, &plain));
+        match sealed {
+            Some((bytes, to)) => {
+                let n = outbox::enqueue(tx, &bytes, &to, Policy::UntilStored)?;
+                results_back::result_sent(tx, task_id, n)
+            }
+            None => results_back::clear_result(tx, task_id),
+        }
+    }
+
     /// `{"kind":"status","object_id","refused":code}` to `sender`,
     /// enqueued in `tx` (none when it can't receive one).
     fn refusal(
@@ -533,6 +574,32 @@ impl HostBridge {
                 });
                 let dropped = store.immediate().and_then(|tx| {
                     admit::clear(&tx, &message_id)?;
+                    Ok(tx.commit()?)
+                });
+                if dropped.is_err() {
+                    return;
+                }
+            }
+        }
+        // The results owed (design II.4.4): each reply sealed for its
+        // sender in its own transaction; one that can't be built is dropped
+        // with a line, never blocking the others (the owner reads it).
+        let owed =
+            crate::runtime::delegated::results_back::owed_results(&store.db, STATUSES_PER_PASS)
+                .unwrap_or_default();
+        for task_id in owed {
+            let sealed = store.immediate().and_then(|tx| {
+                signing.result(&tx, store, &task_id)?;
+                Ok(tx.commit()?)
+            });
+            if let Err(error) = sealed {
+                super::delegated_mail_pass::log_limited(&UNSEALED, || {
+                    format!(
+                        "atem runtime: task {task_id}'s result not sent to its host sender ({error:#})"
+                    )
+                });
+                let dropped = store.immediate().and_then(|tx| {
+                    crate::runtime::delegated::results_back::clear_result(&tx, &task_id)?;
                     Ok(tx.commit()?)
                 });
                 if dropped.is_err() {

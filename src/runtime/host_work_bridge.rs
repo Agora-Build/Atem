@@ -2950,6 +2950,7 @@ mod local_tests {
         include!("delegated/mail_pass_tests.rs");
         include!("delegated/send_pass_tests.rs");
         include!("delegated/admit_tests.rs");
+        include!("delegated/results_tests.rs");
     }
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::broker::{InProcess, Launcher};

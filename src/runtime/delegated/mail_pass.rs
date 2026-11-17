@@ -82,11 +82,13 @@ impl HostBridge {
         if let Some((store, identity)) = self.mail_store()
             && self.work.mail_prepared.as_ref() != Some(&identity.host)
         {
-            // The sending host's outbox tables too (`remote_send`), and
-            // admission's (`admit`).
+            // The sending host's outbox tables too (`remote_send`),
+            // admission's (`admit`) and the results back's
+            // (`results_back`).
             match mailbox_store::prepare(store)
                 .and_then(|()| crate::runtime::delegated::remote_send::prepare(store))
                 .and_then(|()| crate::runtime::delegated::admit::prepare(store))
+                .and_then(|()| crate::runtime::delegated::results_back::prepare(store))
             {
                 Ok(()) => self.work.mail_prepared = Some(identity.host),
                 Err(error) => log_limited(&UNPREPARED, || {
