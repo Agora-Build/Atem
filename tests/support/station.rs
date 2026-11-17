@@ -1849,6 +1849,98 @@ impl Drop for Pump {
     }
 }
 
+impl FakeStation {
+    /// The host this fake serves: its link's association.
+    pub fn host(&self) -> (String, u64) {
+        (self.host_id.clone(), self.host_trust_gen)
+    }
+
+    /// The objects the mailbox of `host_id` in `host_trust_gen` stores now,
+    /// taken out of this fake (a [`Courier`] moves them to the fake that
+    /// serves that host).
+    pub fn take_stored(&mut self, host_id: &str, host_trust_gen: u64) -> Vec<SignedObject> {
+        let now = self.now();
+        let mailbox = self.mailbox_of(host_id, host_trust_gen, now);
+        std::mem::take(&mut mailbox.stored)
+            .into_values()
+            .map(|stored| stored.object)
+            .collect()
+    }
+
+    /// `object`, put by the host `host_id` in `host_trust_gen` (a host
+    /// another fake serves), stored here as that host's put is (rules 1
+    /// and 3): whether it was stored. Its answer would go to that host's
+    /// own link, which already had one: dropped, and a lost answer the test
+    /// set for this fake's own host isn't used up by it.
+    pub fn deliver(&mut self, host_id: &str, host_trust_gen: u64, object: SignedObject) -> bool {
+        let put = MailboxPut::new(uuid::Uuid::new_v4().to_string(), object)
+            .to_json()
+            .expect("a put")
+            .to_string();
+        let lost = std::mem::take(&mut self.drop_stored);
+        let answer = self.put(host_id, host_trust_gen, put.as_bytes());
+        self.drop_stored = lost;
+        answer.is_some_and(|a| a.contains("\"mailbox_stored\""))
+    }
+}
+
+/// Two fake Stations as one Station, for two real hosts each on its own
+/// fake Astation (the same origin and account, host-work-v1 §11.5 "Same
+/// Station"): what one host puts into the other's mailbox is moved, every
+/// 20 ms, into the fake that serves the other, as that host's put (its
+/// rules, quotas and idempotency there: a copy put again after the first
+/// was moved is stored again only once the first is done). Each fake keeps
+/// serving its own host's link ([`Pump`]). It stops when dropped.
+pub struct Courier {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Courier {
+    pub fn start(
+        a: std::sync::Arc<std::sync::Mutex<FakeStation>>,
+        b: std::sync::Arc<std::sync::Mutex<FakeStation>>,
+    ) -> Courier {
+        use std::sync::atomic::Ordering;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        let lock = |s: &std::sync::Arc<std::sync::Mutex<FakeStation>>| {
+            s.lock().unwrap_or_else(|e| e.into_inner()).host()
+        };
+        let thread = std::thread::spawn(move || {
+            while !stopped.load(Ordering::SeqCst) {
+                for (from, to) in [(&a, &b), (&b, &a)] {
+                    let (sender, sender_gen) = lock(from);
+                    let (receiver, receiver_gen) = lock(to);
+                    let objects = from
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take_stored(&receiver, receiver_gen);
+                    for object in objects {
+                        to.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .deliver(&sender, sender_gen, object);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        Courier {
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Courier {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// Whether `bytes` is a `host_route` (the host's answer to a challenge).
 fn is_host_route(bytes: &str) -> bool {
     serde_json::from_str::<Value>(bytes)
