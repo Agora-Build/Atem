@@ -618,7 +618,7 @@ Every apply prints one line per target:
 ### Verify in plan task 1
 
 Verified 2026-09-24 on this machine. All targets assumed by the spec and by
-the `Agent::*` path functions in Task 10 are confirmed correct; no path
+the `Agent::*` path functions (`src/memory/adapters.rs`) are confirmed correct; no path
 changes needed.
 
 **Claude (tested live, `claude -p`, in a scratch `mktemp -d` git repo, deleted
@@ -672,7 +672,7 @@ live `codex exec` canary test would have required editing the user's real
   user-level directory is `~/.agents/skills` and the project-level directory
   is `.agents/skills`, scanned from cwd up through parent directories to the
   repo root. Confirms Codex `skills_root` = `~/.agents/skills` (global) and
-  `<repo>/.agents/skills` (project) — matching the spec and Task 10 exactly.
+  `<repo>/.agents/skills` (project) — matching the spec and the `Agent::*` path functions exactly.
   `SKILL.md` requires `name` and `description` frontmatter, same as Claude's
   skill format; no feature flag needed (skills are on by default).
 - Local-install observation (not a contradiction, just noted): this
@@ -683,7 +683,7 @@ live `codex exec` canary test would have required editing the user's real
   path above. `codex --version` on this machine: `codex-cli 0.155.0`
   (`@openai/codex`).
 
-No `Agent::*` path function in Task 10 needs to change:
+No `Agent::*` path function (`src/memory/adapters.rs`) needs to change:
 `global_memory_file`/`project_memory_file`/`skills_root` for both `Claude`
 and `Codex` already match verified reality.
 

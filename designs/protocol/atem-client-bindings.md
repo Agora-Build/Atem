@@ -345,7 +345,8 @@ Effects and timers:
   binding enforces it); show `pending_recovery`; `fetch_to(log)` → fetch
   up to that head and `extend` the log (never adopt it unverified).
   `verifier` is the host verifier's inventory, absent when the host sent
-  none (Atem's proposal; see "The verifier's inventory" below).
+  none (Atem's proposal, agreed with Astation (2026-11-13, #120 comment 6848326392); see "The verifier's
+  inventory" below).
 - **`ClientEvent::Outgoing{frame}`**: send it now (a chat resync `open`).
 - **`ClientEvent::MembershipHead{head, pending_recovery}`**: as `fetch_to`.
 - **`ClientEvent::Fenced{code, detail}`**: the attachment is over
@@ -611,8 +612,7 @@ key, `verify_host_enc_sig` on every `enc_sig` whose binding fields parse,
 and (Kotlin and Swift, whose providers see the request) the signing
 purposes.
 
-**The verifier's inventory** (**Atem's proposal, for Astation's
-agreement**; session-v1 R9.2 "How a verifier reports itself").
+**The verifier's inventory** (**Atem's proposal, agreed with Astation (2026-11-13, #120 comment 6848326392)**; session-v1 R9.2 "How a verifier reports itself").
 `verifier_inventory()` returns `VerifierInventory{version, actions}` (JS
 `verifierInventory()`: `{version, actions}`). It describes this binding's
 own verifier: version 2, the sixteen actions `MembershipLog` accepts,
@@ -623,8 +623,8 @@ one. Atem hosts send one in every welcome from the first release that
 carries this change; hosts from v0.8.0 to v0.8.5 send none. It is the
 host's claim about itself and never opens the gate alone.
 
-How a signer's gate uses it (**Atem's proposal, for Astation's
-agreement**; session-v1 R9.2 "How the signing gate uses it"). It says when
+How a signer's gate uses it (**Atem's proposal, agreed with Astation (2026-11-13, #120 comment 6848326392), its adoption
+closed until the shared `required_version` helper exists**; session-v1 R9.2 "How the signing gate uses it"). It says when
 a verifier is confirmed, and it extends the gate to three scope ops:
 
 - Versions only widen. A version lists every action of the one before it

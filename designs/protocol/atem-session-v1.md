@@ -1676,8 +1676,7 @@ and every later append refused until the journal is reopened.
    within 8 MiB, `MAX_RECORD_BYTES`): an entry that would is refused, and
    nothing is written (R9.14 item 4 says what that means for a withdrawal;
    a failed admission write has halted the journal first, so it never
-   meets a full list in practice). (**Changed agreed meaning, needs
-   Astation's agreement**: §I.2 named neither rule. Before them the only
+   meets a full list in practice). (**Changed agreed meaning, agreed with Astation (2026-11-13, #120 comment 6848326392)**: §I.2 named neither rule. Before them the only
    writer was this one, which halts first, so neither changes r8's
    outcomes.)
 3. **Resolved at restart, never executed.** When the journal reopens,
@@ -2008,8 +2007,7 @@ unconfirmed verifier keeps signing off, removing an obsolete verifier is
 an explicit manager action, and no feature flag alone is proof
 (delegated host work II.2.2 "The signing gate", I.8).
 
-*How a verifier reports itself* (**Atem's proposal, for Astation's
-agreement**). A verifier describes itself with an inventory
+*How a verifier reports itself* (**Atem's proposal, agreed with Astation (2026-11-13, #120 comment 6848326392)**). A verifier describes itself with an inventory
 `{version, actions}`, so a signer's gate can tell which verifiers accept
 which entries:
 
@@ -2064,8 +2062,8 @@ which entries:
   update. The signer's gate keeps its rules: an unknown, offline or
   unconfirmed verifier keeps signing off, and a host whose welcome carries
   no `verifier` is unconfirmed.
-- *How the signing gate uses it* (**Atem's proposal, for Astation's
-  agreement**). This says when a verifier is confirmed, and it extends the
+- *How the signing gate uses it* (**Atem's proposal, agreed with Astation (2026-11-13, #120 comment 6848326392), its adoption
+  closed until the shared `required_version` helper exists**). This says when a verifier is confirmed, and it extends the
   gate to three scope ops (below). It removes none of the rules above.
   - Versions only widen. Version N lists every action of version N − 1,
     and it accepts every entry N − 1 accepts, with the same derived state.
@@ -2553,8 +2551,7 @@ fenced). Atem sends every attachment `membership_head{head,
 pending_recovery}` (no `re`) when its head moves or a pending entry
 starts, takes effect or is cancelled, so clients fetch. Atem may also fetch the suffix
 from the relay over its own link; it gets no more trust than any
-carrier. **Amended in step 4, 2026-11-13 (Atem's proposal, for
-Astation's agreement):** Atem does so behind `host.delegated` until its
+carrier. **Amended in step 4, 2026-11-13 (Atem's proposal, agreed with Astation (2026-11-13, #164 comment 6858189009)):** Atem does so behind `host.delegated` until its
 activation (a host without it fetches nothing), with `membership_fetch{after}`
 (host-work-v1 §11.4) whenever its Station's `heads` name a device-list head
 beyond its own, the result applied as a carriage; a fetch that stops at a
@@ -2816,7 +2813,7 @@ estimate on the host's clock, recomputed on every report. The 100 ms
 asks the relay over its link for the suffix after its head every 15
 minutes and 5 minutes before `effective_at` (a fetch never delays
 activation: a relay that fails it gains nothing). **Amended in step 4,
-2026-11-13 (changed agreed meaning, needs Astation's agreement):** that
+2026-11-13 (changed agreed meaning, agreed with Astation (2026-11-13, #164 comment 6858189009)):** that
 fetch is R9.3's, run at its Station's `heads` (every (re)connection, every
 30 s, and at once when it stores a control record; host-work-v1 §11.4) in
 place of this schedule, and at once, with no `heads`, when a deferral it
@@ -3450,11 +3447,11 @@ unadvertised `host.delegated`, so are a service a control record revoked
 (after `unauthorized`, `revoked`), a service a control record holds (after
 `busy`, `paused`; reversible: its `hello` is admitted again after a
 `release`; **Atem's reading that implements Astation's item 7, #120,
-2026-11-14**; a service held and revoked in one page or pass, in either
+2026-11-14; agreed with Astation (2026-11-15, #120 comment 6889906767)**; a service held and revoked in one page or pass, in either
 order, gets only the revoke's close, after `unauthorized`, `revoked`), and
 every service's channel when the host's control state
 becomes unchecked (after `busy`, `revocations not yet checked`): each a
-fence preceded by its error frame. (Atem's reading, for Astation.)
+fence preceded by its error frame. (Atem's reading, agreed with Astation (2026-11-14, #120 comment 6885269470).)
 
 **Clients and bindings.** A client implementation holds one
 `ClientConnection` (the shared core's per-channel state) per virtual
@@ -3792,7 +3789,7 @@ replaced key, also for a proof at an ancestor head; `relay_replies`:
 | op | dir | fields |
 |---|---|---|
 | `hello` | C→H (the `finish` plaintext) | `revision: 9` (required), `proof{principal, sig}` (`sig` = `sig_c`, b64u), `membership{head{seq,hash}, entries, more?}`, `grant?` (signed grant, browser only); no `resume` |
-| `welcome` | H→C (first record) | r8 fields (`revision: 9`, `features`) plus `principal` (string), `client_kind` (`native`/`service`/`browser`), `permissions`, `scope?` (service/browser: `{ops, sessions?, projects?}`), `head{seq,hash}` (after the carriage), `pending_recovery` (always present, possibly empty: `[{entry_hash, seq, action, subject, effective_at}]`, R9.5), `channel_id`, `authorization_ms_left`, `verifier?` (`{version, actions}`, the host verifier's inventory, read strictly, absent rather than `null`; R9.2 "How a verifier reports itself"; **Atem's proposal, for Astation's agreement**) |
+| `welcome` | H→C (first record) | r8 fields (`revision: 9`, `features`) plus `principal` (string), `client_kind` (`native`/`service`/`browser`), `permissions`, `scope?` (service/browser: `{ops, sessions?, projects?}`), `head{seq,hash}` (after the carriage), `pending_recovery` (always present, possibly empty: `[{entry_hash, seq, action, subject, effective_at}]`, R9.5), `channel_id`, `authorization_ms_left`, `verifier?` (`{version, actions}`, the host verifier's inventory, read strictly, absent rather than `null`; R9.2 "How a verifier reports itself"; **Atem's proposal, agreed with Astation (2026-11-13, #120 comment 6848326392)**) |
 | `membership` | C→H | `entries` (R9.3) → `membership_head{re, head}` |
 | `membership_head` | H→C | `head`, `pending_recovery` (event when Atem's head moves or a pending entry changes state; reply with `re`) |
 | `revoke_grant` | C→H | `grant_id` → `grant_revoked{re}` (issuer or a member with `control`) |
@@ -4121,8 +4118,9 @@ it has neither `state` nor `session_id`, `process_gen` or `approval_id`:
   for an alert: nothing cancels a stage, and an alert's own state is read
   with `alert_list` (it lasts until its task is resolved). The daily reminder
   is Astation's. **Atem's choice, for Astation to confirm.**
-- **When Atem makes and sends it** (**Atem's choices, for Astation to
-  confirm**):
+- **When Atem makes and sends it** (**Atem's choices, agreed with Astation (2026-11-13, #120 comment 6848463998),
+  with suppression, the recipients' current authorization, the relay's and
+  provider's expiry checks and pairing resets still applying**):
   - The host makes an alert's hints once, when the alert is committed. Their
     `created_at` is the alert's, and their window is exactly 900 000 ms.
   - It resends them until acknowledged or until `expires_at + 300 000`. The
@@ -4319,10 +4317,10 @@ key, head and fences don't depend on the Mac or the cred agent. Fixtures:
 | `recovery_pending` | session | the principal is the subject of a `recovery_add` pending on this host, or is added only behind one; carries `entry_hash`, `effective_at` (R9.5) |
 | `membership_invalid` | session | a carried entry failed (R9.3); carries `head` (after the valid prefix), `index`, `detail` (e.g. `signer_not_manager`, `recovery_key_retired`, `kit_sig_missing`, `self_approval`, `not_a_recovery_entry`, `blob_version_not_increasing`, `array_not_canonical`; planned actions: the details of R9.2 "Host senders and projects"), and `need_before` when the window starts after a divergence |
 | `membership_incomplete` | session | `more` and the principal isn't in the chain yet; carries `head`; reconnect with the next window |
-| `unauthorized` | session | not a current member, removed, expired, grant revoked or issuer fenced (detail says which; the principal is authenticated); with the unadvertised `host.delegated` on, a service a control record revoked on this host (`revoked`: its attachments when it is fenced, and its later `hello`s; host-work-v1 §11.1, **Atem's reading, for Astation**) |
+| `unauthorized` | session | not a current member, removed, expired, grant revoked or issuer fenced (detail says which; the principal is authenticated); with the unadvertised `host.delegated` on, a service a control record revoked on this host (`revoked`: its attachments when it is fenced, and its later `hello`s; host-work-v1 §11.1, **Atem's reading, agreed with Astation (2026-11-14, #120 comment 6885269470)**) |
 | `forbidden` | session | also: an op outside a service's or grant's `ops` |
 | `unknown_session` | all | also: a session outside a service's or grant's scope |
-| `busy` | channel/session | also: `init` rate; a device list that exists but can't be opened (clear, at `init`); a failed device-list write ("device list not recorded"), then the journal halt; a held host (a recorded device-list fault, or a carriage record the start can't reconcile): every `hello` but a manager's reconciliation ("device list not reconciled", R9.3); with the unadvertised `host.delegated` on, on a host that keeps a control state (a host-work store with the control tables, whichever identity it is bound to and whatever hosting's state; a host that never had one, hosting never enabled included, refuses no service), every service's `hello` the device list would admit while that state is damaged, doesn't load, was never read (a new store's, a first pairing's or a re-verify's, until its first complete read of the host's own Station's feed), is another identity's (hosting paused across a re-verify or a re-pair: until hosting makes this identity's store and it reads in full; a service revoked under the old identity included), or can't be checked because the host's receipt database faulted (until `atem runtime restart`), and its attachments when that state begins ("revocations not yet checked"; it comes after the device-list decision, so a removed or expired service gets its final `unauthorized`; host-work-v1 §11.1, **Atem's reading, for Astation**); with it on, a service a control record holds on this host (a `hold` not released since), its `hello`s and its attachments when the hold is applied, and any request of such an attachment that reaches the host before its close ("paused"; reversible: a `release` admits its next `hello`; host-work-v1 §11.1, **Atem's reading that implements Astation's item 7, #120, 2026-11-14**) |
+| `busy` | channel/session | also: `init` rate; a device list that exists but can't be opened (clear, at `init`); a failed device-list write ("device list not recorded"), then the journal halt; a held host (a recorded device-list fault, or a carriage record the start can't reconcile): every `hello` but a manager's reconciliation ("device list not reconciled", R9.3); with the unadvertised `host.delegated` on, on a host that keeps a control state (a host-work store with the control tables, whichever identity it is bound to and whatever hosting's state; a host that never had one, hosting never enabled included, refuses no service), every service's `hello` the device list would admit while that state is damaged, doesn't load, was never read (a new store's, a first pairing's or a re-verify's, until its first complete read of the host's own Station's feed), is another identity's (hosting paused across a re-verify or a re-pair: until hosting makes this identity's store and it reads in full; a service revoked under the old identity included), or can't be checked because the host's receipt database faulted (until `atem runtime restart`), and its attachments when that state begins ("revocations not yet checked"; it comes after the device-list decision, so a removed or expired service gets its final `unauthorized`; host-work-v1 §11.1, **Atem's reading, agreed with Astation (2026-11-14, #120 comment 6885269470)**); with it on, a service a control record holds on this host (a `hold` not released since), its `hello`s and its attachments when the hold is applied, and any request of such an attachment that reaches the host before its close ("paused"; reversible: a `release` admits its next `hello`; host-work-v1 §11.1, **Atem's reading that implements Astation's item 7, #120, 2026-11-14; agreed with Astation (2026-11-15, #120 comment 6889906767)**) |
 | `unsupported_version` | session | also: `hello` without `revision: 9`; the removed outer `transportPolicy`/`transportPolicyAck` (R9.8a) |
 | `request_id_reused` | session | also: a `host_policy_set` reusing a `request_id` with another body (R9.8a); a `request_id` recorded under another submitter when either is the `host-work` principal (R9.14 item 7; built, behind the unadvertised `host.delegated`) |
 | relay `push_hint` refusals | relay | `skew`, `invalid_times`, `duplicate`, `bad_signature`, `stale` |
@@ -4330,7 +4328,7 @@ key, head and fences don't depend on the Mac or the cred agent. Fixtures:
 
 **The order of a service's `hello` refusals** (with the unadvertised
 `host.delegated` on; **Atem's reading that implements Astation's item 7,
-#120, 2026-11-14**): the device list's own first (a removed, expired or
+#120, 2026-11-14; agreed with Astation (2026-11-15, #120 comment 6889906767)**): the device list's own first (a removed, expired or
 out-of-scope service gets its final `unauthorized`), then a control
 record's revoke (`unauthorized`, `revoked`: final, it wins over a hold),
 then the unchecked control state (`busy`, `revocations not yet checked`:
@@ -4344,7 +4342,7 @@ host's pinned list (another account's list, a different genesis, is `stale_targe
 that list admits at its committed head, after the carriage. The control
 state they come from is the current identity's. So they never answer for
 a principal of another account (Astation's condition on #120, 2026-11-14:
-no cross-account revocation oracle; **Atem's reading, as built**).
+no cross-account revocation oracle; **Atem's reading, as built, agreed with Astation (2026-11-15, #120 comment 6889906767)**).
 
 ### R9.12 Fixtures
 
@@ -4467,7 +4465,7 @@ verdict from the steps' signed times (the hold time kept per principal) and
 reads the acknowledgments' typed reasons (O5). (Amended for step 4: the
 Station-calls checker and the control vectors' bound and `why` checks are
 **agreed with Astation (2026-11-13, #120 comment 6848326392)**; the O1 and O5 checks
-are **for Astation's sign-off**.) Scenarios
+are **signed off by Astation (2026-11-13, #156 comment 6858184397; reaffirmed 2026-11-15, #120 comment 6889906767)**.) Scenarios
 (`kind: "scenario"`): chain (`valid-suffix`, `rollback`,
 `removed-signer-conflict`, `current-manager-conflict`, `unknown-carrier`,
 `honest-concurrent-appends`, `relay-cas-failure`, `signature-retry`,
@@ -4524,7 +4522,7 @@ Station's acknowledgments (delegated host work, host-work-v1 §11.4;
 `side: "relay"`, run against atem-client's reference ledger):
 `r9-control-ack-resign`, `r9-control-ack-per-effect`,
 `r9-control-ack-deadline`, `r9-control-ack-durable`,
-`r9-control-ack-portal-refusals`, and (**for Astation's sign-off**,
+`r9-control-ack-portal-refusals`, and (**signed off by Astation (2026-11-13, #156 comment 6858184397; reaffirmed 2026-11-15, #120 comment 6889906767)**,
 amended for step 4: typed reasons, host-work-v1 §11.4 wire rule 10)
 `r9-control-ack-reasons`.
 
@@ -4623,8 +4621,8 @@ and item 6's reconciliation of `executing` prompts (changed agreed
 meaning, needs Astation's agreement). Astation then agreed items 1 to 7
 with those step-4 amendments, and answered item 1's UI question (a generic
 controller label until receipt provenance names the task; no holder
-field), on 2026-11-13 (#120 comment 6848326392): the marks below predate
-that answer. Item 8's request stays open.
+field), on 2026-11-13 (#120 comment 6848326392): each is marked agreed
+below. Item 8's request stays open.
 
 1. **The `host-work` principal.** Its name is `host-work`
    (`atem_client::session::wire::HOST_WORK_PRINCIPAL`), a bare word like
@@ -4652,17 +4650,18 @@ that answer. Item 8's request stays open.
      §F's rules. Except for item 5, the host-work principal never takes
      over a lease. Clients see it as any controller (`controller{
      controller_session, lease_epoch}`, `lease_held`); the receipts of
-     item 2 say which task holds it. (**Needs Astation's agreement:**
-     whether its UI needs to tell the host-work holder apart from a device;
-     this revision adds no field for it.)
-   - **Leases, as built** (**Atem's choice, for Astation to confirm**). A
+     item 2 say which task holds it. (**Answered by Astation (2026-11-13, #120 comment 6848326392):** its UI
+     shows a generic controller label until receipt provenance names the
+     task, never guessing that an opaque controller session is a named
+     device; no holder field is needed, and this revision adds none.)
+   - **Leases, as built** (**Atem's choice, agreed with Astation (2026-11-13, #120 comment 6848326392)**). A
      prompt it submits without `acquire: true`, or with `takeover`, is
      `invalid_request`, and nothing is recorded. After a restart a turn
      still running and rebound (item 6) holds no lease: leases aren't
      persisted and host-work doesn't acquire again, so a native may
      acquire it without a takeover.
    - **How long it holds the lease, as built** (**changed agreed
-     meaning, needs Astation's agreement**: the agreed text above says it
+     meaning, agreed with Astation (2026-11-13, #120 comment 6848326392)**: the agreed text above says it
      holds the lease "for that turn"). It keeps the lease while any
      request of its on that session is open (`accepted` or `executing`),
      not only for one turn, and releases it at the first pass after the
@@ -4720,7 +4719,7 @@ that answer. Item 8's request stays open.
    device list. The requests of every other principal keep §H's dispatch
    check only, which the `host-work` principal passes trivially (item 1).
 
-   As built (**Atem's choice, for Astation to confirm**): with no check
+   As built (**Atem's choice, agreed with Astation (2026-11-13, #120 comment 6848326392)**): with no check
    installed, every request of the `host-work` principal is withdrawn
    (`withdrawn by the host`, fail closed). A refusal whose `rejected`
    write fails halts the journal (§I), and the request goes on the refusal
@@ -4751,7 +4750,7 @@ that answer. Item 8's request stays open.
    applies only to the `host-work` principal's own requests, and is seen
    only as the receipt's `rejected` state.
 
-   As built (**changed agreed meaning, needs Astation's agreement**: the
+   As built (**changed agreed meaning, agreed with Astation (2026-11-13, #120 comment 6848326392)**: the
    refusal list's own rules, §I.2):
    - **One entry per `request_id`.** The first entry stays, whoever
      submitted it. A withdrawal of an id already listed writes nothing and
@@ -4832,7 +4831,7 @@ that answer. Item 8's request stays open.
      - After a restart a pending intent is carried out again, delivering
        once more if that turn is still the session's current turn; a
        turn that has already ended makes it do nothing. **As built
-       (changed agreed meaning, needs Astation's agreement):** the host
+       (changed agreed meaning, agreed with Astation (2026-11-13, #120 comment 6848326392)):** the host
        knows that turn is still current only when the prompt's turn was
        journaled (item 6's `turn_started`) and the adopted worker's chat
        shows it running: then the attempt stays `executing`, rebound to
@@ -4880,8 +4879,7 @@ that answer. Item 8's request stays open.
    refusal list first, as §I.7 rules for every principal) is **Atem's
    choice, agreed with Astation (2026-11-11, #120 comment 6810116314)**.
 
-   **The reconciliation, as built (changed agreed meaning, needs
-   Astation's agreement):**
+   **The reconciliation, as built (changed agreed meaning, agreed with Astation (2026-11-13, #120 comment 6848326392)):**
    - **The turn a prompt started is journaled** (`turn_started`): ids
      only, the turn and the user message, written durably at the chat's
      acceptance (after the paste, while `executing`), for the `host-work`

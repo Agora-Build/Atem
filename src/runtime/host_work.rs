@@ -3104,7 +3104,7 @@ mod tests {
     }
 
     /// The `delegated` column is additive: a store whose `work_waits` has
-    /// none (this branch before Task 19's review) gets it when it opens,
+    /// none (a v0.8.5 store) gets it when it opens,
     /// filled from the records, and its triggers keep it from then on.
     #[test]
     fn work_waits_gains_its_delegated_column_when_a_store_opens() {
@@ -3282,7 +3282,7 @@ mod tests {
 
     /// `work_waits`' triggers change additively too: a store whose triggers
     /// keep a row for a delegated task of unknown outcome past its deadline
-    /// (this branch before Task 23) gets them made again when it opens, and
+    /// (a v0.8.5 store) gets them made again when it opens, and
     /// its rows refilled from the records, once.
     #[test]
     fn work_waits_triggers_without_the_deadline_rule_are_made_again() {

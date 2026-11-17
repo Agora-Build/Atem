@@ -266,7 +266,7 @@ owner's local consent in `runtime.toml`.
   `busy` while that state is unchecked (damaged, not yet read for this
   host identity, or the receipt database faulted until `atem runtime
   restart`), and a revoked service's `hello` is refused `unauthorized`,
-  `revoked` (**Atem's readings, for Astation's agreement**; host-work-v1
+  `revoked` (**Atem's readings, agreed with Astation (2026-11-14, #120 comment 6885269470)**; host-work-v1
   §11.1, session-v1 R9.11).
 - Memory or vault access gives no execution right. Vault `writer_id` and relay
   room names are labels, not authority.
@@ -558,8 +558,7 @@ unresolved unknown outcome drops its payloads a day after its deadline and
 keeps its alert. A new host identity's database starts with an empty control
 state and reads its Station's feed from position 0; until that read reaches
 the head the Station announced, and while a stored control state doesn't
-read, every service is `busy` (section 4; **Atem's reading, for Astation's
-agreement**).
+read, every service is `busy` (section 4; **Atem's reading, agreed with Astation (2026-11-14, #120 comment 6885269470)**).
 
 ## 10. Limits
 
@@ -792,7 +791,8 @@ its environment holds.
      moves the host's records aside and starts a fresh store for the new
      identity. The live link is never carried over to the new identity
      (host-work-v1 §11.4, "An identity change", Atem's reading of
-     Astation's item 15 on #120): once the verification's operation ends,
+     Astation's item 15 on #120, agreed with Astation for a re-verify on
+     the live link, 2026-11-15, #120 comment 6889906767): once the verification's operation ends,
      the runtime drops its Astation link and reconnects (`runtime.log`:
      `this host's identity changed on its Astation link; reconnecting …`),
      so the new link is authenticated, and proves its route, under the new
@@ -820,10 +820,10 @@ its environment holds.
        - the same over Astation's `:8080`;
        - the relay's handling of a host connection's route binding once
          the device list grows with the host's new `add_host`, hook or
-         no hook. Atem's reading of a local relay checkout, which may not
-         be what is deployed: the relay checks the binding again at each
-         delivery and closes a host connection whose proof no longer
-         verifies (`host route changed`). If Astation publishes the new
-         `add_host` before it delivers `deviceVerified`, that close could
-         come during the ceremony and fail it. Check which behaviour the
-         deployed relay has, and the order of the two.
+         no hook. Astation confirmed what is deployed (#120 comment
+         6889906767): the dev Station checks a route proof again at each
+         delivery and closes a bound socket whose proof no longer verifies
+         (`host route changed`), and the native app appends the new
+         `add_host` durably before it sends `deviceVerified`, so the old
+         proved socket can close before the certificate is delivered. That
+         ceremony-ordering risk is Astation's, tracked in Astation #80.

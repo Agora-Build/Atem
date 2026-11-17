@@ -898,10 +898,10 @@ records applied to the tasks from the host's own Station's feed through
   is built and tested against a fake Station that speaks only the shared
   builders;
 - the goldens are `fixtures/r9-vectors-station-calls.json` (agreed, as
-  marked in §11.4); O1 and O5, marked "for Astation's sign-off" below, were
-  signed off on 2026-11-13 (#156 comment 6858184397), and the correlation
-  amendment (wire rule 11), made on Astation's request, waits for its
-  sign-off on #156;
+  marked in §11.4); O1 and O5 were signed off on 2026-11-13 (#156 comment
+  6858184397) and are marked so below, and the correlation amendment (wire
+  rule 11), made on Astation's request, was signed off on 2026-11-14 (#156
+  comment 6885246159, #120 comment 6885269470);
 - the clock provider's tests run on real OSes (`scripts/clock-real-os.py`,
   `.github/workflows/clock-real-os.yml`);
 - `no_match`'s wire form and a selector-resolved task's status belong to
@@ -910,12 +910,15 @@ records applied to the tasks from the host's own Station's feed through
 
 Passages written in step 4 say "as built in step 4" or "step 4". Astation
 answered step 4's contract questions on 2026-11-13 (#120 comments
-6848326392 and 6848463998, #164 comment 6858189009); marks written before
-those answers still read "for Astation" until a docs change marks them
-agreed, as step 3's were. The readings written since (§11.1's effects on
-the tasks and its service refusals, §11.4's acknowledgments and pacing)
-wait for Astation's answer. The hook activates nothing outside a debug
-build.
+6848326392 and 6848463998, #164 comment 6858189009); each mark written
+before those answers that they agree is marked agreed below, as step 3's
+were. Astation answered the readings written since
+(§11.1's effects on the tasks and its service refusals, §11.4's
+acknowledgments and pacing) on 2026-11-14 (#120 comment 6885269470, which
+also agrees to the narrowed pacing), and the two host changes it asked for there
+(a hold's fence of session-v1, an identity change on the live link) on
+2026-11-15 (#120 comment 6889906767): each reading it agreed is marked
+agreed below. The hook activates nothing outside a debug build.
 
 ### 11.1 Control records
 
@@ -1217,7 +1220,8 @@ The rules:
 
    **A release lifts only holds issued before it** (**O1, requested by
    Astation (2026-11-13, #120 comment 6848326392)**; amended for step 4,
-   the built form for Astation's sign-off). Feed order alone can't protect
+   the built form **signed off by Astation (2026-11-13, #156 comment 6858184397; reaffirmed 2026-11-15, #120 comment 6889906767)**).
+   Feed order alone can't protect
    a newer hold: `feed_seq` isn't signed, and the evicted floor (rule 1)
    guards only evicted records, so a carrier could serve a release it
    withheld, or one refused before, after a newer hold. So:
@@ -1293,7 +1297,7 @@ principal's holds and releases were read from (one, for a host syncing its
 own Station), and a few hundred bytes more. The whole state (`to_json`,
 `"v": 2`) is the parts by principal under the device list's account and
 genesis. **A service's part keeps the hold's time** (`hold_issued_at`,
-O1; **for Astation's sign-off**, amended for step 4): the newest `issued_at` of every
+O1; **signed off by Astation (2026-11-13, #156 comment 6858184397; reaffirmed 2026-11-15, #120 comment 6889906767)**, amended for step 4): the newest `issued_at` of every
 hold verified for it (rule 6), present from its first hold on and whenever
 `held`. The format stays `"v": 2`. A stored part without it (written
 before O1) is read as "no hold's time known" only while `held` is false:
@@ -1342,8 +1346,9 @@ can't be decided yet. A grant entry under a kid the host never hashes
 (one the cred agent no longer retains) keeps that `busy`, where v1 answers
 `forbidden`; such a grant can't be honoured either way.
 
-**The effects on tasks, as built in step 4 (Atem's reading, for
-Astation).** A record's effects are written in its transaction with the
+**The effects on tasks, as built in step 4 (Atem's reading, agreed with Astation (2026-11-14, #120 comment 6885269470),
+except the last item, `host.delegated` off, which that answer doesn't
+name).** A record's effects are written in its transaction with the
 touched parts and the cursor (design I.5.5), a pending record's when it
 applies again; what needs the session host comes after that commit.
 - **`revoke`.** Every unstarted task of the service (`queued`, `blocked`,
@@ -1370,7 +1375,7 @@ applies again; what needs the session host comes after that commit.
   tasks end the same way, never holding their sessions
   until their deadlines.
 - **No service holds session-v1 while the control state is unchecked**
-  (**Atem's reading, for Astation**), on a
+  (**Atem's reading, agreed with Astation (2026-11-14, #120 comment 6885269470)**), on a
   host that keeps a control state: a host-work store whose control tables
   exist (read once when the store opens), whichever host identity it is
   bound to, or a store that exists and can't be opened or read. With
@@ -1435,7 +1440,7 @@ applies again; what needs the session host comes after that commit.
   counted whoever makes it: the start check, or the recovery after a crash
   (`withdrawn at recovery`).
 - **A hold also fences the service's session-v1, reversibly** (**Atem's
-  reading that implements Astation's item 7, #120, 2026-11-14**), so a held
+  reading that implements Astation's item 7, #120, 2026-11-14; agreed with Astation (2026-11-15, #120 comment 6889906767)**), so a held
   integration can't go around the delegated queue through the channel it
   already has. Behind `host.delegated`:
   - **The fence.** Every hold applied asks for it after its commit, like a
@@ -1474,7 +1479,9 @@ applies again; what needs the session host comes after that commit.
     no fence; while the committed state still holds it, the loaded state
     writes the fence at the next start, before any service is admitted
     (services are refused as unchecked until the state loads).
-  - **The residual** (**Atem's reading, for Astation**): a crash
+  - **The residual** (**Atem's reading, agreed with Astation (2026-11-15, #120 comment 6889906767) for a
+    crash, never for a reload that keeps the old attachments or queued
+    commands**): a crash
     between the commit of a hold and of its release (one page or pass) and
     their fence leaves no fence at all. After the restart the committed
     state shows the service released, so nothing is fenced, and the hold's
@@ -1488,7 +1495,8 @@ applies again; what needs the session host comes after that commit.
     under `host-work`, which no fence names), interrupts no running turn,
     and is undone by a `release`. Natives, browser grants and `local` are
     unaffected; a revoke wins over a hold and stays final.
-  - **v1 work the service had** (**Atem's reading of Astation's item 7**):
+  - **v1 work the service had** (**Atem's reading of Astation's item 7,
+    agreed with Astation (2026-11-15, #120 comment 6889906767)**):
     the fence is session-v1's §H, so v1 work follows v1's rules, as with a
     revoke's or the unchecked state's fence, and nothing of it waits for
     the release. A v1 task admitted before the service's cover ends
@@ -1496,7 +1504,8 @@ applies again; what needs the session host comes after that commit.
     turn is running is marked so while the turn goes on, never interrupted.
     A v1 launch reserved and not yet started is fenced the same way at the
     spawn boundary.
-  - **What a held service can't do over r9** (**Atem's reading**).
+  - **What a held service can't do over r9** (**Atem's reading,
+    agreed with Astation (2026-11-15, #120 comment 6889906767)**).
     Astation's answer lets reads and results go on through the authorized
     Station API where its lifecycle permits them. On the host, with its
     attachments closed and its `hello`s refused, a held service reads
@@ -1653,7 +1662,7 @@ record is pending or refused or kept as evidence (the bindings'
 sequence's `state` is v2, each step carries its `standing` and `why`, two
 sequences and three records are new in the file, and the checker's checks
 of parts, `why` and the bound below are new; its steps' other fields are as
-they were.) (**For Astation's sign-off**, amended for step 4, O1: the records
+they were.) (**Signed off by Astation (2026-11-13, #156 comment 6858184397; reaffirmed 2026-11-15, #120 comment 6889906767)**, amended for step 4, O1: the records
 `W1_release_withheld`…`W8_b_release_newer`, the sequences `Q21`…`Q27` (a
 withheld and a previously refused release after a newer hold, equal
 timestamps, a newer hold while held, holds from another feed, at no
@@ -1681,7 +1690,7 @@ alone: the ids each step counts and the oldest unpinned ones evicted past
 evicted, and every possible replay (an unrevoked principal's cover or
 release, its id not counted, issued no later than the floor then) refused
 as evidence with `why` `possible_replay`. It also derives O1 from the steps
-alone (**for Astation's sign-off**, amended for step 4): the hold's time as the newest
+alone (**signed off by Astation (2026-11-13, #156 comment 6858184397; reaffirmed 2026-11-15, #120 comment 6889906767)**, amended for step 4): the hold's time as the newest
 `issued_at` of every hold step that holds or finds the principal held while
 it isn't revoked, from `initial`'s; every release that reaches the rule
 (held, not revoked, not refused for another reason) `applied` exactly when
@@ -1714,7 +1723,7 @@ they serialize back to the same JSON.
 | `task_id` | a UUID v4 |
 | `resolution.kind` | `failed` or `done`, exactly its fields |
 | `failed.detail` | 1–1024 bytes, not blank (something besides White_Space), no control character and no Cf character (bidi controls, zero-width characters; the framing module's General_Category Cf, `framing::is_format`): the detail the task then shows. **Atem's choice, agreed with Astation (2026-11-11, #120 comment 6810116314)**: the design says only `failed{detail}`, so a multi-line, blank or Cf-carrying reason is `invalid_request` |
-| `done.result` | a context snapshot, with `work_complete`'s checks and no more (a `result` kind is local only; **Atem's choice, for Astation to confirm**) |
+| `done.result` | a context snapshot, with `work_complete`'s checks and no more (a `result` kind is local only; **Atem's choice, agreed with Astation (2026-11-13, #120 comment 6848463998)**) |
 
 **Authority.** Both are directed-work requests: the channel checks `notify`
 before decoding (`forbidden`; a native member needs `control`), as for every
@@ -1774,8 +1783,7 @@ not name is `forbidden`, as for `work_query`.
   (`local`, a browser grant, a service no feed covers) is `forbidden`, to
   its sender and to the owner, as for `work_resolve`: only a delegated
   task's turn runs under the host's own principal, which is what the host
-  interrupts (session-v1 R9.14 item 5). **Atem's reading, for Astation to
-  confirm.**
+  interrupts (session-v1 R9.14 item 5). **Atem's reading, agreed with Astation (2026-11-13, #120 comment 6848463998).**
 - **The session's current turn** is the task's current attempt
   `executing`, its turn shown running by the session's chat (R9.14 item
   5's turn check). Anything else answers `not running`: a queued task, an
@@ -1820,8 +1828,8 @@ not name is `forbidden`, as for `work_query`.
   - **Atem's choice.**
 - **While hosting is paused** (`runtime.toml` doesn't load, or `enabled =
   false`), `work_interrupt` is still served: a stop always wins, as for
-  the deadline's interrupt (§11.6). **Atem's reading, for Astation to
-  confirm.**
+  the deadline's interrupt (§11.6). **Atem's reading, agreed with Astation (2026-11-13, #120 comment 6848463998)
+  for `work_interrupt`, with fresh current authorization.**
   - **Which channels.** While hosting is paused, the host takes
     `work_interrupt` only from a channel whose welcome listed
     `host.delegated`, that is one welcomed before the pause. A welcome
@@ -1960,8 +1968,7 @@ outcome is unknown". The 256-byte `reason` is a short phrase (a task's status
     takes. The host passes 64, and no request carries a limit.
 - **An unknown cursor.** An `after` the host has no alert for (the alert
   ended, or never was) is `stale_target`, detail `unknown alert`; the caller
-  lists again from the start (**Atem's choice of code, for Astation to
-  confirm**: the host triple is what §7's `stale_target` usually names, but a
+  lists again from the start (**Atem's choice of code, agreed with Astation (2026-11-13, #120 comment 6848463998)**: the host triple is what §7's `stale_target` usually names, but a
   cursor that no longer points at anything is a stale target too).
 - **What is listed.** Exactly the delegated tasks that are
   `outcome_unknown` and unresolved, one alert each. An alert ends when its
@@ -2029,7 +2036,7 @@ Vectors:
   among them.
 - `fixtures/r9-vectors-push-hint.json`: the hints, and
   `outcome_unknown_invalid_facts` (a `local` and a browser grant's task,
-  and, **for Astation** (amended for step 4: the deferred blank-reason
+  and, **agreed with Astation (2026-11-13, #156 comment 6858184397)** (amended for step 4: the deferred blank-reason
   vector Astation's review of #156 asked for before phone hint support is
   accepted, #120 comment 6848326392), a delegated task whose `reason` is
   blank, a space, a no-break space and an ideographic space, with no
@@ -2050,7 +2057,7 @@ relay messages, not session ops, so no welcome feature gates them: the
 host's own `host.delegated` does. (This section said they arrive "with
 `host.senders` and delegated work"; the design's V.2 puts the feeds and
 the host's own fetch in step 4, Part I, so they come with `host.delegated`
-alone: **Atem's reading, for Astation's agreement**. Astation agreed to the
+alone: **Atem's reading, agreed with Astation (2026-11-14, #120 comment 6885269470)**. Astation agreed to the
 host's own fetch behind `host.delegated`, #164 comment 6858189009.) Types:
 `atem_client::control::relay`
 (every message, its reader and builder) and `atem_client::control::ledger`
@@ -2134,8 +2141,8 @@ messages, not these rules):
    principal's `interrupt_running`): it names the host's own Station feed
    (the feed of the Station its link reaches) and its cursor there.
 10. **Typed reasons** (**O5, requested by Astation (2026-11-13, #120
-    comment 6848326392)**; amended for step 4, the exact shape for
-    Astation's review). Each effect of a result may carry `why`, a code of
+    comment 6848326392)**; amended for step 4, the exact shape **signed off by Astation (2026-11-13, #156 comment 6858184397; reaffirmed 2026-11-15, #120 comment 6889906767)**).
+    Each effect of a result may carry `why`, a code of
     the shared vocabulary (§11.1, "The state, per principal": `Applied.why`'s
     codes), `{"effect":"release","result":"refused","why":"not_after_hold"}`.
     - **Writer.** An authenticated host writes a reason exactly where its
@@ -2215,7 +2222,7 @@ messages, not these rules):
       id is a correlation value, never authorization: a retired, timed-out,
       unsolicited or old-generation result advances nothing and can't
       reopen the gate. **Built on the host (step 4; Atem's reading
-      of the transition, for Astation, #120):** Astation asked to keep the
+      of the transition, agreed with Astation (2026-11-14, #120 comment 6885269470)):** Astation asked to keep the
       one-owed-call-per-physical-socket rule until this amendment is built
       and jointly tested, and never to retry uncorrelated. Every retry is
       now correlated, and the Station cancels an old generation's jobs, so
@@ -2426,7 +2433,7 @@ gate are design I.5.2 and I.5.8's, as §11.1 ("Resets") states them:
   identity has read the feed: "An identity change", below), and when
   no head arrived for 60 seconds. While it is closed no unstarted remote
   task of a principal that feed covers starts (`blocked`, `revocations not
-  yet checked`). (**Atem's reading, for Astation**, step 4, 2026-11-13:
+  yet checked`). (**Atem's reading, agreed with Astation (2026-11-13, #164 comment 6858189009)**, step 4, 2026-11-13:
   "up to its head" is the host's list holding the device-list head the
   last `heads` announced as that very entry, `seq` and hash, never a
   `membership_fetch_result`'s `head`; so `heads.membership` must be exactly
@@ -2442,7 +2449,7 @@ gate are design I.5.2 and I.5.8's, as §11.1 ("Resets") states them:
 unless marked; nothing on the wire changes).** The host syncs only its
 own Station's feed:
 
-- **What a `heads` announces** (**for Astation's agreement**: it narrows
+- **What a `heads` announces** (**agreed with Astation (2026-11-14, #120 comment 6885269470)**: it narrows
   the table's "each feed covering a principal with work on this host").
   The account's feed at the host's own Station must be named exactly
   once, empty or not, even when it covers no principal ("One feed per
@@ -2495,7 +2502,7 @@ own Station's feed:
   and no recursion, so a lone surrogate, a duplicate key (`op`'s
   included), nesting past a parser's depth, or a page cut short after
   its `op` still make it a page, and its fault alert goes.
-- **What stays dropped unread** (**Atem's reading, for Astation**): a
+- **What stays dropped unread** (**Atem's reading, agreed with Astation (2026-11-13, #164 comment 6858189009)**): a
   frame over 256 KiB (dropped and counted at the link, as every relay
   message), and a frame whose top-level `type` and `op` can't be read at
   all (not a JSON object, or broken before its `type` or its `op`):
@@ -2536,7 +2543,7 @@ own Station's feed:
   head (a resynchronization's) has nothing to be behind unless a later
   `heads` or its answer names more.
 - **Matching a page to its call** (wire rule 11; **Atem's reading of the
-  transition, for Astation**, see rule 11's "Built on the host").
+  transition, agreed with Astation (2026-11-14, #120 comment 6885269470)**, see rule 11's "Built on the host").
   - **A fresh id per call.** Every `control_sync` gets a fresh lowercase
     UUID v4 `request_id` from the host's CSPRNG: a retry and a new link
     generation's call too, even at the same cursor. One call is live at a
@@ -2723,7 +2730,7 @@ table of `host-work.sqlite`, made only with the hook on):
   body under that `record_id`. A row of the table that doesn't read, or
   that the writer wouldn't take, is kept as it is, logged once with no
   content, and never sent.
-- **What an ack names** (**Atem's reading, for Astation**). The claim of
+- **What an ack names** (**Atem's reading, agreed with Astation (2026-11-14, #120 comment 6885269470)**). The claim of
   the identity the host's store is bound to (its account, root, host id and
   trust generation), and the host's own Station's feed and its committed
   cursor, whatever feed a result's record was read from: a feedless
@@ -2732,7 +2739,7 @@ table of `host-work.sqlite`, made only with the hook on):
   cursor say how far the host reads the feed it reads now). A result of a
   record read from another Station's feed (one the host has left) is
   dropped unsent: the host has no link to that Station.
-- **Only this identity's store** (**Atem's reading, for Astation and
+- **Only this identity's store** (**Atem's reading, agreed with Astation (2026-11-14, #120 comment 6885269470); for
   Auth/Portal**). A store bound to another identity (hosting paused across
   a re-verify, §11.1) takes no page, applies no re-verification and sends
   no ack, its unsent results included: never under the new identity's
@@ -2745,7 +2752,7 @@ table of `host-work.sqlite`, made only with the hook on):
   owner command that opens the store) binds it. Until then services stay
   `busy` (§11.1): fail closed, a cost in liveness only.
 - **An identity change on the live link** (**Atem's reading that
-  implements Astation's item 15, #120**; "Matching a page to its call").
+  implements Astation's item 15, #120; agreed with Astation (2026-11-15, #120 comment 6889906767)**; "Matching a page to its call").
   An ack owed under the old identity never goes under the new one: the
   old store's results go aside with it, unsent ones included, and nothing
   is acknowledged on the old association after the change, the new
@@ -2754,7 +2761,7 @@ table of `host-work.sqlite`, made only with the hook on):
   on the old link (the Station refusing an old-association ack,
   metadata-free) advances nothing: no result is taken as delivered, and
   the new link starts its own connection.
-- **Resends, bounded** (**Atem's reading, for Astation**). A service's own
+- **Resends, bounded** (**Atem's reading, agreed with Astation (2026-11-14, #120 comment 6885269470)**). A service's own
   revoke's in-force result: on every connection (a link generation on its
   socket: a restart, a reconnection or a re-authentication starts one) and
   every 10 minutes on `D` (§11.6) while connected, until its `issued_at`
@@ -2995,7 +3002,7 @@ agreed with Astation 2026-11-16.
 `r9-control-ack-resign` (a native stop refused under the strict rule while
 the cursor moves past it, its re-sign alert kept, the re-signed copy
 applied, and a host that applied the original done for the copy),
-`r9-control-ack-reasons` (**for Astation's sign-off**, new in step 4,
+`r9-control-ack-reasons` (**signed off by Astation (2026-11-13, #156 comment 6858184397; reaffirmed 2026-11-15, #120 comment 6889906767)**, new in step 4,
 O5: the same scenario's acks with typed reasons on their refused and
 pending results, and the same ack without them, giving the same reports
 and re-sign alerts; a reason of a later version read as unrecognized
@@ -3045,7 +3052,7 @@ evidence, and a page that isn't strict JSON keeps the gate closed), `heads`,
 `control_ack` with both result forms, `membership_fetch` and its result, and
 the three refusals; and the invalid variants a reader refuses, each with its
 code (an unknown field, a `null`, a duplicate key, an unknown refusal code
-and a count over 64 among them). (**For Astation's sign-off**, amended for step 4,
+and a count over 64 among them). (**Signed off by Astation (2026-11-13, #156 comment 6858184397; reaffirmed 2026-11-15, #120 comment 6889906767)**, amended for step 4,
 O5: `control_ack_with_reasons`, partial effects whose effects not in force
 say why beside effects in force that say nothing, and
 `control_ack_with_unrecognized_reasons`, codes of a later version, one at
@@ -4175,7 +4182,7 @@ The sender's channel and online status are not conditions.
     condition 4. A waiting launch reads `starting`, a refused one `failed`;
     the reason goes to `runtime.log` (§3 has no `detail`). A
     `runtime.toml` that doesn't load is waited out at the spawn boundary
-    too. **Atem's reading, for Astation to confirm:** the check just
+    too. **Atem's reading, agreed with Astation (2026-11-13, #120 comment 6848463998):** the check just
     before the worker is spawned is the launch's linearization point; after
     the spawn its guard only fences, as every launch's. A restart turns a
     launch still waiting into `outcome_unknown`, as §3 says of every
@@ -4316,7 +4323,8 @@ As built in step 4:
 - **The detail.** `interrupted at deadline` names only a turn the
   deadline's interrupt reached. A turn that ended interrupted otherwise
   keeps `turn interrupted`.
-- **While hosting is paused. Atem's reading, for Astation to confirm.**
+- **While hosting is paused. Atem's reading, agreed with Astation (2026-11-13, #120 comment 6848463998),
+  which claims no immediate stop in the residuals below.**
   The interrupt, and every pending intent, is carried out while hosting
   is paused (`runtime.toml` doesn't load, or `enabled = false`). A stop
   grants nothing, and the turn's own lease goes on renewing during a
@@ -4329,7 +4337,7 @@ As built in step 4:
   - **Residuals.** A receipt-database fault holds the intents until the
     restart it asks for (recovery step 3 carries them out then). A runtime
     started while paused carries them out once hosting is on.
-- **At a restart. Atem's reading, for Astation to confirm.** A pending
+- **At a restart. Atem's reading, agreed with Astation (2026-11-13, #120 comment 6848463998).** A pending
   intent whose attempt is `rejected` at recovery step 3 gives the task the
   intent's state. That covers `withdrawn at recovery`, and also a
   `session closed` not yet processed: the task becomes `expired`, not
@@ -4337,7 +4345,7 @@ As built in step 4:
 - **With `host.delegated` turned off after tasks were accepted** (the
   debug-only hook removed), a started task's turn is still interrupted at
   its deadline.
-- **A task of unknown outcome. Atem's reading, for Astation to confirm.**
+- **A task of unknown outcome. Atem's reading, agreed with Astation (2026-11-14, #120 comment 6885269470).**
   It gets no deadline interrupt: the host can't identify its turn (design
   I.6.3; its alert tells the owner, §11.3, "Unknown outcomes" below). So a
   worker still alive whose chat arrives after the 60-second recovery
@@ -4359,9 +4367,9 @@ As built in step 4:
   ran: the task moves to `awaiting_result` and still needs
   `work_complete`. A reply that arrives after a `failed` resolution, before
   the deadline, is stored, and the task stays `failed`. **Atem's reading,
-  for Astation:** after the task's deadline (on the delegated clock below),
+  agreed with Astation (2026-11-13, #120 comment 6848463998):** after the task's deadline (on the delegated clock below),
   as for every task, a reply is refused (`expired`) and nothing is stored.
-- **Atem's choice, for Astation:** while the task stays `outcome_unknown`
+- **Atem's choice, agreed with Astation (2026-11-13, #120 comment 6848463998):** while the task stays `outcome_unknown`
   (its reply still publishing, or refused), its `detail` stays its reason
   (the Details table's `outcome_unknown` rows: `agent exited`, `outcome
   could not be established`, `write interrupted`, or the deadline's text);
@@ -4388,7 +4396,7 @@ As built in step 4:
   remote sender, host senders included, with the same code and detail,
   until the owner resolves some. Local tasks are never refused for
   unresolved outcomes. Which requests count, and the one detail for both
-  limits, are **Atem's choice, for Astation to confirm**: the design says
+  limits, are **Atem's choice, agreed with Astation (2026-11-13, #120 comment 6848463998)**: the design says
   "new tasks" and "new remote tasks", and names the 64's detail only.
 
 #### Details
@@ -4402,8 +4410,8 @@ exact.
 | `blocked` | `revocations not yet checked` | the revocation gate (or, for a host sender, the mailbox gate) is closed |
 | `blocked` | `device list update pending` | the last carriage or fetch stopped at a deferred entry |
 | `blocked` | `waiting for unlock` | a locked cred agent leaves the project scope pending |
-| `blocked` | `journal halted; restart Atem` | (**Atem's addition, for Astation**) the session journal halted with the device list usable (no fault): the task waits until the restart; session-v1 §I's own text |
-| `blocked` | `host.delegated is off` | (**Atem's addition, for Astation**) a task accepted while `host.delegated` was on, not started, after a restart without it: it is never dispatched, and expires at its deadline (on the clock below) |
+| `blocked` | `journal halted; restart Atem` | (**Atem's addition, agreed with Astation (2026-11-13, #120 comment 6848463998)**) the session journal halted with the device list usable (no fault): the task waits until the restart; session-v1 §I's own text |
+| `blocked` | `host.delegated is off` | (**Atem's addition, agreed with Astation (2026-11-13, #120 comment 6848463998)**) a task accepted while `host.delegated` was on, not started, after a restart without it: it is never dispatched, and expires at its deadline (on the clock below) |
 | `cancelled` | `sender revoked` | a `revoke` record, an R9 removal, or a host sender's `host_sender_revoke`, `remove_host` or new membership epoch |
 | `failed` | `sender's authorization narrowed` | the current grant (or a host sender's projects) no longer covers the task |
 | `failed` | `route changed` | the route's revision, principals or profile changed |
@@ -4412,7 +4420,7 @@ exact.
 | `failed` | `expired before the spawn` | a launch still waiting at the spawn boundary at its expiry |
 | `awaiting_result` | `interrupted at deadline` | a running turn interrupted at the task's deadline (then `expired` as today) |
 | `outcome_unknown` | `deadline passed; outcome unknown` | its deadline passed unresolved |
-| `outcome_unknown` | `agent exited`, `outcome could not be established`, `write interrupted` | (**Atem's addition, for Astation**) why, as its attempt's receipt says (session-v1 R9.14 item 6; design I.6.3: "the task follows"): its agent exited; no turn state proves its turn ran or is current (a restart's reconciliation); a write failed after it may have reached the agent. The reason the owner's alert names (§11.3) |
+| `outcome_unknown` | `agent exited`, `outcome could not be established`, `write interrupted` | (**Atem's addition, agreed with Astation (2026-11-13, #120 comment 6848463998)**) why, as its attempt's receipt says (session-v1 R9.14 item 6; design I.6.3: "the task follows"): its agent exited; no turn state proves its turn ran or is current (a restart's reconciliation); a write failed after it may have reached the agent. The reason the owner's alert names (§11.3) |
 | (a `work_interrupt` result) | `not running` | the task's turn isn't the session's current turn (§11.2) |
 | (an error) | `too many unresolved outcomes` | `busy`, the 64 or 256 limit |
 | (a receipt) | `withdrawn by the host`, `withdrawn at recovery` | session-v1 R9.14 items 3, 4 and 6; the task's state follows the event |
