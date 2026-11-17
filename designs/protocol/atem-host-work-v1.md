@@ -3810,8 +3810,11 @@ exactly as without this section):
     (the owner still reads the reply); signed while this host is a current
     host at its own trust generation, `authorized` or not, as statuses are.
     A result goes only once, so one that a store fault keeps from sealing
-    stays owed and goes on a later pass; only one whose records no longer
-    read is dropped.
+    stays owed and goes on a later pass, each on its own (one that keeps
+    failing holds none of the others), and is settled, its mark cleared
+    with a runtime.log line, only after 8 tries in a row and a minute on
+    the monotonic clock; one whose records no longer read is dropped at
+    once.
   - **Not built:** a `select`'s `launch` (the recipient resolves to the
     running agents only, as when its route doesn't allow a launch).
 
@@ -3898,25 +3901,36 @@ exactly as without this section):
   - **A result.** Its reply is recorded against its task once (a later copy
     changes nothing): due for delivery, or kept as data with the verdict's
     reason when its sender is revoked or removed.
-  - **What waits, what goes.** A result (never a status or a refusal) that
+  - **What waits, what goes.** A drain applies every status it holds
+    before it decides anything about a result that answers no row yet, then
+    judges those again. A result (never a status or a refusal) that still
     answers no row while one of this host's rows to that host has no status
     yet waits in the kept results (statuses and results arrive in any
     order; `accept_result_among` names the task such a result named): it is
     judged again once a status is recorded, or a minute later, until its
-    expiry; so does one signed beyond this host's list (`Pending`) and one
-    a local fault left undecided (`Unavailable`). Those that wait for their
-    sender's sake are bounded apart, at half the sender's results share and
-    half the total: a newer one over the bound is dropped, so the statuses
-    they wait for always find room. Anything else refused, or answering no
-    row, is dropped, with a runtime.log line (the first, then at powers of
-    two): the kept results stay drained.
+    expiry. So does one signed beyond this host's list (`Pending`: it waits
+    for the list, bounded by the share and its expiry, never by the bound
+    below) and one a local fault left undecided (`Unavailable`). A result is
+    dropped only when `accept_result` refuses it for good or it answers no
+    row of this host's at all, with a runtime.log line (the first, then at
+    powers of two). The results waiting for their status are bounded at
+    the mailbox's intake (back-pressure, as for the inboxes): a result that
+    would wait (it opens there and names a task no recorded resolution
+    holds) is taken only while the results waiting so hold less than half
+    its sender's results share, half the total count and half the byte
+    budget; else it is left on the Station, not done, and read again once
+    room frees. What holds: at least half of each sender's share, by count,
+    and half the byte budget are never taken by results waiting for their
+    status, so a status finds room unless its sender's other kept objects
+    fill the rest, and those are judged and leave on the next drain.
   - **Task ids.** A remote task id is its host's for one message (a
     selector task id derives from the message): a status naming one another
     message of that host already holds doesn't take it, its recipient
     recorded `refused`, `task id <id> is another message's`, so a result
     for it answers one message only. Each delivery has its own task id,
     UUIDv5 of `delivery:` and the JSON array of the message id, the host id
-    and the task id.
+    and the task id. The reuse check and the per-host read of the recorded
+    resolutions use an index (`remote_tasks_host`).
   - **The delivery.** A reply due is delivered once, as data, into the
     session that sent the message, through collaboration §10's result
     delivery (a local task carrying it, through the normal queue,
@@ -3940,8 +3954,10 @@ exactly as without this section):
     else kept, `not delivered: <the task's detail>` (expired unstarted,
     failed, its receipt rejected, cancelled), or `delivery outcome unknown:
     <detail>`. With host senders turned off (a debug runtime started again
-    without the hook) a queued delivery isn't dispatched: nothing would
-    check its sender or its grant. The
+    without the hook) a queued delivery isn't dispatched (nothing would
+    check its sender or its grant): it waits, `host senders are off on this
+    host`, holding no session, until the hook is back or its deadline,
+    when it expires. The
     prompt's first line names the host only, `Result of task <task id> from
     host:<host_id>, as data, not the owner's instruction` (design III.2:
     the result plaintext names no session, so none is named; the design's
