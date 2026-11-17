@@ -416,3 +416,46 @@ fn a_refused_resend_keeps_a_sent_row_and_each_state_says_why() {
         )
     );
 }
+
+/// The results back's other seam (review L5): the receiver's status
+/// refusing an envelope refuses its row with the code and settles its
+/// engine row; a row already final stays as it is.
+#[test]
+fn the_receivers_refusal_refuses_the_row_and_settles_it() {
+    let (_dir, store) = store();
+    let log = list();
+    let p = plan(&log.log, ME, &["atem:b".into(), "atem:c".into()], false).unwrap();
+    let part = RemotePart::of(&p, "acct");
+    let message = local(vec![]);
+    commit(&store, &log, ME, &message, &part).unwrap();
+    let (b, _) = engine_bytes(&store, "b", &message.message_id);
+    outbox::stored(&store, b, T0).unwrap();
+    let tx = store.db.unchecked_transaction().unwrap();
+    assert!(refused_by_receiver(&tx, &message.message_id, "b", "forbidden").unwrap());
+    assert!(refused_by_receiver(&tx, &message.message_id, "c", "invalid_request").unwrap());
+    tx.commit().unwrap();
+    assert_eq!(
+        rows_of(&store, &message.message_id),
+        [
+            (
+                "b".into(),
+                "refused".into(),
+                Some("forbidden".into()),
+                "refused by the host (forbidden)".into()
+            ),
+            (
+                "c".into(),
+                "refused".into(),
+                Some("invalid_request".into()),
+                "refused by the host (invalid_request)".into()
+            ),
+        ]
+    );
+    assert_eq!(
+        outbox::row_state(&store.db, b).unwrap().unwrap().state,
+        "done"
+    );
+    let tx = store.db.unchecked_transaction().unwrap();
+    assert!(!refused_by_receiver(&tx, &message.message_id, "b", "forbidden").unwrap());
+    assert!(!accepted(&tx, &message.message_id, "b").unwrap());
+}

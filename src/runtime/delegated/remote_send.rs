@@ -26,7 +26,8 @@
 //!   Station `expired` is its expiry; an expired object's row `expired`.
 //! - **Acceptance** is the receiver's status naming its resolution, which
 //!   the sending host reads with the results back (not built here):
-//!   [`accepted`] is its seam, settling the engine row too.
+//!   [`accepted`] and [`refused_by_receiver`] are its seams, each settling
+//!   the engine row too.
 use super::outbox::{self, Policy};
 use super::send_plan::{Me, Plan, signs};
 use crate::runtime::host_work::Store;
@@ -37,7 +38,7 @@ use atem_client::host_principal::host_principal;
 use atem_client::membership::Membership;
 use atem_client::session::host_work::HostTarget;
 use atem_client::session::messages::{Destination, Message, Recipient};
-use rusqlite::{Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 
 /// The rows' table and the triggers that move them (made by [`prepare`],
@@ -375,6 +376,43 @@ fn upsert(
 /// row settled (put no more). Whether a `ready` or `sent` row moved.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn accepted(tx: &Transaction, object_id: &str, host_id: &str) -> Result<bool> {
+    settle_row(
+        tx,
+        object_id,
+        host_id,
+        "accepted",
+        None,
+        "accepted by the host",
+    )
+}
+
+/// The receiver's status refused the envelope `object_id` at `host_id`
+/// (`refused{code}`, or `invalid_request` for its checks 5 and 6; the
+/// results back feed it): the row `refused` with `code`, its engine row
+/// settled. Whether a `ready` or `sent` row moved.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn refused_by_receiver(
+    tx: &Transaction,
+    object_id: &str,
+    host_id: &str,
+    code: &str,
+) -> Result<bool> {
+    let detail = format!("refused by the host ({code})");
+    settle_row(tx, object_id, host_id, "refused", Some(code), &detail)
+}
+
+/// A `ready` or `sent` row's final state from the receiver, its engine
+/// row settled (the row moves first: the engine's trigger then finds it
+/// final and leaves it).
+#[cfg_attr(not(test), allow(dead_code))]
+fn settle_row(
+    tx: &Transaction,
+    object_id: &str,
+    host_id: &str,
+    state: &str,
+    code: Option<&str>,
+    detail: &str,
+) -> Result<bool> {
     let n: Option<Option<i64>> = tx
         .query_row(
             "SELECT outbox_n FROM remote_deliveries WHERE object_id=?1 AND host_id=?2
@@ -382,18 +420,14 @@ pub fn accepted(tx: &Transaction, object_id: &str, host_id: &str) -> Result<bool
             params![object_id, host_id],
             |r| r.get(0),
         )
-        .map(Some)
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            e => Err(e),
-        })?;
+        .optional()?;
     let Some(n) = n else {
         return Ok(false);
     };
     tx.execute(
-        "UPDATE remote_deliveries SET state='accepted', detail='accepted by the host'
+        "UPDATE remote_deliveries SET state=?3, code=?4, detail=?5
         WHERE object_id=?1 AND host_id=?2",
-        params![object_id, host_id],
+        params![object_id, host_id, state, code, detail],
     )?;
     if let Some(n) = n {
         outbox::settle(tx, n)?;
