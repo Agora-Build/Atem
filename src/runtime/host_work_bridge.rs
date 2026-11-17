@@ -264,6 +264,9 @@ pub(super) struct State {
     /// What the mailbox keeps at most (`mailbox_store::Limits`; tests lower
     /// them).
     mail_limits: crate::runtime::delegated::mailbox_store::Limits,
+    /// Admission's rows and reports that failed, by key, with their tries
+    /// so far (review M2: one is settled after a bound).
+    admit_failures: HashMap<String, u32>,
     /// Tests: at the mailbox's crash point (after a page's commit, before
     /// its dones), the dones the store owed and the positions of the dones
     /// live then.
@@ -369,6 +372,7 @@ impl State {
             mail_rejudge_failed: false,
             mail_pruned_at: None,
             mail_limits: Default::default(),
+            admit_failures: HashMap::new(),
             #[cfg(test)]
             mail_crash_probe: Vec::new(),
             ack_failures: 0,

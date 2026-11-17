@@ -1239,3 +1239,71 @@ fn early_stops_are_never_pruned_under_a_clock_anchor() {
         assert!(db(&rig).unwrap().is_empty());
     });
 }
+
+/// Review M2: a row that can't be decided never wedges the gate. Each row
+/// and each report is tried on its own (one that fails skips none of the
+/// others), and one still failing after [`MAX_ADMIT_FAILURES`] tries is
+/// settled as an unreadable record is: refused `busy` to its sender by its
+/// own object id (a request also recorded), removed, one runtime.log line.
+#[test]
+fn a_row_that_cant_be_decided_is_settled_after_bounded_tries() {
+    use super::super::delegated_admit_pass::MAX_ADMIT_FAILURES;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        let message = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
+        ad_inbox_request(&rig, &message);
+        ad_admit(&mut rig);
+        let task = ad_tasks(&rig, &message).remove(0);
+        // Its task's record no longer reads (another build's shape).
+        let db = |rig: &LocalRig, sql: &str| {
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .execute_batch(sql)
+                .unwrap()
+        };
+        db(
+            &rig,
+            &format!(
+                "UPDATE work SET record='{{\"shape\":2}}' WHERE id='{}'",
+                task.task.task_id
+            ),
+        );
+        let cancel = ad_inbox_stop(&rig, &task.task.task_id, false, host_now().wall_ms + HOUR);
+        // A report whose mark can't be cleared (its update fails).
+        db(
+            &rig,
+            "CREATE TRIGGER ad_block BEFORE UPDATE OF report ON mailbox_refused
+            BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+        );
+        db(
+            &rig,
+            "INSERT INTO mailbox_refused(evidence, reason, sender_host, object_id, report, bytes,
+                keep_until, at_ms) VALUES('ad-evidence', 'expired', 'host-b',
+                'b06daa5d-9f48-4512-8a98-c6d98b159d8e', 1, NULL, 9999999999999, 0)",
+        );
+        // Neither the failing row nor the failing report holds the next row.
+        let next = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
+        ad_inbox_request(&rig, &next);
+        ad_admit(&mut rig);
+        assert_eq!(ad_tasks(&rig, &next).len(), 1, "the next row admitted");
+        assert_eq!(ad_inbox_rows(&rig), 1, "the failing cancel kept");
+        for _ in 1..MAX_ADMIT_FAILURES {
+            ad_admit(&mut rig);
+        }
+        assert_eq!(ad_inbox_rows(&rig), 0, "settled");
+        assert!(ad_statuses(&rig).iter().any(|(_, s)| *s
+            == ResultPlain::Refusal {
+                object_id: cancel.clone(),
+                refused: "busy".into()
+            }));
+        mb_tick(&mut rig, &mut host, 0);
+        assert_eq!(mb_store(&rig).inbox, 0, "the gate's inbox part drained");
+        db(&rig, "DROP TRIGGER ad_block");
+    });
+}

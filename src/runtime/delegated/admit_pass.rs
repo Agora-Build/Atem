@@ -47,6 +47,9 @@ use rusqlite::Transaction;
 use std::collections::BTreeSet;
 use std::sync::atomic::AtomicU64;
 
+/// Tries of a row, or a report, that can't be decided before it is settled
+/// (review M2).
+pub(super) const MAX_ADMIT_FAILURES: u32 = 8;
 /// Inbox rows decided per pass, at most (the inbox holds 128).
 const ROWS_PER_PASS: usize = 128;
 /// Statuses sealed per pass, at most (the rest next pass).
@@ -149,6 +152,26 @@ impl Signing {
     }
 }
 
+/// A report or an inbox row admission failed to decide (review M2).
+enum Failed {
+    Row(InboxRow, String),
+    Report {
+        evidence: String,
+        sender: String,
+        object_id: String,
+    },
+}
+
+impl Failed {
+    /// Its key in the failures' count.
+    fn key(&self) -> String {
+        match self {
+            Failed::Row(row, _) => format!("row:{}", row.n),
+            Failed::Report { evidence, .. } => format!("report:{evidence}"),
+        }
+    }
+}
+
 /// The ops of every project in effect that lists both `sender` and this
 /// host (`me`): a host sender's account permission toward it (design
 /// II.2.3), whatever the route.
@@ -218,53 +241,147 @@ impl HostBridge {
         let Some(signing) = self.signing() else {
             return;
         };
-        match self.admit_with(&signing, sessions) {
-            // The gate's mailbox part as the inbox now stands, before
-            // anything of this pass is dispatched.
-            Ok(true) => {
-                self.mail_observe();
-                self.publish_mail_gate();
+        let (mut decided, failed) = match self.admit_with(&signing, sessions) {
+            Ok(done) => done,
+            Err(error) => {
+                super::delegated_mail_pass::log_limited(&UNADMITTED, || {
+                    format!(
+                        "atem runtime: host senders' mail not admitted ({error:#}); tried again"
+                    )
+                });
+                return;
             }
-            Ok(false) => {}
-            Err(error) => super::delegated_mail_pass::log_limited(&UNADMITTED, || {
-                format!("atem runtime: host senders' mail not admitted ({error:#}); tried again")
-            }),
+        };
+        // Review M2: one that failed is tried again on the next passes; one
+        // still failing after `MAX_ADMIT_FAILURES` tries is settled, so it
+        // never holds the gate for good. A count goes once its row or
+        // report no longer fails.
+        let mut counts = std::mem::take(&mut self.work.admit_failures);
+        for failure in failed {
+            let key = failure.key();
+            let tries = counts.remove(&key).unwrap_or(0) + 1;
+            if tries < MAX_ADMIT_FAILURES {
+                self.work.admit_failures.insert(key, tries);
+            } else if self.settle_failure(&signing, &failure, tries) {
+                decided = true;
+            } else {
+                self.work.admit_failures.insert(key, tries);
+            }
+        }
+        // The gate's mailbox part as the inbox now stands, before anything
+        // of this pass is dispatched.
+        if decided {
+            self.mail_observe();
+            self.publish_mail_gate();
         }
     }
 
-    /// Whether an inbox row was decided.
+    /// Every report and inbox row decided, each on its own: whether a row
+    /// was taken, and what failed (each logged; review M2: one failing
+    /// skips none of the others).
     fn admit_with(
         &self,
         signing: &Signing,
         sessions: &BTreeMap<SessionId, BrokerSession>,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<(bool, Vec<Failed>)> {
         let Some(store) = self.outbox_store() else {
-            return Ok(false);
+            return Ok((false, Vec::new()));
         };
+        let mut failed = Vec::new();
         // II.4.4: an authenticated object refused at check 5 or 6 is
         // reported to its sender, `invalid_request`, its mark cleared in
         // the transaction that enqueues the status.
         for (evidence, sender, object_id) in admit::reports(&store.db, ROWS_PER_PASS)? {
-            let tx = store.immediate()?;
-            signing.refusal(&tx, &sender, &object_id, "invalid_request")?;
-            admit::reported(&tx, &evidence)?;
-            tx.commit()?;
+            let reported = (|| -> anyhow::Result<()> {
+                let tx = store.immediate()?;
+                signing.refusal(&tx, &sender, &object_id, "invalid_request")?;
+                admit::reported(&tx, &evidence)?;
+                tx.commit()?;
+                Ok(())
+            })();
+            if let Err(error) = reported {
+                super::delegated_mail_pass::log_limited(&UNADMITTED, || {
+                    format!(
+                        "atem runtime: host sender {sender}'s refused object {object_id} not reported ({error:#}); tried again"
+                    )
+                });
+                failed.push(Failed::Report {
+                    evidence,
+                    sender,
+                    object_id,
+                });
+            }
         }
         let mut decided = false;
         for row in admit::inbox(&store.db, ROWS_PER_PASS)? {
-            // A row that can't be decided now stays (holding the gate: fail
-            // closed); the rows after it are decided all the same.
+            // A row that can't be decided now stays, holding the gate (fail
+            // closed) until it is settled; the rows after it are decided all
+            // the same.
             match self.admit_row(store, signing, &row, sessions) {
                 Ok(taken) => decided |= taken,
-                Err(error) => super::delegated_mail_pass::log_limited(&UNADMITTED, || {
-                    format!(
-                        "atem runtime: host sender {}'s mailbox object {} not admitted ({error:#}); tried again",
-                        row.sender_host, row.object_id
-                    )
-                }),
+                Err(error) => {
+                    super::delegated_mail_pass::log_limited(&UNADMITTED, || {
+                        format!(
+                            "atem runtime: host sender {}'s mailbox object {} not admitted ({error:#}); tried again",
+                            row.sender_host, row.object_id
+                        )
+                    });
+                    failed.push(Failed::Row(row, format!("{error:#}")));
+                }
             }
         }
-        Ok(decided)
+        Ok((decided, failed))
+    }
+
+    /// A row that failed `tries` times settled, as an unreadable task
+    /// record is (review M2): refused `busy` to its sender by its own
+    /// object id (a request's refusal recorded, as any whole refusal),
+    /// removed, one runtime.log line; a report's mark cleared. Whether it
+    /// was.
+    fn settle_failure(&self, signing: &Signing, failure: &Failed, tries: u32) -> bool {
+        let Some(store) = self.outbox_store() else {
+            return false;
+        };
+        let settled = (|| -> anyhow::Result<()> {
+            let tx = store.immediate()?;
+            match failure {
+                Failed::Row(row, _) => {
+                    if let Some(EnvelopePlain::Request { message }) = &row.plain {
+                        admit::refuse(
+                            &tx,
+                            &row.sender_host,
+                            &message.message_id,
+                            &message.digest(),
+                            "busy",
+                            signing.now_d,
+                        )?;
+                    }
+                    signing.refusal(&tx, &row.sender_host, &row.object_id, "busy")?;
+                    admit::take_row(&tx, row.n)?;
+                }
+                Failed::Report { evidence, .. } => admit::reported(&tx, evidence)?,
+            }
+            tx.commit()?;
+            Ok(())
+        })();
+        match (&settled, failure) {
+            (Ok(()), Failed::Row(row, error)) => eprintln!(
+                "atem runtime: host sender {}'s mailbox object {} couldn't be admitted after {tries} tries ({error}); refused busy",
+                row.sender_host, row.object_id
+            ),
+            (
+                Ok(()),
+                Failed::Report {
+                    sender, object_id, ..
+                },
+            ) => eprintln!(
+                "atem runtime: host sender {sender}'s refused object {object_id} couldn't be reported after {tries} tries; dropped"
+            ),
+            (Err(error), _) => super::delegated_mail_pass::log_limited(&UNADMITTED, || {
+                format!("atem runtime: a host sender's mailbox object not settled ({error:#})")
+            }),
+        }
+        settled.is_ok()
     }
 
     /// One inbox row decided in its own transaction, removed with its
