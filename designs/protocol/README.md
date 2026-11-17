@@ -22,7 +22,7 @@ The local protocols run over same-user Unix sockets.
 | atem-ch1 | one remote client ↔ the host: r9's end-to-end encrypted channel; atem-session runs inside it. The router (the relay or Astation's `:8080`) carries its frames in a `channel` envelope | 1 (in the name) | atem-session-v1.md §R9.7, §R9.7a; clients use atem-client ([atem-client-bindings.md](atem-client-bindings.md)) |
 | Host work (`host.launch`, `host.work`, `host.messages`, `host.attachments`; stage 1, v0.8.5: `host.reply`) | the same clients ↔ the host, inside r9 channels: remote launch from approved profiles, directed work, messages and notices, PNG screenshots and Chisel/mark | features of r9 (v0.8.2) | [atem-host-work-v1.md](atem-host-work-v1.md); [../agent-hosting.md](../agent-hosting.md) |
 | Selected Station (`stationRoute` messages) | Astation ↔ Atem on the paired link: which Station (relay) Atem connects to | v1 (v0.8.2) | [station-route-v1.md](station-route-v1.md); [../astation-connection.md](../astation-connection.md#station-selection) |
-| Relay messages (`relay`) | the host ↔ the relay: host route proof (`host_challenge`, `host_route`), sealed push hints and seen (`push_hint`, `push_seen`, `push_ack`) | part of r9 | atem-session-v1.md §R9.7b, §R9.9 |
+| Relay messages (`relay`) | the host ↔ the relay: host route proof (`host_challenge`, `host_route`), sealed push hints and seen (`push_hint`, `push_seen`, `push_ack`); behind a debug-only hook only (delegated host work, no release build): the host ↔ its Station's calls (`heads`, the control feed, acknowledgments, the device-list fetch) and host senders' mailbox calls | part of r9 | atem-session-v1.md §R9.7b, §R9.9; [atem-host-work-v1.md](atem-host-work-v1.md) §11.4, §11.5 |
 | Pairing v1 (`pairing`) | Atem ↔ Astation during `atem pair`: the token-free pairing bootstrap (`hello`, `introduction`, `error`) | v1 | Astation's `designs/protocol/pairing-and-service-authorization.md`; Atem's strict reader is `src/pairing_wire.rs` |
 | Local protocol ("local v1") | `atem` commands and the terminal frontend ↔ the background `atem runtime` | v1 | [../agent-runtime.md](../agent-runtime.md) "Local protocol (v1)"; `src/runtime/protocol.rs` |
 | Worker protocol | the runtime (the broker) ↔ each `atem worker` (one per agent session) | v1 | `src/runtime/worker_protocol.rs`; ../agent-runtime.md |
@@ -171,7 +171,11 @@ Notes:
 - More r9 behavior in the real runtime, beyond the fixtures:
   `tests/r9_*_binary.rs` (admission, several devices, push, services,
   two enrolled hosts, revoked grants, host route proof) and
-  `tests/membership_binary.rs`. `tests/approvals_real_agents.rs` answers
+  `tests/membership_binary.rs`; behind the debug-only hook, delegated host
+  work against a fake Station: `tests/delegated_binary.rs`,
+  `tests/control_feed_binary.rs`, and host senders'
+  `tests/host_mail_binary.rs` and `tests/host_senders_binary.rs` (two real
+  hosts). `tests/approvals_real_agents.rs` answers
   approvals with the real Claude Code and Codex
   (`ATEM_REAL_AGENTS=1 cargo test --test approvals_real_agents -- --ignored --nocapture --test-threads=1`;
   real API calls).

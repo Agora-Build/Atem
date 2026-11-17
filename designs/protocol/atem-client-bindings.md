@@ -688,14 +688,15 @@ them, but for its `:8080` proxy, which matches a feed result to the call it
 forwarded with `relay_control_sync_answers` (correlation, §9 "Station
 calls").
 
-### Mail between hosts (delegated host work; planned, host role)
+### Mail between hosts (delegated host work; host role, used only behind the debug-only hook)
 
 The `atem-envelope` a host sender seals to another host of the account (a
 request, a cancel or a complete) and the `atem-result` the host that ran the
 work sends back (a status, a refusal or a result): host-work-v1 §11.5, the
 objects, seals, plaintexts, the receiver's checks and their verdicts. **Host
 role only** (feature `host`, never in an app build, like `sign_seen`):
-nothing sends them in this version, and an app never holds a host's keys.
+only an Atem host sends them, behind its debug-only hook (through the Rust
+core, not the bindings), and an app never holds a host's keys.
 The bindings carry them so the Swift, Kotlin and WASM suites run
 `r9-vectors-host-envelope` through the host's own code.
 

@@ -1,16 +1,17 @@
 # Agent collaboration: Atem-to-Atem messaging
 
-Status (2026-11-15): **stage 1 released in v0.8.5** (merged in #124, with the agreed
+Status (2026-11-17): **stage 1 released in v0.8.5** (merged in #124, with the agreed
 prompt framing); sections 10 and 17 give its lifecycle, retention and
 known limits. Agents in one Atem runtime can send work and reply through the
-existing host queue. **Not implemented (planned):** cross-instance delivery,
-agents on different instances as host senders, see
-[delegated-host-work.md](delegated-host-work.md), Part II. Both its sides
-are built behind a debug-only hook that no release build turns on: planning
-from the device list, sealing and the puts (section 7), admission and launch
-on message on the receiving host (section 5), the results back and
-`message status`, `cancel` and `complete` across hosts (section 10), run end
-to end by two real hosts in the tests.
+existing host queue. **Cross-instance delivery**, agents on different
+instances as host senders ([delegated-host-work.md](delegated-host-work.md),
+Part II), is not released. Both its sides are built behind a debug-only hook
+that no release build turns on: planning from the device list, sealing and
+the puts (section 7), admission and launch on message on the receiving host
+(section 5), the results back and `message status`, `cancel` and `complete`
+across hosts (section 10), run end to end by two real hosts in the tests.
+**Not implemented:** a Station's side of the mailbox (Astation's), the
+directory in the vault, and anything of it in a release build.
 Security is at user authentication and authorization (section 6): a principal
 allowed to reach an agent acts through it with the local user's permissions,
 `atem message send` included, so a route that lists `local` takes work from
@@ -62,7 +63,7 @@ It comes in two steps:
 | Stage | Covers | Depends on |
 |---|---|---|
 | 1. Local (released in v0.8.5) | Agents on the same Atem instance | Atem only; owner opts in through runtime.toml |
-| Cross-instance (planned): host senders | Agents on different instances, online or offline (store-and-forward for up to 24 h), with project-level permissions | See [delegated-host-work.md](delegated-host-work.md) (II.2 to II.9) |
+| Cross-instance (built behind a debug-only hook, not released): host senders | Agents on different instances, online or offline (store-and-forward for up to 24 h), with project-level permissions | See [delegated-host-work.md](delegated-host-work.md) (II.2 to II.9) |
 
 The agreed design had two cross-instance stages: stage 2, an instance enrolled
 as a Station integration, online only, and stage 3, the instance itself as a
@@ -130,7 +131,7 @@ The agent working on token scopes in the Auth repo adds `self:tokens` itself.
 - Labels only address. Adding `self:tokens` makes an agent reachable by
   messages addressed to `self:tokens`; whether a sender may give it work is
   still decided by permissions (section 6). A project grants nothing either
-  (signed project grants are planned:
+  (signed project grants, built only behind the debug-only hook:
   [delegated-host-work.md](delegated-host-work.md), II.2.2). Labels do decide
   where content goes, which is why only the owner sets `project:` and `tag:`.
 
@@ -157,7 +158,7 @@ agent at most once; the sending agent never receives its own message.
    end-to-end encrypted, refreshed on change and every 10 minutes, stale after
    an hour. A record is a hint, never authority. The plan names each target
    host by its exact identity, never by a label or `atem_id`, and the channel's
-   `welcome` must match it. (Cross-instance, planned: the first version plans
+   `welcome` must match it. (Cross-instance, built behind the debug-only hook: the first version plans
    from the signed device list instead, with no records; see below. A host's
    `host_id` is its `atem_id`, so `atem:<atem_id>` needs no record.)
 2. The sender splits one budget of at most **32 agents per message** across
@@ -180,7 +181,7 @@ from the local runtime only; no vault directory record is published yet
 The shared types include a new host-work destination,
 `select{selectors, budget}`, beside `host`, `project` and `agent` (feature
 `host.select`). Stage 1 uses it internally: `host.select` is not advertised and
-remote host admission refuses `select`. **Cross-instance (planned):** host
+remote host admission refuses `select`. **Cross-instance (built behind the debug-only hook):** host
 senders' envelopes carry `select`, never a channel, and the first version
 addresses other hosts through the signed device list with the selectors
 above: `project:<name>` reaches the hosts the signed project lists, and
@@ -226,7 +227,7 @@ is `local`, whoever prompted the agent that sent it (below).
 | Stage | Sender identity | Account permission | Route consent |
 |---|---|---|---|
 | 1. Local | `local`: an internal attachment of the session host, never welcomed over a link | none: the message never leaves the machine (the same-user boundary every local command has); the sending agent's session is verified from its process (below) | the route lists `local` in `principals` |
-| Cross-instance (planned) | the instance itself as `host:<host_id>` (an instance doesn't enroll as a Station integration: owner decision 2026-11-15) | see [delegated-host-work.md](delegated-host-work.md), II.2 | see [delegated-host-work.md](delegated-host-work.md), II.2.3 |
+| Cross-instance (built behind the debug-only hook) | the instance itself as `host:<host_id>` (an instance doesn't enroll as a Station integration: owner decision 2026-11-15) | see [delegated-host-work.md](delegated-host-work.md), II.2 | see [delegated-host-work.md](delegated-host-work.md), II.2.3 |
 
 **Trust model: security is at user authentication.** Prompts must come from
 an authenticated, authorized user, neither forged nor altered on the way.
@@ -292,7 +293,7 @@ each command it runs; native members with `control`, and services and browser
 grants with the `approval` op, can answer them remotely. What is planned
 against the rest is in section 17 ("Known limits").
 
-**Cross-instance (planned):** see
+**Cross-instance (built behind the debug-only hook):** see
 [delegated-host-work.md](delegated-host-work.md), Part II.
 
 **Limits against runaway chains.** A misleading message must not fan out:
@@ -434,8 +435,11 @@ before its snapshot is frozen ("vault context contains a credential value;
 remove it"), on a send and on a reply: its text would reach other agents, and
 remote senders through `reply_query`, as it is.
 
-**Cross-instance (planned):** see
-[delegated-host-work.md](delegated-host-work.md), Part II.
+**Cross-instance (built behind the debug-only hook):** a send with context
+keeps its rows to other hosts `publishing` until the context is frozen, then
+seals the frozen snapshots into each envelope (host-work-v1 §11.5, "On the
+sending host"); see [delegated-host-work.md](delegated-host-work.md), Part
+II.
 
 **Later: atomic (Station).** The Station stores the encrypted context version
 and the pending envelope in one transaction, so neither exists without the
@@ -742,9 +746,9 @@ its sender: two separate steps.
   after the task settled past its deadline only the text goes ("Records and
   retention" below, [agent-hosting.md](agent-hosting.md) section 9).
 
-Stage 1 implements all of this within one runtime. **Cross-instance
-(planned):** see [delegated-host-work.md](delegated-host-work.md), Part II.
-**Built behind the debug-only hook** (host-work-v1 §11.5, both sides): the
+Stage 1 implements all of this within one runtime. **Cross-instance**
+([delegated-host-work.md](delegated-host-work.md), Part II) is **built
+behind the debug-only hook** (host-work-v1 §11.5, both sides): the
 host that ran a host sender's task sends its agent's submitted reply back
 as one result (the reply as `reply_query` returns it); the sending host
 judges every status and result with the shared core, records the other
@@ -923,7 +927,9 @@ one.
 Stage 1 persists local sends, resolutions, tasks, counters, replies and return
 grants across broker restarts. It needs no network transport for text-only work;
 Memory/Vault publication waits for a reachable relay. A lost or uncertain
-launch is not respawned automatically. **Cross-instance (planned):** see
+launch is not respawned automatically. **Cross-instance (built behind the
+debug-only hook):** each side's records survive a restart, and objects are
+committed before they are put or marked done (host-work-v1 §11.5); see
 [delegated-host-work.md](delegated-host-work.md), Part II.
 
 **Delegated senders** (built behind a debug-only hook; advertised by no
@@ -941,12 +947,12 @@ tasks keep section 10's lifecycle.
 | Transport | Stage | Sender identity | Carried by | Offline |
 |---|---|---|---|---|
 | In-process | 1 | `local` (the internal attachment; the sending session is recorded with the envelope) | the runtime | not needed |
-| Station mailbox with sealed envelopes (planned) | cross-instance | `host:<host_id>`: the sending host's verified identity in the signed device list; its envelopes and results are signed with its `host_key` and sealed to the receiving host's encryption key | the Station mailbox of the receiving host: stores sealed objects per host, with acknowledgments, deduplication and quotas; the Station reads none of the content | yes, up to 24 h |
+| Station mailbox with sealed envelopes (Atem's side built behind the debug-only hook; the Station's is Astation's) | cross-instance | `host:<host_id>`: the sending host's verified identity in the signed device list; its envelopes and results are signed with its `host_key` and sealed to the receiving host's encryption key | the Station mailbox of the receiving host: stores sealed objects per host, with acknowledgments, deduplication and quotas; the Station reads none of the content | yes, up to 24 h |
 
-**Cross-instance (planned):** see
+**Cross-instance (Atem's side built behind the debug-only hook):** see
 [delegated-host-work.md](delegated-host-work.md), Part II (the mailbox:
-II.4.3; its wire, proposed: [atem-host-work-v1.md](protocol/atem-host-work-v1.md)
-§11.5). Its envelopes are addressed with `project:<name>` and
+II.4.3; its wire, agreed with Astation 2026-11-16:
+[atem-host-work-v1.md](protocol/atem-host-work-v1.md) §11.5). Its envelopes are addressed with `project:<name>` and
 `atem:<atem_id>[/<route_id>]` through the signed device list (section 5). A
 Station integration (the agreed stage 2) isn't a transport between Atem
 instances: the owner decided (2026-11-15) that they use only host senders.
@@ -982,7 +988,7 @@ id = "auth"
 revision = 1
 profile_id = "auth"
 labels = ["tag:auth"]
-principals = ["local"]      # local agents; project:<name> and host:<host_id> are planned (delegated-host-work.md II.2.3)
+principals = ["local"]      # local agents; project:<name> and host:<host_id> only behind the debug-only hook (delegated-host-work.md II.2.3)
 launch = "on_message"       # optional; the profile must be Claude Code in stage 1
 results = true              # off by default: results of tasks this route's agents sent reach them
 auto_report = "status"      # or "final_message" (opt-in)
@@ -1007,8 +1013,9 @@ validate it with `atem runtime check`. Repeat `--to` for a union of selectors.
 
 ## 14. Ownership and dependencies
 
-The local items below are implemented; Codex launch on message, atomic
-write-and-notify and every cross-instance item are planned.
+The local items below are implemented; Codex launch on message and atomic
+write-and-notify are planned. The cross-instance items are built on Atem's
+side behind the debug-only hook only (below).
 
 | Item | Owner | Depends on |
 |---|---|---|
@@ -1021,7 +1028,7 @@ write-and-notify and every cross-instance item are planned.
 | Launch on message for Codex | Atem | Codex's first-prompt readiness fixed and tested first |
 | Atomic write-and-notify | Station | a transaction over encrypted context versions and pending envelopes, with its boundary specified |
 
-**Cross-instance (planned):** host senders: the mailbox, origin-signed
+**Cross-instance (Atem's side built behind the debug-only hook, not released):** host senders: the mailbox, origin-signed
 envelopes, the `host:` principal and signed projects (no Station integration
 between Atem instances, owner decision 2026-11-15; the directory in the vault
 comes later, for discovery and display): see
@@ -1063,7 +1070,8 @@ Auth/Portal (answered 2026-11-04):
 Cross-instance (stages 2 and 3):
 
 **6-8.** Answered in [delegated-host-work.md](delegated-host-work.md) (II.1,
-II.2.1, II.2.2); planned, nothing built.
+II.2.1, II.2.2): stage 2 isn't used between Atem hosts, and Atem's side of
+stage 3 is built behind the debug-only hook.
 
 Still open:
 
@@ -1215,8 +1223,10 @@ fencing.
 These are runtime and protocol tests with fake providers. They do not claim a
 live Claude/Codex conversation, native app acceptance or deployed cross-host
 delivery. Cross-instance delivery (host senders: the mailbox, signed
-projects, results across hosts), and later the directory in the vault, remain
-outside this implementation ([delegated-host-work.md](delegated-host-work.md));
+projects, results across hosts) is built only behind the debug-only hook and
+tested there (`tests/host_mail_binary.rs`, `tests/host_senders_binary.rs`,
+against a fake Station); the directory in the vault remains outside this
+implementation ([delegated-host-work.md](delegated-host-work.md));
 the Station's typed adapters and capacity were stage 2's, which Atem hosts
 don't use between themselves (owner decision 2026-11-15).
 
