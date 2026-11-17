@@ -17,8 +17,18 @@
 //!   good beside the host-work message records, which are never deleted
 //!   either: a resend is judged against both ([`refusal`]), never only
 //!   against the mailbox's claims, which are pruned.
+//! - **Status owed** (`mail_status_owed`): a host sender's message whose
+//!   status is to go to it. A trigger on `work` marks it in the statement
+//!   that changes the state of one of its tasks (a host sender's: its
+//!   principal `host:…`), whoever writes it; the bridge seals the message's
+//!   current status, enqueues it and clears the mark in one transaction
+//!   ([`sent`], [`clear`]).
 //! - **The latest status** (`mail_status_sent`): per message, the put
-//!   engine's row of the status sent last.
+//!   engine's row of the status sent last. A newer one supersedes it while
+//!   the Station hasn't stored it (the engine settles it: never put again):
+//!   each status is its own object with its own id, and carries every
+//!   task's current state.
+use super::outbox;
 use crate::runtime::host_work::{MessageRecord, Store};
 use anyhow::{Result, anyhow};
 use atem_client::host_mail::EnvelopePlain;
@@ -28,8 +38,9 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 /// Early stops kept per sender host, at most (ruling R38).
 pub const MAX_EARLY_STOPS: u64 = 32;
 
-/// Admission's tables (made by [`prepare`], only with `host.senders`).
-/// Additive, as every host-work table.
+/// Admission's tables and the trigger that marks a status owed (made by
+/// [`prepare`], only with `host.senders`). Additive, as every host-work
+/// table.
 const TABLES: &str = "
     CREATE TABLE IF NOT EXISTS mail_stops (
         sender_host TEXT NOT NULL, object_id TEXT NOT NULL, task_id TEXT NOT NULL,
@@ -40,8 +51,18 @@ const TABLES: &str = "
         sender_host TEXT NOT NULL, message_id TEXT NOT NULL, digest TEXT NOT NULL,
         code TEXT NOT NULL, at_ms INTEGER NOT NULL,
         PRIMARY KEY(sender_host, message_id)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS mail_status_owed (message_id TEXT PRIMARY KEY) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS mail_status_sent (
-        message_id TEXT PRIMARY KEY, outbox_n INTEGER NOT NULL) WITHOUT ROWID;";
+        message_id TEXT PRIMARY KEY, outbox_n INTEGER NOT NULL) WITHOUT ROWID;
+    CREATE TRIGGER IF NOT EXISTS mail_status_changed AFTER UPDATE OF state ON work
+    WHEN NEW.state IS NOT OLD.state AND CASE WHEN json_valid(NEW.record)
+        THEN json_extract(NEW.record, '$.principal') GLOB 'host:*'
+            AND json_extract(NEW.record, '$.message.message_id') IS NOT NULL
+        ELSE 0 END
+    BEGIN
+        INSERT OR IGNORE INTO mail_status_owed(message_id)
+            VALUES(json_extract(NEW.record, '$.message.message_id'));
+    END;";
 
 /// Admission's tables in `store`, made if missing.
 pub fn prepare(store: &Store) -> Result<()> {
@@ -179,13 +200,64 @@ pub fn refuse(
     Ok(())
 }
 
+/// The messages whose status is owed, at most `limit`.
+pub fn owed(db: &Connection, limit: usize) -> Result<Vec<String>> {
+    let mut q = db.prepare("SELECT message_id FROM mail_status_owed LIMIT ?1")?;
+    let rows = q.query_map([limit as i64], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// No status of `message_id` is owed any more (none can go: its sender
+/// can't receive one now; the record keeps the state).
+pub fn clear(tx: &Transaction, message_id: &str) -> Result<()> {
+    tx.execute(
+        "DELETE FROM mail_status_owed WHERE message_id=?1",
+        [message_id],
+    )?;
+    Ok(())
+}
+
 /// The status of `message_id` enqueued as the engine's row `n`, in the
-/// transaction that enqueued it.
+/// transaction that enqueued it: the one before it superseded (settled,
+/// never put, while the Station hasn't stored it), and none owed.
 pub fn sent(tx: &Transaction, message_id: &str, n: i64) -> Result<()> {
+    let before: Option<i64> = tx
+        .query_row(
+            "SELECT outbox_n FROM mail_status_sent WHERE message_id=?1",
+            [message_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(before) = before.filter(|b| *b != n) {
+        outbox::settle(tx, before)?;
+    }
     tx.execute(
         "INSERT INTO mail_status_sent(message_id, outbox_n) VALUES(?1, ?2)
         ON CONFLICT(message_id) DO UPDATE SET outbox_n=excluded.outbox_n",
         params![message_id, n],
+    )?;
+    clear(tx, message_id)
+}
+
+/// The refusals the mailbox marked for a status to their sender (`report`,
+/// an authenticated object refused at II.4.2's checks 5 or 6): `(evidence,
+/// sender host, object id)`, at most `limit`, oldest first.
+pub fn reports(db: &Connection, limit: usize) -> Result<Vec<(String, String, String)>> {
+    let mut q = db.prepare(
+        "SELECT evidence, sender_host, object_id FROM mailbox_refused
+        WHERE report=1 AND sender_host IS NOT NULL AND object_id IS NOT NULL
+        ORDER BY n LIMIT ?1",
+    )?;
+    let rows = q.query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// The refusal `evidence` reported (its status enqueued), in that
+/// transaction: never reported again.
+pub fn reported(tx: &Transaction, evidence: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE mailbox_refused SET report=0 WHERE evidence=?1",
+        [evidence],
     )?;
     Ok(())
 }

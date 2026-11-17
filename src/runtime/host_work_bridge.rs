@@ -1176,6 +1176,11 @@ impl HostBridge {
                 // Host senders' later interrupts carried on channels: stops,
                 // served while paused (answered `busy` when they can't be).
                 self.control_records_pass();
+                // Their statuses owed (the device list's effects change
+                // their tasks while paused too).
+                if self.kept_here() {
+                    self.mail_statuses();
+                }
             }
             // A stop always wins: what control records' effects asked once
             // they committed is carried out while paused too.
@@ -1319,6 +1324,8 @@ impl HostBridge {
                 self.work_fail();
             }
         }
+        // The statuses owed to host senders for their tasks' changes.
+        self.mail_statuses();
     }
 
     /// The inputs of the checks of waiting tasks and return grants

@@ -4,8 +4,9 @@
 // project `build` lists this host and B with a task's ops, and route `rh`
 // consents to `project:build`); B's objects reach the inbox through this
 // host's mailbox, or are written there as the mailbox writes them; then
-// admission (`admit_mail`). B's statuses are opened with B's key and the
-// shared core. Every name here starts with `ad_`.
+// admission (`admit_mail`) and the statuses owed (`mail_statuses`). B's
+// statuses are opened with B's key and the shared core. Every name here
+// starts with `ad_`.
 
 use crate::runtime::delegated::admit;
 use atem_client::host_mail::{EnvelopePlain, ResultPlain};
@@ -638,6 +639,78 @@ fn duplicates_are_judged_against_the_message_records() {
     });
 }
 
+/// VII.B 34 and 35: a request with a mark is refused authenticated when it
+/// opens (`attachments_not_allowed`), and so is one whose lifetime is too
+/// long (`lifetime_too_long`): each refusal marked for its sender is
+/// reported once, `{"kind":"status","object_id","refused":
+/// "invalid_request"}`, its mark cleared in that commit. Nothing is queued.
+#[test]
+fn refusals_marked_for_their_sender_are_reported_once() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        let host_target = ad_here(&rig);
+        let mut marked = ad_message(
+            &rig,
+            vec![Destination::Agent {
+                route_id: "rh".into(),
+                route_revision: 1,
+                target: wire::Target {
+                    account_id: host_target.account_id.clone(),
+                    atem_device_id: host_target.atem_device_id.clone(),
+                    host_trust_gen: host_target.host_trust_gen,
+                    session_id: rig.sid.to_string(),
+                    process_gen: rig.sessions[&rig.sid].process_gen.clone(),
+                },
+            }],
+        );
+        marked.mark = Some(atem_client::session::mark::MarkTask {
+            mark_id: "mark_ad".into(),
+            url: "http://localhost:3000/".into(),
+            title: "Page".into(),
+            screenshot: atem_client::session::attachments::Attachment {
+                attachment_id: uuid::Uuid::new_v4().to_string(),
+                digest: hw::digest(b"png"),
+                size: 68,
+                media_type: "image/png".into(),
+            },
+            annotations: vec![],
+        });
+        let mark = ad_request(&rig, &host, &marked);
+        let mut long = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
+        long.expires_at = long.created_at + 2 * hw::MAX_LIFETIME_MS;
+        let too_long = ad_request(&rig, &host, &long);
+        ad_deliver(&mut rig, &mut host, &[mark, too_long]);
+        assert_eq!(ad_inbox_rows(&rig), 0);
+        let reports: i64 = rig
+            .bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .query_row(
+                "SELECT count(*) FROM mailbox_refused WHERE report=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reports, 2);
+        ad_admit(&mut rig);
+        ad_admit(&mut rig);
+        let statuses: Vec<ResultPlain> = ad_statuses(&rig).into_iter().map(|(_, p)| p).collect();
+        assert_eq!(
+            statuses,
+            [&marked.message_id, &long.message_id].map(|id| ResultPlain::Refusal {
+                object_id: id.clone(),
+                refused: "invalid_request".into()
+            })
+        );
+        assert!(ad_tasks(&rig, &marked).is_empty());
+    });
+}
+
 /// II.9's limits, as a channel member's publish meets them, refuse a host
 /// sender's request whole, `busy`, recorded for good (a resend gets
 /// `busy` again): `per_workflow` messages per workflow, the 256
@@ -890,6 +963,96 @@ fn a_stop_before_its_request_is_kept_and_applied_at_admission() {
     });
 }
 
+/// II.4.4: a status is owed at every change of a host sender's task's
+/// state, marked by the trigger in the statement that changes it (queued,
+/// blocked, submitted, awaiting its result, completed; failed by a
+/// device-list entry), and sent with every task's current state; a newer
+/// status supersedes one not stored yet (the engine settles it, never
+/// put), while one stored stays done.
+#[test]
+fn a_status_is_owed_at_each_change_and_supersedes_the_unstored_one() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        let message = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
+        ad_inbox_request(&rig, &message);
+        ad_admit(&mut rig);
+        let task = ad_tasks(&rig, &message).remove(0);
+        let owed = |rig: &LocalRig| rows(rig, "mail_status_owed");
+        assert_eq!(owed(&rig), 0);
+        for state in [
+            WorkState::Blocked,
+            WorkState::Submitted,
+            WorkState::AwaitingResult,
+            WorkState::Completed,
+        ] {
+            ad_set_state(&rig, &task, state);
+            assert_eq!(owed(&rig), 1, "{state:?}");
+            rig.bridge.mail_statuses();
+            assert_eq!(owed(&rig), 0);
+            assert_eq!(ad_one_state(&rig, &message).0, state);
+        }
+        // A detail alone changes no state: nothing owed.
+        let mut r = ad_tasks(&rig, &message).remove(0);
+        r.status.detail = "another detail".into();
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .save_work(&r)
+            .unwrap();
+        assert_eq!(owed(&rig), 0);
+        // Superseded: every status but the newest settled unput.
+        let states: Vec<String> = ad_statuses(&rig).into_iter().map(|(s, _)| s).collect();
+        assert_eq!(states, ["done", "done", "done", "done", "queued"]);
+        // One stored stays as it was when a newer one comes.
+        let put = sp_out(&mut rig);
+        assert_eq!(put.len(), 1);
+        sp_stored(&mut rig, &put[0]);
+        // A device-list narrowing fails an unstarted task: owed, sent.
+        let queued = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
+        ad_inbox_request(&rig, &queued);
+        ad_admit(&mut rig);
+        sign_and_carry(
+            &mut rig,
+            &mut host.s,
+            project_set("build", ["host", "host-b"], [ProjectOp::Message], 0).unwrap(),
+        );
+        rig.bridge.sync_list_view();
+        rig.bridge.host_senders_pass();
+        assert_eq!(owed(&rig), 1);
+        rig.bridge.mail_statuses();
+        assert_eq!(
+            ad_one_state(&rig, &queued),
+            (WorkState::Failed, "sender's authorization narrowed".into())
+        );
+        let states: Vec<String> = ad_statuses(&rig).into_iter().map(|(s, _)| s).collect();
+        assert_eq!(states[4], "done", "stored, not superseded");
+        // A task awaiting its result at its deadline expires (`settle_due`):
+        // owed, sent.
+        let late = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
+        sign_and_carry(
+            &mut rig,
+            &mut host.s,
+            project_set("build", ["host", "host-b"], task_ops(), 0).unwrap(),
+        );
+        rig.bridge.sync_list_view();
+        ad_inbox_request(&rig, &late);
+        ad_admit(&mut rig);
+        ad_set_state(&rig, &ad_tasks(&rig, &late)[0], WorkState::AwaitingResult);
+        rig.bridge.mail_statuses();
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        store
+            .settle_due(late.expires_at, Some(late.expires_at))
+            .unwrap();
+        assert_eq!(owed(&rig), 1);
+        rig.bridge.mail_statuses();
+        assert_eq!(ad_one_state(&rig, &late).0, WorkState::Expired);
+    });
+}
+
 /// Entry criterion 1: admission takes every inbox row whatever host
 /// senders' gate says (it waits for the inbox, so admission that waited for
 /// it would wait for itself): with the mailbox not read to its head, a pass
@@ -935,6 +1098,10 @@ fn no_status_goes_to_a_sender_with_no_key() {
         ad_admit(&mut rig);
         assert_eq!(ad_tasks(&rig, &message).len(), 1);
         assert_eq!(rows(&rig, "mail_outbox"), 0);
+        ad_set_state(&rig, &ad_tasks(&rig, &message)[0], WorkState::Blocked);
+        rig.bridge.mail_statuses();
+        assert_eq!(rows(&rig, "mail_outbox"), 0);
+        assert_eq!(rows(&rig, "mail_status_owed"), 0, "none owed");
     });
 }
 
@@ -989,6 +1156,7 @@ fn without_host_senders_nothing_is_admitted() {
         rig.bridge.features = HostFeatures::parse("host.delegated").unwrap();
         rig.bridge.mail_observe();
         ad_admit(&mut rig);
+        rig.bridge.mail_statuses();
         let made: bool = rig
             .bridge
             .work

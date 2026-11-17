@@ -23,8 +23,10 @@
 //!   whose task isn't here yet is kept as an early stop (ruling R38).
 //! - **Status objects** (II.4.4): the message's current status, sealed to
 //!   the sender's current `host_enc_key` with this host's
-//!   `host_channel_key`, signed at the committed head, at acceptance and
-//!   for a stop. A sender with no current key, or no longer a current host,
+//!   `host_channel_key`, signed at the committed head; a refused
+//!   authenticated object's status (`report`); and, each pass, the statuses
+//!   owed for a host sender's task whose state changed ([`admit`]'s
+//!   trigger). A sender with no current key, or no longer a current host,
 //!   gets none: the record keeps the state for the owner.
 use super::*;
 use crate::runtime::delegated::admit::{self, InboxRow};
@@ -47,6 +49,8 @@ use std::sync::atomic::AtomicU64;
 
 /// Inbox rows decided per pass, at most (the inbox holds 128).
 const ROWS_PER_PASS: usize = 128;
+/// Statuses sealed per pass, at most (the rest next pass).
+const STATUSES_PER_PASS: usize = 64;
 
 static UNADMITTED: AtomicU64 = AtomicU64::new(0);
 static UNSEALED: AtomicU64 = AtomicU64::new(0);
@@ -98,7 +102,8 @@ impl Signing {
     }
 
     /// The current status of `record` (a host sender's message) to its
-    /// sender, enqueued in `tx` (none when the sender can't receive one).
+    /// sender, enqueued in `tx` (the one before it superseded), or none
+    /// owed when the sender can't receive one.
     fn status(
         &self,
         tx: &Transaction,
@@ -117,7 +122,7 @@ impl Signing {
                 let n = outbox::enqueue(tx, &bytes, &to, Policy::UntilStored)?;
                 admit::sent(tx, message_id, n)
             }
-            None => Ok(()),
+            None => admit::clear(tx, message_id),
         }
     }
 
@@ -229,6 +234,15 @@ impl HostBridge {
             return Ok(false);
         };
         admit::prune_stops(&store.db, signing.now_d)?;
+        // II.4.4: an authenticated object refused at check 5 or 6 is
+        // reported to its sender, `invalid_request`, its mark cleared in
+        // the transaction that enqueues the status.
+        for (evidence, sender, object_id) in admit::reports(&store.db, ROWS_PER_PASS)? {
+            let tx = store.immediate()?;
+            signing.refusal(&tx, &sender, &object_id, "invalid_request")?;
+            admit::reported(&tx, &evidence)?;
+            tx.commit()?;
+        }
         let mut decided = false;
         for row in admit::inbox(&store.db, ROWS_PER_PASS)? {
             // A row that can't be decided now stays (holding the gate: fail
@@ -277,6 +291,61 @@ impl HostBridge {
         admit::take_row(&tx, row.n)?;
         tx.commit()?;
         Ok(true)
+    }
+
+    /// The statuses owed (a host sender's task changed state: [`admit`]'s
+    /// trigger), each sealed with its message's current state and enqueued,
+    /// the mark cleared, in one transaction; at most
+    /// [`STATUSES_PER_PASS`] a pass. With `host.senders` on, while hosting
+    /// runs or is paused (a device-list entry's effects change tasks then
+    /// too). Kept owed while this host can't sign.
+    pub(super) fn mail_statuses(&mut self) {
+        if !self.senders_on() || crate::runtime::test_hooks::admission_held() {
+            return;
+        }
+        let Some(signing) = self.signing() else {
+            return;
+        };
+        let Some(store) = self.outbox_store() else {
+            return;
+        };
+        let owed = match admit::owed(&store.db, STATUSES_PER_PASS) {
+            Ok(owed) => owed,
+            Err(error) => {
+                super::delegated_mail_pass::log_limited(&UNSEALED, || {
+                    format!("atem runtime: host senders' statuses not read ({error:#})")
+                });
+                return;
+            }
+        };
+        for message_id in owed {
+            let sealed = (|| -> anyhow::Result<()> {
+                let tx = store.immediate()?;
+                match store.message(&message_id)? {
+                    Some(record) => signing.status(&tx, store, &record)?,
+                    None => admit::clear(&tx, &message_id)?,
+                }
+                tx.commit()?;
+                Ok(())
+            })();
+            // One that can't be built (a task record that doesn't read)
+            // is dropped, never blocking the others: the record keeps the
+            // state for the owner.
+            if let Err(error) = sealed {
+                super::delegated_mail_pass::log_limited(&UNSEALED, || {
+                    format!(
+                        "atem runtime: message {message_id}'s status not sent to its host sender ({error:#})"
+                    )
+                });
+                let dropped = store.immediate().and_then(|tx| {
+                    admit::clear(&tx, &message_id)?;
+                    Ok(tx.commit()?)
+                });
+                if dropped.is_err() {
+                    return;
+                }
+            }
+        }
     }
 
     /// A host sender's request (design II.4.2 step 7, "Duplicates"; the
