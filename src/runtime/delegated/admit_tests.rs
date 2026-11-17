@@ -7,6 +7,7 @@
 // admission (`admit_mail`). B's statuses are opened with B's key and the
 // shared core. Every name here starts with `ad_`.
 
+use crate::runtime::delegated::admit;
 use atem_client::host_mail::{EnvelopePlain, ResultPlain};
 use atem_client::session::messages::{Delivery, RecipientReceipt, WorkProgress};
 
@@ -192,6 +193,35 @@ fn ad_inbox_request(rig: &LocalRig, message: &Message) {
     );
 }
 
+/// B's `cancel` (or with `result` its `complete`) of `task_id`, written
+/// into the inbox: its object id.
+fn ad_inbox_stop(rig: &LocalRig, task_id: &str, complete: bool, expires_at: u64) -> String {
+    let id = uuid::Uuid::new_v4().to_string();
+    let plain = if complete {
+        EnvelopePlain::Complete {
+            task_id: task_id.into(),
+            result: ad_snapshot(),
+        }
+    } else {
+        EnvelopePlain::Cancel {
+            task_id: task_id.into(),
+        }
+    };
+    ad_inbox(rig, &id, expires_at, None, &plain);
+    id
+}
+
+/// A result snapshot, as `work_complete` takes one.
+fn ad_snapshot() -> hw::ContextSnapshot {
+    hw::ContextSnapshot {
+        kind: hw::ContextKind::Memory,
+        id: "mem_ad".into(),
+        version: 1,
+        digest: hw::digest(b"done"),
+        text: "done".into(),
+    }
+}
+
 /// One admission pass.
 fn ad_admit(rig: &mut LocalRig) {
     rig.bridge.admit_mail(&rig.sessions);
@@ -278,6 +308,28 @@ fn ad_tasks(rig: &LocalRig, message: &Message) -> Vec<WorkRecord> {
         .unwrap()
         .map(|r| serde_json::from_str(&r.unwrap()).unwrap())
         .collect()
+}
+
+/// `task`'s state set by hand (as a dispatch or a reply would move it).
+fn ad_set_state(rig: &LocalRig, task: &WorkRecord, state: WorkState) {
+    let mut r = task.clone();
+    r.status.state = state;
+    // A completed task carries its result (`work_complete`'s).
+    r.status.result = (state == WorkState::Completed).then(ad_snapshot);
+    rig.bridge
+        .work
+        .store
+        .as_ref()
+        .unwrap()
+        .save_work(&r)
+        .unwrap();
+}
+
+/// A status's single recipient's single task, with its state.
+fn ad_one_state(rig: &LocalRig, message: &Message) -> (WorkState, String) {
+    let receipts = ad_receipts(rig, message);
+    let task = &ad_resolved(&receipts[0])[0];
+    (task.state, task.detail.clone())
 }
 
 /// A request to this host's agents (`atem:host`) through the mailbox
@@ -666,6 +718,175 @@ fn the_limits_refuse_a_request_busy() {
         ad_inbox_request(&rig, &unresolved);
         ad_admit(&mut rig);
         busy(&rig, &unresolved);
+    });
+}
+
+/// Design II.7: B's `cancel` cancels its own queued task (`cancelled
+/// before submission`) and its `complete` completes its own task awaiting
+/// its result, with the snapshot; one that finds its task running, or
+/// not awaiting its result, isn't reached. Each enqueues the message's
+/// current status. A complete of a task admitted before a revoke (B
+/// revoked, then readmitted) isn't reached either: that task is the
+/// owner's.
+#[test]
+fn cancel_and_complete_reach_only_the_senders_current_tasks() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        let expires = host_now().wall_ms + HOUR;
+        let message = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
+        ad_inbox_request(&rig, &message);
+        ad_admit(&mut rig);
+        let task = ad_tasks(&rig, &message).remove(0);
+        // Running: the cancel isn't reached.
+        ad_set_state(&rig, &task, WorkState::Submitted);
+        ad_inbox_stop(&rig, &task.task.task_id, false, expires);
+        ad_admit(&mut rig);
+        assert_eq!(ad_one_state(&rig, &message).0, WorkState::Submitted);
+        // Queued: cancelled.
+        ad_set_state(&rig, &task, WorkState::Queued);
+        ad_inbox_stop(&rig, &task.task.task_id, false, expires);
+        ad_admit(&mut rig);
+        assert_eq!(
+            ad_one_state(&rig, &message),
+            (WorkState::Cancelled, "cancelled before submission".into())
+        );
+        // A complete of a queued task isn't reached; awaiting, it completes.
+        let message = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
+        ad_inbox_request(&rig, &message);
+        ad_admit(&mut rig);
+        let task = ad_tasks(&rig, &message).remove(0);
+        ad_inbox_stop(&rig, &task.task.task_id, true, expires);
+        ad_admit(&mut rig);
+        assert_eq!(ad_one_state(&rig, &message).0, WorkState::Queued);
+        ad_set_state(&rig, &task, WorkState::AwaitingResult);
+        ad_inbox_stop(&rig, &task.task.task_id, true, expires);
+        ad_admit(&mut rig);
+        assert_eq!(ad_one_state(&rig, &message).0, WorkState::Completed);
+        let done = ad_tasks(&rig, &message).remove(0);
+        assert_eq!(done.status.result, Some(ad_snapshot()));
+        // Admitted before a revoke and a readmit: the owner's alone (the
+        // device list's own effects, which would cancel the queued one, not
+        // run here).
+        let message = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
+        ad_inbox_request(&rig, &message);
+        ad_admit(&mut rig);
+        let task = ad_tasks(&rig, &message).remove(0);
+        ad_set_state(&rig, &task, WorkState::AwaitingResult);
+        let queued = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
+        ad_inbox_request(&rig, &queued);
+        ad_admit(&mut rig);
+        let queued_task = ad_tasks(&rig, &queued).remove(0);
+        sign_and_carry(
+            &mut rig,
+            &mut host.s,
+            host_sender_revoke("host-b", false, 0).unwrap(),
+        );
+        sign_and_carry(
+            &mut rig,
+            &mut host.s,
+            host_sender_readmit("host-b", 0).unwrap(),
+        );
+        rig.bridge.sync_list_view();
+        mb_tick(&mut rig, &mut host, 0);
+        ad_inbox_stop(&rig, &task.task.task_id, true, expires);
+        ad_inbox_stop(&rig, &queued_task.task.task_id, false, expires);
+        ad_admit(&mut rig);
+        assert_eq!(ad_one_state(&rig, &message).0, WorkState::AwaitingResult);
+        assert_eq!(ad_one_state(&rig, &queued).0, WorkState::Queued);
+        assert_eq!(ad_inbox_rows(&rig), 0);
+    });
+}
+
+/// Ruling R38: a cancel that opens before its request (B named the task by
+/// its recipient's id) is kept as an early stop, and its request's
+/// admission cancels the task at once; one past its expiry is dropped and
+/// the request's task queues; a 33rd early stop of one sender stays in
+/// the inbox (holding the gate) until its request comes.
+#[test]
+fn a_stop_before_its_request_is_kept_and_applied_at_admission() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        let now = host_now().wall_ms;
+        let host_target = ad_here(&rig);
+        let agent = |rig: &LocalRig| Destination::Agent {
+            route_id: "rh".into(),
+            route_revision: 1,
+            target: wire::Target {
+                account_id: host_target.account_id.clone(),
+                atem_device_id: host_target.atem_device_id.clone(),
+                host_trust_gen: host_target.host_trust_gen,
+                session_id: rig.sid.to_string(),
+                process_gen: rig.sessions[&rig.sid].process_gen.clone(),
+            },
+        };
+        // The mailbox read to its head: the gate's part opens.
+        ad_deliver(&mut rig, &mut host, &[]);
+        assert!(mb_gate(&rig));
+        let early = ad_message(&rig, vec![agent(&rig)]);
+        let task_id = early.recipients[0].recipient_id.clone();
+        ad_inbox_stop(&rig, &task_id, false, now + HOUR);
+        ad_admit(&mut rig);
+        assert_eq!(ad_inbox_rows(&rig), 0);
+        assert_eq!(
+            admit::stops(&rig.bridge.work.store.as_ref().unwrap().db).unwrap(),
+            [("host-b".to_string(), task_id.clone(), "cancel".to_string())]
+        );
+        ad_inbox_request(&rig, &early);
+        ad_admit(&mut rig);
+        let receipts = ad_receipts(&rig, &early);
+        let Delivery::Work { work } = &receipts[0].delivery else {
+            panic!("not work");
+        };
+        assert_eq!(work.state, WorkState::Cancelled);
+        assert!(
+            admit::stops(&rig.bridge.work.store.as_ref().unwrap().db)
+                .unwrap()
+                .is_empty()
+        );
+        // Past its expiry on `D`: dropped, the request's task queues.
+        let late = ad_message(&rig, vec![agent(&rig)]);
+        ad_inbox_stop(&rig, &late.recipients[0].recipient_id, false, now + 60_000);
+        ad_admit(&mut rig);
+        sp_d(&rig, now + 60_000);
+        ad_admit(&mut rig);
+        assert!(
+            admit::stops(&rig.bridge.work.store.as_ref().unwrap().db)
+                .unwrap()
+                .is_empty()
+        );
+        sp_d(&rig, now);
+        ad_inbox_request(&rig, &late);
+        ad_admit(&mut rig);
+        assert_eq!(ad_tasks(&rig, &late)[0].status.state, WorkState::Queued);
+        // 32 kept; a 33rd stays in the inbox.
+        for _ in 0..32 {
+            ad_inbox_stop(&rig, &uuid::Uuid::new_v4().to_string(), false, now + HOUR);
+        }
+        let last = ad_message(&rig, vec![agent(&rig)]);
+        ad_inbox_stop(&rig, &last.recipients[0].recipient_id, false, now + HOUR);
+        ad_admit(&mut rig);
+        assert_eq!(
+            admit::stops(&rig.bridge.work.store.as_ref().unwrap().db)
+                .unwrap()
+                .len(),
+            32
+        );
+        assert_eq!(ad_inbox_rows(&rig), 1, "the 33rd waits");
+        mb_tick(&mut rig, &mut host, 0);
+        assert!(!mb_gate(&rig), "a waiting stop holds the gate");
+        // Its request: admitted, and the stop waiting in the inbox finds its
+        // task at the next pass, queued, and cancels it.
+        ad_inbox_request(&rig, &last);
+        ad_admit(&mut rig);
+        ad_admit(&mut rig);
+        assert_eq!(ad_inbox_rows(&rig), 0);
+        assert_eq!(ad_tasks(&rig, &last)[0].status.state, WorkState::Cancelled);
+        mb_tick(&mut rig, &mut host, 0);
+        assert!(mb_gate(&rig));
     });
 }
 

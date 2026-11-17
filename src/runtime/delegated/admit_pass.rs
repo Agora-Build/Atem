@@ -17,16 +17,19 @@
 //!   permit (`host_sender_permits`) in place of a channel scope, `select`
 //!   expanded once with stage 1's `resolve` over the agents of routes that
 //!   consent to it; the limits; the message record, its tasks (each with
-//!   its admission record, `Admission::for_host`). A `cancel` or
-//!   `complete` waits in the inbox for now.
+//!   its admission record, `Admission::for_host`) and its early stops.
+//! - **A `cancel` or `complete`** (II.7): applied to the sender's own task
+//!   admitted at its current generation and epoch, else not reached; one
+//!   whose task isn't here yet is kept as an early stop (ruling R38).
 //! - **Status objects** (II.4.4): the message's current status, sealed to
 //!   the sender's current `host_enc_key` with this host's
-//!   `host_channel_key`, signed at the committed head, at acceptance. A sender with no current key, or no longer a current host,
+//!   `host_channel_key`, signed at the committed head, at acceptance and
+//!   for a stop. A sender with no current key, or no longer a current host,
 //!   gets none: the record keeps the state for the owner.
 use super::*;
 use crate::runtime::delegated::admit::{self, InboxRow};
 use crate::runtime::delegated::host_senders::{
-    HostOp, HostSender, host_sender_permits, host_standing,
+    HostOp, HostSender, host_sender_permits, host_standing, host_task_covered,
 };
 use crate::runtime::delegated::outbox::{self, Policy};
 use crate::runtime::host_work::MessageRecord;
@@ -225,6 +228,7 @@ impl HostBridge {
         let Some(store) = self.outbox_store() else {
             return Ok(false);
         };
+        admit::prune_stops(&store.db, signing.now_d)?;
         let mut decided = false;
         for row in admit::inbox(&store.db, ROWS_PER_PASS)? {
             // A row that can't be decided now stays (holding the gate: fail
@@ -243,8 +247,7 @@ impl HostBridge {
     }
 
     /// One inbox row decided in its own transaction, removed with its
-    /// decision (a `cancel` or `complete` stays: not admitted yet): whether
-    /// it was taken.
+    /// decision (a stop waiting for room stays): whether it was taken.
     fn admit_row(
         &self,
         store: &Store,
@@ -258,7 +261,12 @@ impl HostBridge {
                 self.admit_request(&tx, store, signing, row, message, sessions)?;
                 true
             }
-            Some(EnvelopePlain::Cancel { .. } | EnvelopePlain::Complete { .. }) => false,
+            Some(EnvelopePlain::Cancel { task_id }) => {
+                self.admit_stop(&tx, store, signing, row, task_id, None)?
+            }
+            Some(EnvelopePlain::Complete { task_id, result }) => {
+                self.admit_stop(&tx, store, signing, row, task_id, Some(result))?
+            }
             // Its bytes no longer read (a stricter reader than the one that
             // wrote it): nothing to decide.
             None => true,
@@ -375,6 +383,17 @@ impl HostBridge {
                 return refuse("busy", true);
             }
             return Err(error);
+        }
+        // Early stops of its tasks (ruling R38): a cancel cancels it now;
+        // a complete finds it queued, not reached.
+        for task in &mut tasks {
+            for kind in admit::take_stops(tx, sender, &task.task.task_id)? {
+                if kind == "cancel" {
+                    task.status.state = WorkState::Cancelled;
+                    task.status.detail =
+                        super::delegated_requests::CANCELLED_BEFORE_SUBMISSION.into();
+                }
+            }
         }
         let key = list
             .host(sender)
@@ -684,6 +703,89 @@ impl HostBridge {
                         && s.provider == profile.provider
                         && self.projects.key_of(s.id.as_str()) == Some(profile.project.as_str())
                 })
+    }
+
+    /// A host sender's `cancel` or `complete` (`result`) of `task_id`
+    /// (design II.7), decided in `tx`; false when it waits in the inbox
+    /// (its sender's early stops full, ruling R38).
+    ///
+    /// - Its own task, admitted at its current generation and epoch, from
+    ///   a sender that may send now: a cancel finds it `queued` or
+    ///   `blocked` (no live attempt) and cancels it (`cancelled before
+    ///   submission`); a complete finds it `awaiting_result` with the
+    ///   project still covering a task and completes it with the result
+    ///   snapshot. Otherwise it isn't reached. Either way the message's
+    ///   current status goes to the sender.
+    /// - No such task yet: an early stop until its expiry (dropped once
+    ///   expired, or when its sender may not send now).
+    /// - Another sender's task: nothing, and no status.
+    fn admit_stop(
+        &self,
+        tx: &Transaction,
+        store: &Store,
+        signing: &Signing,
+        row: &InboxRow,
+        task_id: &str,
+        result: Option<&hw::ContextSnapshot>,
+    ) -> anyhow::Result<bool> {
+        let sender = row.sender_host.as_str();
+        let list = &signing.list;
+        let sends = may_send(list, sender, row.signed_seq);
+        let Some(mut task) = store.work(task_id)? else {
+            if !sends || row.expires_at <= signing.now_d {
+                return Ok(true);
+            }
+            let kind = if result.is_some() {
+                "complete"
+            } else {
+                "cancel"
+            };
+            return admit::keep_stop(tx, row, task_id, kind);
+        };
+        if task.principal != host_principal(sender) {
+            return Ok(true);
+        }
+        let me = self.work_host().atem_device_id;
+        let current = task
+            .delegated
+            .as_ref()
+            .and_then(|adm| adm.host_admitted())
+            .filter(|(host_id, admitted)| {
+                sends
+                    && host_standing(list, host_id, Some((admitted.generation, admitted.epoch)))
+                        .is_ok()
+            });
+        if let Some((host_id, admitted)) = current {
+            match result {
+                None if matches!(task.status.state, WorkState::Queued | WorkState::Blocked)
+                    && store.live_attempt(task_id)?.is_none() =>
+                {
+                    task.status.state = WorkState::Cancelled;
+                    task.status.detail =
+                        super::delegated_requests::CANCELLED_BEFORE_SUBMISSION.into();
+                    store.save_work(&task)?;
+                }
+                Some(result)
+                    if task.status.state == WorkState::AwaitingResult
+                        && host_task_covered(list, &me, host_id, admitted, HostOp::Task)
+                            .is_ok() =>
+                {
+                    task.status.state = WorkState::Completed;
+                    task.status.result = Some(result.clone());
+                    task.status.detail = crate::runtime::host_work::RESULT_PUBLISHED.into();
+                    store.save_work(&task)?;
+                }
+                _ => {}
+            }
+        }
+        let record = match &task.message {
+            Some(frame) => store.message(&frame.message_id)?,
+            None => None,
+        };
+        if let Some(record) = record {
+            signing.status(tx, store, &record)?;
+        }
+        Ok(true)
     }
 }
 

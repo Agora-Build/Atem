@@ -5,6 +5,13 @@
 //! mailbox's. The decisions themselves are the bridge's (`admit_pass.rs`);
 //! here is what they keep.
 //!
+//! - **Early stops** (`mail_stops`, ruling R38): a `cancel` or `complete`
+//!   opened before its request (a free between two pages can open a later
+//!   object of a sender first) is kept, bound to its sender, its own object
+//!   id and the task it names, until its object's expiry; at most
+//!   [`MAX_EARLY_STOPS`] per sender (one more stays in the inbox,
+//!   back-pressure as ruling R31's). Its request's admission takes it
+//!   ([`take_stops`]) in its own transaction.
 //! - **Whole refusals** (`mail_refusals`): a request admission refused as a
 //!   whole (the sender, the message id, its digest and the code), kept for
 //!   good beside the host-work message records, which are never deleted
@@ -18,9 +25,17 @@ use atem_client::host_mail::EnvelopePlain;
 use atem_client::session::messages::{Delivery, RecipientReceipt, WorkProgress};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
+/// Early stops kept per sender host, at most (ruling R38).
+pub const MAX_EARLY_STOPS: u64 = 32;
+
 /// Admission's tables (made by [`prepare`], only with `host.senders`).
 /// Additive, as every host-work table.
 const TABLES: &str = "
+    CREATE TABLE IF NOT EXISTS mail_stops (
+        sender_host TEXT NOT NULL, object_id TEXT NOT NULL, task_id TEXT NOT NULL,
+        kind TEXT NOT NULL, expires_at INTEGER NOT NULL,
+        PRIMARY KEY(sender_host, object_id)) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS mail_stops_task ON mail_stops(sender_host, task_id);
     CREATE TABLE IF NOT EXISTS mail_refusals (
         sender_host TEXT NOT NULL, message_id TEXT NOT NULL, digest TEXT NOT NULL,
         code TEXT NOT NULL, at_ms INTEGER NOT NULL,
@@ -44,7 +59,6 @@ pub struct InboxRow {
     pub plain: Option<EnvelopePlain>,
     /// Its object's expiry and `signed_at_head.seq`: 0 for a row written
     /// before the inbox kept them.
-    #[allow(dead_code)]
     pub expires_at: u64,
     pub signed_seq: u64,
 }
@@ -71,6 +85,64 @@ pub fn inbox(db: &Connection, limit: usize) -> Result<Vec<InboxRow>> {
 /// Inbox row `n` taken: decided. Whether it was still there.
 pub fn take_row(tx: &Transaction, n: i64) -> Result<bool> {
     Ok(tx.execute("DELETE FROM mailbox_inbox WHERE n=?1", [n])? == 1)
+}
+
+/// `row`, a `cancel` or `complete` (`kind`) of `task_id` opened before its
+/// request, kept as an early stop until its expiry; false when its sender
+/// has [`MAX_EARLY_STOPS`] already (it stays in the inbox).
+pub fn keep_stop(tx: &Transaction, row: &InboxRow, task_id: &str, kind: &str) -> Result<bool> {
+    let kept: u64 = tx.query_row(
+        "SELECT count(*) FROM mail_stops WHERE sender_host=?1",
+        [&row.sender_host],
+        |r| r.get(0),
+    )?;
+    if kept >= MAX_EARLY_STOPS {
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO mail_stops(sender_host, object_id, task_id, kind, expires_at)
+        VALUES(?1, ?2, ?3, ?4, ?5)",
+        params![
+            row.sender_host,
+            row.object_id,
+            task_id,
+            kind,
+            row.expires_at
+        ],
+    )?;
+    Ok(true)
+}
+
+/// The early stops of `sender_host` naming `task_id`, taken: their kinds
+/// (`cancel`, `complete`).
+pub fn take_stops(tx: &Transaction, sender_host: &str, task_id: &str) -> Result<Vec<String>> {
+    let kinds: Vec<String> = {
+        let mut q =
+            tx.prepare("SELECT kind FROM mail_stops WHERE sender_host=?1 AND task_id=?2")?;
+        q.query_map([sender_host, task_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    tx.execute(
+        "DELETE FROM mail_stops WHERE sender_host=?1 AND task_id=?2",
+        [sender_host, task_id],
+    )?;
+    Ok(kinds)
+}
+
+/// Early stops whose object expired by `now_ms` (the delegated clock's
+/// `D`) dropped: their request can no longer come.
+pub fn prune_stops(db: &Connection, now_ms: u64) -> Result<usize> {
+    Ok(db.execute("DELETE FROM mail_stops WHERE expires_at <= ?1", [now_ms])?)
+}
+
+/// The early stops kept now: `(sender host, task id, kind)` (tests).
+#[cfg(test)]
+pub fn stops(db: &Connection) -> Result<Vec<(String, String, String)>> {
+    let mut q = db.prepare(
+        "SELECT sender_host, task_id, kind FROM mail_stops ORDER BY sender_host, task_id",
+    )?;
+    let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// The recorded whole refusal of `sender_host`'s message `message_id`: its
