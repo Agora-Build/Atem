@@ -6948,6 +6948,17 @@ fn delegated_wire_vectors(book: &Book) -> Value {
         case("receipt_provenance_service", true, with("service:svc-1")),
         case("receipt_provenance_member", true, with("member:dev-phone")),
         case("receipt_provenance_host", true, with("host:host-b")),
+        // A host sender's selector task: its UUID v5 (host-work-v1 §11.5).
+        case(
+            "receipt_provenance_host_selector_task",
+            true,
+            receipt(
+                ReceiptKind::Prompt,
+                ReceiptState::Executing,
+                Some("80160896-4fcd-5e6e-adac-98bac5497321"),
+                Some("host:host-b"),
+            ),
+        ),
         case(
             "receipt_provenance_128_byte_id",
             true,
@@ -7018,7 +7029,7 @@ fn delegated_wire_vectors(book: &Book) -> Value {
         "name": "r9-vectors-delegated-wire",
         "kind": "vectors",
         "requires": "r9",
-        "note": "Delegated host work's session-v1 shapes (R9.14, planned; not advertised): host_enc_key_get (exactly v, op and a UUID v4 id), its answer host_enc_key (exactly v, op, id, re, host_id, host_trust_gen, enc_key {alg: x25519, pub: 32 bytes}, enc_sig: 64 bytes), and receipts with provenance (task_id a UUID v4 and sender member:/service:/host: with a 1-128 byte id, both or neither, on a prompt receipt only; absent, never null) and without; and the r9 welcome's optional verifier (R9.2 \"How a verifier reports itself\", R9.8; Atem's proposal, for Astation's agreement): absent, or exactly version (an integer from 1 to 2^32 - 1) and actions (1-64 names, sorted by bytes, each once, each 1-32 bytes of [a-z0-9_] starting with a letter; a name the reader doesn't know is read, never refused); `verifier` is this release's own (version 2: R9.2's sixteen actions). Each case is valid or refused as a whole; a `raw` case is read as its exact text. The valid answer's enc_key and enc_sig are r9-vectors-membership-log's first host_enc_key pair: enc_sig verifies with host-a's host_key of log L over enc_sig_input_hex.",
+        "note": "Delegated host work's session-v1 shapes (R9.14, planned; not advertised): host_enc_key_get (exactly v, op and a UUID v4 id), its answer host_enc_key (exactly v, op, id, re, host_id, host_trust_gen, enc_key {alg: x25519, pub: 32 bytes}, enc_sig: 64 bytes), and receipts with provenance (task_id a UUID v4, or for a host: sender the UUID v5 of a selector's fixed resolution (host-work-v1 §11.5; Atem's reading, for Astation's agreement), and sender member:/service:/host: with a 1-128 byte id, both or neither, on a prompt receipt only; absent, never null) and without; and the r9 welcome's optional verifier (R9.2 \"How a verifier reports itself\", R9.8; Atem's proposal, for Astation's agreement): absent, or exactly version (an integer from 1 to 2^32 - 1) and actions (1-64 names, sorted by bytes, each once, each 1-32 bytes of [a-z0-9_] starting with a letter; a name the reader doesn't know is read, never refused); `verifier` is this release's own (version 2: R9.2's sixteen actions). Each case is valid or refused as a whole; a `raw` case is read as its exact text. The valid answer's enc_key and enc_sig are r9-vectors-membership-log's first host_enc_key pair: enc_sig verifies with host-a's host_key of log L over enc_sig_input_hex.",
         "host_enc_key_binding": {
             "account_id": log.account_id(),
             "genesis_hash": genesis.to_hex(),

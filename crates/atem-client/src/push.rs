@@ -1044,7 +1044,8 @@ impl Seen {
 
 /// The sealed plaintext of an `outcome_unknown` hint:
 /// `jcs({"reason":…, "sender":…, "session_id":…, "task_id":…})`. Every field
-/// is bounded as `alert_list`'s alert is ([`alerts::valid_task_id`],
+/// is bounded as `alert_list`'s alert is (its task id for its sender,
+/// [`crate::session::wire::is_delegated_task_id`],
 /// [`alerts::valid_sender`], [`alerts::valid_reason`], a session id).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlertPlain {
@@ -1059,7 +1060,7 @@ impl AlertPlain {
         if self.reason.len() > alerts::MAX_REASON_BYTES {
             return Err(Error::TooLarge);
         }
-        if !alerts::valid_task_id(&self.task_id) {
+        if !crate::session::wire::is_delegated_task_id(&self.task_id, &self.sender) {
             return Err(Error::Malformed("task_id"));
         }
         if !crate::session::wire::is_session_id(&self.session_id) {
