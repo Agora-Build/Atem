@@ -201,7 +201,8 @@ decision, 2026-11-15"), and Atem's proposed refinements and tests of the same da
 "Proposed refinement (2026-11-15, Atem's proposal, agreed with Astation 2026-11-16)", "Atem's proposal, agreed with Astation 2026-11-16" or "Proposed tests for the proposals (2026-11-15, agreed with Astation 2026-11-16)"), and
 what is built of Part II: the paragraph "Part II built on Atem's side" above, the marks that open each Part II section
 and V.2's steps 3 and 9 (each starting "Built" or "Not built"), V.1's note on `host.senders`, and VII.B's "Covered by
-Atem's tests (fake Station)", which says what Atem's tests show of each joint test and changes none. The diagram is
+Atem's tests (fake Station)", which says what Atem's tests show of each joint test and changes none; and VII.B's tests
+37m and 37n, marked "Added on Astation's request (2026-11-17, #120 comment 6938206284)". The diagram is
 `delegated-host-work-flows.html` (frozen `flows.html`, SHA-256
 `587a4c74ca9c2645dd3a2c79908813da573451479c0a0a846896fd3ff909cf6a`), changed only in the phone's login in figures 1
 and 2, marked the same way, and, after step 3's agreements, in figure 1 (both hosts use the same Station) and
@@ -3418,6 +3419,19 @@ Nothing is merged or deployed before step 1.
      `atem:<atem_id>/<route_id>` selector naming that host is invalid: the shared core refuses to build it, and a
      receiving host refuses it (`invalid_request`) and starts nothing.
 
+**Added on Astation's request (2026-11-17, [#120 comment 6938206284](https://github.com/Agora-Build/Atem/issues/120#issuecomment-6938206284)),**
+with its agreement to the receiving host's mailbox readings (host-work-v1 §11.5, "On the receiving host"):
+
+37m. **No older `heads` after a newer page.** Within one mailbox history, a `heads` the Station queued or cached
+     before it answered a page, or one another replica sends, never reaches the host's association after that page;
+     a page read past the last `heads`' head is no reset on the host.
+
+37n. **A replica switch and a real reset.** The host's link moves to another Station replica while it reads its
+     mailbox: the new replica answers from the committed shared store, and the host reads on with no reset and
+     nothing applied twice. A real reset or history replacement fences the old jobs and links and shows the reset (a
+     new `mailbox_id`, or a head below the host's furthest read), never masked by taking the larger head; the host
+     reads the mailbox from 0, marks done only what it reads there, and nothing runs twice.
+
 **Covered by Atem's tests (fake Station)** (2026-11-17; the tests above are unchanged). What Atem's binaries already
 show of each test, behind the debug-only hook, against a fake Station speaking only the shared builders:
 `tests/host_mail_binary.rs` (one real receiving host, the sending host played by the test) and
@@ -3480,6 +3494,8 @@ real Station and Astation can show.
   mailbox's scenarios. 37f: `mail::an_object_over_the_pending_limits_is_marked_done`. 37g: `mail::`'s reset, lost-done
   and late-page tests. 37h: `mail::without_host_senders_heads_mailbox_is_refused_and_no_mailbox_table_is_made`. 37l:
   send_plan_tests.rs and the shared core. Joint for each: the real Station and Astation's app.
+- **37m, 37n.** The host's side only: mailbox_tests.rs's `a_page_beyond_the_announced_head_is_no_reset`, and
+  `mail::`'s reset tests (a new `mailbox_id`, the same one gone back). Joint only: the Station's replicas.
 
 ### VII.C Framing and vectors
 
