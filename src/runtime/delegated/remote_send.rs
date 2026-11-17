@@ -318,6 +318,7 @@ fn upsert(
 /// The receiver's status named the envelope `object_id`'s effect at
 /// `host_id` (the results back feed it): the row `accepted`, its engine
 /// row settled (put no more). Whether a `ready` or `sent` row moved.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn accepted(tx: &Transaction, object_id: &str, host_id: &str) -> Result<bool> {
     let n: Option<Option<i64>> = tx
         .query_row(
@@ -345,8 +346,9 @@ pub fn accepted(tx: &Transaction, object_id: &str, host_id: &str) -> Result<bool
     Ok(true)
 }
 
-/// One delivery row, as `atem message status` shows it.
+/// One delivery row, as `atem message status` will show it (not built yet).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct Row {
     pub host_id: String,
     pub kind: String,
@@ -359,6 +361,7 @@ pub struct Row {
 }
 
 /// The rows of the message `message_id`, in the order they were made.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn rows(db: &rusqlite::Connection, message_id: &str) -> Result<Vec<Row>> {
     let mut q = db.prepare(
         "SELECT host_id, kind, task_id, state, code, detail, outbox_n FROM remote_deliveries

@@ -39,8 +39,10 @@ pub const RESEND_MS: u64 = 10 * 60 * 1000;
 /// A final row's bytes are kept this long after its object's expiry.
 const KEEP_BYTES_MS: u64 = 24 * 60 * 60 * 1000;
 
-/// When a row is put again (the module docs).
+/// When a row is put again (the module docs). `UntilStored` is the
+/// receiving host's (its status objects and results back, not built yet).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub enum Policy {
     /// Every 10 minutes until settled, refused or expired: envelopes.
     Repeat,
@@ -218,7 +220,9 @@ pub fn refused(store: &Store, n: i64, code: PutRefusal, now_ms: u64) -> Result<(
 }
 
 /// The owner settles row `n` in its own transaction (a repeat row's
-/// delivery accepted): put no more.
+/// delivery accepted): put no more. Called by the results back (not built
+/// yet).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn settle(tx: &Transaction, n: i64) -> Result<()> {
     tx.execute(
         "UPDATE mail_outbox SET state='done' WHERE n=?1 AND state IN ('queued','stored')",
@@ -246,9 +250,10 @@ pub fn prune(store: &Store, now_ms: u64) -> Result<usize> {
     )?)
 }
 
-/// A row as `atem message status` reads it: its state, code, puts and
+/// A row as `atem message status` will read it: its state, code, puts and
 /// quota refusals in a row.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct RowState {
     pub state: String,
     pub code: Option<String>,
@@ -256,6 +261,7 @@ pub struct RowState {
     pub quota: u32,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn row_state(db: &rusqlite::Connection, n: i64) -> Result<Option<RowState>> {
     Ok(db
         .query_row(
