@@ -271,6 +271,9 @@ pub(super) struct State {
     /// monotonic clock (reviews M2, N2: one is settled after a bound of
     /// both). This store's: cleared when another opens.
     admit_failures: HashMap<String, (u32, u64)>,
+    /// The owed results (by task) whose sealing failed: their tries in a
+    /// row so far and when the first failed (review N4). This store's.
+    result_failures: HashMap<String, (u32, u64)>,
     /// The mailbox committed objects since admission last ran: it runs on
     /// the next pass (review L1; else on the scheduling pass's cadence).
     admit_due: bool,
@@ -386,6 +389,7 @@ impl State {
             mail_pruned_at: None,
             mail_limits: Default::default(),
             admit_failures: HashMap::new(),
+            result_failures: HashMap::new(),
             admit_due: true,
             results_due: true,
             results_drained_at: None,
@@ -625,6 +629,7 @@ impl HostBridge {
                     // Admission's failure counts are a store's (its rows'
                     // numbers; review N2).
                     self.work.admit_failures.clear();
+                    self.work.result_failures.clear();
                     // Read once it opened (with the hook only: off, nothing
                     // reads it, as on main).
                     self.work.kept = (!prepared).then_some(KeptControls::Unreadable);
@@ -1498,6 +1503,7 @@ impl HostBridge {
                 // The new store numbers its inbox rows afresh: no failure
                 // count of the old one's carries over (review N2).
                 self.work.admit_failures.clear();
+                self.work.result_failures.clear();
                 true
             }
             Err(_) => false,
@@ -2465,6 +2471,19 @@ impl HostBridge {
             // than hold the session's queue until it expires.
             if let Some(lost) = self.work_lost(&r.accepted(), now) {
                 self.work_fail_lost(&mut r, lost)?;
+                continue;
+            }
+            // Another host's reply left queued with host senders off (a
+            // debug runtime started again without the hook): it waits,
+            // holding no session, until the hook is back or its deadline
+            // (review N5), as a delegated task does with the hook off.
+            if !self.remote_delivery_allowed(&r) {
+                let detail = delegated_send_pass::SENDERS_OFF;
+                if r.status.state != WorkState::Blocked || r.status.detail != detail {
+                    r.status.state = WorkState::Blocked;
+                    r.status.detail = detail.into();
+                    self.work.store.as_ref().unwrap().save_work(&r)?;
+                }
                 continue;
             }
             if self.collab_wait_for_launch(&mut r)? {

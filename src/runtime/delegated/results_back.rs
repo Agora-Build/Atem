@@ -32,11 +32,13 @@ use super::remote_send;
 use crate::runtime::collab::{RemoteReplyView, RemoteTaskView, RemoteView};
 use crate::runtime::host_work::Store;
 use anyhow::Result;
-use atem_client::host_mail::{ExpectedResult, HostRef};
+use atem_client::host_mail::{ExpectedResult, HostRef, MailBody, Recipient, accept_result_among};
+use atem_client::membership::Membership;
 use atem_client::session::host_work::{
     ContextKind, ContextSnapshot, MAX_LIFETIME_MS, ResultReply, WorkState, digest,
 };
 use atem_client::session::messages::{ContextReference, Delivery, RecipientReceipt, WorkProgress};
+use atem_client::{KeyProvider, SignedObject};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::collections::HashMap;
 
@@ -71,8 +73,8 @@ const TABLES: &str = "
         reply TEXT, reply_at INTEGER, delivery TEXT, delivery_detail TEXT, work_id TEXT,
         sender_gen INTEGER, sender_epoch INTEGER,
         PRIMARY KEY(message_id, host_id, recipient_id, task_id));
-    CREATE INDEX IF NOT EXISTS remote_tasks_task ON remote_tasks(host_id, task_id)
-        WHERE task_id!='';
+    DROP INDEX IF EXISTS remote_tasks_task;
+    CREATE INDEX IF NOT EXISTS remote_tasks_host ON remote_tasks(host_id, task_id);
     CREATE INDEX IF NOT EXISTS remote_tasks_delivery ON remote_tasks(delivery)
         WHERE delivery IN ('due', 'queued');
     CREATE INDEX IF NOT EXISTS remote_tasks_work ON remote_tasks(work_id)
@@ -163,8 +165,7 @@ pub fn candidates(db: &Connection, sender: &HostRef, since_ms: u64) -> Result<Ve
         }
         Ok(found)
     };
-    let mut recorded =
-        by_message("SELECT message_id, task_id FROM remote_tasks WHERE host_id=?1 ORDER BY rowid")?;
+    let mut recorded = by_message(RECORDED_OF_HOST)?;
     let mut stops = by_message(
         "SELECT message_id, object_id FROM remote_deliveries WHERE host_id=?1
         AND kind IN ('cancel', 'complete')",
@@ -190,6 +191,12 @@ pub fn candidates(db: &Connection, sender: &HostRef, since_ms: u64) -> Result<Ve
         .collect())
 }
 
+/// Whether host `?1`'s task `?2` is recorded for another message than `?3`.
+pub const RECORDED_ELSEWHERE: &str = "SELECT EXISTS(SELECT 1 FROM remote_tasks
+    WHERE host_id=?1 AND task_id=?2 AND message_id!=?3)";
+/// Host `?1`'s recorded resolutions' entries: (message id, task id).
+pub const RECORDED_OF_HOST: &str = "SELECT message_id, task_id FROM remote_tasks WHERE host_id=?1";
+
 /// How far back a result's row may have been made: a message lives at
 /// most 24 h, and a result made at its end 24 h more.
 pub const CANDIDATES_SINCE_MS: u64 = 2 * MAX_LIFETIME_MS;
@@ -202,6 +209,42 @@ pub fn kept(db: &Connection, limit: usize) -> Result<Vec<(String, Vec<u8>)>> {
     )?;
     let rows = q.query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Whether `object`, a result from a host of this host's sends kept now,
+/// would wait for its status (ruling R49): it verifies and opens, names a
+/// task no recorded resolution holds, and one of this host's rows to its
+/// sender has no status yet. False in a store without these tables.
+pub fn would_wait(
+    db: &Connection,
+    list: &Membership,
+    me: &Recipient,
+    provider: &dyn KeyProvider,
+    object: &SignedObject,
+    now_ms: u64,
+) -> Result<bool> {
+    if !made(db)? {
+        return Ok(false);
+    }
+    let (_, body) = MailBody::from_object(object)?;
+    let since = now_ms.saturating_sub(CANDIDATES_SINCE_MS);
+    let candidates = candidates(db, &body.sender, since)?;
+    if candidates.iter().all(|c| c.resolved) {
+        return Ok(false);
+    }
+    let rows: Vec<_> = candidates.iter().map(|c| c.expected.clone()).collect();
+    let judged = accept_result_among(object, list, me, &rows, provider, now_ms);
+    Ok(judged.unanswered_task.is_some())
+}
+
+/// The kept result `object_hash` waits for its status: counted toward the
+/// waiting bound ([`would_wait`]).
+pub fn mark_waiting(tx: &Transaction, object_hash: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE mailbox_results SET waiting=1 WHERE object_hash=?1",
+        [object_hash],
+    )?;
+    Ok(())
 }
 
 /// The kept result `object_hash` judged: gone, in the transaction that
@@ -267,8 +310,7 @@ pub fn apply_status(
             // already names isn't taken, and the recipient says why
             // (review L3), so a result for it answers that message only.
             let elsewhere: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM remote_tasks WHERE host_id=?1 AND task_id=?2
-                    AND message_id!=?3)",
+                RECORDED_ELSEWHERE,
                 params![c.host_id, task.task_id, c.message_id],
                 |r| r.get(0),
             )?;

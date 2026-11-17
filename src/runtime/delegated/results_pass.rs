@@ -10,11 +10,15 @@
 //!   effect and its removal from the mailbox's results. A status moves its
 //!   row and records the resolution, a refusal refuses its row, a result
 //!   records its reply (kept as data when its sender is revoked or
-//!   removed). What answers no row is dropped with a runtime.log line,
-//!   except a result that may answer a task whose status hasn't come yet:
-//!   it waits for it, as do one signed beyond this host's list and one a
-//!   local fault left undecided. Run on the pass after the mailbox kept an
-//!   object, and once a minute for those that wait.
+//!   removed). Every status a drain holds applies before anything is
+//!   decided about a result that answers no row yet (ruling R49); one that
+//!   still answers none while a row to its sender has no status waits for
+//!   it (marked `waiting`, the mailbox's intake bound), as do one signed
+//!   beyond this host's list and one a local fault left undecided. Only
+//!   what `accept_result` refuses for good, or what answers no row of this
+//!   host's at all, is dropped, with a runtime.log line. Run on the pass
+//!   after the mailbox kept an object, and once a minute for those that
+//!   wait.
 //! - **The delivery** ([`HostBridge::remote_deliveries`]): a reply `due` is
 //!   delivered once, as data, into the session that sent the message, by
 //!   stage 1's result delivery (a local task carrying it, its prompt framed
@@ -141,146 +145,137 @@ impl HostBridge {
                 return;
             }
         };
-        let mut applied_status = false;
-        let mut waiting = false;
-        // Results that wait for their status (or for this host's list) are
-        // bounded apart, at half their sender's share and half the total
-        // (review L1): the statuses they wait for keep room. The oldest
-        // wait; a newer one over the bound is dropped, unapplied.
-        let limits = self.work.mail_limits;
-        let (cap_sender, cap_all) = (
-            (limits.results_per_sender / 2).max(1),
-            (limits.results / 2).max(1),
-        );
-        let mut waits: HashMap<String, u64> = HashMap::new();
         // The rows a sender's results may answer, read once a drain per
         // sender and generation (review L7), again after a status of its
         // was recorded.
         let mut rows_of: HashMap<(String, u64), Vec<Candidate>> = HashMap::new();
+        // Ruling R49: every status the drain holds applies before anything
+        // is decided about a result that answers no row yet; those are
+        // judged again once the statuses applied, and only then wait.
+        let mut deferred: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut applied_status = false;
         for (hash, bytes) in kept {
-            let judged = (|| -> anyhow::Result<Judged> {
-                let Ok(object) = parse_object(&bytes) else {
-                    return Ok(Judged::Drop("its bytes don't read"));
-                };
-                let Ok((_, body)) = MailBody::from_object(&object) else {
-                    return Ok(Judged::Drop("its bytes don't read"));
-                };
-                let key = (body.sender.host_id.clone(), body.sender.host_trust_gen);
-                if !rows_of.contains_key(&key) {
-                    let since = now_d.saturating_sub(results_back::CANDIDATES_SINCE_MS);
-                    let found = results_back::candidates(&store.db, &body.sender, since)?;
-                    rows_of.insert(key.clone(), found);
-                }
-                let candidates = &rows_of[&key];
-                if candidates.is_empty() {
-                    return Ok(Judged::Drop(DOES_NOT_ANSWER_OUTBOX_ROW));
-                }
-                let rows: Vec<_> = candidates.iter().map(|c| c.expected.clone()).collect();
-                let judged = accept_result_among(
-                    &object,
-                    &list.membership,
-                    &receiver.recipient,
-                    &rows,
-                    &receiver.provider,
-                    now_d,
-                );
-                // The sender's `add_host` generation (the rows', which the
-                // check held it to) and membership epoch now (review M1).
-                let standing = |c: &Candidate| {
-                    let epoch = list.membership.host_membership_epoch(&c.host_id);
-                    (c.expected.recipient.host_trust_gen, epoch.unwrap_or(0))
-                };
-                // Only a result waits for a status (review L2): a status or
-                // a refusal answering no row never will.
-                let waits_for_status =
-                    judged.unanswered_task.is_some() && candidates.iter().any(|c| !c.resolved);
-                Ok(match (judged.verdict, judged.row) {
-                    (ResultVerdict::Accepted { plain, .. }, Some(i)) => Judged::Apply {
-                        standing: standing(&candidates[i]),
-                        candidate: candidates[i].clone(),
-                        plain,
-                        kept: None,
-                        at: body.created_at,
-                    },
-                    (ResultVerdict::NotDelivered { plain, reason, .. }, Some(i)) => Judged::Apply {
-                        standing: standing(&candidates[i]),
-                        candidate: candidates[i].clone(),
-                        plain,
-                        kept: Some(reason),
-                        at: body.created_at,
-                    },
-                    (ResultVerdict::Unavailable { .. }, _) => Judged::Wait,
-                    (ResultVerdict::Pending { .. }, _) => Judged::WaitBounded(body.sender.host_id),
-                    // A result for a task whose status hasn't come yet
-                    // (statuses and results arrive in any order).
-                    (ResultVerdict::RefusedAuthenticated { .. }, _) if waits_for_status => {
-                        Judged::WaitBounded(body.sender.host_id)
-                    }
-                    (ResultVerdict::Refused { reason, .. }, _)
-                    | (ResultVerdict::RefusedAuthenticated { reason, .. }, _) => {
-                        Judged::Drop(reason)
-                    }
-                    (_, None) => Judged::Drop(DOES_NOT_ANSWER_OUTBOX_ROW),
-                })
-            })();
-            let judged = match judged {
-                Ok(Judged::WaitBounded(sender)) => {
-                    let all: u64 = waits.values().sum();
-                    let of_sender = waits.entry(sender).or_default();
-                    if *of_sender < cap_sender && all < cap_all {
-                        *of_sender += 1;
-                        Ok(Judged::Wait)
-                    } else {
-                        Ok(Judged::Drop("too many results wait for their status"))
-                    }
-                }
-                other => other,
-            };
-            let applied = match judged {
-                Ok(Judged::Wait | Judged::WaitBounded(_)) => {
-                    waiting = true;
-                    continue;
-                }
-                Ok(Judged::Drop(reason)) => {
-                    super::delegated_mail_pass::log_limited(&DROPPED, || {
-                        format!("atem runtime: a host's result refused ({reason}); dropped")
-                    });
-                    store.immediate().and_then(|tx| {
-                        results_back::judged(&tx, &hash)?;
-                        Ok(tx.commit()?)
-                    })
-                }
-                Ok(Judged::Apply {
-                    candidate,
-                    plain,
-                    kept,
-                    at,
-                    standing,
-                }) => store.immediate().and_then(|tx| {
-                    let status = apply(&tx, &candidate, &plain, kept, at, standing)?;
-                    results_back::judged(&tx, &hash)?;
-                    tx.commit()?;
-                    if status {
-                        // Its resolution moved: the sender's rows read again.
-                        applied_status = true;
-                        rows_of.retain(|(host, _), _| *host != candidate.host_id);
-                    }
-                    Ok(())
+            match self.result_judged(store, &list, &receiver, now_d, &mut rows_of, &hash, &bytes) {
+                Ok(Settled::Status) => applied_status = true,
+                Ok(Settled::Done | Settled::Left) => {}
+                Ok(Settled::Unanswered) => deferred.push((hash, bytes)),
+                Err(error) => super::delegated_mail_pass::log_limited(&UNAPPLIED, || {
+                    format!("atem runtime: a host's result not applied ({error:#}); tried again")
                 }),
-                Err(error) => Err(error),
+            }
+        }
+        for (hash, bytes) in deferred {
+            let judged = if applied_status {
+                rows_of.clear();
+                self.result_judged(store, &list, &receiver, now_d, &mut rows_of, &hash, &bytes)
+            } else {
+                Ok(Settled::Unanswered)
             };
-            if let Err(error) = applied {
-                waiting = true;
+            // Still answering no row: it waits for its status, counted
+            // toward the waiting bound the mailbox keeps (`would_wait`).
+            let waits = judged.and_then(|settled| {
+                if matches!(settled, Settled::Unanswered) {
+                    let tx = store.immediate()?;
+                    results_back::mark_waiting(&tx, &hash)?;
+                    tx.commit()?;
+                }
+                Ok(())
+            });
+            if let Err(error) = waits {
                 super::delegated_mail_pass::log_limited(&UNAPPLIED, || {
                     format!("atem runtime: a host's result not applied ({error:#}); tried again")
                 });
             }
         }
-        // A status recorded a resolution a waiting result may answer: the
-        // next pass judges it again.
-        self.work.results_due = applied_status && waiting;
         self.work.results_drained_at = Some(Instant::now());
         self.mail_observe();
+    }
+
+    /// One kept result judged with the shared core against the rows to its
+    /// sender (`rows_of`, read once), then, in one `BEGIN IMMEDIATE`
+    /// transaction, applied or dropped with its removal (ruling R49:
+    /// dropped only when `accept_result` refuses it for good, or it
+    /// answers no row of this host's at all).
+    #[allow(clippy::too_many_arguments)]
+    fn result_judged(
+        &self,
+        store: &Store,
+        list: &crate::session_protocol::membership::ListState,
+        receiver: &crate::session_protocol::r9::host_enc::HostRecipient,
+        now_d: u64,
+        rows_of: &mut HashMap<(String, u64), Vec<Candidate>>,
+        hash: &str,
+        bytes: &[u8],
+    ) -> anyhow::Result<Settled> {
+        let drop = |reason: &str| -> anyhow::Result<Settled> {
+            super::delegated_mail_pass::log_limited(&DROPPED, || {
+                format!("atem runtime: a host's result refused ({reason}); dropped")
+            });
+            let tx = store.immediate()?;
+            results_back::judged(&tx, hash)?;
+            tx.commit()?;
+            Ok(Settled::Done)
+        };
+        let Ok(object) = parse_object(bytes) else {
+            return drop("its bytes don't read");
+        };
+        let Ok((_, body)) = MailBody::from_object(&object) else {
+            return drop("its bytes don't read");
+        };
+        let key = (body.sender.host_id.clone(), body.sender.host_trust_gen);
+        if !rows_of.contains_key(&key) {
+            let since = now_d.saturating_sub(results_back::CANDIDATES_SINCE_MS);
+            let found = results_back::candidates(&store.db, &body.sender, since)?;
+            rows_of.insert(key.clone(), found);
+        }
+        let candidates = &rows_of[&key];
+        if candidates.is_empty() {
+            return drop(DOES_NOT_ANSWER_OUTBOX_ROW);
+        }
+        let rows: Vec<_> = candidates.iter().map(|c| c.expected.clone()).collect();
+        let judged = accept_result_among(
+            &object,
+            &list.membership,
+            &receiver.recipient,
+            &rows,
+            &receiver.provider,
+            now_d,
+        );
+        let (plain, kept, c) = match (judged.verdict, judged.row) {
+            (ResultVerdict::Accepted { plain, .. }, Some(i)) => (plain, None, &candidates[i]),
+            (ResultVerdict::NotDelivered { plain, reason, .. }, Some(i)) => {
+                (plain, Some(reason), &candidates[i])
+            }
+            (ResultVerdict::Pending { .. } | ResultVerdict::Unavailable { .. }, _) => {
+                return Ok(Settled::Left);
+            }
+            // A result for a task whose status hasn't come yet (statuses
+            // and results arrive in any order); only a result waits
+            // (review L2).
+            (ResultVerdict::RefusedAuthenticated { .. }, _)
+                if judged.unanswered_task.is_some() && candidates.iter().any(|c| !c.resolved) =>
+            {
+                return Ok(Settled::Unanswered);
+            }
+            (ResultVerdict::Refused { reason, .. }, _)
+            | (ResultVerdict::RefusedAuthenticated { reason, .. }, _) => return drop(reason),
+            (_, None) => return drop(DOES_NOT_ANSWER_OUTBOX_ROW),
+        };
+        // The sender's `add_host` generation (the row's, which the check
+        // held it to) and membership epoch now (review M1).
+        let epoch = list.membership.host_membership_epoch(&c.host_id);
+        let standing = (c.expected.recipient.host_trust_gen, epoch.unwrap_or(0));
+        let tx = store.immediate()?;
+        let status = apply(&tx, c, &plain, kept, body.created_at, standing)?;
+        results_back::judged(&tx, hash)?;
+        tx.commit()?;
+        if status {
+            // Its resolution moved: the sender's rows read again.
+            let host = c.host_id.clone();
+            rows_of.retain(|(h, _), _| *h != host);
+            return Ok(Settled::Status);
+        }
+        Ok(Settled::Done)
     }
 
     /// The replies due delivered or kept, and the deliveries queued but not
@@ -503,27 +498,18 @@ impl HostBridge {
 /// A reply kept because a task of its delivery's id exists already.
 const ALREADY_QUEUED: &str = "reply kept, not delivered: its delivery task already exists";
 
-/// What the drain decided about one kept result.
-// Short-lived: one per kept result, acted on at once.
-#[allow(clippy::large_enum_variant)]
-enum Judged {
-    /// Applied: `plain` from `candidate`'s host, made at `at`; `kept`: a
-    /// revoked or removed sender's, never delivered (why); `standing`: its
-    /// sender's `add_host` generation and membership epoch.
-    Apply {
-        candidate: Candidate,
-        plain: ResultPlain,
-        kept: Option<&'static str>,
-        at: u64,
-        standing: (u64, u64),
-    },
-    /// Left for a later drain (a local fault).
-    Wait,
-    /// Left for a later drain, for the sender's sake (its status, or this
-    /// host's list): bounded apart (review L1).
-    WaitBounded(String),
-    /// Dropped (why), never applied.
-    Drop(&'static str),
+/// What judging one kept result did.
+enum Settled {
+    /// A status applied (its resolution may answer a waiting result).
+    Status,
+    /// Anything else applied, or dropped: gone from the kept results.
+    Done,
+    /// Left as it is: a local fault, or signed beyond this host's list
+    /// (it waits for the list, bounded by the share and its expiry).
+    Left,
+    /// A result answering no row while a row to its sender has no status
+    /// yet: kept, to wait for it.
+    Unanswered,
 }
 
 /// `plain` applied in `tx` (the module docs). Whether it was a status that

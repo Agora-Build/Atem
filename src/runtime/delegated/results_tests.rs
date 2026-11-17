@@ -1272,10 +1272,11 @@ fn a_delivery_that_ends_undelivered_says_why() {
     });
 }
 
-/// Review L1: results waiting for their status are bounded apart (half
-/// the sender's results share), so the status they wait for still finds
-/// room: four results fill a share of four; two wait, two are dropped;
-/// the status is kept and applied, and the two apply after it.
+/// Review L1, ruling R49: results waiting for their status are bounded
+/// apart (half the sender's results share), so the status they wait for
+/// still finds room: of four results for a share of four, two are taken
+/// and wait, two are left on the Station (none dropped); the status is
+/// kept and applied, and the two apply after it in the same drain.
 #[test]
 fn waiting_results_leave_room_for_their_status() {
     local_test(async |root| {
@@ -1300,7 +1301,8 @@ fn waiting_results_leave_room_for_their_status() {
             .map(|t| rb_from_b(&rig, &host, now, &rb_reply(&t.task_id, "early")))
             .collect();
         rb_receive(&mut rig, &mut host, &results);
-        assert_eq!(rows(&rig, "mailbox_results"), 2, "two wait, two dropped");
+        assert_eq!(rows(&rig, "mailbox_results"), 2, "two wait");
+        assert!(mb_store(&rig).skipped, "two left on the Station");
         let status = rb_status(&m, &r, Delivery::Resolved { tasks });
         let status = rb_from_b(&rig, &host, now, &status);
         rb_receive(&mut rig, &mut host, &[status]);
@@ -1434,5 +1436,309 @@ fn an_owed_result_survives_a_passing_fault() {
         .unwrap();
         rig.bridge.mail_statuses();
         assert_eq!(rows(&rig, "mail_result_owed"), 0);
+    });
+}
+
+// ------------------------------------------------------- fix round 2
+
+/// B's result `plain`, signed at `head` (a head of B's list this host may
+/// not hold yet).
+fn rb_from_b_at(
+    rig: &LocalRig,
+    host: &MbHost,
+    head: atem_client::membership::Head,
+    plain: &ResultPlain,
+) -> Value {
+    let list = rig.bridge.membership.as_ref().unwrap().membership();
+    let now = host_now().wall_ms;
+    let fields = atem_client::host_mail::MailFields {
+        account_id: "acct".into(),
+        genesis_hash: list.genesis_hash(),
+        sender: atem_client::host_mail::HostRef {
+            host_id: AD_B.into(),
+            host_trust_gen: 1,
+        },
+        recipient: atem_client::host_mail::HostRef {
+            host_id: "host".into(),
+            host_trust_gen: 1,
+        },
+        enc_kid: atem_client::keys::enc_kid(&host.enc_pub).unwrap(),
+        id: uuid::Uuid::new_v4().to_string(),
+        created_at: now - 1_000,
+        expires_at: now + HOUR,
+        signed_at_head: head,
+    };
+    atem_client::host_mail::seal_result(
+        &host.sender,
+        &atem_client::KeyId::new("host-b"),
+        &fields,
+        plain,
+        &host.enc_pub,
+    )
+    .unwrap()
+    .to_json()
+}
+
+/// Four tasks of B's for `m`'s recipient `r`, each on its own session.
+fn rb_four(m: &str, r: &str) -> Vec<WorkProgress> {
+    [
+        "ses-aaaaaaaaaaaa",
+        "ses-cccccccccccc",
+        "ses-dddddddddddd",
+        "ses-eeeeeeeeeeee",
+    ]
+    .iter()
+    .map(|sid| rb_progress(m, r, sid, WorkState::AwaitingResult, "on B"))
+    .collect()
+}
+
+/// The replies recorded for `m`.
+fn rb_replies(rig: &LocalRig, m: &str) -> usize {
+    rb_remote(rig, m)
+        .into_iter()
+        .filter(|row| row.4.is_some())
+        .count()
+}
+
+/// Review N1 (a), ruling R49: objects signed beyond this host's device
+/// list wait for the list, never counted toward the bound of results
+/// waiting for their status, and none is dropped: past half the sender's
+/// share they all stay, and once the list catches up the status and every
+/// result apply.
+#[test]
+fn results_waiting_for_this_hosts_list_are_never_dropped() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        rig.bridge.work.mail_limits.results_per_sender = 4;
+        let (m, r) = rb_send(&mut rig);
+        let tasks: Vec<_> = rb_four(&m, &r).into_iter().take(3).collect();
+        // B signs at a head this host doesn't hold yet.
+        let entry = host.s.log.append(
+            MAC,
+            atem_client::membership::project_set("later", ["host", "host-b"], task_ops(), 0)
+                .unwrap(),
+        );
+        let ahead = host.s.log.log.head();
+        let mut objects: Vec<Value> = tasks
+            .iter()
+            .map(|t| rb_from_b_at(&rig, &host, ahead, &rb_reply(&t.task_id, "ahead")))
+            .collect();
+        let status = rb_status(&m, &r, Delivery::Resolved { tasks });
+        objects.push(rb_from_b_at(&rig, &host, ahead, &status));
+        rb_receive(&mut rig, &mut host, &objects);
+        rb_pass(&mut rig);
+        assert_eq!(rows(&rig, "mailbox_results"), 4, "all wait, none dropped");
+        carry(&mut rig, &host.s.log, entry);
+        mb_tick(&mut rig, &mut host, 0);
+        rb_pass(&mut rig);
+        assert_eq!(rows(&rig, "mailbox_results"), 0);
+        assert_eq!(rb_replies(&rig, &m), 3);
+    });
+}
+
+/// Review N1 (b) and (c), ruling R49: a result that would wait for its
+/// status while its sender's waiting results already hold their half of
+/// the share is left on the Station (no row, no done), never dropped; a
+/// drain applies the status it holds before it decides about results, so
+/// the results waiting ahead of it apply in that same drain; room frees,
+/// the read rewinds, and the result left there is read again and applies.
+#[test]
+fn a_result_over_the_waiting_bound_is_left_on_the_station_and_read_again() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        rig.bridge.work.mail_limits.results_per_sender = 4;
+        let now = host_now().wall_ms;
+        let (m, r) = rb_send(&mut rig);
+        let tasks: Vec<_> = rb_four(&m, &r).into_iter().take(3).collect();
+        let results: Vec<Value> = tasks
+            .iter()
+            .map(|t| rb_from_b(&rig, &host, now, &rb_reply(&t.task_id, "early")))
+            .collect();
+        let status = rb_from_b(
+            &rig,
+            &host,
+            now,
+            &rb_status(&m, &r, Delivery::Resolved { tasks }),
+        );
+        let page = |rig: &mut LocalRig, object: &Value| {
+            let syncs = ad_syncs(rig);
+            mb_receive(rig, &mb_page(&syncs[0], 4, std::slice::from_ref(object)));
+        };
+        mb_heads(&mut rig, MB_MAILBOX, 4);
+        for object in results.iter().chain([&status]) {
+            page(&mut rig, object);
+        }
+        let observed = mb_store(&rig);
+        assert!(observed.skipped, "the third left on the Station");
+        assert_eq!(observed.owed, [1, 2, 4], "no done for it");
+        assert_eq!(rows(&rig, "mailbox_results"), 3);
+        rig.bridge.results_drain();
+        assert_eq!(rows(&rig, "mailbox_results"), 0);
+        assert_eq!(rb_replies(&rig, &m), 2, "both applied in that drain");
+        // Room freed: the read rewinds to just before it.
+        mb_tick(&mut rig, &mut host, 1_000);
+        let syncs = ad_syncs(&mut rig);
+        assert_eq!(syncs[0].after, 2, "read again from just before it");
+        mb_receive(&mut rig, &mb_page(&syncs[0], 4, &[results[2].clone()]));
+        rb_pass(&mut rig);
+        assert_eq!(rb_replies(&rig, &m), 3);
+    });
+}
+
+/// Review N2: the waiting bound counts bytes too, half the results' byte
+/// budget: a second waiting result that would pass it is left on the
+/// Station though the count allows it.
+#[test]
+fn the_waiting_bound_counts_bytes_too() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let host = sp_host(&mut rig, root, &os);
+        let now = host_now().wall_ms;
+        let (m, r) = rb_send(&mut rig);
+        let tasks: Vec<_> = rb_four(&m, &r).into_iter().take(2).collect();
+        let results: Vec<Value> = tasks
+            .iter()
+            .map(|t| rb_from_b(&rig, &host, now, &rb_reply(&t.task_id, "early")))
+            .collect();
+        let size = results[0].to_string().len() as u64;
+        // Room for both in the budget, but half of it holds one.
+        rig.bridge.work.mail_limits.result_bytes = 3 * size;
+        let page = |rig: &mut LocalRig, object: &Value| {
+            let syncs = ad_syncs(rig);
+            mb_receive(rig, &mb_page(&syncs[0], 2, std::slice::from_ref(object)));
+        };
+        mb_heads(&mut rig, MB_MAILBOX, 2);
+        for object in &results {
+            page(&mut rig, object);
+        }
+        assert_eq!(rows(&rig, "mailbox_results"), 1);
+        assert!(mb_store(&rig).skipped);
+    });
+}
+
+/// Review N3: the task-id reuse check and the per-host read of the
+/// recorded resolutions use an index, never a scan of `remote_tasks`
+/// (kept for good).
+#[test]
+fn the_remote_task_reads_use_an_index() {
+    use crate::runtime::delegated::results_back::{RECORDED_ELSEWHERE, RECORDED_OF_HOST};
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let _host = sp_host(&mut rig, root, &os);
+        let db = &rig.bridge.work.store.as_ref().unwrap().db;
+        for sql in [RECORDED_ELSEWHERE, RECORDED_OF_HOST] {
+            let mut q = db.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let n = q.parameter_count();
+            let steps: Vec<String> = q
+                .query_map(
+                    rusqlite::params_from_iter(std::iter::repeat_n("x", n)),
+                    |r| r.get(3),
+                )
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert!(
+                steps.iter().any(|s| s.contains("INDEX remote_tasks_host"))
+                    && !steps.iter().any(|s| s.starts_with("SCAN remote_tasks")),
+                "{sql}: {steps:?}"
+            );
+        }
+    });
+}
+
+/// Review N4: an owed result that keeps failing never blocks the later
+/// ones (each is tried on its own), and it is settled (its mark cleared)
+/// after a bounded number of tries and a minute on the monotonic clock.
+#[test]
+fn an_owed_result_that_keeps_failing_blocks_no_other() {
+    use super::super::delegated_admit_pass::MAX_ADMIT_FAILURES;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let _host = sp_host(&mut rig, root, &os);
+        let (_, first) = rb_task(&mut rig);
+        let (_, second) = rb_task(&mut rig);
+        let (a, b) = (first.task.task_id.clone(), second.task.task_id.clone());
+        reply(&mut rig, &a, "one", &[]).unwrap();
+        reply(&mut rig, &b, "two", &[]).unwrap();
+        // The one owed first, in the owed rows' order, always fails.
+        let failing = a.clone().min(b.clone());
+        let other = if failing == a { b.clone() } else { a.clone() };
+        let db = &rig.bridge.work.store.as_ref().unwrap().db;
+        db.execute_batch(&format!(
+            "CREATE TRIGGER t_fail BEFORE INSERT ON mail_result_sent
+            WHEN NEW.task_id='{failing}' BEGIN SELECT RAISE(ABORT,'always'); END;"
+        ))
+        .unwrap();
+        rig.bridge.mail_statuses();
+        let sent: Vec<String> = rb_results(&rig).into_iter().map(|r| r.1).collect();
+        assert_eq!(sent, [other], "the later one went");
+        for _ in 1..MAX_ADMIT_FAILURES + 4 {
+            rig.bridge.mail_statuses();
+        }
+        assert_eq!(rows(&rig, "mail_result_owed"), 1, "not within a minute");
+        rig.bridge.clock.skip(60_000);
+        rig.bridge.mail_statuses();
+        assert_eq!(rows(&rig, "mail_result_owed"), 0, "settled");
+    });
+}
+
+/// Review N5: with host senders turned off, a leftover remote delivery
+/// waits without holding its session (a local task for that session
+/// still runs) and expires at its deadline.
+#[test]
+fn with_the_hook_off_a_leftover_delivery_holds_no_session() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        rig.bridge.work.config.routes[0].results = true;
+        let (m, _, task) = rb_replied(&mut rig, &mut host, "RB_LEFTOVER");
+        rig.bridge.remote_deliveries(&rig.sessions);
+        rig.bridge.features = HostFeatures::parse("host.delegated").unwrap();
+        let local = rig.message();
+        rig.publish(&local);
+        rig.until(|r| {
+            std::fs::read_to_string(r.fake.join("input"))
+                .is_ok_and(|i| i.contains("COLLAB_TEST_PROMPT"))
+        })
+        .await;
+        let delivery = rb_delivery(&m, &task);
+        let record = |rig: &LocalRig| {
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .work(&delivery)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(
+            (record(&rig).status.state, record(&rig).status.detail),
+            (
+                WorkState::Blocked,
+                "host senders are off on this host".into()
+            )
+        );
+        let mut past = record(&rig);
+        past.task.expires_at = host_now().wall_ms - 1;
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .save_work(&past)
+            .unwrap();
+        rig.until(|r| record(r).status.state == WorkState::Expired)
+            .await;
+        let input = std::fs::read_to_string(rig.fake.join("input")).unwrap();
+        assert!(!input.contains("RB_LEFTOVER"));
     });
 }

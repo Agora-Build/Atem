@@ -222,7 +222,8 @@ const TABLES: &str = "
     CREATE TABLE IF NOT EXISTS mailbox_results (
         object_hash TEXT PRIMARY KEY, sender_host TEXT NOT NULL, object_id TEXT NOT NULL,
         mailbox_id TEXT NOT NULL, position INTEGER NOT NULL, bytes BLOB NOT NULL,
-        keep_until INTEGER NOT NULL, at_ms INTEGER NOT NULL) WITHOUT ROWID;
+        keep_until INTEGER NOT NULL, at_ms INTEGER NOT NULL,
+        waiting INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS mailbox_results_sender ON mailbox_results(sender_host);
     CREATE TRIGGER IF NOT EXISTS mailbox_results_freed AFTER DELETE ON mailbox_results BEGIN
         UPDATE mailbox_cursor SET freed=freed+1 WHERE one=1;
@@ -235,7 +236,7 @@ const TABLES: &str = "
 /// is kept until its expiry; the sender's standing is checked again at
 /// admission); a row written before them has neither, and admission refuses
 /// it (it can't tell when it was signed).
-const NEW_COLUMNS: [(&str, &str, &str); 12] = [
+const NEW_COLUMNS: [(&str, &str, &str); 13] = [
     ("mailbox_cursor", "skip_at", "INTEGER"),
     ("mailbox_cursor", "skip_freed", "INTEGER NOT NULL DEFAULT 0"),
     ("mailbox_cursor", "freed", "INTEGER NOT NULL DEFAULT 0"),
@@ -248,6 +249,7 @@ const NEW_COLUMNS: [(&str, &str, &str); 12] = [
     ("mailbox_inbox", "signed_seq", "INTEGER"),
     ("mailbox_inbox", "held", "INTEGER NOT NULL DEFAULT 0"),
     ("mailbox_cursor", "seen_to", "INTEGER NOT NULL DEFAULT 0"),
+    ("mailbox_results", "waiting", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 /// The mailbox's tables in `store`, made if missing (a table of an earlier
@@ -917,9 +919,31 @@ fn keep_result(
     {
         return Ok(Decision::Skipped);
     }
+    // Ruling R49: a result of this host's own sends that would wait for its
+    // status (it names a task no recorded resolution holds yet) is taken
+    // only while the results waiting so already hold less than half the
+    // sender's share, half the total and half the byte budget; else it is
+    // left on the Station (back-pressure), so the statuses they wait for
+    // keep room. Never dropped: read again once room frees.
+    let waits =
+        super::results_back::would_wait(tx, cx.list, cx.recipient, cx.provider, object, cx.now_ms)?;
+    if waits {
+        let (of_sender, all, bytes_waiting): (u64, u64, u64) = tx.query_row(
+            "SELECT count(CASE WHEN sender_host=?1 THEN 1 END), count(*),
+                coalesce(sum(length(bytes)), 0) FROM mailbox_results WHERE waiting=1",
+            [&body.sender.host_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        if of_sender >= (cx.limits.results_per_sender / 2).max(1)
+            || all >= (cx.limits.results / 2).max(1)
+            || bytes_waiting + bytes.len() as u64 > cx.limits.result_bytes / 2
+        {
+            return Ok(Decision::Skipped);
+        }
+    }
     tx.execute(
         "INSERT INTO mailbox_results(object_hash, sender_host, object_id, mailbox_id, position,
-            bytes, keep_until, at_ms) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            bytes, keep_until, at_ms, waiting) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             hash,
             body.sender.host_id,
@@ -928,7 +952,8 @@ fn keep_result(
             position,
             bytes,
             cx.keep_until(Some(body.expires_at)),
-            now_ms()
+            now_ms(),
+            waits
         ],
     )?;
     Ok(Decision::Result)

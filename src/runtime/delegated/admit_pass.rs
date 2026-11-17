@@ -581,45 +581,11 @@ impl HostBridge {
                 }
             }
         }
-        // The results owed (design II.4.4): each reply sealed for its
-        // sender in its own transaction; one that can't be built is dropped
-        // with a line, never blocking the others (the owner reads it).
-        let owed =
-            crate::runtime::delegated::results_back::owed_results(&store.db, STATUSES_PER_PASS)
-                .unwrap_or_default();
-        for task_id in owed {
-            let sealed = store.immediate().and_then(|tx| {
-                signing.result(&tx, store, &task_id)?;
-                Ok(tx.commit()?)
-            });
-            if let Err(error) = sealed {
-                // A store fault passes (review L5): the result stays owed
-                // and goes on a later pass (a result goes only once, so
-                // dropping it would lose the reply for its sender).
-                if error.downcast_ref::<rusqlite::Error>().is_some() {
-                    super::delegated_mail_pass::log_limited(&UNSEALED, || {
-                        format!(
-                            "atem runtime: task {task_id}'s result not sent to its host sender yet ({error:#}); tried again"
-                        )
-                    });
-                    break;
-                }
-                // One that can't be built (a record that doesn't read) is
-                // dropped: the owner still reads the reply.
-                super::delegated_mail_pass::log_limited(&UNSEALED, || {
-                    format!(
-                        "atem runtime: task {task_id}'s result not sent to its host sender ({error:#})"
-                    )
-                });
-                let dropped = store.immediate().and_then(|tx| {
-                    crate::runtime::delegated::results_back::clear_result(&tx, &task_id)?;
-                    Ok(tx.commit()?)
-                });
-                if dropped.is_err() {
-                    return;
-                }
-            }
-        }
+        // The results owed (design II.4.4), each on its own (review N4).
+        self.mail_results_owed(&signing);
+        let Some(store) = self.outbox_store() else {
+            return;
+        };
         // Whole refusals a resend asked again (ruling R45's, for a refused
         // request): each sent again in its own transaction.
         let Ok(refusals) = admit::owed_refusals(&store.db, STATUSES_PER_PASS) else {
@@ -646,6 +612,65 @@ impl HostBridge {
                 }
             }
         }
+    }
+
+    /// The results owed (design II.4.4): each reply sealed for its sender
+    /// in its own transaction, at most [`STATUSES_PER_PASS`] a pass. A store
+    /// fault passes (review L5): the result stays owed and is tried again,
+    /// one that keeps failing never holding the later ones (review N4), and
+    /// settled (its mark cleared, a runtime.log line) after
+    /// [`MAX_ADMIT_FAILURES`] tries in a row and [`SETTLE_AFTER_MS`] since
+    /// its first failure on the monotonic clock, as admission's rows are.
+    /// One that can't be built (a record that doesn't read) is dropped at
+    /// once. Either way the owner still reads the reply.
+    fn mail_results_owed(&mut self, signing: &Signing) {
+        use crate::runtime::delegated::results_back;
+        let now = self.clock.now();
+        let mut failures = std::mem::take(&mut self.work.result_failures);
+        if let Some(store) = self.outbox_store() {
+            let owed = results_back::owed_results(&store.db, STATUSES_PER_PASS).unwrap_or_default();
+            for task_id in owed {
+                let sealed = store.immediate().and_then(|tx| {
+                    signing.result(&tx, store, &task_id)?;
+                    Ok(tx.commit()?)
+                });
+                let Err(error) = sealed else {
+                    failures.remove(&task_id);
+                    continue;
+                };
+                if error.downcast_ref::<rusqlite::Error>().is_some() {
+                    let (tries, first) = failures.get(&task_id).copied().unwrap_or((0, now));
+                    let tries = tries + 1;
+                    if tries < MAX_ADMIT_FAILURES || now.saturating_sub(first) < SETTLE_AFTER_MS {
+                        failures.insert(task_id.clone(), (tries, first));
+                        super::delegated_mail_pass::log_limited(&UNSEALED, || {
+                            format!(
+                                "atem runtime: task {task_id}'s result not sent to its host sender yet ({error:#}); tried again"
+                            )
+                        });
+                        continue;
+                    }
+                    eprintln!(
+                        "atem runtime: task {task_id}'s result not sent to its host sender after {tries} tries ({error:#}); the owner still reads the reply"
+                    );
+                } else {
+                    super::delegated_mail_pass::log_limited(&UNSEALED, || {
+                        format!(
+                            "atem runtime: task {task_id}'s result not sent to its host sender ({error:#})"
+                        )
+                    });
+                }
+                failures.remove(&task_id);
+                let dropped = store.immediate().and_then(|tx| {
+                    results_back::clear_result(&tx, &task_id)?;
+                    Ok(tx.commit()?)
+                });
+                if dropped.is_err() {
+                    break;
+                }
+            }
+        }
+        self.work.result_failures = failures;
     }
 
     /// A host sender's request (design II.4.2 step 7, "Duplicates"; the
