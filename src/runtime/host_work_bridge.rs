@@ -1774,7 +1774,7 @@ impl HostBridge {
                         expires_at: *expires_at,
                         permit,
                         local_route: None,
-                            delegated: delegated.map(|d| Self::delegated_pending(d, &launch)),
+                        delegated: delegated.map(|d| Self::delegated_pending(d, &launch)),
                     },
                 );
                 self.work.launches.push_back(launch);
