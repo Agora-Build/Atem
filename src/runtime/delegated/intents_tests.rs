@@ -27,6 +27,31 @@ async fn escs_reach(rig: &LocalRig, n: usize) {
     }
 }
 
+/// Waits until the fake agent has appended `n` Escs while the broker ticks
+/// as the runtime does (host-work's scheduling pass when due, every
+/// 100 ms; none while [`hold_host_work`] holds it). An intent's write that
+/// didn't reach the agent (its turn check refused while the chat lagged,
+/// or the worker answered `dropped`, `consumed` or `no_effect`) is written
+/// again only by a later pass (`intents::Runs::reported`), so after a fixed
+/// number of passes a wait without one can wait for ever on a loaded
+/// host. The exact count is asserted after.
+async fn escs_delivered(rig: &mut LocalRig, n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while escs(rig) < n {
+        assert!(
+            Instant::now() < deadline,
+            "the agent got {} of {n} Escs; writes awaiting the worker's answer: {}",
+            escs(rig),
+            rig.bridge.pending.len()
+        );
+        for s in rig.sessions.values_mut() {
+            s.pump();
+        }
+        rig.bridge.tick(&mut rig.app, &mut rig.sessions, false);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// The worker gets what was written and answers it (the passes alone never
 /// yield to it): a write no pass should have made shows as an Esc too.
 async fn settle(rig: &mut LocalRig) {
@@ -409,8 +434,12 @@ fn an_intent_survives_a_restart_and_is_carried_out() {
         // at the recovery (the adopted chat already there).
         let steps = restart(&mut rig, root, &os, false, true);
         assert_eq!(steps[2], RecoveryStep::PendingIntents(vec![task.clone()]));
+        // The intent's `delivered_turn` is durable, the first run's: the
+        // Esc reaching the agent says this run wrote it, and its answer is
+        // awaited before a pass may count as writing again.
         rig.until(|r| intents(r, &task)[0].delivered_turn.is_some() && escs(r) == 2)
             .await;
+        settle(&mut rig).await;
         for _ in 0..5 {
             passes(&mut rig, 1);
             assert_eq!(pending_write(&rig, &attempt), None, "once in this run");
