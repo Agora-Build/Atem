@@ -74,6 +74,8 @@ const TABLES: &str = "
                         || NEW.code || ')'
                 WHEN NEW.code='quota'
                     THEN 'the Station''s quota is full; put again after a backoff'
+                WHEN NEW.code='forbidden'
+                    THEN 'the Station refused it (forbidden); put again on a later link or once the device list moves'
                 ELSE 'waiting to be put in the host''s mailbox' END
         WHERE outbox_n=NEW.n AND state IN ('ready', 'sent');
     END;

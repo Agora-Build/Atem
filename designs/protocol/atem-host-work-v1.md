@@ -3622,10 +3622,12 @@ exactly as without this section):
   sending host has no signal of a reset of another host's mailbox: the
   10-minute resend is what repairs one.
 - Answers (rule 3): `quota` puts it again after a backoff (30 s doubling to
-  10 minutes); `id_reused`, `expired` and `forbidden` refuse the row with
-  the code (**Atem's reading, for Astation:** rule 3 lets a sender put a
-  `forbidden` object again on a later link generation; this host doesn't).
-  Rule 8: at most 8 puts live per link generation, a put unanswered for 35
+  10 minutes); `forbidden` is final on that link generation, and the object
+  is put again on a later one, or once this host's device list moved, until
+  it expires; `id_reused` and `expired` refuse the row with the code. A row
+  already stored stays `sent` when the Station refuses a later copy (its
+  code recorded): the first copy may be running on the receiver; a Station
+  `expired` there is the row's expiry. Rule 8: at most 8 puts live per link generation, a put unanswered for 35
   s again with a fresh id, every live put retired at a new link generation
   or an identity change (nothing more put on that socket). The schedule and
   expiry are on the delegated clock (design I.6.5): with no reading nothing

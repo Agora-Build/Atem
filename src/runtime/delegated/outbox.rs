@@ -19,7 +19,9 @@
 //! - **Answers** (rule 3). `mailbox_stored`: a repeat row is `stored`, put
 //!   again in 10 minutes; an until-stored row is `done`. `quota`: put
 //!   again after a backoff ([`quota_backoff_ms`]), the object kept.
-//!   `id_reused`, `expired`, `forbidden`: `refused` with the code, final.
+//!   `forbidden`: final on that link generation, put again on a later one
+//!   or once this host's device list moved ([`Place`]), until it expires.
+//!   `id_reused`, `expired`: `refused` with the code, final.
 //!   A put with no answer goes again with a fresh id (`puts.rs`).
 //! - **Expiry.** A row not settled by its object's `expires_at` (at most 24
 //!   h after its `created_at`) is `expired` and put no more.
@@ -71,7 +73,8 @@ const TABLES: &str = "
         policy TEXT NOT NULL, bytes BLOB NOT NULL, object_hash TEXT NOT NULL,
         expires_at INTEGER NOT NULL, state TEXT NOT NULL, code TEXT,
         next_put_ms INTEGER NOT NULL, puts INTEGER NOT NULL DEFAULT 0,
-        quota INTEGER NOT NULL DEFAULT 0, UNIQUE(target_host, object_id));
+        quota INTEGER NOT NULL DEFAULT 0, held_link INTEGER, held_seq INTEGER,
+        UNIQUE(target_host, object_id));
     CREATE INDEX IF NOT EXISTS mail_outbox_due ON mail_outbox(next_put_ms)
         WHERE state IN ('queued','stored');";
 
@@ -127,6 +130,16 @@ pub fn enqueue(tx: &Transaction, bytes: &[u8], target: &HostRef, policy: Policy)
     Ok(tx.last_insert_rowid())
 }
 
+/// Where a put goes: the link generation and this host's committed
+/// device-list head (`seq`). A `forbidden` row is held to the place it was
+/// refused at (host-work-v1 §11.5 rule 3: final on that link generation;
+/// put again on a later one, or after the device list moved).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Place {
+    pub link_gen: u64,
+    pub head_seq: u64,
+}
+
 /// A row due for a put: its number and its exact bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Due {
@@ -134,22 +147,30 @@ pub struct Due {
     pub bytes: Vec<u8>,
 }
 
-/// The rows of `sender` due for a put at `now_ms` (`D`), oldest first, at
-/// most `limit`, none of `live` (being put now).
+/// The rows of `sender` due for a put at `now_ms` (`D`) at `place`, oldest
+/// first, at most `limit`, none of `live` (being put now).
 pub fn due(
     store: &Store,
     sender: &HostRef,
     now_ms: u64,
+    place: Place,
     live: &[i64],
     limit: usize,
 ) -> Result<Vec<Due>> {
     let mut q = store.db.prepare(
         "SELECT n, bytes FROM mail_outbox WHERE state IN ('queued','stored')
         AND next_put_ms <= ?1 AND expires_at > ?1 AND sender_host=?2 AND sender_gen=?3
+        AND NOT (held_link IS ?4 AND held_seq IS ?5)
         ORDER BY next_put_ms, n",
     )?;
     let rows = q.query_map(
-        params![now_ms, sender.host_id, sender.host_trust_gen],
+        params![
+            now_ms,
+            sender.host_id,
+            sender.host_trust_gen,
+            place.link_gen,
+            place.head_seq
+        ],
         |r| {
             Ok(Due {
                 n: r.get(0)?,
@@ -177,7 +198,7 @@ pub fn due(
 /// refused or expired meanwhile stays so.
 pub fn stored(store: &Store, n: i64, now_ms: u64) -> Result<()> {
     store.db.execute(
-        "UPDATE mail_outbox SET puts=puts+1, quota=0, code=NULL,
+        "UPDATE mail_outbox SET puts=puts+1, quota=0, code=NULL, held_link=NULL, held_seq=NULL,
             state=CASE policy WHEN 'repeat' THEN 'stored' ELSE 'done' END,
             next_put_ms=?2
         WHERE n=?1 AND state IN ('queued','stored')",
@@ -192,11 +213,19 @@ pub fn quota_backoff_ms(count: u32) -> u64 {
     (30_000u64 << count.min(5)).min(RESEND_MS)
 }
 
-/// `mailbox_put_refused` of row `n` at `now_ms`: `quota` puts it again
-/// after the backoff (the code kept until it is stored); any other code
-/// refuses it for good, with the code.
-pub fn refused(store: &Store, n: i64, code: PutRefusal, now_ms: u64) -> Result<()> {
-    if code == PutRefusal::Quota {
+/// `mailbox_put_refused` of row `n` at `now_ms`, on `place`: `quota` puts
+/// it again after the backoff (the code kept until it is stored);
+/// `forbidden` holds it to `place` (rule 3: final on that link generation,
+/// put again on a later one or once the device list moved); `id_reused`
+/// and `expired` refuse it for good, with the code.
+pub fn refused(store: &Store, n: i64, code: PutRefusal, now_ms: u64, place: Place) -> Result<()> {
+    if code == PutRefusal::Forbidden {
+        store.db.execute(
+            "UPDATE mail_outbox SET code='forbidden', held_link=?2, held_seq=?3
+            WHERE n=?1 AND state IN ('queued','stored')",
+            params![n, place.link_gen, place.head_seq],
+        )?;
+    } else if code == PutRefusal::Quota {
         let count: Option<u32> = store
             .db
             .query_row("SELECT quota FROM mail_outbox WHERE n=?1", [n], |r| {

@@ -12,6 +12,11 @@ use atem_client::{KeyId, KeyProvider, SoftwareKeys};
 
 const T0: u64 = 1_800_000_000_000;
 const HOUR: u64 = 3_600_000;
+/// The link generation and committed head the puts go at.
+pub(crate) const AT: Place = Place {
+    link_gen: 1,
+    head_seq: 5,
+};
 
 pub(crate) fn host(id: &str) -> HostRef {
     HostRef {
@@ -101,7 +106,7 @@ fn put(store: &Store, bytes: &[u8], to: &str, policy: Policy) -> Result<i64> {
 }
 
 fn due_now(store: &Store, now: u64) -> Vec<i64> {
-    due(store, &host("a"), now, &[], 16)
+    due(store, &host("a"), now, AT, &[], 16)
         .unwrap()
         .into_iter()
         .map(|d| d.n)
@@ -128,7 +133,7 @@ fn an_object_is_enqueued_in_its_callers_transaction() {
     }
     assert_eq!(due_now(&store, T0), Vec::<i64>::new());
     let n = put(&store, &bytes, "b", Policy::Repeat).unwrap();
-    let rows = due(&store, &host("a"), T0, &[], 16).unwrap();
+    let rows = due(&store, &host("a"), T0, AT, &[], 16).unwrap();
     assert_eq!(
         rows,
         [Due {
@@ -147,8 +152,12 @@ fn an_object_is_enqueued_in_its_callers_transaction() {
     assert!(put(&store, &bytes, "c", Policy::Repeat).is_err());
     assert!(put(&store, b"junk", "b", Policy::Repeat).is_err());
     // Another sender's rows aren't this host's to put; live ones wait.
-    assert!(due(&store, &host("b"), T0, &[], 16).unwrap().is_empty());
-    assert!(due(&store, &host("a"), T0, &[n], 16).unwrap().is_empty());
+    assert!(due(&store, &host("b"), T0, AT, &[], 16).unwrap().is_empty());
+    assert!(
+        due(&store, &host("a"), T0, AT, &[n], 16)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// `mailbox_stored`: an envelope is put again with the same bytes every 10
@@ -200,7 +209,7 @@ fn quota_backs_off_and_other_refusals_are_final() {
     .unwrap();
     let mut now = T0;
     for wait in [30_000, 60_000, 120_000, 240_000, 480_000, 600_000, 600_000] {
-        refused(&store, n, PutRefusal::Quota, now).unwrap();
+        refused(&store, n, PutRefusal::Quota, now, AT).unwrap();
         assert_eq!(due_now(&store, now + wait - 1), Vec::<i64>::new(), "{wait}");
         assert_eq!(due_now(&store, now + wait), [n], "{wait}");
         now += wait;
@@ -208,13 +217,9 @@ fn quota_backs_off_and_other_refusals_are_final() {
     assert_eq!(state(&store, n), ("queued".into(), Some("quota".into())));
     stored(&store, n, now).unwrap();
     assert_eq!(state(&store, n), ("stored".into(), None));
-    refused(&store, n, PutRefusal::Quota, now + RESEND_MS).unwrap();
+    refused(&store, n, PutRefusal::Quota, now + RESEND_MS, AT).unwrap();
     assert_eq!(due_now(&store, now + RESEND_MS + 30_000), [n]);
-    for code in [
-        PutRefusal::IdReused,
-        PutRefusal::Expired,
-        PutRefusal::Forbidden,
-    ] {
+    for code in [PutRefusal::IdReused, PutRefusal::Expired] {
         let n = put(
             &store,
             &envelope("b", &new_id(), T0 + HOUR),
@@ -222,7 +227,7 @@ fn quota_backs_off_and_other_refusals_are_final() {
             Policy::Repeat,
         )
         .unwrap();
-        refused(&store, n, code, T0).unwrap();
+        refused(&store, n, code, T0, AT).unwrap();
         assert_eq!(
             state(&store, n),
             ("refused".into(), Some(code.code().into()))
@@ -281,4 +286,57 @@ fn an_unsettled_object_expires_and_its_bytes_are_pruned() {
 
 fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// `forbidden` is final on the link generation it came on (host-work-v1
+/// §11.5 rule 3, ruling R41): the row isn't put again there, but is on a
+/// later generation, or once this host's device list moved, until its
+/// object expires; a store ends the hold.
+#[test]
+fn forbidden_holds_a_row_until_the_link_or_the_list_moves() {
+    let (_dir, store) = store();
+    let n = put(
+        &store,
+        &envelope("b", &new_id(), T0 + HOUR),
+        "b",
+        Policy::Repeat,
+    )
+    .unwrap();
+    let due_at = |place: Place| -> Vec<i64> {
+        due(&store, &host("a"), T0, place, &[], 16)
+            .unwrap()
+            .into_iter()
+            .map(|d| d.n)
+            .collect()
+    };
+    refused(&store, n, PutRefusal::Forbidden, T0, AT).unwrap();
+    assert_eq!(
+        state(&store, n),
+        ("queued".into(), Some("forbidden".into()))
+    );
+    assert_eq!(
+        due_at(AT),
+        Vec::<i64>::new(),
+        "final on this link generation"
+    );
+    let later = Place { link_gen: 2, ..AT };
+    let moved = Place { head_seq: 6, ..AT };
+    assert_eq!(due_at(later), [n]);
+    assert_eq!(due_at(moved), [n]);
+    stored(&store, n, T0).unwrap();
+    refused(&store, n, PutRefusal::Quota, T0 + RESEND_MS, later).unwrap();
+    assert_eq!(
+        due(&store, &host("a"), T0 + RESEND_MS + 30_000, AT, &[], 16)
+            .unwrap()
+            .len(),
+        1,
+        "the hold ended with the store"
+    );
+    refused(&store, n, PutRefusal::Forbidden, T0 + RESEND_MS, AT).unwrap();
+    assert_eq!(
+        state(&store, n),
+        ("stored".into(), Some("forbidden".into()))
+    );
+    expire(&store, T0 + HOUR).unwrap();
+    assert_eq!(state(&store, n).0, "expired");
 }

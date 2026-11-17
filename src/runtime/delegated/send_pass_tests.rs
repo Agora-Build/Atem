@@ -356,8 +356,9 @@ fn a_lost_stored_is_put_again_with_the_same_bytes() {
     });
 }
 
-/// `quota`: put again after the backoff; `forbidden` (as `id_reused` and
-/// `expired`): the row refused with the code, put no more.
+/// `quota`: put again after the backoff; `forbidden`: not again on that
+/// link generation, again on the next; `id_reused` (as `expired`): the row
+/// refused with the code, put no more.
 #[test]
 fn quota_is_retried_and_other_refusals_are_final() {
     local_test(async |root| {
@@ -375,12 +376,28 @@ fn quota_is_retried_and_other_refusals_are_final() {
         assert!(sp_out(&mut rig).is_empty());
         sp_d(&rig, t + 30_000);
         let put = sp_out(&mut rig).remove(0);
+        // `forbidden`: final on this link generation (ruling R41).
         sp_refused(&mut rig, &put, PutRefusal::Forbidden);
         assert_eq!(
             sp_rows(&rig, &id),
-            [("host-b".into(), "refused".into(), Some("forbidden".into()))]
+            [("host-b".into(), "ready".into(), Some("forbidden".into()))]
         );
-        sp_d(&rig, t + 3_600_000);
+        sp_d(&rig, t + 60_000);
+        assert!(sp_out(&mut rig).is_empty(), "not again on this generation");
+        rig.bridge.station.as_mut().unwrap().sync_link(
+            Some(2),
+            1,
+            || crate::runtime::delegated::station::LinkKind::Routed,
+            || Some(ORIGIN.into()),
+        );
+        mb_heads(&mut rig, MB_MAILBOX, 0);
+        let put = sp_out(&mut rig).remove(0);
+        sp_refused(&mut rig, &put, PutRefusal::IdReused);
+        assert_eq!(
+            sp_rows(&rig, &id),
+            [("host-b".into(), "refused".into(), Some("id_reused".into()))]
+        );
+        sp_d(&rig, t + 3_000_000);
         assert!(sp_out(&mut rig).is_empty());
     });
 }

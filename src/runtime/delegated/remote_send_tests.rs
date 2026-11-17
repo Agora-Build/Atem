@@ -275,7 +275,7 @@ fn the_engine_moves_the_rows_and_acceptance_settles_them() {
             .collect()
     };
     outbox::stored(&store, b, T0).unwrap();
-    outbox::refused(&store, c, PutRefusal::Quota, T0).unwrap();
+    outbox::refused(&store, c, PutRefusal::Quota, T0, outbox::tests::AT).unwrap();
     assert_eq!(
         states(),
         [
@@ -284,12 +284,23 @@ fn the_engine_moves_the_rows_and_acceptance_settles_them() {
         ]
     );
     outbox::stored(&store, b, T0 + outbox::RESEND_MS).unwrap();
-    outbox::refused(&store, c, PutRefusal::Forbidden, T0).unwrap();
+    // `forbidden` waits for a later link or a moved list (ruling R41).
+    outbox::refused(&store, c, PutRefusal::Forbidden, T0, outbox::tests::AT).unwrap();
+    assert_eq!(
+        rows_of(&store, &message.message_id)[1],
+        (
+            "c".into(),
+            "ready".into(),
+            Some("forbidden".into()),
+            "the Station refused it (forbidden); put again on a later link or once the device list moves".into()
+        )
+    );
+    outbox::refused(&store, c, PutRefusal::IdReused, T0, outbox::tests::AT).unwrap();
     assert_eq!(
         states(),
         [
             ("sent".into(), None),
-            ("refused".into(), Some("forbidden".into()))
+            ("refused".into(), Some("id_reused".into()))
         ]
     );
     let tx = store.db.unchecked_transaction().unwrap();
@@ -335,7 +346,7 @@ fn a_refused_resend_keeps_a_sent_row_and_each_state_says_why() {
             .find(|r| r.0 == host)
             .unwrap()
     };
-    outbox::refused(&store, b, PutRefusal::Quota, T0).unwrap();
+    outbox::refused(&store, b, PutRefusal::Quota, T0, outbox::tests::AT).unwrap();
     assert_eq!(
         row("b").3,
         "the Station's quota is full; put again after a backoff"
@@ -352,7 +363,14 @@ fn a_refused_resend_keeps_a_sent_row_and_each_state_says_why() {
             "stored in the host's mailbox; put again every 10 minutes until accepted".into()
         )
     );
-    outbox::refused(&store, b, PutRefusal::IdReused, T0 + outbox::RESEND_MS).unwrap();
+    outbox::refused(
+        &store,
+        b,
+        PutRefusal::IdReused,
+        T0 + outbox::RESEND_MS,
+        outbox::tests::AT,
+    )
+    .unwrap();
     assert_eq!(
         row("b"),
         (
@@ -366,7 +384,14 @@ fn a_refused_resend_keeps_a_sent_row_and_each_state_says_why() {
     assert!(accepted(&tx, &message.message_id, "b").unwrap());
     tx.commit().unwrap();
     assert_eq!(row("b").1, "accepted");
-    outbox::refused(&store, c, PutRefusal::Expired, T0 + outbox::RESEND_MS).unwrap();
+    outbox::refused(
+        &store,
+        c,
+        PutRefusal::Expired,
+        T0 + outbox::RESEND_MS,
+        outbox::tests::AT,
+    )
+    .unwrap();
     assert_eq!(
         row("c"),
         (
@@ -380,7 +405,7 @@ fn a_refused_resend_keeps_a_sent_row_and_each_state_says_why() {
     let other = local(vec![]);
     commit(&store, &log, ME, &other, &part).unwrap();
     let (n, _) = engine_bytes(&store, "b", &other.message_id);
-    outbox::refused(&store, n, PutRefusal::IdReused, T0).unwrap();
+    outbox::refused(&store, n, PutRefusal::IdReused, T0, outbox::tests::AT).unwrap();
     assert_eq!(
         rows_of(&store, &other.message_id)[0],
         (

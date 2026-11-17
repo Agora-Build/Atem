@@ -176,9 +176,12 @@ impl HostBridge {
             Some(station) => station.puts.live_rows(),
             None => return Vec::new(),
         };
+        let Some(place) = self.outbox_place() else {
+            return Vec::new();
+        };
         let due = match self
             .outbox_store()
-            .map(|store| outbox::due(store, &me, now, &live, MAX_LIVE_PUTS))
+            .map(|store| outbox::due(store, &me, now, place, &live, MAX_LIVE_PUTS))
         {
             Some(Ok(due)) => due,
             Some(Err(error)) => {
@@ -196,6 +199,14 @@ impl HostBridge {
             .into_iter()
             .map(Call::MailboxPut)
             .collect()
+    }
+
+    /// Where a put goes now: the link generation and the committed
+    /// device-list head (none without a link).
+    fn outbox_place(&self) -> Option<outbox::Place> {
+        let link_gen = self.station.as_ref()?.link()?.link_gen;
+        let head_seq = self.send_list().map_or(0, |list| list.head().seq);
+        Some(outbox::Place { link_gen, head_seq })
     }
 
     /// The Station's answer to a put: written to its row when it answers a
@@ -218,12 +229,15 @@ impl HostBridge {
             .start_view()
             .now_d_ms
             .unwrap_or_else(|| host_now().wall_ms);
+        let Some(place) = self.outbox_place() else {
+            return;
+        };
         let Some(store) = self.outbox_store() else {
             return;
         };
         let written = match code {
             None => outbox::stored(store, n, now),
-            Some(code) => outbox::refused(store, n, code, now),
+            Some(code) => outbox::refused(store, n, code, now, place),
         };
         if let Err(error) = written {
             outbox_fault(error);
