@@ -3180,13 +3180,30 @@ strips and re-signs as its own doesn't open.
 |---|---|
 | envelope | `{"kind":"request","message":<a §5 Message>}`: a host sender's Message: `sender` `host:<sender.host_id>`, `message_id` the body's `id`, `created_at` and `expires_at` the body's, `kind` request (omitted), no `reply_to` or `from_session`, **no attachments** (no `mark`, so no task with `attachments`), and otherwise a valid §5 Message (`Message::valid_from_host`) |
 | envelope | `{"kind":"cancel","task_id":"<UUID>"}` |
-| envelope | `{"kind":"complete","task_id":"<UUID>","result":<a context snapshot, as work_complete takes one>}` |
+| envelope | `{"kind":"complete","task_id":"<UUID>","result":<a context snapshot, as work_complete takes one, or a `result` snapshot naming the task's own reply (below)>}` |
 | result | `{"kind":"status","message_id":"<UUID v4>","recipients":[…]}`: this host's receipts for its recipients (§5 "Publish") |
 | result | `{"kind":"status","object_id":"<UUID v4>","refused":"<code>"}`: an authenticated object this host refused at step 5 or 6; `refused` is one of §7's codes (this host sends `invalid_request`) |
 | result | `{"kind":"result","task_id":"<UUID>","reply":{…}}`: the agent's reply, as `reply_query` returns it once `submitted` and still kept (not `dropped`) |
 
 A task id is the recipient's UUID v4, or the UUID v5 of a selector's fixed
-resolution (collaboration §5). Plaintexts are **strict I-JSON with no
+resolution (collaboration §5).
+
+**A `complete` naming the reply** (**Atem's reading, for Astation**;
+collaboration §10 calls naming the reply as the result a later contract
+addition, and `atem message complete` completes a local task with its
+reply). A host sender completes a task on another host with the reply
+that host sent back, as stage 1's `atem message complete` completes a
+local task with its reply: its `result` may be a `result` snapshot whose
+`id` is the task's own `result:<result_id>` ("`result_id`" below), valid
+as a local snapshot (its `digest` its `text`'s), beside the `memory` and
+`vault` snapshots `work_complete` takes; any other `result` snapshot stays
+local only (`ContextSnapshot::names_reply_of`; a vector of each, opened and
+refused `plaintext_malformed`). Its `text` names the reply, never copies
+it: `{"digest","result_id","task_id"}`, the digest of the reply the
+sending host received, or the ids alone when none came (completed without
+one). The receiving host stores it as the task's result, as
+`work_complete` stores one, and its status's `work.result` names it
+(kind `result`). Plaintexts are **strict I-JSON with no
 `null`**: the seal drops every member whose value is `null` (§5's own wire
 types write `null` for an absent value, such as `work.result`, and a missing
 one reads as absent) and refuses an array holding one; the open refuses any
@@ -3458,18 +3475,20 @@ and for the ceremony's fields. Each is **agreed with Astation 2026-11-16**.
 **Built in the shared core:** the mailbox calls' readers and builders,
 `object_hash` and `heads`' mailbox head behind explicit feature handling
 ("The mailbox calls"), the status forms and the selector task id, and
-`result_id` with both of its checks; `select`'s channel rule; and a
+`result_id` with both of its checks; `select`'s channel rule; a `complete` naming the task's own reply ("The
+plaintexts" above); and a
 reference mailbox in the shared core, a sans-I/O model of the Station's
 side ("The mailbox calls" below). **Built on the receiving host, behind the
 debug-only hook:** its mailbox client, and the admission of what the
-mailbox opens: requests (step 7, `select` expanded into selector tasks),
-`cancel` and `complete`, the status objects and the results back ("The
-mailbox calls", "On the receiving host"). **Built on the sending host,
-behind the same hook:** its planning, sealing and puts, and its reading of
-the statuses and results ("On the sending host"), and `select`'s `launch`
-in the shared core. Nothing else in them is built (`cancel` and `complete`
-sent across hosts, the receiving host's launch for a `select`'s `launch`, a
-Station's side, the ceremony's fields). The status forms
+mailbox opens: requests (step 7, `select` expanded into selector tasks,
+its `launch` starting an agent), `cancel` and `complete`, the status
+objects and the results back ("The mailbox calls", "On the receiving
+host"). **Built on the sending host, behind the same hook:** its planning,
+sealing and puts, its reading of the statuses and results, and its
+`cancel` and `complete` of a task on another host ("On the sending host"),
+and `select`'s `launch` in the shared core. Two real hosts run end to end
+behind the hook (`tests/host_senders_binary.rs`). Nothing else in them is
+built (a Station's side, the ceremony's fields). The status forms
 and the sending host's `result_id` check have their shared vectors in
 `fixtures/r9-vectors-host-envelope.json` (a result failing both the
 `result_id` check and the row's included); the mailbox calls' are
@@ -3817,8 +3836,29 @@ exactly as without this section):
     its rows hit, a column that doesn't read): a fault of the whole store
     (busy, locked, I/O, a full disk) keeps it owed and tried again however
     long it lasts. One whose records no longer read is dropped at once.
-  - **Not built:** a `select`'s `launch` (the recipient resolves to the
-    running agents only, as when its route doesn't allow a launch).
+  - **A `select`'s `launch`** (design II.6; "`select` from host senders"
+    below; collaboration §5, "When no agent runs"). A recipient with
+    `launch` starts an agent only on a route, in route id order, that one of
+    its `atem:<this host>/<route_id>` selectors names, whose owner allows it
+    (`launch = "on_message"`), that consents to the sender with a project
+    granting `launch` as well as a task's ops (one entry's ops, never
+    summed across entries), and where no agent runs. A launch under way on
+    that route (reserved by an earlier request and still starting, or
+    started with its session not yet the route's agent) is shared; else one
+    is reserved, one per profile, in the admission transaction with the
+    tasks that wait for it, within the launch records' limit (else the
+    message is refused `busy`), and started once that commits as a
+    delegated sender's launch: checked at the spawn boundary (design I.4.3,
+    "Launches": the sender's standing at its admission's generation and
+    epoch, the route as admitted still launching on message for the profile
+    approved then, the project's `launch` op, its expiry, the waits), a
+    reason that can clear waiting, one that can't failing it, never
+    `outcome_unknown`. Its tasks wait for it (`blocked`, `launching the
+    approved route`, holding its session); a launch that failed, or whose
+    outcome is unknown after a restart, fails them (**Atem's reading, for
+    Astation:** they never started, so their own outcome is known; stage
+    1's local task becomes `outcome_unknown` there). Without every
+    condition the recipient resolves to the running agents only.
 
 **On the sending host** (built behind the debug-only hook's
 `host.senders`, with `host.delegated`; `runtime/delegated/send_plan.rs`,
@@ -3969,8 +4009,7 @@ exactly as without this section):
     the result plaintext names no session, so none is named; the design's
     example naming one can't be rendered from verified fields), its context
     `sender's snapshot, digest matches`, and its last line `Complete the
-    task with: atem message complete <task id>` (completing a task across
-    hosts is not built yet). A reply's text and context are dropped a day
+    task with: atem message complete <task id>` (below). A reply's text and context are dropped a day
     past its message's expiry; its ids and digest stay.
   - **`atem message status`** shows, under a message the caller sent (or
     any, from the owner's terminal), each row to another host: its state,
@@ -3978,8 +4017,33 @@ exactly as without this section):
     hasn't announced this host's mailbox says it waits for that), "status
     pending" before any status, then the host's resolution: each task with
     its state and detail, its reply and whether it was delivered or kept
-    and why, and a recipient with no task. Text another host sent (its
-    details, its reply) is printed with its control characters escaped.
+    and why, the `cancel` and `complete` sent for it (below), and a
+    recipient with no task. Text another host sent (its details, its
+    reply) is printed with its control characters escaped.
+- **`cancel` and `complete` across hosts** (design II.4.4, II.7;
+  `runtime/delegated/remote_stops.rs`). `atem message cancel` and
+  `complete` of a task id another host's status recorded for one of this
+  host's messages seal a `cancel` or `complete` of their own (a fresh `id`,
+  made on `D`, alive while its message is and at most 24 h, signed at the
+  committed head, sealed to the host's current key at the generation the
+  message went to) and enqueue its exact bytes `Repeat` with its own
+  delivery row (its kind and task id) in one transaction, before any put.
+  It is put every 10 minutes until a status shows its effect (the task
+  `cancelled`, or `completed`: the row `accepted`), the host refuses it by
+  its own id (`busy`, `forbidden`: `refused` with the code), or it expires.
+  As stage 1: only the task's sending session (for a complete, its process
+  too) or the owner outside any session. **Atem's readings, for
+  Astation:** what the newest status shows decides only what can't change,
+  so a cancel of a task it shows started or ended is refused here, as is a
+  complete of one it shows failed, cancelled or expired (one it shows
+  completed is done), and anything else goes (a status may lag behind its
+  task, and the host answers a stop it doesn't reach); a stop of the task
+  that still stands isn't sent again. A complete names the reply this host
+  got back ("A `complete` naming the reply" above), and a delivery of that
+  reply still queued is cancelled in that transaction (`not delivered: its
+  task was completed by its sender`), as stage 1's completion ends its
+  return grant. So the delivered result's last line, `atem message
+  complete <task id>`, completes the task on the host that ran it.
 
 The receiving host's mailbox on the Station (design II.4.3): a sending host
 puts objects over its own link, and the receiving host syncs its own mailbox
@@ -4585,7 +4649,12 @@ The sender's channel and online status are not conditions.
   hosting switched off still fence it as §4 says.
   - **As built in step 4.** Only `host_launch` reaches it (a launch on
     message's sender is `local`). Its profile stands for the route of
-    condition 4. A waiting launch reads `starting`, a refused one `failed`;
+    condition 4. **Host senders, built behind the debug-only hook's
+    `host.senders`:** a host sender's launch on message (§11.5, "On the
+    receiving host") reaches it too, checked as its tasks are (its
+    standing at its admission's generation and epoch) on the route its
+    admission recorded, still launching on message for the profile
+    approved then, with the project's `launch` op. A waiting launch reads `starting`, a refused one `failed`;
     the reason goes to `runtime.log` (§3 has no `detail`). A
     `runtime.toml` that doesn't load is waited out at the spawn boundary
     too. **Atem's reading, agreed with Astation (2026-11-13, #120 comment 6848463998):** the check just

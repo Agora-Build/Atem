@@ -112,10 +112,11 @@ applied device-list `seq` (II.2.2, II.3.1, II.8) and serves `control_records` (h
 receiving host", with Atem's readings for Astation: those effects written in host-work's own pass, and project entries
 judged once per catch-up against the head). Behind the same hook the mailbox is built on both hosts (host-work-v1
 §11.5, "On the receiving host" and "On the sending host"): the receiving host's mailbox client and its admission of
-what the mailbox opens (requests through step 7 with `select` expanded, `cancel` and `complete`, the status objects
-back), and the sending host's planning, sealing and puts. Not built: `cancel` and `complete` sent across hosts, the
-receiving host's launch for a `select`'s `launch`, the results back and the sending host's reading of the statuses.
-The signing gate stays closed. Activation is a later owner decision, after the joint check (V.2 step 7,
+what the mailbox opens (requests through step 7 with `select` expanded and its `launch` starting an agent, `cancel` and
+`complete`, the status objects and the results back), and the sending host's planning, sealing and puts, its reading
+of the statuses and results, and its `cancel` and `complete` of a task on another host; two real hosts run end to end
+behind the hook. Not built: a Station's side and the ceremony's fields (host-work-v1 §11.5). The signing gate stays
+closed. Activation is a later owner decision, after the joint check (V.2 step 7,
 VII.A); a dev host turns the features on as [agent-hosting.md](agent-hosting.md) section 14 says ("Delegated work
 on a dev host"). The contracts say what is built: host-work-v1 §11 (its "as built in step 4" passages) and session-v1
 R9.14. Astation answered step 4's contract questions on 2026-11-13 (#120 comments 6848326392 and 6848463998, #164
@@ -2202,7 +2203,11 @@ result, owed in the reply's own commit; the sending host judges every status and
 its rows to that host, applies each with its removal from the mailbox's results in one transaction, records the
 resolution and each task's newest state (a status made before the recorded one changes nothing), and delivers a reply
 as this section says, or keeps it as data with why. A delivered result's first line names the host only (its plaintext
-names no session; the example in III.2 names one, Atem's reading for Astation).
+names no session; the example in III.2 names one, Atem's reading for Astation). **`cancel` and `complete` across
+hosts built behind the same hook** (host-work-v1 §11.5, "On the sending host"): each its own envelope and delivery
+row, resent with the same bytes every 10 minutes until a status shows its effect, the host answers it by its own id,
+or it expires; so the delivered result's last line, `atem message complete <task id>`, completes the task on the host
+that ran it.
 
 The host that ran the work sends **`atem-result`** objects back to the sending host through the same mailbox. They
 have the envelope's shape with type `atem-result`, signing label `atem-result-v1` and seal label
@@ -2286,7 +2291,10 @@ host plans which hosts to address from its own verified list, and reads no vault
   `host_id` in its pinned device list (which equals its configured `atem_id`), so sender and receiver read it the
   same way. With `/<route_id>` it names one route there. As in stage 1, a message starts an agent only when its
   send asked for it (`--launch`), and only on a route such a selector names whose owner allows it (collaboration §5,
-  "When no agent runs"); a host sender also needs the project's `launch` op (II.2.3). An `atem_id` no current host
+  "When no agent runs"); a host sender also needs the project's `launch` op (II.2.3). **Built on the receiving host
+  behind the debug-only hook** (host-work-v1 §11.5, "On the receiving host"): the launch is reserved with the tasks
+  that wait for it in the admission transaction and checked at the spawn boundary as a delegated sender's launch
+  (I.4.3, "Launches"); a launch that failed fails its tasks. An `atem_id` no current host
   of the list has reaches no other host.
 - **Labels.** Each receiving host expands the selector itself, against its own labels, routes and agents ("The
   receiver decides", below), and answers `no_match` when nothing matches. Labels still only address: a receiving host
@@ -2341,7 +2349,11 @@ is superseded: a host's `host_id` is its `atem_id` (above).
 and `complete` as the table says (a cancel also withdraws an attempt waiting `accepted`, marked durably first so it
 never runs), each answered with the
 message's status, one not reached also by its own id (`busy`, or `forbidden` without authority over the task), and one
-opened before its request kept until its request comes. The sending host doesn't send them yet.
+opened before its request kept until its request comes. **The sending host's side built behind the same hook**
+(host-work-v1 §11.5, "On the sending host"): `atem message cancel` and `complete` of a task another host's status
+named seal a `cancel` or `complete` of their own, put until a status shows its effect, the host refuses it by its own
+id, or it expires; a complete names the reply that host sent back (a `result` snapshot of the task's own
+`result:<result_id>`, Atem's reading, for Astation).
 
 A host sender has no channel (II.2.1), so the source's interaction authority (I.3.1) maps onto objects:
 
@@ -2390,7 +2402,9 @@ a project with it, a result is kept as data and never delivered into a session.
   mailbox message bound of owner choice 13 (II.4.2).
 - **In the mailbox. Changed after Astation's review.** The Station's configurable limits per sending host, receiving
   host and account, on encoded wire bytes, with capacity reserved for control objects and acknowledgments (II.4.3).
-- **On the sending host.** `[collab] send`, `per_hour` and `per_workflow` still apply to its agents' sends
+- **On the sending host.** (Tested behind the debug-only hook: a send to other hosts over `per_hour` or `per_workflow` is
+  refused at send, as a local one is, with two real hosts for `per_workflow`.) `[collab] send`, `per_hour` and
+  `per_workflow` still apply to its agents' sends
   (collaboration §6). They are not a boundary for the receiving host: any process of the sender's user can sign as
   the sender (II.2.1), so the receiver's own limits are what bound the work it accepts.
 
