@@ -3813,8 +3813,10 @@ exactly as without this section):
     stays owed and goes on a later pass, each on its own (one that keeps
     failing holds none of the others), and is settled, its mark cleared
     with a runtime.log line, only after 8 tries in a row and a minute on
-    the monotonic clock; one whose records no longer read is dropped at
-    once.
+    the monotonic clock, and only for a failure of its own (a constraint
+    its rows hit, a column that doesn't read): a fault of the whole store
+    (busy, locked, I/O, a full disk) keeps it owed and tried again however
+    long it lasts. One whose records no longer read is dropped at once.
   - **Not built:** a `select`'s `launch` (the recipient resolves to the
     running agents only, as when its route doesn't allow a launch).
 
@@ -3919,10 +3921,14 @@ exactly as without this section):
     holds) is taken only while the results waiting so hold less than half
     its sender's results share, half the total count and half the byte
     budget; else it is left on the Station, not done, and read again once
-    room frees. What holds: at least half of each sender's share, by count,
-    and half the byte budget are never taken by results waiting for their
-    status, so a status finds room unless its sender's other kept objects
-    fill the rest, and those are judged and leave on the next drain.
+    room frees. What this guarantees, and no more: the bound is checked
+    when the mailbox takes a result, so a result that would wait then is
+    taken only while the results already waiting so hold less than half of
+    its sender's share by count, half the total count and half the byte
+    budget. A result taken while it waited for this host's device list
+    isn't checked then; if it later waits for its status, it counts from
+    then on, so the results waiting may pass half until they are applied
+    or expire.
   - **Task ids.** A remote task id is its host's for one message (a
     selector task id derives from the message): a status naming one another
     message of that host already holds doesn't take it, its recipient
