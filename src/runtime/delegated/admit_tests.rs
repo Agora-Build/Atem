@@ -1139,7 +1139,10 @@ fn a_status_committed_before_a_crash_is_put_after_it() {
         mb_heads(&mut rig, MB_MAILBOX, 0);
         let put = sp_out(&mut rig);
         assert_eq!(put.len(), 1);
-        assert_eq!(put[0].object().to_json().to_string().into_bytes(), committed);
+        assert_eq!(
+            put[0].object().to_json().to_string().into_bytes(),
+            committed
+        );
         sp_stored(&mut rig, &put[0]);
         assert_eq!(ad_statuses(&rig)[0].0, "done");
     });
