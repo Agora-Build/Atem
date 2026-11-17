@@ -357,9 +357,11 @@ pub fn apply_status(
         }
     }
     // A stop of a task whose effect this status shows is done (design
-    // II.4.4: put until a status shows it).
+    // II.4.4: put until a status shows it); a held complete is due once
+    // the task awaits its result, dropped once it ended otherwise (ruling
+    // R50).
     for task in &tasks {
-        remote_send::stops_shown(
+        remote_send::status_shown(
             tx,
             &c.message_id,
             &c.host_id,
@@ -471,6 +473,11 @@ fn insert(
 /// one of its cancel or complete envelopes): that row `refused` with the
 /// code.
 pub fn apply_refusal(tx: &Transaction, c: &Candidate, object_id: &str, code: &str) -> Result<()> {
+    // A complete answered `busy` (the task wasn't awaiting its result
+    // there) is held again (ruling R50), never ended.
+    if code == "busy" && remote_send::rehold(tx, object_id, &c.host_id)? {
+        return Ok(());
+    }
     remote_send::refused_by_receiver(tx, object_id, &c.host_id, code)?;
     Ok(())
 }

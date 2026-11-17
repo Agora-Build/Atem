@@ -149,24 +149,14 @@ pub async fn message(command: crate::cli::MessageCommands) -> Result<()> {
                 "{task_id}: reply refused: {detail}; send a corrected reply (result {result_id})"
             ),
         },
-        RuntimeMsg::MessageCompleted {
-            task_id,
-            host: None,
-        } => println!("{task_id}: completed"),
-        RuntimeMsg::MessageCancelled {
-            task_id,
-            host: None,
-        } => println!("{task_id}: cancelled"),
-        // A task on another host: the stop is sent; the host's status shows
-        // its effect.
-        RuntimeMsg::MessageCompleted {
-            task_id,
-            host: Some(host),
-        } => println!("{task_id}: complete sent to host {host}; `atem message status` shows it"),
-        RuntimeMsg::MessageCancelled {
-            task_id,
-            host: Some(host),
-        } => println!("{task_id}: cancel sent to host {host}; `atem message status` shows it"),
+        RuntimeMsg::MessageCompleted { task_id, remote } => match remote {
+            None => println!("{task_id}: completed"),
+            Some(stop) => println!("{task_id}: {}", stop_said("complete", &stop)),
+        },
+        RuntimeMsg::MessageCancelled { task_id, remote } => match remote {
+            None => println!("{task_id}: cancelled"),
+            Some(stop) => println!("{task_id}: {}", stop_said("cancel", &stop)),
+        },
         RuntimeMsg::MessageDirectory { rows } => {
             for row in rows {
                 println!(
@@ -356,6 +346,32 @@ fn status_lines(messages: Vec<super::collab::MessageView>) -> Result<Vec<String>
         }
     }
     Ok(lines)
+}
+
+/// What `atem message cancel` or `complete` (`kind`) of a task on another
+/// host says became of it: never "sent" when nothing was.
+fn stop_said(kind: &str, stop: &super::protocol::RemoteStop) -> String {
+    use super::protocol::StopOutcome;
+    let host = &stop.host;
+    match stop.outcome {
+        StopOutcome::Sent => {
+            format!("{kind} sent to host {host}; `atem message status` shows its effect")
+        }
+        StopOutcome::Queued => {
+            format!("{kind} queued: it goes to host {host} once the task awaits its result there")
+        }
+        StopOutcome::Pending => {
+            format!("an earlier {kind} for it is still on its way to host {host}; nothing new sent")
+        }
+        StopOutcome::Done => {
+            let done = if kind == "cancel" {
+                "cancelled"
+            } else {
+                "completed"
+            };
+            format!("already {done} on host {host}; nothing sent")
+        }
+    }
 }
 
 /// `text` another host sent, its control characters (C0 other than
@@ -687,6 +703,42 @@ mod tests {
                 "    recipient r-1  no_match",
                 "  host host-e  refused (forbidden)  refused by the host (forbidden)",
             ]
+        );
+    }
+
+    /// Review L4: `atem message cancel` and `complete` of a task on another
+    /// host say what became of the stop, never "sent" when nothing was.
+    #[test]
+    fn a_stop_of_a_task_on_another_host_says_what_became_of_it() {
+        use super::super::protocol::{RemoteStop, StopOutcome};
+        let said = |kind, outcome| {
+            stop_said(
+                kind,
+                &RemoteStop {
+                    host: "host-b".into(),
+                    outcome,
+                },
+            )
+        };
+        assert_eq!(
+            said("complete", StopOutcome::Sent),
+            "complete sent to host host-b; `atem message status` shows its effect"
+        );
+        assert_eq!(
+            said("complete", StopOutcome::Queued),
+            "complete queued: it goes to host host-b once the task awaits its result there"
+        );
+        assert_eq!(
+            said("cancel", StopOutcome::Pending),
+            "an earlier cancel for it is still on its way to host host-b; nothing new sent"
+        );
+        assert_eq!(
+            said("complete", StopOutcome::Done),
+            "already completed on host host-b; nothing sent"
+        );
+        assert_eq!(
+            said("cancel", StopOutcome::Done),
+            "already cancelled on host host-b; nothing sent"
         );
     }
 

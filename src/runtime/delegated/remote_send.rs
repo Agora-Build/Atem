@@ -33,8 +33,12 @@
 //!   host, `remote_stops.rs`): a `cancel` or `complete` envelope's own row
 //!   ([`stop_row`]), kind and task id with it, put by the same engine
 //!   ([`Policy::Repeat`]) until a status shows its effect
-//!   ([`stops_shown`]: `accepted`), the host refuses it by its own id
-//!   ([`refused_by_receiver`]), or it expires.
+//!   ([`status_shown`]: `accepted`), the host refuses it by its own id
+//!   ([`refused_by_receiver`]), or it expires. A `complete` of a task not
+//!   yet shown awaiting its result is `held` (its result frozen,
+//!   `remote_held`), `due` once a status shows it, then sealed; `dropped`
+//!   when the task ends otherwise, `expired` with its message; a `busy`
+//!   answer holds it again under a fresh id ([`rehold`]; ruling R50).
 use super::outbox::{self, Policy};
 use super::send_plan::{Me, Plan, Skipped, signs};
 use crate::runtime::host_work::Store;
@@ -91,6 +95,11 @@ const TABLES: &str = "
                 ELSE 'waiting to be put in the host''s mailbox' END
         WHERE outbox_n=NEW.n AND state IN ('ready', 'sent');
     END;
+    CREATE INDEX IF NOT EXISTS remote_deliveries_held ON remote_deliveries(state)
+        WHERE kind='complete' AND state IN ('held', 'due');
+    CREATE TABLE IF NOT EXISTS remote_held (
+        message_id TEXT NOT NULL, host_id TEXT NOT NULL, task_id TEXT NOT NULL,
+        result TEXT NOT NULL, PRIMARY KEY(message_id, host_id, task_id)) WITHOUT ROWID;
     CREATE TRIGGER IF NOT EXISTS remote_deliveries_publication AFTER UPDATE OF state ON outbox
     WHEN NEW.state IN ('refused', 'expired') BEGIN
         UPDATE remote_deliveries SET state=NEW.state, detail=NEW.detail
@@ -481,24 +490,34 @@ fn settle_row(
     Ok(true)
 }
 
+/// A held `complete`'s detail (ruling R50).
+pub const HELD: &str = "held until the host's status shows the task awaiting its result";
+/// A `complete` held again after the host answered it `busy` by its own id.
+pub const HELD_AFTER_BUSY: &str = "the host answered busy: the task wasn't awaiting its result there; held until its status shows it";
+
 /// The `cancel` or `complete` (`kind`) envelope `object_id` of `task` (a
-/// task on another host this host's message reached), sealed and enqueued
-/// as the engine's row `n`: its own delivery row, `ready`, in `tx`
+/// task on another host this host's message reached), in `tx`: its own
+/// delivery row, `ready` when sealed and enqueued as the engine's row `n`
 /// (design II.4.4: put every 10 minutes until a status shows its effect,
-/// the host answers it by its own id, or it expires).
+/// the host answers it by its own id, or it expires), or, with no `n`, a
+/// `complete` `held` until the host's status shows the task awaiting its
+/// result (ruling R50).
 pub fn stop_row(
     tx: &Transaction,
     task: &super::results_back::RemoteTask,
     kind: &str,
     object_id: &str,
-    n: i64,
+    n: Option<i64>,
     now_ms: u64,
 ) -> Result<()> {
+    let (state, detail) = match n {
+        Some(_) => ("ready", "waiting to be put in the host's mailbox"),
+        None => ("held", HELD),
+    };
     tx.execute(
         "INSERT INTO remote_deliveries(object_id, host_id, host_trust_gen, message_id, kind,
             recipient_id, task_id, outbox_n, state, detail, created_ms)
-        VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ready', 'waiting to be put in the host''s mailbox',
-            ?9)",
+        VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             object_id,
             task.host_id,
@@ -508,55 +527,255 @@ pub fn stop_row(
             task.recipient_id,
             task.task_id,
             n,
+            state,
+            detail,
             now_ms
         ],
     )?;
     Ok(())
 }
 
-/// Whether a `kind` stop of `task` still stands (not refused or expired):
-/// another would add nothing.
-pub fn stop_stands(
+/// A `complete`'s result for `task`, frozen at the command (what it names
+/// when it is sealed, then or later), in `tx`.
+pub fn hold_result(
+    tx: &Transaction,
+    task: &super::results_back::RemoteTask,
+    result: &atem_client::session::host_work::ContextSnapshot,
+) -> Result<()> {
+    tx.execute(
+        "INSERT OR REPLACE INTO remote_held(message_id, host_id, task_id, result)
+        VALUES(?1, ?2, ?3, ?4)",
+        params![
+            task.message_id,
+            task.host_id,
+            task.task_id,
+            serde_json::to_string(result)?
+        ],
+    )?;
+    Ok(())
+}
+
+/// The result frozen for a `complete` of task `task_id` of `message_id`
+/// at `host_id`.
+pub fn held_result(
+    db: &rusqlite::Connection,
+    message_id: &str,
+    host_id: &str,
+    task_id: &str,
+) -> Result<Option<atem_client::session::host_work::ContextSnapshot>> {
+    db.query_row(
+        "SELECT result FROM remote_held WHERE message_id=?1 AND host_id=?2 AND task_id=?3",
+        params![message_id, host_id, task_id],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()?
+    .map(|text| Ok(serde_json::from_str(&text)?))
+    .transpose()
+}
+
+/// How an earlier `kind` stop of a task stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    /// None stands (none made, or one refused, dropped or expired).
+    None,
+    /// One is held or on its way: another would add nothing.
+    Pending,
+    /// The host's status showed its effect.
+    Done,
+}
+
+/// How a `kind` stop of `task` stands now.
+pub fn stop_standing(
     db: &rusqlite::Connection,
     task: &super::results_back::RemoteTask,
     kind: &str,
-) -> Result<bool> {
-    Ok(db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM remote_deliveries WHERE message_id=?1 AND host_id=?2
-            AND task_id=?3 AND kind=?4 AND state IN ('ready', 'sent', 'accepted'))",
-        params![task.message_id, task.host_id, task.task_id, kind],
-        |r| r.get(0),
-    )?)
+) -> Result<Standing> {
+    let states: Vec<String> = db
+        .prepare(
+            "SELECT state FROM remote_deliveries WHERE message_id=?1 AND host_id=?2
+            AND task_id=?3 AND kind=?4",
+        )?
+        .query_map(
+            params![task.message_id, task.host_id, task.task_id, kind],
+            |r| r.get(0),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(if states.iter().any(|s| s == "accepted") {
+        Standing::Done
+    } else if states
+        .iter()
+        .any(|s| matches!(s.as_str(), "held" | "due" | "ready" | "sent"))
+    {
+        Standing::Pending
+    } else {
+        Standing::None
+    })
 }
 
-/// A status of `host_id` shows task `task_id` of `message_id` `state`: a
-/// stop whose effect that is (`cancelled` for a cancel, `completed` for a
-/// complete) is `accepted`, its engine row settled (design II.4.4: "until a
-/// status shows their effect"), in `tx`.
-pub fn stops_shown(
+/// A status of `host_id` shows task `task_id` of `message_id` `state`, in
+/// `tx`:
+/// - a stop whose effect that is (`cancelled` for a cancel, `completed` for
+///   a complete) is `accepted`, its engine row settled (design II.4.4:
+///   "until a status shows their effect");
+/// - a held `complete` is `due` when the task awaits its result (sealed by
+///   the pass), and `dropped`, with why, when the task ended otherwise or
+///   its outcome is unknown (ruling R50).
+pub fn status_shown(
     tx: &Transaction,
     message_id: &str,
     host_id: &str,
     task_id: &str,
     state: &str,
 ) -> Result<()> {
-    let kind = match state {
-        "cancelled" => "cancel",
-        "completed" => "complete",
-        _ => return Ok(()),
+    let effect = match state {
+        "cancelled" => Some("cancel"),
+        "completed" => Some("complete"),
+        _ => None,
     };
-    let ids: Vec<String> = tx
-        .prepare(
-            "SELECT object_id FROM remote_deliveries WHERE message_id=?1 AND host_id=?2
-            AND task_id=?3 AND kind=?4 AND state IN ('ready', 'sent')",
-        )?
-        .query_map(params![message_id, host_id, task_id, kind], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    let detail = format!("the host's status shows the task {state}");
-    for id in ids {
-        settle_row(tx, &id, host_id, "accepted", None, &detail)?;
+    if let Some(kind) = effect {
+        let ids: Vec<String> = tx
+            .prepare(
+                "SELECT object_id FROM remote_deliveries WHERE message_id=?1 AND host_id=?2
+                AND task_id=?3 AND kind=?4 AND state IN ('ready', 'sent')",
+            )?
+            .query_map(params![message_id, host_id, task_id, kind], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let detail = format!("the host's status shows the task {state}");
+        for id in ids {
+            settle_row(tx, &id, host_id, "accepted", None, &detail)?;
+        }
+    }
+    match state {
+        "awaiting_result" => {
+            tx.execute(
+                "UPDATE remote_deliveries SET state='due',
+                    detail='the host''s status shows the task awaiting its result; sealed next'
+                WHERE message_id=?1 AND host_id=?2 AND task_id=?3 AND kind='complete'
+                    AND state='held'",
+                params![message_id, host_id, task_id],
+            )?;
+        }
+        "cancelled" | "failed" | "expired" | "completed" | "outcome_unknown" => {
+            tx.execute(
+                "UPDATE remote_deliveries SET state='dropped', code=NULL, detail=?4
+                WHERE message_id=?1 AND host_id=?2 AND task_id=?3 AND kind='complete'
+                    AND state IN ('held', 'due')",
+                params![
+                    message_id,
+                    host_id,
+                    task_id,
+                    format!("not sent: the host's status shows the task {state}")
+                ],
+            )?;
+        }
+        _ => {}
     }
     Ok(())
+}
+
+/// The host answered the `complete` `object_id` `busy` by its own id (a
+/// race: the task wasn't awaiting its result there; ruling R50): held
+/// again under a fresh id, its engine row settled, to be sealed again once
+/// a status shows the task awaiting its result; dropped, with why, when
+/// the newest status already shows it ended. Whether it was a complete on
+/// its way (else the refusal ends the row as any other).
+pub fn rehold(tx: &Transaction, object_id: &str, host_id: &str) -> Result<bool> {
+    let row: Option<(Option<i64>, String, String)> = tx
+        .query_row(
+            "SELECT outbox_n, message_id, task_id FROM remote_deliveries
+            WHERE object_id=?1 AND host_id=?2 AND kind='complete' AND state IN ('ready', 'sent')",
+            params![object_id, host_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((n, message_id, task_id)) = row else {
+        return Ok(false);
+    };
+    if let Some(n) = n {
+        outbox::settle(tx, n)?;
+    }
+    let shown: Option<String> = tx
+        .query_row(
+            "SELECT state FROM remote_tasks WHERE message_id=?1 AND host_id=?2 AND task_id=?3",
+            params![message_id, host_id, task_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(state) = shown.filter(|s| {
+        matches!(
+            s.as_str(),
+            "cancelled" | "failed" | "expired" | "completed" | "outcome_unknown"
+        )
+    }) {
+        tx.execute(
+            "UPDATE remote_deliveries SET state='dropped', code='busy', outbox_n=NULL, detail=?3
+            WHERE object_id=?1 AND host_id=?2",
+            params![
+                object_id,
+                host_id,
+                format!("the host answered busy; its status shows the task {state}")
+            ],
+        )?;
+        return Ok(true);
+    }
+    tx.execute(
+        "UPDATE remote_deliveries SET object_id=?3, state='held', code='busy', outbox_n=NULL,
+            detail=?4
+        WHERE object_id=?1 AND host_id=?2",
+        params![
+            object_id,
+            host_id,
+            uuid::Uuid::new_v4().to_string(),
+            HELD_AFTER_BUSY
+        ],
+    )?;
+    Ok(true)
+}
+
+/// The `complete` rows due to be sealed (a status showed their task
+/// awaiting its result): (object id, host, message, task).
+pub fn due_stops(db: &rusqlite::Connection) -> Result<Vec<(String, String, String, String)>> {
+    let mut q = db.prepare(
+        "SELECT object_id, host_id, message_id, task_id FROM remote_deliveries
+        WHERE kind='complete' AND state IN ('held', 'due') AND state='due'",
+    )?;
+    let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// The due `complete` `object_id` sealed and enqueued as the engine's row
+/// `n`: `ready`, in `tx`.
+pub fn sealed_due(tx: &Transaction, object_id: &str, host_id: &str, n: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE remote_deliveries SET state='ready', outbox_n=?3, code=NULL,
+            detail='waiting to be put in the host''s mailbox'
+        WHERE object_id=?1 AND host_id=?2 AND state='due'",
+        params![object_id, host_id, n],
+    )?;
+    Ok(())
+}
+
+/// A held or due `complete` that can't go (`why`): `dropped`.
+pub fn drop_stop(tx: &Transaction, object_id: &str, host_id: &str, why: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE remote_deliveries SET state='dropped', detail=?3
+        WHERE object_id=?1 AND host_id=?2 AND state IN ('held', 'due')",
+        params![object_id, host_id, why],
+    )?;
+    Ok(())
+}
+
+/// Held and due `complete`s whose message expired by `now_ms` (`D`):
+/// `expired`, never sent.
+pub fn expire_held(db: &rusqlite::Connection, now_ms: u64) -> Result<usize> {
+    Ok(db.execute(
+        "UPDATE remote_deliveries SET state='expired', detail='expired before it was sent'
+        WHERE kind='complete' AND state IN ('held', 'due') AND EXISTS(
+            SELECT 1 FROM remote_tasks t WHERE t.message_id=remote_deliveries.message_id
+                AND t.host_id=remote_deliveries.host_id AND t.task_id=remote_deliveries.task_id
+                AND t.expires_at <= ?1)",
+        [now_ms],
+    )?)
 }
 
 /// One delivery row, as `atem message status` shows it.

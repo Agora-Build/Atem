@@ -10,6 +10,7 @@ use crate::runtime::collab::{self, Candidate, DirectoryRow, MessageView, SendReq
 use crate::runtime::collab_context::{self, ContextSpec, VaultRef};
 use crate::runtime::delegated::remote_send::RemotePart;
 use crate::runtime::host_work::MessageRecord;
+use crate::runtime::protocol::RemoteStop;
 use anyhow::{Result, anyhow, bail};
 use atem_client::session::messages::{
     Delivery, Destination, Message, MessageKind, MessageReceipt, Recipient, RecipientReceipt,
@@ -733,12 +734,12 @@ impl HostBridge {
         caller: Option<&SessionId>,
         task_id: &str,
         sessions: &BTreeMap<SessionId, BrokerSession>,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<RemoteStop>> {
         self.collab_store_ready()?;
         let store = self.work.store.as_ref().unwrap();
         let Some(mut task) = store.work(task_id)? else {
             return match self.remote_stop(caller, task_id, Stop::Complete, Some(sessions))? {
-                Some(host) => Ok(Some(host)),
+                Some(stop) => Ok(Some(stop)),
                 None => bail!("no task {task_id} in this runtime"),
             };
         };
@@ -1935,12 +1936,12 @@ impl HostBridge {
         &mut self,
         caller: Option<&SessionId>,
         id: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<RemoteStop>> {
         self.collab_store_ready()?;
         let store = self.work.store.as_ref().unwrap();
         let Some(mut task) = store.work(id)?.filter(|r| r.principal == "local") else {
             return match self.remote_stop(caller, id, Stop::Cancel, None)? {
-                Some(host) => Ok(Some(host)),
+                Some(stop) => Ok(Some(stop)),
                 None => bail!("no local collaboration task"),
             };
         };

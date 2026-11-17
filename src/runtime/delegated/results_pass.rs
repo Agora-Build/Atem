@@ -113,6 +113,8 @@ impl HostBridge {
         if due {
             self.results_drain();
         }
+        // Held completes a status made due, sealed in this pass (ruling R50).
+        self.remote_stops_pass();
         self.remote_deliveries(sessions);
     }
 

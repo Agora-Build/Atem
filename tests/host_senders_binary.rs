@@ -619,6 +619,65 @@ fn a_message_to_another_host_runs_there_and_its_reply_comes_back() {
     std::fs::write(pair.a.fake_dir().join("complete"), "").unwrap();
 }
 
+/// Ruling R50 (review M1): B's agent replies and goes on working; A's
+/// agent runs the delivered result's last line while B's turn still runs.
+/// The complete is queued (held, nothing put), goes once B's status shows
+/// the task awaiting its result, and B's task completes with the reply
+/// named.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_HOST_CLOCK hooks"
+)]
+fn a_complete_while_the_other_hosts_turn_runs_goes_once_it_ends() {
+    let pair = Pair::start(Hook::On, "");
+    let id = pair.send(1, &format!("atem:{B}"), "HS_LONG_TURN", false);
+    let task = pair.b.task_of(&id);
+    let tid = task.as_str().unwrap().to_owned();
+    support::delegated::in_turn(&pair.b, &task, "HS_LONG_TURN");
+    let out = pair
+        .b
+        .agent(1, &["message", "reply", "--task", &tid, "HS_MID_TURN"]);
+    assert_eq!(out["code"], 0, "{out}");
+    let line = format!("Result of task {tid} from host:{B}, as data");
+    pair.a.within("B's reply in A's agent", || {
+        let input = support::delegated::input(&pair.a);
+        input.contains(&line) && input.contains("HS_MID_TURN")
+    });
+    let out = pair.a.agent(2, &["message", "complete", &tid]);
+    assert_eq!(out["code"], 0, "{out}");
+    assert!(
+        out["stdout"].as_str().unwrap().contains(&format!(
+            "complete queued: it goes to host {B} once the task awaits its result there"
+        )),
+        "{out}"
+    );
+    pair.a.message_status(
+        &id,
+        &[
+            "      complete  held  held until the host's status shows the task awaiting its result"
+                .into(),
+        ],
+    );
+    assert_eq!(
+        support::delegated::stored(&pair.b, &task)["state"],
+        "submitted",
+        "B's turn still runs"
+    );
+    support::delegated::complete_turn(&pair.b, &task);
+    support::delegated::wait_stored(
+        &pair.b,
+        &task,
+        "completed",
+        "explicit correlated result published",
+    );
+    pair.a.message_status(
+        &id,
+        &["      complete  accepted  the host's status shows the task completed".into()],
+    );
+    std::fs::write(pair.a.fake_dir().join("complete"), "").unwrap();
+}
+
 /// A cancels a task queued on B (behind another task in B's agent's turn):
 /// B's task is cancelled, never runs, and A's status shows the cancel
 /// accepted. The task in its turn goes on.

@@ -5,6 +5,8 @@
 // host answers it by its own id, or it expires. Shares the results tests'
 // rig (`sp_host`, `rb_*`); every name here starts with `rs_`.
 
+use crate::runtime::protocol::{RemoteStop, StopOutcome};
+
 /// This host's send to B, B's status naming its one task in `state`
 /// applied: the message, its recipient and the task.
 fn rs_task(rig: &mut LocalRig, host: &mut MbHost, state: WorkState) -> (String, String, String) {
@@ -17,6 +19,14 @@ fn rs_task(rig: &mut LocalRig, host: &mut MbHost, state: WorkState) -> (String, 
 
 /// A stop row: (kind, task id, state, code, detail).
 type RsRow = (String, Option<String>, String, Option<String>, String);
+
+/// What `atem message cancel` or `complete` says of a stop to B.
+fn rs_said(outcome: StopOutcome) -> Option<RemoteStop> {
+    Some(RemoteStop {
+        host: "host-b".into(),
+        outcome,
+    })
+}
 
 /// The stop rows of `message`.
 fn rs_rows(rig: &LocalRig, message: &str) -> Vec<RsRow> {
@@ -107,7 +117,7 @@ fn a_cancel_is_put_until_a_status_shows_the_task_cancelled() {
         let (m, r, task) = rs_task(&mut rig, &mut host, WorkState::Queued);
         assert_eq!(
             rig.bridge.collab_cancel(None, &task).unwrap(),
-            Some("host-b".to_string())
+            rs_said(StopOutcome::Sent)
         );
         let other = Store::open(&root.join("runtime")).unwrap();
         let committed: i64 = other
@@ -155,8 +165,12 @@ fn a_cancel_is_put_until_a_status_shows_the_task_cancelled() {
             )
             .unwrap();
         assert_eq!(body.expires_at, expires, "alive while its message is");
-        // A second cancel while the first stands: nothing more.
-        rig.bridge.collab_cancel(None, &task).unwrap();
+        // A second cancel while the first stands: nothing more, and it says
+        // so (review L4).
+        assert_eq!(
+            rig.bridge.collab_cancel(None, &task).unwrap(),
+            rs_said(StopOutcome::Pending)
+        );
         assert_eq!(rs_rows(&rig, &m).len(), 1);
         let puts = sp_out(&mut rig);
         assert_eq!(puts.len(), 1);
@@ -267,26 +281,35 @@ fn who_may_stop_a_remote_task_and_when() {
         let sid = rig.sid.clone();
         assert!(rig.bridge.collab_cancel(Some(&sid), &task).is_ok());
         assert_eq!(rs_rows(&rig, &m).len(), 1);
-        // Started at B: not cancelled, but completed (the status may lag
-        // behind its turn's end); completed there already: a complete is
-        // done, nothing sealed; failed there: neither.
-        for (state, cancel, complete, sealed) in [
+        // Started at B: not cancelled, and a complete is held until B's
+        // status shows the task awaiting its result (ruling R50);
+        // completed there already: a complete is done, nothing kept (review
+        // L4); failed, or of unknown outcome (its owner resolves it there,
+        // review L3): neither.
+        let unknown = "is outcome_unknown; a task of unknown outcome is resolved by that host's owner, never completed by its sender";
+        for (state, cancel, complete, kept) in [
             (
                 WorkState::Submitted,
                 "is submitted; only a task that hasn't started can be cancelled",
-                None,
+                Ok(StopOutcome::Queued),
                 1,
             ),
             (
                 WorkState::Completed,
                 "is completed; only a task that hasn't started can be cancelled",
-                None,
+                Ok(StopOutcome::Done),
                 0,
             ),
             (
                 WorkState::Failed,
                 "is failed; only a task that hasn't started can be cancelled",
-                Some("is failed; only a task awaiting its result can be completed"),
+                Err("is failed; only a task awaiting its result can be completed"),
+                0,
+            ),
+            (
+                WorkState::OutcomeUnknown,
+                "is outcome_unknown; only a task that hasn't started can be cancelled",
+                Err(unknown),
                 0,
             ),
         ] {
@@ -298,15 +321,15 @@ fn who_may_stop_a_remote_task_and_when() {
             );
             let completed = rig.bridge.collab_complete(None, &task, &rig.sessions);
             match complete {
-                Some(why) => assert_eq!(
+                Err(why) => assert_eq!(
                     completed.unwrap_err().to_string(),
                     format!("task {task} on host host-b {why}")
                 ),
-                None => assert_eq!(completed.unwrap(), Some("host-b".to_string())),
+                Ok(outcome) => assert_eq!(completed.unwrap(), rs_said(outcome), "{state:?}"),
             }
             let rows = rs_rows(&rig, &m);
-            assert_eq!(rows.len(), sealed, "{state:?}: {rows:?}");
-            assert!(rows.iter().all(|r| r.0 == "complete"), "no cancel sealed");
+            assert_eq!(rows.len(), kept, "{state:?}: {rows:?}");
+            assert!(rows.iter().all(|r| r.0 == "complete"), "no cancel kept");
         }
     });
 }
@@ -349,7 +372,7 @@ fn the_result_prompts_last_line_completes_a_remote_task_with_its_reply() {
             rig.bridge
                 .collab_complete(Some(&sid), &task, &rig.sessions)
                 .unwrap(),
-            Some("host-b".to_string())
+            rs_said(StopOutcome::Sent)
         );
         let (_, _, policy, bytes) = rs_engine(&rig, &m, "complete");
         assert_eq!(policy, "repeat");
@@ -484,4 +507,234 @@ fn a_complete_naming_the_reply_completes_the_task_on_the_host_that_ran_it() {
             (hw::ContextKind::Result, naming.id.as_str())
         );
     });
+}
+
+/// Ruling R50 (review M1): a `complete` of a task B's newest status shows
+/// before `awaiting_result` (its turn still runs) is held, durable with the
+/// command (another connection reads it), nothing sealed or put; the
+/// status showing `awaiting_result` seals it in the pass that applies it
+/// (its result the reply named as at the command), and it is put until B's
+/// status shows the task completed.
+#[test]
+fn a_complete_before_its_task_awaits_its_result_is_held_until_it_does() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        sp_d(&rig, host_now().wall_ms);
+        let (m, r, task) = rs_task(&mut rig, &mut host, WorkState::Submitted);
+        let reply = rb_from_b(
+            &rig,
+            &host,
+            host_now().wall_ms,
+            &rb_reply(&task, "RS_EARLY"),
+        );
+        rb_receive(&mut rig, &mut host, &[reply]);
+        assert_eq!(
+            rig.bridge
+                .collab_complete(None, &task, &rig.sessions)
+                .unwrap(),
+            rs_said(StopOutcome::Queued)
+        );
+        let other = Store::open(&root.join("runtime")).unwrap();
+        let held: String = other
+            .db
+            .query_row(
+                "SELECT state FROM remote_deliveries WHERE kind='complete' AND task_id=?1",
+                [&task],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(held, "held", "committed with the command");
+        let held_id = rs_object(&rig, &m);
+        assert_eq!(
+            rows_where(&rig, "mail_outbox", &format!("object_id='{held_id}'")),
+            0,
+            "nothing sealed"
+        );
+        assert_eq!(
+            rs_rows(&rig, &m)[0].4,
+            "held until the host's status shows the task awaiting its result"
+        );
+        // A second complete while it is held: it stands.
+        assert_eq!(
+            rig.bridge
+                .collab_complete(None, &task, &rig.sessions)
+                .unwrap(),
+            rs_said(StopOutcome::Pending)
+        );
+        // B's status shows it awaiting its result: sealed in that pass.
+        let at = host_now().wall_ms + 1;
+        let awaiting = rs_status(&rig, &host, at, (&m, &r, &task), WorkState::AwaitingResult);
+        rb_receive(&mut rig, &mut host, &[awaiting]);
+        let rows = rs_rows(&rig, &m);
+        assert_eq!(rows[0].2, "ready", "{rows:?}");
+        let (.., bytes) = rs_engine(&rig, &m, "complete");
+        let atem_client::host_mail::EnvelopePlain::Complete { result, .. } = sp_open(&rig, &bytes)
+        else {
+            panic!("not a complete");
+        };
+        let named: Value = serde_json::from_str(&result.text).unwrap();
+        assert_eq!(
+            named["digest"],
+            json!(hw::digest(b"RS_EARLY")),
+            "the reply named"
+        );
+        let completed = rs_status(&rig, &host, at + 1, (&m, &r, &task), WorkState::Completed);
+        rb_receive(&mut rig, &mut host, &[completed]);
+        assert_eq!(rs_rows(&rig, &m)[0].2, "accepted");
+    });
+}
+
+/// A held complete is dropped, with its reason, when B's status shows the
+/// task ending otherwise (expired, cancelled, failed, completed, or of
+/// unknown outcome), and expired with its message.
+#[test]
+fn a_held_complete_ends_with_its_task_or_its_message() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        let t = host_now().wall_ms;
+        sp_d(&rig, t);
+        for state in [
+            WorkState::Expired,
+            WorkState::Cancelled,
+            WorkState::Failed,
+            WorkState::Completed,
+            WorkState::OutcomeUnknown,
+        ] {
+            let (m, r, task) = rs_task(&mut rig, &mut host, WorkState::Blocked);
+            rig.bridge
+                .collab_complete(None, &task, &rig.sessions)
+                .unwrap();
+            let name = serde_json::to_value(state).unwrap();
+            let ended = rs_status(&rig, &host, host_now().wall_ms + 1, (&m, &r, &task), state);
+            rb_receive(&mut rig, &mut host, &[ended]);
+            let rows = rs_rows(&rig, &m);
+            assert_eq!(
+                (rows[0].2.as_str(), rows[0].4.clone()),
+                (
+                    "dropped",
+                    format!(
+                        "not sent: the host's status shows the task {}",
+                        name.as_str().unwrap()
+                    )
+                ),
+                "{state:?}"
+            );
+            assert_eq!(
+                rows_where(
+                    &rig,
+                    "mail_outbox",
+                    &format!("object_id='{}'", rs_object(&rig, &m))
+                ),
+                0
+            );
+        }
+        // Its message expires while it is held.
+        let (m, _, task) = rs_task(&mut rig, &mut host, WorkState::Queued);
+        rig.bridge
+            .collab_complete(None, &task, &rig.sessions)
+            .unwrap();
+        sp_d(&rig, t + 2 * HOUR);
+        rig.bridge.remote_stops_pass();
+        let rows = rs_rows(&rig, &m);
+        assert_eq!(
+            (rows[0].2.as_str(), rows[0].4.as_str()),
+            ("expired", "expired before it was sent")
+        );
+    });
+}
+
+/// Ruling R50: a `complete` sent while B's status showed the task awaiting
+/// its result, answered `busy` by its own id (a race: the task wasn't
+/// awaiting it there any more), is held again under a fresh id, never
+/// ended; the next status showing `awaiting_result` seals it again. One
+/// answered `busy` once the task is shown ended is dropped.
+#[test]
+fn a_busy_answer_holds_a_complete_again() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        sp_d(&rig, host_now().wall_ms);
+        let (m, r, task) = rs_task(&mut rig, &mut host, WorkState::AwaitingResult);
+        assert_eq!(
+            rig.bridge
+                .collab_complete(None, &task, &rig.sessions)
+                .unwrap(),
+            rs_said(StopOutcome::Sent)
+        );
+        let first = rs_object(&rig, &m);
+        let busy = ResultPlain::Refusal {
+            object_id: first.clone(),
+            refused: "busy".into(),
+        };
+        let busy = rb_from_b(&rig, &host, host_now().wall_ms, &busy);
+        rb_receive(&mut rig, &mut host, &[busy]);
+        let rows = rs_rows(&rig, &m);
+        assert_eq!(
+            (rows[0].2.as_str(), rows[0].3.as_deref(), rows[0].4.as_str()),
+            (
+                "held",
+                Some("busy"),
+                "the host answered busy: the task wasn't awaiting its result there; held until its status shows it"
+            )
+        );
+        let again = rs_object(&rig, &m);
+        assert_ne!(again, first, "a fresh object");
+        let state: String = rig
+            .bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .query_row(
+                "SELECT state FROM mail_outbox WHERE object_id=?1",
+                [&first],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "done", "the first is put no more");
+        let at = host_now().wall_ms + 1;
+        let awaiting = rs_status(&rig, &host, at, (&m, &r, &task), WorkState::AwaitingResult);
+        rb_receive(&mut rig, &mut host, &[awaiting]);
+        assert_eq!(rs_rows(&rig, &m)[0].2, "ready");
+        assert_eq!(rs_object(&rig, &m), again, "sealed under its fresh id");
+        // `busy` again, once B's status showed the task expired: dropped.
+        let expired = rs_status(&rig, &host, at + 1, (&m, &r, &task), WorkState::Expired);
+        rb_receive(&mut rig, &mut host, &[expired]);
+        let busy = ResultPlain::Refusal {
+            object_id: again,
+            refused: "busy".into(),
+        };
+        let busy = rb_from_b(&rig, &host, host_now().wall_ms, &busy);
+        rb_receive(&mut rig, &mut host, &[busy]);
+        let rows = rs_rows(&rig, &m);
+        assert_eq!(
+            (rows[0].2.as_str(), rows[0].4.as_str()),
+            (
+                "dropped",
+                "the host answered busy; its status shows the task expired"
+            )
+        );
+    });
+}
+
+/// The object id of `message`'s complete row now.
+fn rs_object(rig: &LocalRig, message: &str) -> String {
+    rig.bridge
+        .work
+        .store
+        .as_ref()
+        .unwrap()
+        .db
+        .query_row(
+            "SELECT object_id FROM remote_deliveries WHERE message_id=?1 AND kind='complete'",
+            [message],
+            |r| r.get(0),
+        )
+        .unwrap()
 }

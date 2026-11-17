@@ -507,6 +507,30 @@ pub struct DelegatedStatus {
     pub unresolved: u32,
 }
 
+/// `atem message cancel` or `complete` of a task on another host (host
+/// senders, behind the debug-only hook): its host and what became of the
+/// stop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteStop {
+    pub host: String,
+    pub outcome: StopOutcome,
+}
+
+/// What became of a stop of a task on another host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopOutcome {
+    /// Sealed and committed now; put until the host's status shows it.
+    Sent,
+    /// A `complete` of a task the host's status doesn't show awaiting its
+    /// result yet: held, sent once a status does.
+    Queued,
+    /// An earlier one of the task still stands (held or sent): nothing new.
+    Pending,
+    /// The host's status already shows its effect: nothing sent.
+    Done,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum RuntimeMsg {
@@ -581,21 +605,20 @@ pub enum RuntimeMsg {
     },
     MessageCompleted {
         task_id: String,
-        /// The host a task on another host was asked to complete on: a
-        /// `complete` sent, its effect shown by `atem message status`
-        /// (host senders, behind the debug-only hook).
+        /// A task on another host (host senders, behind the debug-only
+        /// hook): its host, and what became of the `complete`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        host: Option<String>,
+        remote: Option<RemoteStop>,
     },
     MessageStatus {
         messages: Vec<super::collab::MessageView>,
     },
     MessageCancelled {
         task_id: String,
-        /// The host a task on another host was asked to cancel on: a
-        /// `cancel` sent, its effect shown by `atem message status`.
+        /// A task on another host: its host, and what became of the
+        /// `cancel`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        host: Option<String>,
+        remote: Option<RemoteStop>,
     },
     MessageDirectory {
         rows: Vec<super::collab::DirectoryRow>,
