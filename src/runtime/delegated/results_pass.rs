@@ -36,6 +36,7 @@ use atem_client::host_mail::{
 };
 use atem_client::host_principal::host_principal;
 use atem_client::membership::{HostSenderState, Membership};
+use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 
 /// Kept results judged per drain, at most (the mailbox keeps 256).
@@ -65,16 +66,24 @@ enum Check {
 
 use crate::runtime::collab::results::OriginRoute;
 
-/// Why a reply from `host_id` isn't delivered while `list` says so
-/// (design II.4.4): revoked (first, when it is removed too), removed, or no
-/// current project lists both it and this host (`me`).
-fn not_delivered(list: &Membership, me: &str, host_id: &str) -> Option<&'static str> {
+/// Why `d`'s reply isn't delivered while `list` says so (design II.4.4):
+/// its sender revoked (first, when it is removed too), removed, no longer
+/// at the `add_host` generation and membership epoch it was accepted under
+/// (review M1: verified again, or removed and added again; `removed`, the
+/// key it came under being gone), or no current project lists both it and
+/// this host (`me`).
+fn not_delivered(list: &Membership, me: &str, d: &Delivering) -> Option<&'static str> {
+    let host_id = d.host_id.as_str();
     match list.host_sender_state(host_id) {
         Some(HostSenderState::Revoked { .. }) => return Some(NOT_DELIVERED_SENDER_REVOKED),
         None => return Some(NOT_DELIVERED_SENDER_REMOVED),
         Some(HostSenderState::Authorized { .. }) => {}
     }
-    if list.host(host_id).is_none() {
+    if list
+        .host(host_id)
+        .is_none_or(|h| h.host_trust_gen != d.sender_gen)
+        || list.host_membership_epoch(host_id) != Some(d.sender_epoch)
+    {
         return Some(NOT_DELIVERED_SENDER_REMOVED);
     }
     let shared = list
@@ -134,6 +143,20 @@ impl HostBridge {
         };
         let mut applied_status = false;
         let mut waiting = false;
+        // Results that wait for their status (or for this host's list) are
+        // bounded apart, at half their sender's share and half the total
+        // (review L1): the statuses they wait for keep room. The oldest
+        // wait; a newer one over the bound is dropped, unapplied.
+        let limits = self.work.mail_limits;
+        let (cap_sender, cap_all) = (
+            (limits.results_per_sender / 2).max(1),
+            (limits.results / 2).max(1),
+        );
+        let mut waits: HashMap<String, u64> = HashMap::new();
+        // The rows a sender's results may answer, read once a drain per
+        // sender and generation (review L7), again after a status of its
+        // was recorded.
+        let mut rows_of: HashMap<(String, u64), Vec<Candidate>> = HashMap::new();
         for (hash, bytes) in kept {
             let judged = (|| -> anyhow::Result<Judged> {
                 let Ok(object) = parse_object(&bytes) else {
@@ -142,13 +165,18 @@ impl HostBridge {
                 let Ok((_, body)) = MailBody::from_object(&object) else {
                     return Ok(Judged::Drop("its bytes don't read"));
                 };
-                let since = now_d.saturating_sub(results_back::CANDIDATES_SINCE_MS);
-                let candidates = results_back::candidates(&store.db, &body.sender, since)?;
+                let key = (body.sender.host_id.clone(), body.sender.host_trust_gen);
+                if !rows_of.contains_key(&key) {
+                    let since = now_d.saturating_sub(results_back::CANDIDATES_SINCE_MS);
+                    let found = results_back::candidates(&store.db, &body.sender, since)?;
+                    rows_of.insert(key.clone(), found);
+                }
+                let candidates = &rows_of[&key];
                 if candidates.is_empty() {
                     return Ok(Judged::Drop(DOES_NOT_ANSWER_OUTBOX_ROW));
                 }
                 let rows: Vec<_> = candidates.iter().map(|c| c.expected.clone()).collect();
-                let (verdict, answered) = accept_result_among(
+                let judged = accept_result_among(
                     &object,
                     &list.membership,
                     &receiver.recipient,
@@ -156,29 +184,37 @@ impl HostBridge {
                     &receiver.provider,
                     now_d,
                 );
-                Ok(match (verdict, answered) {
+                // The sender's `add_host` generation (the rows', which the
+                // check held it to) and membership epoch now (review M1).
+                let standing = |c: &Candidate| {
+                    let epoch = list.membership.host_membership_epoch(&c.host_id);
+                    (c.expected.recipient.host_trust_gen, epoch.unwrap_or(0))
+                };
+                // Only a result waits for a status (review L2): a status or
+                // a refusal answering no row never will.
+                let waits_for_status =
+                    judged.unanswered_task.is_some() && candidates.iter().any(|c| !c.resolved);
+                Ok(match (judged.verdict, judged.row) {
                     (ResultVerdict::Accepted { plain, .. }, Some(i)) => Judged::Apply {
+                        standing: standing(&candidates[i]),
                         candidate: candidates[i].clone(),
                         plain,
                         kept: None,
                         at: body.created_at,
                     },
                     (ResultVerdict::NotDelivered { plain, reason, .. }, Some(i)) => Judged::Apply {
+                        standing: standing(&candidates[i]),
                         candidate: candidates[i].clone(),
                         plain,
                         kept: Some(reason),
                         at: body.created_at,
                     },
-                    (ResultVerdict::Pending { .. } | ResultVerdict::Unavailable { .. }, _) => {
-                        Judged::Wait
-                    }
+                    (ResultVerdict::Unavailable { .. }, _) => Judged::Wait,
+                    (ResultVerdict::Pending { .. }, _) => Judged::WaitBounded(body.sender.host_id),
                     // A result for a task whose status hasn't come yet
                     // (statuses and results arrive in any order).
-                    (ResultVerdict::RefusedAuthenticated { reason, .. }, _)
-                        if reason == DOES_NOT_ANSWER_OUTBOX_ROW
-                            && candidates.iter().any(|c| !c.resolved) =>
-                    {
-                        Judged::Wait
+                    (ResultVerdict::RefusedAuthenticated { .. }, _) if waits_for_status => {
+                        Judged::WaitBounded(body.sender.host_id)
                     }
                     (ResultVerdict::Refused { reason, .. }, _)
                     | (ResultVerdict::RefusedAuthenticated { reason, .. }, _) => {
@@ -187,8 +223,21 @@ impl HostBridge {
                     (_, None) => Judged::Drop(DOES_NOT_ANSWER_OUTBOX_ROW),
                 })
             })();
+            let judged = match judged {
+                Ok(Judged::WaitBounded(sender)) => {
+                    let all: u64 = waits.values().sum();
+                    let of_sender = waits.entry(sender).or_default();
+                    if *of_sender < cap_sender && all < cap_all {
+                        *of_sender += 1;
+                        Ok(Judged::Wait)
+                    } else {
+                        Ok(Judged::Drop("too many results wait for their status"))
+                    }
+                }
+                other => other,
+            };
             let applied = match judged {
-                Ok(Judged::Wait) => {
+                Ok(Judged::Wait | Judged::WaitBounded(_)) => {
                     waiting = true;
                     continue;
                 }
@@ -206,10 +255,17 @@ impl HostBridge {
                     plain,
                     kept,
                     at,
+                    standing,
                 }) => store.immediate().and_then(|tx| {
-                    applied_status |= apply(&tx, &candidate, &plain, kept, at)?;
+                    let status = apply(&tx, &candidate, &plain, kept, at, standing)?;
                     results_back::judged(&tx, &hash)?;
-                    Ok(tx.commit()?)
+                    tx.commit()?;
+                    if status {
+                        // Its resolution moved: the sender's rows read again.
+                        applied_status = true;
+                        rows_of.retain(|(host, _), _| *host != candidate.host_id);
+                    }
+                    Ok(())
                 }),
                 Err(error) => Err(error),
             };
@@ -286,6 +342,29 @@ impl HostBridge {
                 });
             }
         }
+        // A delivery task that ended (or whose outcome is unknown) settles
+        // its row, with why when it didn't deliver (review M2).
+        let store = self.work.store.as_ref().unwrap();
+        let settled = results_back::ended(&store.db).and_then(|ended| {
+            for d in ended {
+                let work = d.work.as_ref().map(|(s, w)| (s.as_str(), w.as_str()));
+                let (_, says, Some(final_state)) =
+                    results_back::delivery_says(Some("queued"), None, work)
+                else {
+                    continue;
+                };
+                let detail = (final_state != "delivered").then_some(says.as_str());
+                let tx = store.immediate()?;
+                results_back::settle(&tx, &d, final_state, detail)?;
+                tx.commit()?;
+            }
+            Ok(())
+        });
+        if let Err(error) = settled {
+            super::delegated_mail_pass::log_limited(&UNAPPLIED, || {
+                format!("atem runtime: a host's reply delivery not settled ({error:#})")
+            });
+        }
     }
 
     /// Whether `d`'s reply may be delivered now (`due`: also its expiry and
@@ -301,7 +380,7 @@ impl HostBridge {
             return Check::Wait;
         };
         let me = self.work_host().atem_device_id;
-        if let Some(why) = not_delivered(&list, &me, &d.host_id) {
+        if let Some(why) = not_delivered(&list, &me, d) {
             return Check::Keep(why);
         }
         let origin = self.work.store.as_ref().and_then(|store| {
@@ -363,7 +442,7 @@ impl HostBridge {
             return Ok(());
         };
         let task = hw::WorkTask {
-            task_id: results::delivery_id(&d.task_id),
+            task_id: results_back::delivery_id(&d.message_id, &d.host_id, &d.task_id),
             workflow_id: d.workflow_id.clone(),
             target: origin.target.clone(),
             expires_at: d.expires_at,
@@ -381,7 +460,7 @@ impl HostBridge {
         }
         let tx = store.immediate()?;
         let work_id = task.task_id.clone();
-        store.enqueue(&WorkRecord {
+        let queued = store.enqueue(&WorkRecord {
             delegated: None,
             deadline_passed: false,
             cancel_id: None,
@@ -410,25 +489,39 @@ impl HostBridge {
             authorization_expires_at: None,
             message: None,
         })?;
-        results_back::delivered(&tx, d, &work_id)?;
+        if queued {
+            results_back::delivered(&tx, d, &work_id)?;
+        } else {
+            // A task of that id is there already (review L3): never this
+            // reply's delivery.
+            results_back::keep(&tx, d, ALREADY_QUEUED)?;
+        }
         Ok(tx.commit()?)
     }
 }
+
+/// A reply kept because a task of its delivery's id exists already.
+const ALREADY_QUEUED: &str = "reply kept, not delivered: its delivery task already exists";
 
 /// What the drain decided about one kept result.
 // Short-lived: one per kept result, acted on at once.
 #[allow(clippy::large_enum_variant)]
 enum Judged {
     /// Applied: `plain` from `candidate`'s host, made at `at`; `kept`: a
-    /// revoked or removed sender's, never delivered (why).
+    /// revoked or removed sender's, never delivered (why); `standing`: its
+    /// sender's `add_host` generation and membership epoch.
     Apply {
         candidate: Candidate,
         plain: ResultPlain,
         kept: Option<&'static str>,
         at: u64,
+        standing: (u64, u64),
     },
-    /// Left for a later drain.
+    /// Left for a later drain (a local fault).
     Wait,
+    /// Left for a later drain, for the sender's sake (its status, or this
+    /// host's list): bounded apart (review L1).
+    WaitBounded(String),
     /// Dropped (why), never applied.
     Drop(&'static str),
 }
@@ -441,6 +534,7 @@ fn apply(
     plain: &ResultPlain,
     kept: Option<&'static str>,
     at: u64,
+    standing: (u64, u64),
 ) -> anyhow::Result<bool> {
     match plain {
         ResultPlain::Status { recipients, .. } => results_back::apply_status(tx, c, recipients, at),
@@ -449,7 +543,7 @@ fn apply(
             Ok(false)
         }
         ResultPlain::Result { task_id, reply } => {
-            results_back::record_reply(tx, c, task_id, reply, kept, at)?;
+            results_back::record_reply(tx, c, task_id, reply, kept, at, standing)?;
             Ok(false)
         }
     }

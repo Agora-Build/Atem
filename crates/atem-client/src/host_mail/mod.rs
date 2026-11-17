@@ -75,8 +75,8 @@ pub use body::{
 };
 pub use mailbox::object_hash;
 pub use receive::{
-    EnvelopeVerdict, ExpectedResult, Recipient, ResultVerdict, accept_result, accept_result_among,
-    evidence_hash, open_envelope,
+    AmongVerdict, EnvelopeVerdict, ExpectedResult, Recipient, ResultVerdict, accept_result,
+    accept_result_among, evidence_hash, open_envelope,
 };
 pub use reference::{
     CurrentHosts, MailboxTransition, Quota, Quotas, ReferenceMailbox, Reset, Usage,

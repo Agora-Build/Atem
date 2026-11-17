@@ -2529,6 +2529,18 @@ impl Rig {
     }
 }
 
+/// The local task delivering the sending host's reply to its task `task`
+/// of message `message`: UUIDv5 of `delivery:` and the JSON array of the
+/// message, the host and the task (host-work-v1 §11.5, the results back).
+fn delivery_id(message: &str, task: &str) -> String {
+    let name = serde_json::to_string(&[message, SENDER, task]).unwrap();
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("delivery:{name}").as_bytes(),
+    )
+    .to_string()
+}
+
 /// This host ran a host sender's task: its agent's reply (`atem message
 /// reply`) goes back to the sending host as a result, which the sending
 /// host's own check (the shared core's `accept_result`) takes. The
@@ -2626,13 +2638,7 @@ fn a_reply_from_another_host_is_delivered_and_shown() {
     let (id, recipient, task) = rig.send_to_other("HM_TO_OTHER");
     rig.message_status(&id, &["    status pending".into()]);
     rig.answer_back(&id, &recipient, &task, "HM_FROM_OTHER");
-    let delivery = json!(
-        uuid::Uuid::new_v5(
-            &uuid::Uuid::NAMESPACE_OID,
-            format!("delivery:{task}").as_bytes()
-        )
-        .to_string()
-    );
+    let delivery = json!(delivery_id(&id, &task));
     support::delegated::in_turn(
         &rig,
         &delivery,
@@ -2691,11 +2697,7 @@ fn a_reply_from_a_host_revoked_meanwhile_is_kept_as_data() {
             "      result not delivered: sender revoked".into(),
         ],
     );
-    let delivery = uuid::Uuid::new_v5(
-        &uuid::Uuid::NAMESPACE_OID,
-        format!("delivery:{task}").as_bytes(),
-    )
-    .to_string();
+    let delivery = delivery_id(&id, &task);
     rig.two_passes();
     assert_eq!(
         rig.db()

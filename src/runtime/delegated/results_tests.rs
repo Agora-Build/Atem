@@ -589,7 +589,7 @@ fn a_result_is_delivered_once_as_data_on_a_route_that_takes_results() {
         );
         let result = rb_from_b(&rig, &host, now, &rb_reply(&task, "RB_REPLY"));
         rb_receive(&mut rig, &mut host, &[status, result.clone()]);
-        let delivery = crate::runtime::collab::results::delivery_id(&task);
+        let delivery = rb_delivery(&m, &task);
         let deliveries = rb_deliveries(&rig);
         assert_eq!(
             deliveries,
@@ -618,9 +618,16 @@ fn a_result_is_delivered_once_as_data_on_a_route_that_takes_results() {
             "{prompt}"
         );
         assert!(prompt.contains("begin result (8 bytes)\nRB_REPLY\n"));
-        // The same result again (a later copy): nothing more.
-        rb_receive(&mut rig, &mut host, &[result]);
+        // The same result again (a later copy): nothing more. Nor does
+        // another reply for the task: the first recorded stays (review L8).
+        let other = rb_from_b(&rig, &host, now, &rb_reply(&task, "RB_OTHER"));
+        rb_receive(&mut rig, &mut host, &[result, other]);
         assert_eq!(rb_deliveries(&rig).len(), 1);
+        let row = rb_remote(&rig, &m).remove(0);
+        assert_eq!(
+            (row.4.as_deref(), row.5.as_deref()),
+            (Some("RB_REPLY"), Some("queued"))
+        );
         // The agent takes it, framed as another host's result; its turn
         // completes the delivery.
         let line = format!("Result of task {task} from host:host-b, as data");
@@ -813,7 +820,7 @@ fn a_result_from_a_revoked_or_ungranted_host_is_kept_as_data() {
         );
         mb_tick(&mut rig, &mut host, 0);
         rig.bridge.remote_deliveries(&rig.sessions);
-        let delivery = crate::runtime::collab::results::delivery_id(&task);
+        let delivery = rb_delivery(&m, &task);
         let record = rig
             .bridge
             .work
@@ -837,32 +844,57 @@ fn a_result_from_a_revoked_or_ungranted_host_is_kept_as_data() {
     });
 }
 
-/// Durable before visible: the drain commits the reply (another
-/// connection reads it, due) with its row gone from the mailbox's
-/// results, before anything is delivered; a crash then (the delivery
-/// step not run) loses nothing, and the delivery step delivers it once,
-/// however often it runs.
+/// The runtime again over the same store (a crash): a new bridge, its
+/// recovery, then the Station link as `mb_host` set it up.
+fn rb_restart(rig: &mut LocalRig, root: &Path, os: &ManualOs) {
+    use crate::runtime::delegated::station::{LinkKind, Station};
+    restart(rig, root, os, false, true);
+    let pairing = crate::profile::Sources::in_dir(&root.join("profile"))
+        .paths
+        .pairing;
+    rig.bridge.pairing = Some(pairing);
+    rig.bridge.start_view().now_d_ms = Some(host_now().wall_ms);
+    let mut station = Station::with_senders(true);
+    station.sync_link(Some(1), 1, || LinkKind::Routed, || Some(ORIGIN.into()));
+    rig.bridge.station = Some(station);
+    rig.bridge.station_identity();
+    rig.bridge.mail_observe();
+}
+
+/// A send to B whose status (B's task awaiting its result) and reply
+/// `text` came back and were judged (none delivered yet): the message, its
+/// recipient and B's task.
+fn rb_replied(rig: &mut LocalRig, host: &mut MbHost, text: &str) -> (String, String, String) {
+    let now = host_now().wall_ms;
+    let (m, r) = rb_send(rig);
+    let task = rb_task_id(&m, &r);
+    let objects = [
+        rb_from_b(
+            rig,
+            host,
+            now,
+            &rb_resolved(&m, &r, WorkState::AwaitingResult),
+        ),
+        rb_from_b(rig, host, now, &rb_reply(&task, text)),
+    ];
+    ad_deliver(rig, host, &objects);
+    rig.bridge.results_drain();
+    (m, r, task)
+}
+
+/// Durable before visible, across a crash: the drain commits the reply
+/// (another connection reads it, due) with its row gone from the
+/// mailbox's results, before anything is delivered. The runtime dies
+/// there and starts again over the same store: the reply is delivered
+/// once.
 #[test]
-fn a_crash_after_the_drain_delivers_once() {
+fn a_crash_after_the_drain_delivers_once_after_the_restart() {
     local_test(async |root| {
         let mut rig = LocalRig::new(root).await;
         let os = ManualOs::at(host_now().wall_ms);
         let mut host = sp_host(&mut rig, root, &os);
         rig.bridge.work.config.routes[0].results = true;
-        let now = host_now().wall_ms;
-        let (m, r) = rb_send(&mut rig);
-        let task = rb_task_id(&m, &r);
-        let objects = [
-            rb_from_b(
-                &rig,
-                &host,
-                now,
-                &rb_resolved(&m, &r, WorkState::AwaitingResult),
-            ),
-            rb_from_b(&rig, &host, now, &rb_reply(&task, "durable")),
-        ];
-        ad_deliver(&mut rig, &mut host, &objects);
-        rig.bridge.results_drain();
+        let (m, _, task) = rb_replied(&mut rig, &mut host, "durable");
         let other = Store::open(&root.join("runtime")).unwrap();
         let (delivery, kept): (Option<String>, i64) = other
             .db
@@ -875,10 +907,41 @@ fn a_crash_after_the_drain_delivers_once() {
             .unwrap();
         assert_eq!((delivery.as_deref(), kept), (Some("due"), 0));
         assert!(rb_deliveries(&rig).is_empty(), "nothing delivered yet");
+        rb_restart(&mut rig, root, &os);
+        rig.until(|r| !rb_deliveries(r).is_empty()).await;
         for _ in 0..3 {
             rig.bridge.remote_deliveries(&rig.sessions);
         }
         assert_eq!(rb_deliveries(&rig).len(), 1);
+        assert_eq!(rb_deliveries(&rig)[0].0, rb_delivery(&m, &task));
+    });
+}
+
+/// A crash between the delivery's commit and its dispatch: after the
+/// restart the queued delivery reaches the agent once, and its turn
+/// completes it (`delivered`).
+#[test]
+fn a_crash_after_the_deliverys_commit_dispatches_it_once() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        rig.bridge.work.config.routes[0].results = true;
+        let (m, _, task) = rb_replied(&mut rig, &mut host, "RB_ONCE");
+        rig.bridge.remote_deliveries(&rig.sessions);
+        assert_eq!(rb_remote(&rig, &m)[0].5.as_deref(), Some("queued"));
+        rb_restart(&mut rig, root, &os);
+        rig.until(|r| {
+            std::fs::read_to_string(r.fake.join("input")).is_ok_and(|i| i.contains("RB_ONCE"))
+        })
+        .await;
+        std::fs::write(rig.fake.join("complete"), "").unwrap();
+        rig.until(|r| rb_remote(r, &m)[0].5.as_deref() == Some("delivered"))
+            .await;
+        let input = std::fs::read_to_string(rig.fake.join("input")).unwrap();
+        assert_eq!(input.matches("RB_ONCE").count(), 1);
+        assert_eq!(rb_deliveries(&rig).len(), 1);
+        let _ = task;
     });
 }
 
@@ -910,6 +973,37 @@ fn without_host_senders_no_result_is_judged() {
     });
 }
 
+/// The hook turned off over a store that has the tables (a debug runtime
+/// started again without it): no kept result is judged, and a delivery
+/// queued meanwhile is never dispatched (review L4): it waits, the
+/// sender's standing unchecked.
+#[test]
+fn with_the_hook_turned_off_nothing_is_judged_or_delivered() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        rig.bridge.work.config.routes[0].results = true;
+        let (m, r, _) = rb_replied(&mut rig, &mut host, "RB_HOOK_OFF");
+        rig.bridge.remote_deliveries(&rig.sessions);
+        let newer = rb_from_b(
+            &rig,
+            &host,
+            host_now().wall_ms + 1_000,
+            &rb_resolved(&m, &r, WorkState::Expired),
+        );
+        ad_deliver(&mut rig, &mut host, &[newer]);
+        assert_eq!(rows(&rig, "mailbox_results"), 1);
+        rig.bridge.features = HostFeatures::parse("host.delegated").unwrap();
+        rb_pass(&mut rig);
+        assert_eq!(rows(&rig, "mailbox_results"), 1, "never judged");
+        let until = Instant::now() + Duration::from_secs(2);
+        rig.until(|_| Instant::now() >= until).await;
+        let input = std::fs::read_to_string(rig.fake.join("input")).unwrap_or_default();
+        assert!(!input.contains("RB_HOOK_OFF"), "never dispatched");
+    });
+}
+
 // ------------------------------------------------ `atem message status`
 
 /// Item 3: a message's rows to other hosts in `atem message status` (from
@@ -917,7 +1011,8 @@ fn without_host_senders_no_result_is_judged() {
 /// another session's view): before any status, "status pending", and a
 /// row waiting for the Station to announce this host's mailbox says so;
 /// once statuses and a result came, each task with its state and its
-/// reply, delivered or kept. Hook off: no rows.
+/// reply, delivered or kept. With the hook turned off afterwards, the rows
+/// stay readable.
 #[test]
 fn message_status_shows_rows_to_other_hosts_and_what_came_back() {
     local_test(async |root| {
@@ -999,5 +1094,345 @@ fn message_status_shows_rows_to_other_hosts_and_what_came_back() {
         );
         rig.bridge.features = HostFeatures::parse("host.delegated").unwrap();
         assert_eq!(remote(&mut rig, None).len(), 1, "rows stay readable");
+    });
+}
+
+// ------------------------------------------------------- fix round 1
+
+/// The delivery task's id of B's task `task` for message `m`.
+fn rb_delivery(m: &str, task: &str) -> String {
+    crate::runtime::delegated::results_back::delivery_id(m, "host-b", task)
+}
+
+/// How `atem message status` says the reply to `m`'s first task stands:
+/// (delivered, how).
+fn rb_delivered(rig: &mut LocalRig, m: &str) -> (bool, String) {
+    let view = rig.bridge.collab_status(None, Some(m)).unwrap().remove(0);
+    let reply = view.remote[0].tasks[0].reply.clone().unwrap();
+    (reply.delivered, reply.delivery)
+}
+
+/// Review M1: a reply waiting for its delivery (queued, or due) is kept
+/// as data once its sender is no longer at the `add_host` generation and
+/// membership epoch its result came under: verified again (a newer
+/// `add_host`), or removed and added again. The delivery queued is
+/// cancelled.
+#[test]
+fn a_reply_waiting_for_delivery_is_kept_once_its_sender_moves_in_the_list() {
+    use crate::session_protocol::membership::r9log::secret;
+    // Verified again while its delivery is queued.
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        rig.bridge.work.config.routes[0].results = true;
+        let (m, _, task) = rb_replied(&mut rig, &mut host, "RB_OLD_KEY");
+        rig.bridge.remote_deliveries(&rig.sessions);
+        assert_eq!(rb_remote(&rig, &m)[0].5.as_deref(), Some("queued"));
+        host.s
+            .log
+            .add_host("host-b", 2, &secret("host b verified again"));
+        let entry = host.s.log.entries.last().unwrap().object().to_json();
+        carry(&mut rig, &host.s.log, entry);
+        mb_tick(&mut rig, &mut host, 0);
+        rig.bridge.remote_deliveries(&rig.sessions);
+        let record = rig
+            .bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .work(&rb_delivery(&m, &task))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (record.status.state, record.status.detail.as_str()),
+            (
+                WorkState::Cancelled,
+                "not delivered: result not delivered: sender removed"
+            )
+        );
+        assert_eq!(
+            rb_remote(&rig, &m)[0].5.as_deref(),
+            Some("kept: result not delivered: sender removed")
+        );
+    });
+    // Removed and added again while it is due.
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        rig.bridge.work.config.routes[0].results = true;
+        let (m, _, _) = rb_replied(&mut rig, &mut host, "RB_READDED");
+        sign_and_carry(
+            &mut rig,
+            &mut host.s,
+            ListAction::RemoveHost {
+                host_id: "host-b".into(),
+            },
+        );
+        host.s
+            .log
+            .add_host("host-b", 2, &secret("host b added again"));
+        let entry = host.s.log.entries.last().unwrap().object().to_json();
+        carry(&mut rig, &host.s.log, entry);
+        mb_tick(&mut rig, &mut host, 0);
+        rig.bridge.remote_deliveries(&rig.sessions);
+        assert!(rb_deliveries(&rig).is_empty());
+        assert_eq!(
+            rb_remote(&rig, &m)[0].5.as_deref(),
+            Some("kept: result not delivered: sender removed")
+        );
+    });
+}
+
+/// Review M2: a delivery task that ends without delivering moves its
+/// row to a final state with why, and `atem message status` says so,
+/// never "being delivered" for good: expired unstarted, failed (its
+/// authority lost, or its receipt rejected), cancelled, of unknown
+/// outcome; completed is `delivered`.
+#[test]
+fn a_delivery_that_ends_undelivered_says_why() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        rig.bridge.work.config.routes[0].results = true;
+        let ends = [
+            (
+                WorkState::Expired,
+                "expired before submission",
+                "kept",
+                false,
+                "not delivered: expired before submission",
+            ),
+            (
+                WorkState::Failed,
+                "sender's authority changed",
+                "kept",
+                false,
+                "not delivered: sender's authority changed",
+            ),
+            (
+                WorkState::Failed,
+                "session closed",
+                "kept",
+                false,
+                "not delivered: session closed",
+            ),
+            (
+                WorkState::Cancelled,
+                "cancelled before submission",
+                "kept",
+                false,
+                "not delivered: cancelled before submission",
+            ),
+            (
+                WorkState::OutcomeUnknown,
+                "receipt no longer available",
+                "unknown",
+                false,
+                "delivery outcome unknown: receipt no longer available",
+            ),
+            (
+                WorkState::Completed,
+                "explicit result delivered to the originating agent",
+                "delivered",
+                true,
+                "delivered",
+            ),
+        ];
+        for (state, detail, final_state, delivered, says) in ends {
+            let (m, _, task) = rb_replied(&mut rig, &mut host, "RB_ENDS");
+            rig.bridge.remote_deliveries(&rig.sessions);
+            let store = rig.bridge.work.store.as_ref().unwrap();
+            let mut record = store.work(&rb_delivery(&m, &task)).unwrap().unwrap();
+            record.status.state = state;
+            record.status.detail = detail.into();
+            store.save_work(&record).unwrap();
+            // Said at once, before the pass settles the row.
+            assert_eq!(
+                rb_delivered(&mut rig, &m),
+                (delivered, says.into()),
+                "{state:?}"
+            );
+            rig.bridge.remote_deliveries(&rig.sessions);
+            let row = rb_remote(&rig, &m).remove(0);
+            let expected = match final_state {
+                "delivered" => "delivered".to_string(),
+                other => format!("{other}: {says}"),
+            };
+            assert_eq!(row.5.as_deref(), Some(expected.as_str()), "{state:?}");
+            assert_eq!(
+                rb_delivered(&mut rig, &m),
+                (delivered, says.into()),
+                "{state:?}"
+            );
+        }
+    });
+}
+
+/// Review L1: results waiting for their status are bounded apart (half
+/// the sender's results share), so the status they wait for still finds
+/// room: four results fill a share of four; two wait, two are dropped;
+/// the status is kept and applied, and the two apply after it.
+#[test]
+fn waiting_results_leave_room_for_their_status() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        rig.bridge.work.mail_limits.results_per_sender = 4;
+        let now = host_now().wall_ms;
+        let (m, r) = rb_send(&mut rig);
+        let sessions = [
+            "ses-aaaaaaaaaaaa",
+            "ses-cccccccccccc",
+            "ses-dddddddddddd",
+            "ses-eeeeeeeeeeee",
+        ];
+        let tasks: Vec<WorkProgress> = sessions
+            .iter()
+            .map(|sid| rb_progress(&m, &r, sid, WorkState::AwaitingResult, "on B"))
+            .collect();
+        let results: Vec<Value> = tasks
+            .iter()
+            .map(|t| rb_from_b(&rig, &host, now, &rb_reply(&t.task_id, "early")))
+            .collect();
+        rb_receive(&mut rig, &mut host, &results);
+        assert_eq!(rows(&rig, "mailbox_results"), 2, "two wait, two dropped");
+        let status = rb_status(&m, &r, Delivery::Resolved { tasks });
+        let status = rb_from_b(&rig, &host, now, &status);
+        rb_receive(&mut rig, &mut host, &[status]);
+        rb_pass(&mut rig);
+        assert_eq!(rows(&rig, "mailbox_results"), 0);
+        let replies = rb_remote(&rig, &m)
+            .into_iter()
+            .filter(|row| row.4.is_some())
+            .count();
+        assert_eq!(replies, 2);
+    });
+}
+
+/// Review L2: only a result waits for its status; a status that answers
+/// no row is dropped at once, even while a row to its host has no status.
+#[test]
+fn a_status_answering_no_row_never_waits() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        let now = host_now().wall_ms;
+        let (_m, r) = rb_send(&mut rig);
+        let never = uuid::Uuid::new_v4().to_string();
+        let stray = rb_from_b(
+            &rig,
+            &host,
+            now,
+            &rb_resolved(&never, &r, WorkState::Queued),
+        );
+        rb_receive(&mut rig, &mut host, &[stray]);
+        assert_eq!(rows(&rig, "mailbox_results"), 0);
+    });
+}
+
+/// Review L3: a task id B reuses across two of this host's messages is
+/// caught: the second resolution doesn't take it (its recipient says
+/// why), so a result for it answers the first message only, and each
+/// message's delivery has its own id.
+#[test]
+fn a_task_id_reused_across_messages_is_caught() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        let now = host_now().wall_ms;
+        let (m1, r1) = rb_send(&mut rig);
+        let (m2, r2) = rb_send(&mut rig);
+        let task = rb_task_id(&m1, &r1);
+        let reused = rb_progress(&m1, &r1, RB_SESSION, WorkState::AwaitingResult, "on B");
+        let objects = [
+            rb_from_b(
+                &rig,
+                &host,
+                now,
+                &rb_status(
+                    &m1,
+                    &r1,
+                    Delivery::Resolved {
+                        tasks: vec![reused.clone()],
+                    },
+                ),
+            ),
+            rb_from_b(
+                &rig,
+                &host,
+                now,
+                &rb_status(
+                    &m2,
+                    &r2,
+                    Delivery::Resolved {
+                        tasks: vec![reused],
+                    },
+                ),
+            ),
+            rb_from_b(&rig, &host, now, &rb_reply(&task, "for the first")),
+        ];
+        rb_receive(&mut rig, &mut host, &objects);
+        assert_eq!(rb_remote(&rig, &m1)[0].1, task);
+        assert_eq!(rb_remote(&rig, &m1)[0].4.as_deref(), Some("for the first"));
+        assert_eq!(
+            rb_remote(&rig, &m2),
+            [(
+                r2,
+                String::new(),
+                "refused".into(),
+                format!("task id {task} is another message's"),
+                None,
+                None
+            )]
+        );
+        assert_ne!(rb_delivery(&m1, &task), rb_delivery(&m2, &task));
+    });
+}
+
+/// Review L5: a result whose sealing fails for a passing fault (the
+/// store refusing its enqueue) stays owed and goes on a later pass; one
+/// whose record no longer reads is dropped, its mark cleared.
+#[test]
+fn an_owed_result_survives_a_passing_fault() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let _host = sp_host(&mut rig, root, &os);
+        let (_, task) = rb_task(&mut rig);
+        let id = task.task.task_id.clone();
+        reply(&mut rig, &id, "the answer", &[]).unwrap();
+        let db = &rig.bridge.work.store.as_ref().unwrap().db;
+        db.execute_batch(
+            "CREATE TRIGGER t_block BEFORE INSERT ON mail_outbox
+            WHEN NEW.kind='atem-result' AND NEW.bytes IS NOT NULL
+            BEGIN SELECT RAISE(ABORT,'blocked'); END;",
+        )
+        .unwrap();
+        rig.bridge.mail_statuses();
+        assert!(rb_results(&rig).is_empty());
+        assert_eq!(rows(&rig, "mail_result_owed"), 1, "still owed");
+        let db = &rig.bridge.work.store.as_ref().unwrap().db;
+        db.execute_batch("DROP TRIGGER t_block;").unwrap();
+        rig.bridge.mail_statuses();
+        assert_eq!(rb_results(&rig).len(), 1);
+        // A record that no longer reads: dropped, not owed for good.
+        let (_, task) = rb_task(&mut rig);
+        let id = task.task.task_id.clone();
+        reply(&mut rig, &id, "another", &[]).unwrap();
+        let db = &rig.bridge.work.store.as_ref().unwrap().db;
+        db.execute(
+            "UPDATE results SET record='not json' WHERE task_id=?1",
+            [&id],
+        )
+        .unwrap();
+        rig.bridge.mail_statuses();
+        assert_eq!(rows(&rig, "mail_result_owed"), 0);
     });
 }

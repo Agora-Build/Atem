@@ -18,12 +18,16 @@
 //!   task), each task's state as the newest status says (a status applies
 //!   only when made after the one recorded, [`apply_status`]; a resolution
 //!   never changes), and a task's reply once its result came
-//!   ([`record_reply`]: once, its delivery `due`, or `kept` with why). A
+//!   ([`record_reply`]: once, its delivery `due`, or `kept` with why, with
+//!   the `add_host` generation and membership epoch its sender held). A
 //!   reply `due` is delivered by the bridge into the session that sent the
-//!   message (`queued`, with the delivery task's id) or kept with why.
-//!   Each status and result is judged first (`accept_result_among`, in the
-//!   bridge) against [`candidates`]: the rows a result from that host may
-//!   answer.
+//!   message (`queued`, with the delivery task's id, [`delivery_id`]) or
+//!   kept with why; once that task ends the row settles ([`settle`],
+//!   [`delivery_says`]): `delivered`, `kept` with why, or `unknown`. A
+//!   task id is its host's for one message: a status naming one another
+//!   message of that host holds isn't taken. Each status and result is
+//!   judged first (`accept_result_among`, in the bridge) against
+//!   [`candidates`]: the rows a result from that host may answer.
 use super::remote_send;
 use crate::runtime::collab::{RemoteReplyView, RemoteTaskView, RemoteView};
 use crate::runtime::host_work::Store;
@@ -34,6 +38,7 @@ use atem_client::session::host_work::{
 };
 use atem_client::session::messages::{ContextReference, Delivery, RecipientReceipt, WorkProgress};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use std::collections::HashMap;
 
 /// A reply kept, never delivered: the route that sent the message takes no
 /// results (collaboration §10: shown by `atem message status`, never
@@ -64,7 +69,10 @@ const TABLES: &str = "
         task_id TEXT NOT NULL, receipt_id TEXT NOT NULL, state TEXT NOT NULL,
         detail TEXT NOT NULL, result TEXT, at_ms INTEGER NOT NULL, expires_at INTEGER NOT NULL,
         reply TEXT, reply_at INTEGER, delivery TEXT, delivery_detail TEXT, work_id TEXT,
+        sender_gen INTEGER, sender_epoch INTEGER,
         PRIMARY KEY(message_id, host_id, recipient_id, task_id));
+    CREATE INDEX IF NOT EXISTS remote_tasks_task ON remote_tasks(host_id, task_id)
+        WHERE task_id!='';
     CREATE INDEX IF NOT EXISTS remote_tasks_delivery ON remote_tasks(delivery)
         WHERE delivery IN ('due', 'queued');
     CREATE INDEX IF NOT EXISTS remote_tasks_work ON remote_tasks(work_id)
@@ -143,26 +151,33 @@ pub fn candidates(db: &Connection, sender: &HostRef, since_ms: u64) -> Result<Ve
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?
         .collect::<rusqlite::Result<_>>()?;
-    let mut tasks = db.prepare(
-        "SELECT task_id FROM remote_tasks WHERE message_id=?1 AND host_id=?2 ORDER BY rowid",
-    )?;
-    let mut stops = db.prepare(
-        "SELECT object_id FROM remote_deliveries WHERE message_id=?1 AND host_id=?2
+    // What the rows expect, read once for the host (review L7): the
+    // recorded resolutions' entries and the cancel and complete envelopes,
+    // by message.
+    let by_message = |sql: &str| -> Result<HashMap<String, Vec<String>>> {
+        let mut q = db.prepare(sql)?;
+        let mut found: HashMap<String, Vec<String>> = HashMap::new();
+        for row in q.query_map([&sender.host_id], |r| Ok((r.get(0)?, r.get(1)?)))? {
+            let (message, id): (String, String) = row?;
+            found.entry(message).or_default().push(id);
+        }
+        Ok(found)
+    };
+    let mut recorded =
+        by_message("SELECT message_id, task_id FROM remote_tasks WHERE host_id=?1 ORDER BY rowid")?;
+    let mut stops = by_message(
+        "SELECT message_id, object_id FROM remote_deliveries WHERE host_id=?1
         AND kind IN ('cancel', 'complete')",
     )?;
-    rows.into_iter()
+    Ok(rows
+        .into_iter()
         .map(|(message_id, recipient_id, expires_at)| {
-            let recorded: Vec<String> = tasks
-                .query_map([&message_id, &sender.host_id], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            let cancel_complete_ids = stops
-                .query_map([&message_id, &sender.host_id], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            Ok(Candidate {
+            let recorded = recorded.remove(&message_id).unwrap_or_default();
+            Candidate {
                 expected: ExpectedResult {
                     recipient: sender.clone(),
                     message_id: message_id.clone(),
-                    cancel_complete_ids,
+                    cancel_complete_ids: stops.remove(&message_id).unwrap_or_default(),
                     task_ids: recorded.iter().filter(|t| !t.is_empty()).cloned().collect(),
                 },
                 resolved: !recorded.is_empty(),
@@ -170,9 +185,9 @@ pub fn candidates(db: &Connection, sender: &HostRef, since_ms: u64) -> Result<Ve
                 host_id: sender.host_id.clone(),
                 recipient_id,
                 expires_at,
-            })
+            }
         })
-        .collect()
+        .collect())
 }
 
 /// How far back a result's row may have been made: a message lives at
@@ -247,6 +262,21 @@ pub fn apply_status(
             insert(tx, c, "", "", state, &detail, None, at)?;
         }
         for task in &tasks {
+            // A task id is its host's for one message (a selector task id
+            // derives from the message): one another message of this host
+            // already names isn't taken, and the recipient says why
+            // (review L3), so a result for it answers that message only.
+            let elsewhere: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM remote_tasks WHERE host_id=?1 AND task_id=?2
+                    AND message_id!=?3)",
+                params![c.host_id, task.task_id, c.message_id],
+                |r| r.get(0),
+            )?;
+            if elsewhere {
+                let why = format!("task id {} is another message's", task.task_id);
+                insert(tx, c, "", "", "refused", &why, None, at)?;
+                continue;
+            }
             insert(
                 tx,
                 c,
@@ -329,9 +359,12 @@ pub fn apply_refusal(tx: &Transaction, c: &Candidate, object_id: &str, code: &st
     Ok(())
 }
 
-/// The reply to `c`'s task `task_id`, recorded once (another copy changes
-/// nothing): `due` for delivery, or with `kept` never delivered, with why.
-/// Whether it was recorded now.
+/// The reply to `c`'s task `task_id`, recorded once (another copy, or
+/// another reply, changes nothing): `due` for delivery, or with `kept`
+/// never delivered, with why. `sender`: the `add_host` generation and the
+/// membership epoch its sender held when it was accepted (review M1: it is
+/// delivered only while its sender still holds both). Whether it was
+/// recorded now.
 pub fn record_reply(
     tx: &Transaction,
     c: &Candidate,
@@ -339,9 +372,11 @@ pub fn record_reply(
     reply: &ResultReply,
     kept: Option<&str>,
     at: u64,
+    sender: (u64, u64),
 ) -> Result<bool> {
     Ok(tx.execute(
-        "UPDATE remote_tasks SET reply=?4, reply_at=?5, delivery=?6, delivery_detail=?7
+        "UPDATE remote_tasks SET reply=?4, reply_at=?5, delivery=?6, delivery_detail=?7,
+            sender_gen=?8, sender_epoch=?9
         WHERE message_id=?1 AND host_id=?2 AND task_id=?3 AND reply IS NULL",
         params![
             c.message_id,
@@ -350,7 +385,9 @@ pub fn record_reply(
             serde_json::to_string(reply)?,
             at,
             if kept.is_some() { "kept" } else { "due" },
-            kept
+            kept,
+            sender.0,
+            sender.1
         ],
     )? == 1)
 }
@@ -370,11 +407,20 @@ pub struct Delivering {
     pub expires_at: u64,
     /// The delivery task, once queued.
     pub work_id: Option<String>,
+    /// The `add_host` generation and membership epoch its sender held when
+    /// the reply was accepted.
+    pub sender_gen: u64,
+    pub sender_epoch: u64,
+    /// The delivery task's state and detail, once queued.
+    pub work: Option<(String, String)>,
 }
 
 const DELIVERING: &str = "SELECT t.message_id, t.host_id, t.recipient_id, t.task_id, t.state,
-    t.reply, coalesce(json_extract(o.envelope, '$.workflow_id'), ''), t.expires_at, t.work_id
-    FROM remote_tasks t LEFT JOIN outbox o ON o.message_id=t.message_id";
+    t.reply, coalesce(json_extract(o.envelope, '$.workflow_id'), ''), t.expires_at, t.work_id,
+    coalesce(t.sender_gen, 0), coalesce(t.sender_epoch, 0), w.state,
+    CASE WHEN json_valid(w.record) THEN json_extract(w.record, '$.status.detail') END
+    FROM remote_tasks t LEFT JOIN outbox o ON o.message_id=t.message_id
+    LEFT JOIN work w ON w.id=t.work_id";
 
 fn delivering(r: &rusqlite::Row<'_>) -> rusqlite::Result<(Delivering, String)> {
     let reply = r.get(5)?;
@@ -389,6 +435,17 @@ fn delivering(r: &rusqlite::Row<'_>) -> rusqlite::Result<(Delivering, String)> {
             workflow_id: r.get(6)?,
             expires_at: r.get(7)?,
             work_id: r.get(8)?,
+            sender_gen: r.get(9)?,
+            sender_epoch: r.get(10)?,
+            work: r
+                .get::<_, Option<String>>(11)?
+                .map(|state| {
+                    Ok::<_, rusqlite::Error>((
+                        state,
+                        r.get::<_, Option<String>>(12)?.unwrap_or_default(),
+                    ))
+                })
+                .transpose()?,
         },
         reply,
     ))
@@ -421,13 +478,82 @@ pub fn due(db: &Connection, limit: usize) -> Result<Vec<Delivering>> {
 /// The replies whose delivery task is queued and hasn't started.
 pub fn queued(db: &Connection) -> Result<Vec<Delivering>> {
     let mut q = db.prepare(&format!(
-        "{DELIVERING} JOIN work w ON w.id=t.work_id
-        WHERE t.delivery='queued' AND w.state IN ('queued', 'blocked')"
+        "{DELIVERING} WHERE t.delivery='queued' AND w.state IN ('queued', 'blocked')"
     ))?;
     let rows = q
         .query_map([], delivering)?
         .collect::<rusqlite::Result<_>>()?;
     Ok(read_delivering(rows))
+}
+
+/// The replies whose delivery task ended (or whose outcome is unknown): to
+/// be settled ([`settle`]).
+pub fn ended(db: &Connection) -> Result<Vec<Delivering>> {
+    let mut q = db.prepare(&format!(
+        "{DELIVERING} WHERE t.delivery='queued'
+        AND w.state NOT IN ('queued', 'blocked', 'submitting', 'submitted')"
+    ))?;
+    let rows = q
+        .query_map([], delivering)?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(read_delivering(rows))
+}
+
+/// How a reply's delivery stands, from its row (`delivery`, its detail)
+/// and its delivery task's state and detail: whether it was delivered,
+/// what `atem message status` says, and the row's final state (none while
+/// it can still change). A delivery task that ended without its turn
+/// completing, or whose outcome is unknown, says so with its detail
+/// (review M2).
+pub fn delivery_says(
+    delivery: Option<&str>,
+    detail: Option<&str>,
+    work: Option<(&str, &str)>,
+) -> (bool, String, Option<&'static str>) {
+    match (delivery, work) {
+        (Some("kept" | "unknown"), _) => (false, detail.unwrap_or_default().into(), None),
+        (Some("delivered"), _) | (Some("queued"), Some(("completed" | "awaiting_result", _))) => {
+            (true, "delivered".into(), Some("delivered"))
+        }
+        (Some("queued"), Some(("outcome_unknown", why))) => (
+            false,
+            format!("delivery outcome unknown: {why}"),
+            Some("unknown"),
+        ),
+        (Some("queued"), Some(("failed" | "cancelled" | "expired", why))) => {
+            (false, format!("not delivered: {why}"), Some("kept"))
+        }
+        (Some("queued"), _) => (
+            false,
+            "being delivered to the session that sent it".into(),
+            None,
+        ),
+        _ => (false, "delivery pending".into(), None),
+    }
+}
+
+/// `d`'s delivery ended: its row moved to the final state `delivery`
+/// (`delivered`, `kept` or `unknown`) with `detail`, in `tx`.
+pub fn settle(
+    tx: &Transaction,
+    d: &Delivering,
+    delivery: &str,
+    detail: Option<&str>,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE remote_tasks SET delivery=?5, delivery_detail=?6
+        WHERE message_id=?1 AND host_id=?2 AND recipient_id=?3 AND task_id=?4
+            AND delivery='queued'",
+        params![
+            d.message_id,
+            d.host_id,
+            d.recipient_id,
+            d.task_id,
+            delivery,
+            detail
+        ],
+    )?;
+    Ok(())
 }
 
 /// `d`'s reply queued for delivery as the task `work_id`, in `tx`.
@@ -537,7 +663,8 @@ pub fn views(db: &Connection, message_id: &str, announced: bool) -> Result<Vec<R
     }
     let mut tasks = db.prepare(
         "SELECT t.recipient_id, t.task_id, t.state, t.detail, t.reply, t.delivery,
-            t.delivery_detail, w.state
+            t.delivery_detail, w.state,
+            CASE WHEN json_valid(w.record) THEN json_extract(w.record, '$.status.detail') END
         FROM remote_tasks t LEFT JOIN work w ON w.id=t.work_id
         WHERE t.message_id=?1 AND t.host_id=?2 ORDER BY t.rowid",
     )?;
@@ -573,8 +700,17 @@ fn task_view(r: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteTaskView> {
         .and_then(|text| serde_json::from_str(&text).ok());
     let delivery: Option<String> = r.get(5)?;
     let why: Option<String> = r.get(6)?;
-    let work: Option<String> = r.get(7)?;
-    let delivered = work.as_deref() == Some("completed");
+    let work: Option<(String, String)> = r
+        .get::<_, Option<String>>(7)?
+        .map(|state| {
+            Ok::<_, rusqlite::Error>((state, r.get::<_, Option<String>>(8)?.unwrap_or_default()))
+        })
+        .transpose()?;
+    let (delivered, says, _) = delivery_says(
+        delivery.as_deref(),
+        why.as_deref(),
+        work.as_ref().map(|(s, d)| (s.as_str(), d.as_str())),
+    );
     Ok(RemoteTaskView {
         recipient_id: r.get(0)?,
         task_id: r.get(1)?,
@@ -595,12 +731,20 @@ fn task_view(r: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteTaskView> {
                 })
                 .collect(),
             delivered,
-            delivery: match delivery.as_deref() {
-                Some("kept") => why.unwrap_or_default(),
-                Some("queued") if delivered => "delivered".into(),
-                Some("queued") => "being delivered to the session that sent it".into(),
-                _ => "delivery pending".into(),
-            },
+            delivery: says,
         }),
     })
+}
+
+/// The id of the local task delivering `host_id`'s reply to its task
+/// `task_id` of message `message_id`: one per (message, host, task), so a
+/// task id a host reuses across messages never shares a delivery (review
+/// L3). UUIDv5 of `delivery:` and the JSON array of the three.
+pub fn delivery_id(message_id: &str, host_id: &str, task_id: &str) -> String {
+    let name = serde_json::to_string(&[message_id, host_id, task_id]).expect("three strings");
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("delivery:{name}").as_bytes(),
+    )
+    .to_string()
 }

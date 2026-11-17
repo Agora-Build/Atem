@@ -593,6 +593,19 @@ impl HostBridge {
                 Ok(tx.commit()?)
             });
             if let Err(error) = sealed {
+                // A store fault passes (review L5): the result stays owed
+                // and goes on a later pass (a result goes only once, so
+                // dropping it would lose the reply for its sender).
+                if error.downcast_ref::<rusqlite::Error>().is_some() {
+                    super::delegated_mail_pass::log_limited(&UNSEALED, || {
+                        format!(
+                            "atem runtime: task {task_id}'s result not sent to its host sender yet ({error:#}); tried again"
+                        )
+                    });
+                    break;
+                }
+                // One that can't be built (a record that doesn't read) is
+                // dropped: the owner still reads the reply.
                 super::delegated_mail_pass::log_limited(&UNSEALED, || {
                     format!(
                         "atem runtime: task {task_id}'s result not sent to its host sender ({error:#})"

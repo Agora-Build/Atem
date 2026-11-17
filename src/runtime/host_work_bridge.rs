@@ -1009,6 +1009,22 @@ impl HostBridge {
                         && self.collab_origin_live(&grant.origin, sessions)
                 })
             })
+            && self.remote_delivery_allowed(record)
+    }
+
+    /// Another host's reply is delivered only with host senders on, where
+    /// its sender's standing and return grant are checked each pass
+    /// (`remote_deliveries`); with the hook turned off it waits (review
+    /// L4). Any other task: allowed.
+    fn remote_delivery_allowed(&self, record: &WorkRecord) -> bool {
+        if self.senders_on() || record.principal != "local" {
+            return true;
+        }
+        let Some(store) = self.work.store.as_ref() else {
+            return true;
+        };
+        crate::runtime::delegated::results_back::delivery_of(&store.db, &record.task.task_id)
+            .is_ok_and(|delivers| delivers.is_none())
     }
 
     fn work_route_allowed(&self, record: &WorkRecord, a: &Sender) -> bool {

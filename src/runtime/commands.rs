@@ -288,9 +288,11 @@ fn status_lines(messages: Vec<super::collab::MessageView>) -> Result<Vec<String>
                 }
             }
         }
+        // What another host sent reaches the terminal with its controls
+        // escaped (review L6).
         for host in m.remote {
             let state = match &host.code {
-                Some(code) => format!("{} ({code})", host.state),
+                Some(code) => format!("{} ({})", host.state, escaped(code)),
                 None => host.state,
             };
             lines.push(format!("  host {}  {state}  {}", host.host_id, host.detail));
@@ -301,19 +303,22 @@ fn status_lines(messages: Vec<super::collab::MessageView>) -> Result<Vec<String>
                 if task.task_id.is_empty() {
                     lines.push(format!(
                         "    recipient {}  {}",
-                        task.recipient_id, task.state
+                        task.recipient_id,
+                        escaped(&task.state)
                     ));
                     continue;
                 }
                 lines.push(format!(
                     "    {}  {}  {}",
-                    task.task_id, task.state, task.detail
+                    task.task_id,
+                    escaped(&task.state),
+                    escaped(&task.detail)
                 ));
                 if let Some(reply) = task.reply {
                     let text = if reply.dropped {
-                        "(text no longer kept)"
+                        "(text no longer kept)".to_string()
                     } else {
-                        &reply.text
+                        escaped(&reply.text)
                     };
                     lines.push(format!("      reply {}: {text}", reply.result_id));
                     for reference in reply.context {
@@ -328,6 +333,21 @@ fn status_lines(messages: Vec<super::collab::MessageView>) -> Result<Vec<String>
         }
     }
     Ok(lines)
+}
+
+/// `text` another host sent, its control characters (C0 other than
+/// newline and tab, DEL, C1) escaped (`\u{1b}`), so none reaches the
+/// terminal as a sequence.
+fn escaped(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' {
+                c.escape_unicode().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 /// A reply's text as `atem message status` shows it.
@@ -622,6 +642,57 @@ mod tests {
                 "    recipient r-1  no_match",
                 "  host host-e  refused (forbidden)  refused by the host (forbidden)",
             ]
+        );
+    }
+
+    /// Review L6: text another host sent (its status's detail, its reply)
+    /// reaches the owner's terminal with its control characters escaped
+    /// (C0, DEL and C1), never as terminal sequences; newlines and tabs in
+    /// a reply stay.
+    #[test]
+    fn another_hosts_text_is_printed_with_its_controls_escaped() {
+        use super::super::collab::{MessageView, RemoteReplyView, RemoteTaskView, RemoteView};
+        let view = MessageView {
+            message_id: "m-1".into(),
+            workflow_id: "w-1".into(),
+            delivery: "accepted".into(),
+            detail: "to other hosts only".into(),
+            tasks: vec![],
+            remote: vec![RemoteView {
+                host_id: "host-b".into(),
+                state: "accepted".into(),
+                code: None,
+                detail: "accepted by the host".into(),
+                status_pending: false,
+                tasks: vec![RemoteTaskView {
+                    recipient_id: "r-1".into(),
+                    task_id: "t-1".into(),
+                    state: "awaiting_result".into(),
+                    detail: "on B \u{1b}[2J\u{7f}\u{9b}31m".into(),
+                    reply: Some(RemoteReplyView {
+                        result_id: "res-1".into(),
+                        text: "line one\n\tline \u{1b}]0;title\u{7}two".into(),
+                        dropped: false,
+                        context: vec![],
+                        delivered: false,
+                        delivery: "delivery pending".into(),
+                    }),
+                }],
+            }],
+        };
+        let lines = status_lines(vec![view]).unwrap();
+        assert_eq!(
+            lines[2],
+            "    t-1  awaiting_result  on B \\u{1b}[2J\\u{7f}\\u{9b}31m"
+        );
+        assert_eq!(
+            lines[3],
+            "      reply res-1: line one\n\tline \\u{1b}]0;title\\u{7}two"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|l| !l.chars().any(|c| c.is_control() && c != '\n' && c != '\t'))
         );
     }
 
