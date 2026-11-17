@@ -6,7 +6,7 @@
 use super::*;
 use crate::session_protocol::membership::r9log::{MAC, TestLog, secret};
 use atem_client::membership::{host_enc_key, project_set, sign_host_enc_key};
-use atem_client::{KeyId, KeyProvider, SoftwareKeys};
+use atem_client::{KeyId, KeyProvider, PublicKey, SoftwareKeys};
 
 const ME: Me<'static> = Me {
     host_id: "a",
@@ -95,12 +95,6 @@ fn each_selector_form_plans_its_hosts() {
     assert_eq!(remote(&p), [("b", vec!["atem:b/auth"], 32, false)]);
     let target = &p.remote[0];
     assert_eq!(target.host_trust_gen, 1);
-    let key = log.log.host_enc_key("b").unwrap();
-    assert_eq!(target.enc_key, key.current.key);
-    assert_eq!(
-        target.enc_kid,
-        atem_client::keys::enc_kid(&key.current.key).unwrap()
-    );
     let p = plan_of(&["project:build+tag:auth"]);
     assert_eq!(p.local, Some(11));
     assert_eq!(

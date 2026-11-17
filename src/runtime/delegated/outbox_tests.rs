@@ -151,7 +151,13 @@ fn an_object_is_enqueued_in_its_callers_transaction() {
     );
     assert!(put(&store, &bytes, "c", Policy::Repeat).is_err());
     assert!(put(&store, b"junk", "b", Policy::Repeat).is_err());
-    // Another sender's rows aren't this host's to put; live ones wait.
+    // Another sender's rows aren't this host's to put, nor this host's of an
+    // older trust generation (review L6); live ones wait.
+    let newer = HostRef {
+        host_id: "a".into(),
+        host_trust_gen: 2,
+    };
+    assert!(due(&store, &newer, T0, AT, &[], 16).unwrap().is_empty());
     assert!(due(&store, &host("b"), T0, AT, &[], 16).unwrap().is_empty());
     assert!(
         due(&store, &host("a"), T0, AT, &[n], 16)

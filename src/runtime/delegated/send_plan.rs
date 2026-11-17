@@ -24,7 +24,6 @@
 //!   local part (when a selector can reach this host's agents) first, then
 //!   each planned host by `host_id`, each the same share, the remainder one
 //!   each to the first.
-use atem_client::PublicKey;
 use atem_client::membership::{HostSenderState, Membership, ProjectOp};
 use atem_client::session::select::{Label, MAX_AGENTS, Selector};
 use std::collections::BTreeMap;
@@ -53,9 +52,6 @@ pub struct Target {
     pub host_id: String,
     /// Its newest `add_host`'s generation.
     pub host_trust_gen: u64,
-    /// Its current encryption key, and that key's `enc_kid`.
-    pub enc_key: PublicKey,
-    pub enc_kid: String,
     /// The selectors that planned it, in the send's order.
     pub selectors: Vec<String>,
     /// Its share of the message's 32 agents.
@@ -200,7 +196,9 @@ fn target(list: &Membership, me: Me<'_>, host_id: &str, launch: bool) -> Result<
     let host = list.host(host_id).ok_or_else(|| {
         format!("{host_id}: no current host of this account's device list has that id")
     })?;
-    let key = list.host_enc_key(host_id).ok_or_else(|| {
+    // A current key is needed now; the envelope is sealed to the key the
+    // committed list names when the message is accepted (review L6).
+    list.host_enc_key(host_id).ok_or_else(|| {
         format!(
             "host {host_id} has no encryption key in the device list yet; it can't receive messages from other hosts"
         )
@@ -219,8 +217,6 @@ fn target(list: &Membership, me: Me<'_>, host_id: &str, launch: bool) -> Result<
     Ok(Target {
         host_id: host_id.to_owned(),
         host_trust_gen: host.host_trust_gen,
-        enc_key: key.current.key.clone(),
-        enc_kid: atem_client::encoding::hex(&key.current.kid),
         selectors: Vec::new(),
         budget: 0,
         launch,

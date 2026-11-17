@@ -122,12 +122,27 @@ fn a_send_to_another_host_commits_its_sealed_envelope_before_any_put() {
         let os = ManualOs::at(host_now().wall_ms);
         let _host = sp_host(&mut rig, root, &os);
         let id = sp_send(&mut rig, &["atem:host-b/rh"]).unwrap();
+        // Committed (another connection reads it) before any put.
+        let other = Store::open(&root.join("runtime")).unwrap();
+        let committed: (String, Vec<u8>) = other
+            .db
+            .query_row(
+                "SELECT d.state, o.bytes FROM remote_deliveries d
+                JOIN mail_outbox o ON o.n=d.outbox_n WHERE d.object_id=?1",
+                [&id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(committed.0, "ready");
         assert_eq!(
             sp_rows(&rig, &id),
             [("host-b".into(), "ready".into(), None)]
         );
         let (_, state, bytes) = sp_engine(&rig, &id);
         assert_eq!(state, "queued");
+        assert_eq!(bytes, committed.1);
+        let put = sp_out(&mut rig).remove(0);
+        assert_eq!(put.object.to_json().to_string().into_bytes(), committed.1);
         let atem_client::host_mail::EnvelopePlain::Request { message } = sp_open(&rig, &bytes)
         else {
             panic!("not a request");
@@ -740,5 +755,102 @@ fn a_row_whose_bytes_dont_read_is_refused() {
         )
         .unwrap();
         assert!(due.is_empty());
+    });
+}
+
+/// A seal that fails inside the accepting transaction leaves nothing of
+/// the send (review L6): no stage-1 row, message, counter, delivery or
+/// engine row.
+#[test]
+fn a_failed_seal_rolls_the_whole_send_back() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let _host = sp_host(&mut rig, root, &os);
+        let file = rig
+            .bridge
+            .pairing
+            .as_ref()
+            .unwrap()
+            .host_channel_key
+            .clone();
+        std::fs::rename(&file, file.with_extension("aside")).unwrap();
+        rig.bridge.host_key = None;
+        let before: Vec<i64> = [
+            "outbox",
+            "messages",
+            "counters",
+            "remote_deliveries",
+            "mail_outbox",
+        ]
+        .iter()
+        .map(|t| rows(&rig, t))
+        .collect();
+        assert_eq!(
+            sp_send(&mut rig, &["atem:atem-host", "atem:host-b"])
+                .unwrap_err()
+                .to_string(),
+            "host senders' outbox unavailable; publication will retry"
+        );
+        let after: Vec<i64> = [
+            "outbox",
+            "messages",
+            "counters",
+            "remote_deliveries",
+            "mail_outbox",
+        ]
+        .iter()
+        .map(|t| rows(&rig, t))
+        .collect();
+        assert_eq!(after, before);
+    });
+}
+
+/// The envelope follows the committed list when the message is accepted,
+/// not the one that planned it (review L6): B's key rotated while the
+/// context published, the envelope is sealed to the new key, signed at
+/// the new head.
+#[test]
+fn a_context_send_seals_to_the_list_at_acceptance() {
+    local_test(async |root| {
+        use crate::session_protocol::membership::r9log::secret;
+        use atem_client::KeyProvider;
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        let id = sp_context_send(&mut rig, root, &["atem:host-b"]);
+        // B's key rotates.
+        let mut keys = atem_client::SoftwareKeys::new();
+        let (host_key, enc) = (
+            atem_client::KeyId::new("b"),
+            atem_client::KeyId::new("b enc 2"),
+        );
+        keys.insert_ed25519(host_key.clone(), &secret("host b"));
+        keys.insert_x25519(enc.clone(), &secret("host b enc 2"));
+        let enc_key = keys.public_key(&enc).unwrap();
+        let sig = atem_client::membership::sign_host_enc_key(
+            &keys,
+            &host_key,
+            "acct",
+            &host.s.log.genesis_hash(),
+            "host-b",
+            1,
+            enc_key.as_32().unwrap(),
+        )
+        .unwrap();
+        let action =
+            atem_client::membership::host_enc_key("host-b", 1, &enc_key, &sig, false, 0).unwrap();
+        sign_and_carry(&mut rig, &mut host.s, action);
+        let head = rig.bridge.membership.as_ref().unwrap().head();
+        sp_publish(&mut rig, &id).await;
+        rig.until(|r| sp_rows(r, &id)[0].1 == "ready").await;
+        let bytes = sp_engine(&rig, &id).2;
+        let object = atem_client::host_mail::parse_object(&bytes).unwrap();
+        let (_, body) = atem_client::host_mail::MailBody::from_object(&object).unwrap();
+        assert_eq!(body.signed_at_head, head);
+        assert_eq!(body.enc_kid, atem_client::keys::enc_kid(&enc_key).unwrap());
+        let sender = rig.bridge.host_key.as_ref().unwrap().public_key().unwrap();
+        let verified = atem_client::host_mail::VerifiedMail::verify(&object, &sender).unwrap();
+        assert!(atem_client::host_mail::unseal_envelope(&keys, &enc, &verified).is_ok());
     });
 }
