@@ -556,8 +556,16 @@ fn a_client_reconnects_to_a_restarted_agent_process_and_checks_it_again() {
     make_private(&run);
     let config = home.join(".config").join("atem");
     let finding = || CredAgentClient::finding(&config, Some(run.clone().into_os_string()), None);
+    let started = |log: &str| {
+        let log = std::fs::read_to_string(dir.path().join(log)).unwrap_or_default();
+        format!("the agent never answered; its log:\n{log}")
+    };
     let first = cred_agent_process(&home, &run, &dir.path().join("a.log"));
-    assert!(eventually(|| finding().is_running()));
+    assert!(
+        eventually(|| finding().is_running()),
+        "{}",
+        started("a.log")
+    );
     let build = finding().status().unwrap().build;
     let client = finding().checking_build(&build);
     for _ in 0..3 {
@@ -567,7 +575,11 @@ fn a_client_reconnects_to_a_restarted_agent_process_and_checks_it_again() {
     assert_eq!(client.traffic().probes(), 1);
     drop(first);
     let _second = cred_agent_process(&home, &run, &dir.path().join("b.log"));
-    assert!(eventually(|| finding().is_running()));
+    assert!(
+        eventually(|| finding().is_running()),
+        "{}",
+        started("b.log")
+    );
     assert!(!client.status().unwrap().unlocked);
     assert_eq!(client.traffic().connections(), 2);
     assert_eq!(client.traffic().probes(), 2);
