@@ -989,7 +989,9 @@ fn cancel_and_complete_reach_only_the_senders_current_tasks() {
 /// its recipient's id) is kept as an early stop, and its request's
 /// admission cancels the task at once; one past its expiry is dropped and
 /// the request's task queues; a 33rd early stop of one sender stays in
-/// the inbox (holding the gate) until its request comes.
+/// the inbox (holding its sender's task starts only, ruling R47) until a
+/// kept one expires and the minute prune frees room, then it is kept, and
+/// its request's admission cancels the task at once.
 #[test]
 fn a_stop_before_its_request_is_kept_and_applied_at_admission() {
     local_test(async |root| {
@@ -1050,9 +1052,11 @@ fn a_stop_before_its_request_is_kept_and_applied_at_admission() {
         ad_inbox_request(&rig, &late);
         ad_admit(&mut rig);
         assert_eq!(ad_tasks(&rig, &late)[0].status.state, WorkState::Queued);
-        // 32 kept; a 33rd stays in the inbox.
-        for _ in 0..32 {
-            ad_inbox_stop(&rig, &uuid::Uuid::new_v4().to_string(), false, now + HOUR);
+        // 32 kept (the first expiring in a minute); a 33rd stays in the
+        // inbox.
+        for i in 0..32 {
+            let expires = if i == 0 { now + 60_000 } else { now + HOUR };
+            ad_inbox_stop(&rig, &uuid::Uuid::new_v4().to_string(), false, expires);
         }
         let last = ad_message(&rig, vec![agent(&rig)]);
         ad_inbox_stop(&rig, &last.recipients[0].recipient_id, false, now + HOUR);
@@ -1068,15 +1072,32 @@ fn a_stop_before_its_request_is_kept_and_applied_at_admission() {
         // Ruling R47: it holds its own sender's task starts only.
         assert!(!mb_gate(&rig), "B's tasks wait for its stop");
         assert!(ad_gate_for(&rig, "host-c"), "another sender's don't");
-        // Its request: admitted, and the stop waiting in the inbox finds its
-        // task at the next pass, queued, and cancels it.
-        ad_inbox_request(&rig, &last);
+        // A kept one expires, the minute prune frees its room: the 33rd is
+        // kept, the gate opens again.
+        sp_d(&rig, now + 60_000);
+        rig.bridge.work.mail_pruned_at = None;
+        mb_tick(&mut rig, &mut host, 1_000);
+        sp_d(&rig, now);
+        let kept = |rig: &LocalRig| {
+            admit::stops(&rig.bridge.work.store.as_ref().unwrap().db)
+                .unwrap()
+                .into_iter()
+                .map(|(_, task, _)| task)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(kept(&rig).len(), 31);
         ad_admit(&mut rig);
+        assert_eq!(ad_inbox_rows(&rig), 0, "the 33rd taken");
+        assert_eq!(kept(&rig).len(), 32);
+        assert!(kept(&rig).contains(&last.recipients[0].recipient_id));
+        mb_tick(&mut rig, &mut host, 0);
+        assert!(mb_gate(&rig));
+        // Its request: admitted, its task cancelled at once.
+        ad_inbox_request(&rig, &last);
         ad_admit(&mut rig);
         assert_eq!(ad_inbox_rows(&rig), 0);
         assert_eq!(ad_tasks(&rig, &last)[0].status.state, WorkState::Cancelled);
-        mb_tick(&mut rig, &mut host, 0);
-        assert!(mb_gate(&rig));
+        assert_eq!(kept(&rig).len(), 31);
     });
 }
 
