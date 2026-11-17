@@ -1013,7 +1013,7 @@ restart; interrupting a turn that has already ended does nothing.
     and Astation is a native manager. **New rule:** the host's own device-list fetch (below) and the mailbox calls
     (II.4.3) are proxied the same way.
   - **With neither path**, the gate stays closed.
-  - **An identity change. Astation's item 15, #120 (Atem's reading that implements it, host-work-v1 §11.4).** A
+  - **An identity change. Astation's item 15, #120 (Atem's reading that implements it, host-work-v1 §11.4; agreed with Astation for a re-verify on the live link, 2026-11-15, #120 comment 6889906767, and while Astation authenticates the link again, 2026-11-16, #120 comment 6929176743).** A
     link's association is the host identity its socket was authenticated under (its account, device and trust
     generation, the device list's genesis and its `host_channel_key`), and on the relay the route proof that
     identity made (R9.7b). When that identity changes while the link is up (`atem pair verify` on the live link, or a

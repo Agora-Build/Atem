@@ -2297,8 +2297,8 @@ proxy forwards with the proof and the verdict unchanged, on its local link
 once Astation authenticated that link as the paired Astation, through the
 same code and for the same inputs as its relay link (the relay room, the
 pairing's Astation id, and its own `atem_id`, at its device list's head),
-but with a proof of the **proxy kind** (**proposed, for Astation's
-agreement**): `atem-host-route-proxy`, the same fields signed over
+but with a proof of the **proxy kind** (**agreed with Astation 2026-11-16,
+#174 comment 6919776085**): `atem-host-route-proxy`, the same fields signed over
 `enc(["atem-host-route-proxy-v1", jcs(body)])`. The Station accepts it only
 on Astation's native-bound forwarding connection and never as a relay
 route; the relay's verifier refuses it. Atem doesn't authenticate its local
@@ -2558,7 +2558,10 @@ own Station's feed:
     host never makes one) the page's feed must also be the own feed this
     generation's `heads` announced.
   - **An identity change** (**Atem's reading that implements Astation's
-    item 15, #120, 2026-11-14**; nothing on the wire changes). A link's
+    item 15, #120, 2026-11-14; agreed with Astation for a re-verify on the
+    live link (2026-11-15, #120 comment 6889906767) and while Astation
+    authenticates the link again (2026-11-16, #120 comment 6929176743)**;
+    nothing on the wire changes). A link's
     association with its Station is the host identity its socket was
     authenticated under, and on the relay the route proof its challenge
     got (session-v1 R9.7b): the host's account, device and trust

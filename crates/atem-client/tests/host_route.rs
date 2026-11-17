@@ -211,7 +211,7 @@ fn every_refusal_code_is_a_reply_code_and_replies_round_trip() {
 }
 
 /// The proxy kind (the delegated host-work design I.5.8 through Astation's
-/// `:8080`; proposed, for Astation's agreement) is domain separated from the
+/// `:8080`; agreed with Astation 2026-11-16, #174) is domain separated from the
 /// relay's: its own body `type` (`atem-host-route-proxy`) and signing label
 /// (`atem-host-route-proxy-v1`) over the same fields. A proof a host gives
 /// on a local link verifies only as a proxy proof: the relay's verifier

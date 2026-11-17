@@ -25,7 +25,7 @@ pub enum SignLabel {
     /// `atem-host-route` bodies (§R9.7b).
     HostRoute,
     /// `atem-host-route-proxy` bodies (§R9.7b, a Station's challenge through
-    /// Astation's `:8080` proxy; proposed, for Astation's agreement): the
+    /// Astation's `:8080` proxy; agreed with Astation 2026-11-16, #174): the
     /// host route proof's fields under their own domain, so a proof given
     /// on a local link is never a relay route.
     HostRouteProxy,
