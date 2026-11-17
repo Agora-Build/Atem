@@ -130,7 +130,24 @@ impl Rig {
         Rig::build(Via::Local, Hook::Senders, Some(collab))
     }
 
+    /// [`Rig::admitting`], this host sending too: `[collab] send = true`,
+    /// and the route `backend` consents to `local` and takes results, so a
+    /// reply another host sends back is delivered into the session that
+    /// sent the message (design II.4.4).
+    fn sending() -> Rig {
+        Rig::build_with(
+            Via::Local,
+            Hook::Senders,
+            Some("[collab]\nsend = true"),
+            true,
+        )
+    }
+
     fn build(via: Via, hook: Hook, admitting: Option<&str>) -> Rig {
+        Rig::build_with(via, hook, admitting, false)
+    }
+
+    fn build_with(via: Via, hook: Hook, admitting: Option<&str>, sending: bool) -> Rig {
         let sandbox = Sandbox::new();
         write_verified_pairing(&sandbox.config(), ACCOUNT, HOST, 1);
         let host_seed = secret("host mail host");
@@ -165,6 +182,11 @@ impl Rig {
             &json!({"CLAUDE_CLI_BIN": bin, "FAKE_DIR": fake}).to_string(),
         );
         let mac = format!("member:{}", support::r9log::MAC);
+        let (local, results) = if sending {
+            (r#", "local""#, "results = true")
+        } else {
+            ("", "")
+        };
         let toml = match admitting {
             None => hosting_toml(&sandbox.home, &env_file, std::slice::from_ref(&mac)),
             Some(collab) => format!(
@@ -186,7 +208,8 @@ env_file = {env:?}
 id = "backend"
 revision = 1
 profile_id = "backend"
-principals = [{mac:?}, "project:{PROJECT}"]
+principals = [{mac:?}, "project:{PROJECT}"{local}]
+{results}
 "#,
                 cwd = sandbox.home.to_str().unwrap(),
                 env = env_file.to_str().unwrap()
@@ -2393,4 +2416,293 @@ fn per_workflow_bounds_a_host_senders_messages() {
         rig.statuses().iter().filter(|s| **s == busy).count() == 2
     });
     assert!(!rig.has_message(&second.message_id));
+}
+
+// ── Results back (design II.4.4; host-work-v1 §11.5) ──
+
+impl Rig {
+    /// `args` run by the fake agent's own child (`run-<number>.json`), as an
+    /// agent runs a command: what it printed (`code`, `stdout`, `stderr`).
+    fn agent(&self, number: u32, args: &[&str]) -> Value {
+        let fake = self.sandbox.dir.path().join("fake");
+        let argv: Vec<_> = std::iter::once(env!("CARGO_BIN_EXE_atem"))
+            .chain(args.iter().copied())
+            .collect();
+        private(
+            &fake.join(format!("run-{number}.tmp")),
+            &json!({ "argv": argv }).to_string(),
+        );
+        std::fs::rename(
+            fake.join(format!("run-{number}.tmp")),
+            fake.join(format!("run-{number}.json")),
+        )
+        .unwrap();
+        let out = fake.join(format!("run-{number}.out"));
+        within("the agent's command", || out.exists());
+        serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap()
+    }
+
+    /// `atem message status MESSAGE` from the owner's terminal, until its
+    /// output contains every line of `expected`.
+    #[track_caller]
+    fn message_status(&self, message: &str, expected: &[String]) -> String {
+        let mut last = String::new();
+        self.within("atem message status", || {
+            let (out, err, _) = self.sandbox.atem(&["message", "status", message]);
+            last = format!("{out}{err}");
+            expected.iter().all(|line| out.lines().any(|l| l == line))
+        });
+        last
+    }
+
+    /// The agent sends `text` to the sending host's agents (`atem:` that
+    /// host): the message id, and its recipient there and the task the test
+    /// host resolves it to (on its session `ses-bbbbbbbbbbbb`), read from the
+    /// envelope the runtime put into that host's mailbox.
+    fn send_to_other(&self, text: &str) -> (String, String, String) {
+        let out = self.agent(
+            1,
+            &["message", "send", "--to", &format!("atem:{SENDER}"), text],
+        );
+        assert_eq!(out["code"], 0, "{out}");
+        let id = out["stdout"].as_str().unwrap().trim().to_owned();
+        let key = self.log.log.host(HOST).unwrap().host_key.clone();
+        let mut envelope = None;
+        self.within("the envelope in the other host's mailbox", || {
+            envelope = self
+                .station()
+                .stored_objects(SENDER, 1)
+                .into_iter()
+                .find(|o| id_of(o) == id);
+            envelope.is_some()
+        });
+        let atem_client::host_mail::EnvelopePlain::Request { message } =
+            self.sender.open_envelope(&envelope.unwrap(), &key)
+        else {
+            panic!("not a request");
+        };
+        let recipient = message.recipients[0].recipient_id.clone();
+        let task =
+            atem_client::session::select::selector_task_id(&id, &recipient, "ses-bbbbbbbbbbbb");
+        (id, recipient, task)
+    }
+
+    /// The test host's status of message `id` (its recipient's task
+    /// awaiting its result) and its reply `text` to the task, put into this
+    /// host's mailbox.
+    fn answer_back(&self, id: &str, recipient: &str, task: &str, text: &str) {
+        use atem_client::session::host_work::{ReplyState, ResultReply, digest, result_id};
+        use atem_client::session::messages::{RecipientReceipt, WorkProgress};
+        let me = self.receiver(1);
+        let status = ResultPlain::Status {
+            message_id: id.into(),
+            recipients: vec![RecipientReceipt {
+                recipient_id: recipient.into(),
+                delivery: Delivery::Resolved {
+                    tasks: vec![WorkProgress {
+                        task_id: task.into(),
+                        receipt_id: uuid::Uuid::new_v4().to_string(),
+                        state: WorkState::AwaitingResult,
+                        detail: "reply submitted".into(),
+                        result: None,
+                    }],
+                },
+            }],
+        };
+        let reply = ResultPlain::Result {
+            task_id: task.into(),
+            reply: ResultReply {
+                result_id: result_id(task),
+                state: ReplyState::Submitted,
+                digest: digest(text.as_bytes()),
+                text: text.into(),
+                context: vec![],
+                submitted_at: Some(1),
+                dropped: false,
+            },
+        };
+        let head = self.log.log.head();
+        self.put(&self.sender.result_of(&me, head, &status));
+        self.put(&self.sender.result_of(&me, head, &reply));
+    }
+}
+
+/// This host ran a host sender's task: its agent's reply (`atem message
+/// reply`) goes back to the sending host as a result, which the sending
+/// host's own check (the shared core's `accept_result`) takes. The
+/// Station's answer to its first put is lost: 35 s later it is put again,
+/// the same object under a fresh request id, stored once, never put after.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_reply_goes_back_to_its_host_sender_once_stored() {
+    use atem_client::host_mail::{ExpectedResult, HostRef, ResultVerdict};
+    let rig = Rig::admitting("");
+    rig.online();
+    let sid = rig.launch();
+    let to = rig.receiver(1);
+    let message = rig
+        .sender
+        .message(&to, &[&format!("atem:{HOST}")], 1, "HM_REPLIED");
+    rig.put(&rig.sender.request_of(&to, rig.log.log.head(), &message));
+    let task = task_of(&message, &sid);
+    support::delegated::in_turn(&rig, &task, "HM_REPLIED");
+    support::delegated::complete_turn(&rig, &task);
+    rig.until_status("awaiting its result", |s| {
+        resolved_state(s, &message.message_id) == Some(WorkState::AwaitingResult)
+    });
+    rig.station().drop_stored(1);
+    let tid = task.as_str().unwrap();
+    let out = rig.agent(1, &["message", "reply", "--task", tid, "HM_THE_REPLY"]);
+    assert_eq!(out["code"], 0, "{out}");
+    let result = rig.until_status("the result", |s| matches!(s, ResultPlain::Result { .. }));
+    let ResultPlain::Result { task_id, reply } = &result else {
+        unreachable!()
+    };
+    assert_eq!(
+        (task_id.as_str(), reply.text.as_str()),
+        (tid, "HM_THE_REPLY")
+    );
+    let key = rig.log.log.host(HOST).unwrap().host_key.clone();
+    let object = rig
+        .station()
+        .stored_objects(SENDER, 1)
+        .into_iter()
+        .find(|o| matches!(rig.sender.open(o, &key), ResultPlain::Result { .. }))
+        .unwrap();
+    let expected = ExpectedResult {
+        recipient: HostRef {
+            host_id: HOST.into(),
+            host_trust_gen: 1,
+        },
+        message_id: message.message_id.clone(),
+        cancel_complete_ids: vec![],
+        task_ids: vec![tid.into()],
+    };
+    assert!(
+        matches!(
+            rig.sender.accept(&object, &rig.log.log, &expected),
+            ResultVerdict::Accepted { .. }
+        ),
+        "the sending host takes it"
+    );
+    let id = id_of(&object);
+    let puts = |rig: &Rig| rig.put_ids().iter().filter(|p| **p == id).count();
+    assert_eq!(puts(&rig), 1);
+    rig.clock.add_mono(CALL_DEADLINE + 1_000);
+    rig.within("the result put again", || puts(&rig) == 2);
+    let stored = |rig: &Rig| {
+        rig.station()
+            .stored_objects(SENDER, 1)
+            .iter()
+            .filter(|o| id_of(o) == id)
+            .count()
+    };
+    assert_eq!(stored(&rig), 1);
+    rig.clock.add_mono(CALL_DEADLINE + 1_000);
+    rig.two_passes();
+    rig.two_passes();
+    assert_eq!(puts(&rig), 2, "never put again once stored");
+}
+
+/// This host sends to another host's agents: the other host's status
+/// (its resolution) and its reply come back; the reply is delivered once,
+/// as data, into the session that sent the message (its prompt framed as
+/// that host's result), and `atem message status` shows the row accepted,
+/// the remote task and its reply, delivered.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_reply_from_another_host_is_delivered_and_shown() {
+    let rig = Rig::sending();
+    rig.online();
+    let _sid = rig.launch();
+    let (id, recipient, task) = rig.send_to_other("HM_TO_OTHER");
+    rig.message_status(&id, &["    status pending".into()]);
+    rig.answer_back(&id, &recipient, &task, "HM_FROM_OTHER");
+    let delivery = json!(
+        uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_OID,
+            format!("delivery:{task}").as_bytes()
+        )
+        .to_string()
+    );
+    support::delegated::in_turn(
+        &rig,
+        &delivery,
+        &format!("Result of task {task} from host:{SENDER}, as data"),
+    );
+    assert!(support::delegated::input(&rig).contains("HM_FROM_OTHER"));
+    std::fs::write(rig.sandbox.dir.path().join("fake/complete"), "").unwrap();
+    support::delegated::wait_stored(
+        &rig,
+        &delivery,
+        "completed",
+        "explicit result delivered to the originating agent",
+    );
+    let result_id = atem_client::session::host_work::result_id(&task);
+    rig.message_status(
+        &id,
+        &[
+            format!("  host {SENDER}  accepted  accepted by the host"),
+            format!("    {task}  awaiting_result  reply submitted"),
+            format!("      reply {result_id}: HM_FROM_OTHER"),
+            "      delivered".into(),
+        ],
+    );
+}
+
+/// The other host is revoked as a sender after this host sent to it: its
+/// status is still recorded, its reply is kept as data, never delivered,
+/// and `atem message status` says why.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_reply_from_a_host_revoked_meanwhile_is_kept_as_data() {
+    use atem_client::membership::host_sender_revoke;
+    let mut rig = Rig::sending();
+    rig.online();
+    let _sid = rig.launch();
+    let (id, recipient, task) = rig.send_to_other("HM_TO_REVOKED");
+    rig.log.append(
+        support::r9log::MAC,
+        host_sender_revoke(SENDER, false, 0).unwrap(),
+    );
+    rig.station().set_log(&rig.log);
+    let head = rig.log.log.head().seq;
+    rig.within("the revoke applied", || {
+        rig.dump()["membership"]["head"]["seq"].as_u64() == Some(head)
+    });
+    rig.answer_back(&id, &recipient, &task, "HM_KEPT");
+    let result_id = atem_client::session::host_work::result_id(&task);
+    rig.message_status(
+        &id,
+        &[
+            format!("    {task}  awaiting_result  reply submitted"),
+            format!("      reply {result_id}: HM_KEPT"),
+            "      result not delivered: sender revoked".into(),
+        ],
+    );
+    let delivery = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("delivery:{task}").as_bytes(),
+    )
+    .to_string();
+    rig.two_passes();
+    assert_eq!(
+        rig.db()
+            .query_row("SELECT count(*) FROM work WHERE id=?1", [&delivery], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0,
+        "never delivered"
+    );
+    assert!(!support::delegated::input(&rig).contains("HM_KEPT"));
 }
