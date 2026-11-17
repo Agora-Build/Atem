@@ -86,10 +86,44 @@ impl ContextSnapshot {
     /// `vault` snapshot, to complete the task with the reply it got back
     /// (host-work-v1 §11.5; Atem's reading, for Astation). No other
     /// `result` snapshot leaves its host.
+    /// The `result` snapshot naming task `task_id`'s own reply
+    /// (host-work-v1 §11.5): id `result:<result_id>`, version 1, its text
+    /// exactly `jcs({"digest", "result_id", "task_id"})` with the reply's
+    /// digest, or without `digest` when it names no reply (completed
+    /// without one).
+    pub fn naming_reply(task_id: &str, reply_digest: Option<&str>) -> ContextSnapshot {
+        let result_id = result_id(task_id);
+        let mut named = json!({"result_id": result_id, "task_id": task_id});
+        if let Some(reply) = reply_digest {
+            named["digest"] = json!(reply);
+        }
+        let text = crate::canonical::jcs(&named).expect("strings only");
+        ContextSnapshot {
+            kind: ContextKind::Result,
+            id: format!("result:{result_id}"),
+            version: 1,
+            digest: digest(text.as_bytes()),
+            text,
+        }
+    }
+
+    ///
+    /// Exactly the contract's naming ([`ContextSnapshot::naming_reply`]):
+    /// a copy of the reply, another version, or a text that isn't the
+    /// canonical naming is no such snapshot.
     pub fn names_reply_of(&self, task_id: &str) -> bool {
-        self.kind == ContextKind::Result
-            && self.id == format!("result:{}", result_id(task_id))
-            && self.valid_local()
+        if self.kind != ContextKind::Result || self.version != 1 {
+            return false;
+        }
+        let Ok(named) = serde_json::from_str::<Value>(&self.text) else {
+            return false;
+        };
+        let reply = match named.get("digest") {
+            None => None,
+            Some(Value::String(d)) if is_digest(d) => Some(d.as_str()),
+            Some(_) => return false,
+        };
+        *self == ContextSnapshot::naming_reply(task_id, reply)
     }
 
     pub fn valid_local(&self) -> bool {

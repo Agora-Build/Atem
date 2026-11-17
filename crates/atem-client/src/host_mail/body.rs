@@ -1312,7 +1312,39 @@ mod tests {
             task_id: ID2.into(),
             result: wrong,
         };
-        for refused in [other, wrong] {
+        // The contract's naming only (review L2): its text exactly
+        // `jcs({"digest"?, "result_id", "task_id"})`, version 1; a copy of
+        // the reply, another version or a digest that isn't one are refused.
+        let named = |text: String, version: u64| EnvelopePlain::Complete {
+            task_id: ID2.into(),
+            result: ContextSnapshot {
+                kind: ContextKind::Result,
+                id: format!("result:{}", result_id(ID2)),
+                version,
+                digest: digest(text.as_bytes()),
+                text,
+            },
+        };
+        let with_digest = format!(
+            r#"{{"digest":"{}","result_id":"{}","task_id":"{ID2}"}}"#,
+            "ab".repeat(32),
+            result_id(ID2)
+        );
+        let ok = named(with_digest.clone(), 1);
+        assert_eq!(EnvelopePlain::parse(&ok.to_bytes().unwrap()).unwrap(), ok);
+        assert_eq!(
+            ok,
+            EnvelopePlain::Complete {
+                task_id: ID2.into(),
+                result: ContextSnapshot::naming_reply(ID2, Some(&"ab".repeat(32))),
+            }
+        );
+        let copied = named("Done: the client uses /v2/orders".into(), 1);
+        let version = named(with_digest.clone(), 2);
+        let not_a_digest = named(with_digest.replace(&"ab".repeat(32), "AB"), 1);
+        let spaced = named(with_digest.replace(':', ": "), 1);
+        let extra = named(with_digest.replace('}', r#","x":1}"#), 1);
+        for refused in [other, wrong, copied, version, not_a_digest, spaced, extra] {
             assert_eq!(refused.to_bytes(), Err(Error::Malformed("complete")));
             let raw = jcs(&json!({"kind": "complete", "task_id": match &refused {
                 EnvelopePlain::Complete { task_id, .. } => task_id.clone(),

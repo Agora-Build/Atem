@@ -433,19 +433,7 @@ pub fn remote_task(db: &Connection, task_id: &str) -> Result<Vec<RemoteTask>> {
 /// 1's `atem message complete` completes with the reply, named, never
 /// copied back. With no reply, the ids alone: completed without one.
 pub fn naming(task_id: &str, reply: Option<&ResultReply>) -> ContextSnapshot {
-    let result_id = atem_client::session::host_work::result_id(task_id);
-    let mut named = serde_json::json!({"result_id": result_id, "task_id": task_id});
-    if let Some(reply) = reply {
-        named["digest"] = serde_json::json!(reply.digest);
-    }
-    let text = named.to_string();
-    ContextSnapshot {
-        kind: ContextKind::Result,
-        id: format!("result:{result_id}"),
-        version: 1,
-        digest: digest(text.as_bytes()),
-        text,
-    }
+    ContextSnapshot::naming_reply(task_id, reply.map(|r| r.digest.as_str()))
 }
 
 #[allow(clippy::too_many_arguments)]
