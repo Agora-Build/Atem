@@ -322,7 +322,7 @@
   ],
   "kind": "vectors",
   "name": "r9-vectors-delegated-wire",
-  "note": "Delegated host work's session-v1 shapes (R9.14, planned; not advertised): host_enc_key_get (exactly v, op and a UUID v4 id), its answer host_enc_key (exactly v, op, id, re, host_id, host_trust_gen, enc_key {alg: x25519, pub: 32 bytes}, enc_sig: 64 bytes), and receipts with provenance (task_id a UUID v4 and sender member:/service:/host: with a 1-128 byte id, both or neither, on a prompt receipt only; absent, never null) and without; and the r9 welcome's optional verifier (R9.2 \"How a verifier reports itself\", R9.8; Atem's proposal, for Astation's agreement): absent, or exactly version (an integer from 1 to 2^32 - 1) and actions (1-64 names, sorted by bytes, each once, each 1-32 bytes of [a-z0-9_] starting with a letter; a name the reader doesn't know is read, never refused); `verifier` is this release's own (version 2: R9.2's sixteen actions). Each case is valid or refused as a whole; a `raw` case is read as its exact text. The valid answer's enc_key and enc_sig are r9-vectors-membership-log's first host_enc_key pair: enc_sig verifies with host-a's host_key of log L over enc_sig_input_hex.",
+  "note": "Delegated host work's session-v1 shapes (R9.14, planned; not advertised): host_enc_key_get (exactly v, op and a UUID v4 id), its answer host_enc_key (exactly v, op, id, re, host_id, host_trust_gen, enc_key {alg: x25519, pub: 32 bytes}, enc_sig: 64 bytes), and receipts with provenance (task_id a UUID v4, or for a host: sender the UUID v5 of a selector's fixed resolution (host-work-v1 §11.5; Atem's reading, for Astation's agreement), and sender member:/service:/host: with a 1-128 byte id, both or neither, on a prompt receipt only; absent, never null) and without; and the r9 welcome's optional verifier (R9.2 \"How a verifier reports itself\", R9.8; Atem's proposal, for Astation's agreement): absent, or exactly version (an integer from 1 to 2^32 - 1) and actions (1-64 names, sorted by bytes, each once, each 1-32 bytes of [a-z0-9_] starting with a letter; a name the reader doesn't know is read, never refused); `verifier` is this release's own (version 2: R9.2's sixteen actions). Each case is valid or refused as a whole; a `raw` case is read as its exact text. The valid answer's enc_key and enc_sig are r9-vectors-membership-log's first host_enc_key pair: enc_sig verifies with host-a's host_key of log L over enc_sig_input_hex.",
   "receipt": [
     {
       "message": {
@@ -443,6 +443,31 @@
         "type": "session"
       },
       "name": "receipt_provenance_host",
+      "valid": true
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "kind": "prompt",
+          "op": "receipt",
+          "request_id": "44444444-4444-4444-8444-000000000001",
+          "sender": "host:host-b",
+          "state": "executing",
+          "target": {
+            "account_id": "acct-test-1",
+            "atem_device_id": "host-a",
+            "host_trust_gen": 1,
+            "process_gen": "22222222-2222-4222-8222-222222222222",
+            "session_id": "ses-aaaaaaaaaaaa"
+          },
+          "task_id": "80160896-4fcd-5e6e-adac-98bac5497321",
+          "updated_at": 1793620800000,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "receipt_provenance_host_selector_task",
       "valid": true
     },
     {
@@ -591,6 +616,31 @@
         "type": "session"
       },
       "name": "receipt_provenance_task_id_is_uuid_v4",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "kind": "prompt",
+          "op": "receipt",
+          "request_id": "44444444-4444-4444-8444-000000000001",
+          "sender": "member:dev-phone",
+          "state": "executing",
+          "target": {
+            "account_id": "acct-test-1",
+            "atem_device_id": "host-a",
+            "host_trust_gen": 1,
+            "process_gen": "22222222-2222-4222-8222-222222222222",
+            "session_id": "ses-aaaaaaaaaaaa"
+          },
+          "task_id": "80160896-4fcd-5e6e-adac-98bac5497321",
+          "updated_at": 1793620800000,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "receipt_provenance_selector_task_of_a_member",
       "valid": false
     },
     {

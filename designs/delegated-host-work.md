@@ -110,8 +110,12 @@ with `host.delegated`): a debug build then lists it with hosting on, holds its h
 host sender's task to both locks in the start check, writes the device list's effects on its tasks with host-work's
 applied device-list `seq` (II.2.2, II.3.1, II.8) and serves `control_records` (host-work-v1 §11.6 "Host senders on the
 receiving host", with Atem's readings for Astation: those effects written in host-work's own pass, and project entries
-judged once per catch-up against the head). The mailbox and its envelopes are not built, and the signing gate stays
-closed. Activation is a later owner decision, after the joint check (V.2 step 7,
+judged once per catch-up against the head). Behind the same hook the mailbox is built on both hosts (host-work-v1
+§11.5, "On the receiving host" and "On the sending host"): the receiving host's mailbox client and its admission of
+what the mailbox opens (requests through step 7 with `select` expanded, `cancel` and `complete`, the status objects
+back), and the sending host's planning, sealing and puts. Not built: `cancel` and `complete` sent across hosts, the
+receiving host's launch for a `select`'s `launch`, the results back and the sending host's reading of the statuses.
+The signing gate stays closed. Activation is a later owner decision, after the joint check (V.2 step 7,
 VII.A); a dev host turns the features on as [agent-hosting.md](agent-hosting.md) section 14 says ("Delegated work
 on a dev host"). The contracts say what is built: host-work-v1 §11 (its "as built in step 4" passages) and session-v1
 R9.14. Astation answered step 4's contract questions on 2026-11-13 (#120 comments 6848326392 and 6848463998, #164
@@ -2189,6 +2193,11 @@ most 24 h retention, quotas, acknowledgments and deduplication").
 
 ### II.4.4 Status and results back
 
+**Status objects built behind the debug-only hook** (host-work-v1 §11.5, "On the receiving host": sent at
+acceptance and at every later change of a task's state, a newer one superseding one the Station hasn't stored, none
+to a sender with no current key or re-verified since its message; a resend the mailbox reads as a duplicate gets the
+status, or the whole refusal, again). Results back and the sending host's check are not built.
+
 The host that ran the work sends **`atem-result`** objects back to the sending host through the same mailbox. They
 have the envelope's shape with type `atem-result`, signing label `atem-result-v1` and seal label
 `atem-result-seal-v1`; `sender` is the host that ran the work and `recipient` the host that asked. A result also
@@ -2321,6 +2330,12 @@ is superseded: a host's `host_id` is its `atem_id` (above).
   (collaboration §15 question 1) applies to host senders' envelopes too. **Needs agreement.**
 
 ## II.7 What a host sender can do after admission
+
+**Built on the receiving host behind the debug-only hook** (host-work-v1 §11.5, "On the receiving host"): `cancel`
+and `complete` as the table says (a cancel also withdraws an attempt waiting `accepted`, marked durably first so it
+never runs), each answered with the
+message's status, one not reached also by its own id (`busy`, or `forbidden` without authority over the task), and one
+opened before its request kept until its request comes. The sending host doesn't send them yet.
 
 A host sender has no channel (II.2.1), so the source's interaction authority (I.3.1) maps onto objects:
 

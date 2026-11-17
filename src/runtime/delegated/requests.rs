@@ -18,7 +18,7 @@ use crate::session_protocol::wire::ReceiptState;
 
 /// A task cancelled before its prompt was submitted (host-work v1's text,
 /// kept for delegated tasks: §11.6 adds none for a cancel).
-pub(super) const CANCELLED_BEFORE_SUBMISSION: &str = "cancelled before submission";
+pub(super) use crate::runtime::delegated::start::CANCELLED_BEFORE_SUBMISSION;
 
 impl HostBridge {
     /// The store may hold a delegated task: `host.delegated` is on, or the

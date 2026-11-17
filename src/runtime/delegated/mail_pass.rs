@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A runtime.log line that would come at every pass (a store the mailbox
 /// can't use): the first, then at powers of two.
-fn log_limited(count: &AtomicU64, line: impl FnOnce() -> String) {
+pub(super) fn log_limited(count: &AtomicU64, line: impl FnOnce() -> String) {
     let n = count.fetch_add(1, Ordering::Relaxed) + 1;
     if n.is_power_of_two() {
         eprintln!("{} ({n} so far)", line());
@@ -82,9 +82,11 @@ impl HostBridge {
         if let Some((store, identity)) = self.mail_store()
             && self.work.mail_prepared.as_ref() != Some(&identity.host)
         {
-            // The sending host's outbox tables too (`remote_send`).
+            // The sending host's outbox tables too (`remote_send`), and
+            // admission's (`admit`).
             match mailbox_store::prepare(store)
                 .and_then(|()| crate::runtime::delegated::remote_send::prepare(store))
+                .and_then(|()| crate::runtime::delegated::admit::prepare(store))
             {
                 Ok(()) => self.work.mail_prepared = Some(identity.host),
                 Err(error) => log_limited(&UNPREPARED, || {
@@ -230,6 +232,10 @@ impl HostBridge {
             }
         }
         self.mail_observe();
+        // Admission takes what the page opened on the next pass.
+        if matches!(&committed, Ok(Commit::Committed(c)) if !c.decided.is_empty()) {
+            self.work.admit_due = true;
+        }
         let Some(station) = self.station.as_mut() else {
             return;
         };
@@ -362,7 +368,11 @@ impl HostBridge {
         let judged = mailbox_store::rejudge_pending(store, &identity, &cx);
         self.work.mail_rejudge_failed = judged.is_err();
         match judged {
-            Ok(_) => self.work.mail_rejudged = Some(key),
+            Ok(decided) => {
+                self.work.mail_rejudged = Some(key);
+                // Admission takes what opened on the next pass.
+                self.work.admit_due |= !decided.is_empty();
+            }
             Err(error) => log_limited(&UNJUDGED, || {
                 format!(
                     "atem runtime: host senders' waiting mailbox objects not judged again ({error:#})"
@@ -401,7 +411,12 @@ impl HostBridge {
         let Some((store, _)) = self.mail_store() else {
             return;
         };
-        if let Err(error) = mailbox_store::prune(store, now_ms) {
+        // Admission's early stops past their expiry too: their request can
+        // no longer come (review M1: here, never under an anchor).
+        let pruned = mailbox_store::prune(store, now_ms)
+            .and_then(|_| crate::runtime::delegated::admit::prune_stops(&store.db, now_ms))
+            .and_then(|_| crate::runtime::delegated::admit::prune_refusals(&store.db, now_ms));
+        if let Err(error) = pruned {
             log_limited(&UNPRUNED, || {
                 format!("atem runtime: host senders' mailbox records not pruned ({error:#})")
             });
@@ -441,7 +456,10 @@ impl HostBridge {
             eprintln!("{line}");
         }
         let open = station.mailbox.open();
-        self.start_view().gates.set_mailbox(open);
+        let held = station.mailbox.held();
+        let mut view = self.start_view();
+        view.gates.set_mailbox(open);
+        view.gates.set_mailbox_held(held);
     }
 
     /// `atem status`'s mailbox part, on the `Control feeds:` line (with

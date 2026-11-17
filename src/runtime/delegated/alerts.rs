@@ -455,6 +455,7 @@ mod tests {
             authorization_expires_at: None,
             message: None,
             deadline_passed: false,
+            cancel_id: None,
             delegated: Some(Admission {
                 principal: sender.into(),
                 principal_key: "ab".repeat(32),

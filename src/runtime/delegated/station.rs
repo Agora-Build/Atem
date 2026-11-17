@@ -719,6 +719,7 @@ mod tests {
             waiting_for_room: 0,
             rewind_due: false,
             skip_expires: None,
+            held: Default::default(),
         };
         s.mailbox.observe(Some(observed(1)));
         s.mailbox.tick(10_000);

@@ -2886,6 +2886,16 @@ fn outcome_unknown_vectors(book: &Book) -> BTreeMap<&'static str, Value> {
             "a browser grant's task: browser grants keep v1 and raise no alert",
         ),
         (
+            "bf70c146-8293-4ebd-962f-5c3db42f7089",
+            json!({
+                "task_id": "80160896-4fcd-5e6e-adac-98bac5497321",
+                "session_id": "ses-aaaaaaaaaaaa",
+                "sender": "service:svc-discord",
+                "reason": "agent exited",
+            }),
+            "a UUID v5 task of a service: only a host sender's selector task (sender host:) has a UUID v5 id (host-work-v1 §11.5); a channel sender's is a UUID v4",
+        ),
+        (
             "ae6fb035-7182-4dac-b50d-4b2ca31e6f78",
             json!({
                 "task_id": "c4d9e8f7-1a2b-4c3d-8e5f-6a7b8c9d0e1f",
@@ -2952,7 +2962,7 @@ fn outcome_unknown_vectors(book: &Book) -> BTreeMap<&'static str, Value> {
         (
             "outcome_unknown_note",
             json!(
-                "Hints of kind outcome_unknown (delegated host-work I.4.6): the body's type is atem-push-hint and its label atem-push-hint-v1 like an approval hint's, told apart by `kind` (no `state`, no session_id, process_gen or approval_id; `alert_id` instead). The task, session, sender and reason are only in the sealed part, jcs of {reason, sender, session_id, task_id}. info = enc([\"atem-push-seal-v1\", account_id, genesis_hash, host_id, u64(host_trust_gen), \"outcome_unknown\", alert_id, u64(created_at), u64(expires_at), device_id, enc_kid]) (11 fields; an approval's has 12). ikmE_hex = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Entries 0 and 1 are one alert for two recipients; entry 2 is another alert at the bounds. Only a delegated sender's (member:, service: or host:) UUID v4 task raises an alert. outcome_unknown_acks are the push_ack entries, one per hint. Each outcome_unknown_invalid carries the first hint's sealed envelope (except bad_sealed's, which is the point) so only its code refuses it; the runner checks the code with both verifiers. Each outcome_unknown_invalid_facts is well signed and well sealed (both verifiers take it, and its sealed_hash names its sealed part), but its sealed facts aren't a delegated task's, or its reason is blank (nothing but White_Space; for Astation, amended for step 4: the deferred blank-reason case, Astation's review of PR 2): the recipient refuses it at open (malformed)."
+                "Hints of kind outcome_unknown (delegated host-work I.4.6): the body's type is atem-push-hint and its label atem-push-hint-v1 like an approval hint's, told apart by `kind` (no `state`, no session_id, process_gen or approval_id; `alert_id` instead). The task, session, sender and reason are only in the sealed part, jcs of {reason, sender, session_id, task_id}. info = enc([\"atem-push-seal-v1\", account_id, genesis_hash, host_id, u64(host_trust_gen), \"outcome_unknown\", alert_id, u64(created_at), u64(expires_at), device_id, enc_kid]) (11 fields; an approval's has 12). ikmE_hex = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Entries 0 and 1 are one alert for two recipients; entry 2 is another alert at the bounds. Only a delegated sender's (member:, service: or host:) task raises an alert: a UUID v4, or a host sender's selector task's UUID v5 (host-work-v1 §11.5; Atem's reading, for Astation). outcome_unknown_acks are the push_ack entries, one per hint. Each outcome_unknown_invalid carries the first hint's sealed envelope (except bad_sealed's, which is the point) so only its code refuses it; the runner checks the code with both verifiers. Each outcome_unknown_invalid_facts is well signed and well sealed (both verifiers take it, and its sealed_hash names its sealed part), but its sealed facts aren't a delegated task's, or its reason is blank (nothing but White_Space; for Astation, amended for step 4: the deferred blank-reason case, Astation's review of PR 2): the recipient refuses it at open (malformed)."
             ),
         ),
     ])
@@ -6948,6 +6958,17 @@ fn delegated_wire_vectors(book: &Book) -> Value {
         case("receipt_provenance_service", true, with("service:svc-1")),
         case("receipt_provenance_member", true, with("member:dev-phone")),
         case("receipt_provenance_host", true, with("host:host-b")),
+        // A host sender's selector task: its UUID v5 (host-work-v1 §11.5).
+        case(
+            "receipt_provenance_host_selector_task",
+            true,
+            receipt(
+                ReceiptKind::Prompt,
+                ReceiptState::Executing,
+                Some("80160896-4fcd-5e6e-adac-98bac5497321"),
+                Some("host:host-b"),
+            ),
+        ),
         case(
             "receipt_provenance_128_byte_id",
             true,
@@ -6978,6 +6999,17 @@ fn delegated_wire_vectors(book: &Book) -> Value {
         (
             "receipt_provenance_task_id_is_uuid_v4",
             edit(&|m| m["data"]["task_id"] = json!("6ba7b810-9dad-51d1-80b4-00c04fd430c8")),
+        ),
+        // A UUID v5 is a host sender's selector task only: a channel
+        // sender's (a member's here, a service's above) is refused.
+        (
+            "receipt_provenance_selector_task_of_a_member",
+            receipt(
+                ReceiptKind::Prompt,
+                ReceiptState::Executing,
+                Some("80160896-4fcd-5e6e-adac-98bac5497321"),
+                Some("member:dev-phone"),
+            ),
         ),
         (
             "receipt_provenance_sender_not_local",
@@ -7018,7 +7050,7 @@ fn delegated_wire_vectors(book: &Book) -> Value {
         "name": "r9-vectors-delegated-wire",
         "kind": "vectors",
         "requires": "r9",
-        "note": "Delegated host work's session-v1 shapes (R9.14, planned; not advertised): host_enc_key_get (exactly v, op and a UUID v4 id), its answer host_enc_key (exactly v, op, id, re, host_id, host_trust_gen, enc_key {alg: x25519, pub: 32 bytes}, enc_sig: 64 bytes), and receipts with provenance (task_id a UUID v4 and sender member:/service:/host: with a 1-128 byte id, both or neither, on a prompt receipt only; absent, never null) and without; and the r9 welcome's optional verifier (R9.2 \"How a verifier reports itself\", R9.8; Atem's proposal, for Astation's agreement): absent, or exactly version (an integer from 1 to 2^32 - 1) and actions (1-64 names, sorted by bytes, each once, each 1-32 bytes of [a-z0-9_] starting with a letter; a name the reader doesn't know is read, never refused); `verifier` is this release's own (version 2: R9.2's sixteen actions). Each case is valid or refused as a whole; a `raw` case is read as its exact text. The valid answer's enc_key and enc_sig are r9-vectors-membership-log's first host_enc_key pair: enc_sig verifies with host-a's host_key of log L over enc_sig_input_hex.",
+        "note": "Delegated host work's session-v1 shapes (R9.14, planned; not advertised): host_enc_key_get (exactly v, op and a UUID v4 id), its answer host_enc_key (exactly v, op, id, re, host_id, host_trust_gen, enc_key {alg: x25519, pub: 32 bytes}, enc_sig: 64 bytes), and receipts with provenance (task_id a UUID v4, or for a host: sender the UUID v5 of a selector's fixed resolution (host-work-v1 §11.5; Atem's reading, for Astation's agreement), and sender member:/service:/host: with a 1-128 byte id, both or neither, on a prompt receipt only; absent, never null) and without; and the r9 welcome's optional verifier (R9.2 \"How a verifier reports itself\", R9.8; Atem's proposal, for Astation's agreement): absent, or exactly version (an integer from 1 to 2^32 - 1) and actions (1-64 names, sorted by bytes, each once, each 1-32 bytes of [a-z0-9_] starting with a letter; a name the reader doesn't know is read, never refused); `verifier` is this release's own (version 2: R9.2's sixteen actions). Each case is valid or refused as a whole; a `raw` case is read as its exact text. The valid answer's enc_key and enc_sig are r9-vectors-membership-log's first host_enc_key pair: enc_sig verifies with host-a's host_key of log L over enc_sig_input_hex.",
         "host_enc_key_binding": {
             "account_id": log.account_id(),
             "genesis_hash": genesis.to_hex(),

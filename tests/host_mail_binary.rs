@@ -18,7 +18,11 @@
 mod support;
 
 use atem_client::control::RefusedCall;
+use atem_client::host_mail::ResultPlain;
 use atem_client::host_mail::mailbox::{MailboxDone, MailboxToStation, PutRefusal};
+use atem_client::membership::ProjectOp;
+use atem_client::session::host_work::WorkState;
+use atem_client::session::messages::Delivery;
 use serde_json::{Value, json};
 use std::cell::Cell;
 use std::collections::BTreeSet;
@@ -53,6 +57,9 @@ const NO_RELAY: &str = "http://127.0.0.1:1";
 /// A call's deadline on the host's monotonic clock (the Station's 30 s and
 /// a 5 s grace, §11.5 rule 8).
 const CALL_DEADLINE: u64 = 35_000;
+/// The signed project that lets the sending host give this host tasks
+/// ([`Rig::admitting`]).
+const PROJECT: &str = "hm";
 /// The mailbox's reasons, as `atem status` and the dump give them
 /// (`MailboxClient::closed`).
 const READ_TO_HEAD: &str = "host senders' mailbox read to its head";
@@ -106,8 +113,24 @@ impl Rig {
     /// A verified host whose pinned list is the Mac, this host, the sending
     /// host and another host, agent hosting on, the runtime running `hook`.
     /// The fake Station holds the same list and reads the host as one whose
-    /// welcome lists `host.senders` when the hook turns it on.
+    /// welcome lists `host.senders` when the hook turns it on. Admission
+    /// waits (`<pty faults>/hold_admission`): these tests see the mailbox's
+    /// own rows, and admit by hand ([`Rig::admit_all`]).
     fn start(via: Via, hook: Hook) -> Rig {
+        Rig::build(via, hook, None)
+    }
+
+    /// [`Rig::start`] on Astation's local link with `host.senders`, for
+    /// admission: the sending host has an encryption key in the list (so
+    /// statuses go back to it) and shares project [`PROJECT`] with this
+    /// host, granting a task's ops; the route `backend` consents to
+    /// `project:hm` too, and `collab` is `runtime.toml`'s `[collab]` table
+    /// (empty: the defaults). Admission runs.
+    fn admitting(collab: &str) -> Rig {
+        Rig::build(Via::Local, Hook::Senders, Some(collab))
+    }
+
+    fn build(via: Via, hook: Hook, admitting: Option<&str>) -> Rig {
         let sandbox = Sandbox::new();
         write_verified_pairing(&sandbox.config(), ACCOUNT, HOST, 1);
         let host_seed = secret("host mail host");
@@ -115,6 +138,21 @@ impl Rig {
         log.add_host(HOST, 1, &host_seed);
         log.add_host(SENDER, 1, &secret(SENDER_SEED));
         log.add_host(OTHER_HOST, 1, &secret("host mail other host"));
+        let mut sender = SenderHost::new(&log, SENDER, 1, &secret(SENDER_SEED));
+        if admitting.is_some() {
+            sender = sender.with_enc(&secret("host mail sender enc"));
+            log.append(support::r9log::MAC, sender.enc_key_action());
+            log.append(
+                support::r9log::MAC,
+                atem_client::membership::project_set(
+                    PROJECT,
+                    [HOST, SENDER],
+                    [ProjectOp::Message, ProjectOp::Notify, ProjectOp::Prompt],
+                    0,
+                )
+                .unwrap(),
+            );
+        }
         write_pin(&sandbox.config(), &log, HOST, 1, &host_seed);
         // Agent hosting on: the host-work store opens only with it.
         let fake = sandbox.dir.path().join("fake");
@@ -126,14 +164,40 @@ impl Rig {
             &env_file,
             &json!({"CLAUDE_CLI_BIN": bin, "FAKE_DIR": fake}).to_string(),
         );
-        private(
-            &sandbox.config().join("runtime.toml"),
-            &hosting_toml(
-                &sandbox.home,
-                &env_file,
-                &[format!("member:{}", support::r9log::MAC)],
+        let mac = format!("member:{}", support::r9log::MAC);
+        let toml = match admitting {
+            None => hosting_toml(&sandbox.home, &env_file, std::slice::from_ref(&mac)),
+            Some(collab) => format!(
+                r#"
+version = 1
+enabled = true
+{collab}
+[[profiles]]
+id = "backend"
+revision = 1
+label = "Backend"
+provider = "claude"
+cwd = {cwd:?}
+project = "local:home"
+principals = [{mac:?}]
+env_names = ["CLAUDE_CLI_BIN", "FAKE_DIR"]
+env_file = {env:?}
+[[routes]]
+id = "backend"
+revision = 1
+profile_id = "backend"
+principals = [{mac:?}, "project:{PROJECT}"]
+"#,
+                cwd = sandbox.home.to_str().unwrap(),
+                env = env_file.to_str().unwrap()
             ),
-        );
+        };
+        private(&sandbox.config().join("runtime.toml"), &toml);
+        let faults = sandbox.dir.path().join("faults");
+        std::fs::create_dir_all(&faults).unwrap();
+        if admitting.is_none() {
+            private(&faults.join("hold_admission"), "");
+        }
         let head = log.log.head();
         let head = json!({"seq": head.seq, "hash": head.hash.to_hex()});
         let (astation, relay_events) = match via {
@@ -163,7 +227,6 @@ impl Rig {
         station.silence_heads(true);
         station.host_lists_senders(hook == Hook::Senders);
         let clock = HostClock::start(sandbox.dir.path(), "host-clock");
-        let sender = SenderHost::new(&log, SENDER, 1, &secret(SENDER_SEED));
         let mut rig = Rig {
             sandbox,
             astation,
@@ -474,7 +537,10 @@ impl Rig {
 
     /// The inbox's rows: `(sender host, object id, kind)`, in order.
     fn inbox(&self) -> Vec<(String, String, String)> {
-        let db = self.db();
+        // Polled from the start: none while the runtime hasn't made it.
+        let Some(db) = self.store() else {
+            return Vec::new();
+        };
         let Ok(mut q) =
             db.prepare("SELECT sender_host, object_id, kind FROM mailbox_inbox ORDER BY n")
         else {
@@ -488,7 +554,9 @@ impl Rig {
 
     /// The refusal rows: `(reason, report)`, in order.
     fn refused(&self) -> Vec<(String, bool)> {
-        let db = self.db();
+        let Some(db) = self.store() else {
+            return Vec::new();
+        };
         let Ok(mut q) = db.prepare("SELECT reason, report FROM mailbox_refused ORDER BY n") else {
             return Vec::new();
         };
@@ -518,8 +586,8 @@ impl Rig {
             == 1
     }
 
-    /// Admission takes every inbox row (it isn't built: the test does what
-    /// it will do), in one transaction.
+    /// Admission takes every inbox row (held in these rigs, [`Rig::start`]:
+    /// the test does it), in one transaction.
     fn admit_all(&self) {
         let mut db = self.db();
         let tx = db
@@ -547,6 +615,19 @@ impl Rig {
             .into_iter()
             .filter_map(|(link, call)| match call {
                 MailboxToStation::Done(done) => Some((link, done)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The ids of the objects the host's `mailbox_put`s carried so far, a
+    /// resent put's again.
+    fn put_ids(&self) -> Vec<String> {
+        self.station()
+            .mailbox_calls()
+            .into_iter()
+            .filter_map(|(_, call)| match call {
+                MailboxToStation::Put(put) => Some(put.mail().expect("its own put reads").1.id),
                 _ => None,
             })
             .collect()
@@ -606,6 +687,142 @@ impl Rig {
         });
         last
     }
+}
+
+// ── Admission (design II.4.2 step 7, II.4.4, II.7; host-work-v1 §11.5) ──
+
+impl support::delegated::HostRig for Rig {
+    fn config_dir(&self) -> PathBuf {
+        self.sandbox.config()
+    }
+
+    fn fake_dir(&self) -> PathBuf {
+        self.sandbox.dir.path().join("fake")
+    }
+}
+
+impl Rig {
+    /// The owner launches the fake agent on the profile's directory over
+    /// the runtime's local socket (`launch`): its session id, once it is
+    /// ready.
+    fn launch(&self) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        use support::delegated::HostRig;
+        let path = std::fs::read_to_string(self.sandbox.config().join("runtime.socket")).unwrap();
+        let socket = std::os::unix::net::UnixStream::connect(path.trim()).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        let mut write = socket.try_clone().unwrap();
+        let fake = self.fake_dir();
+        let mut env = self.sandbox.env();
+        env.push((
+            "CLAUDE_CLI_BIN".into(),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/approvals/fake-agent.py")
+                .display()
+                .to_string(),
+        ));
+        env.push(("FAKE_DIR".into(), fake.display().to_string()));
+        writeln!(
+            write,
+            "{}",
+            json!({"v":1,"op":"hello","protocol":1,"build":"test"})
+        )
+        .unwrap();
+        let launch = json!({"v":1,"op":"launch","provider":"claude","cwd":self.sandbox.home,
+            "env":env,"rows":24,"cols":80});
+        writeln!(write, "{launch}").unwrap();
+        let mut session = None;
+        for line in BufReader::new(socket).lines() {
+            let message: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            assert_ne!(message["op"], "error", "{message}");
+            if message["op"] == "launched" {
+                session = message["session"]["id"].as_str().map(str::to_owned);
+                break;
+            }
+        }
+        within("fake agent ready", || fake.join("events").exists());
+        session.expect("launched")
+    }
+
+    /// The objects this host put into the sending host's mailbox (its
+    /// statuses), opened by the sending host, by position.
+    fn statuses(&self) -> Vec<ResultPlain> {
+        let key = self.log.log.host(HOST).unwrap().host_key.clone();
+        let objects = self.station().stored_objects(SENDER, 1);
+        objects.iter().map(|o| self.sender.open(o, &key)).collect()
+    }
+
+    /// Waits until a status the sending host got satisfies `done`.
+    #[track_caller]
+    fn until_status(&self, what: &str, done: impl Fn(&ResultPlain) -> bool) -> ResultPlain {
+        let mut found = None;
+        self.within(what, || {
+            found = self.statuses().into_iter().find(|s| done(s));
+            found.is_some()
+        });
+        found.unwrap()
+    }
+
+    /// Message `message_id`'s task records (`work`), in order.
+    fn tasks_of(&self, message_id: &str) -> Vec<Value> {
+        let db = self.db();
+        let mut q = db
+            .prepare(
+                "SELECT record FROM work WHERE json_extract(record,'$.message.message_id')=?1
+                ORDER BY rowid",
+            )
+            .unwrap();
+        q.query_map([message_id], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| serde_json::from_str(&r.unwrap()).unwrap())
+            .collect()
+    }
+
+    /// Whether the store holds a message record of `message_id`.
+    fn has_message(&self, message_id: &str) -> bool {
+        self.store().is_some_and(|db| {
+            db.query_row(
+                "SELECT count(*) FROM messages WHERE id=?1",
+                [message_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .is_ok_and(|n| n == 1)
+        })
+    }
+
+    /// The runtime stops (SIGKILL), its link ended.
+    fn kill(&mut self) {
+        let mut child = self.runtime.take().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        self.sandbox.track();
+    }
+}
+
+/// The state of the first task a status names (`resolved`), when it is
+/// message `message_id`'s.
+fn resolved_state(status: &ResultPlain, message_id: &str) -> Option<WorkState> {
+    match status {
+        ResultPlain::Status {
+            message_id: id,
+            recipients,
+        } if id == message_id => match &recipients[0].delivery {
+            Delivery::Resolved { tasks } => Some(tasks[0].state),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The selector task id of `message`'s first recipient on session `sid`.
+fn task_of(message: &atem_client::session::messages::Message, sid: &str) -> Value {
+    json!(atem_client::session::select::selector_task_id(
+        &message.message_id,
+        &message.recipients[0].recipient_id,
+        sid,
+    ))
 }
 
 impl Drop for Rig {
@@ -1810,4 +2027,370 @@ fn with_the_hook_off_the_host_reads_no_mailbox() {
     assert_eq!(mailbox_tables(&rig), 0);
     assert!(!rig.sandbox.config().join("pairing/host_enc_key").exists());
     assert_eq!(rig.station().mailbox_positions(), [1], "nothing done");
+}
+
+// ── Admission (design II.4.2 step 7, II.4.4, II.7; VII.B 23, 28, 30, 31, 34,
+// 35, 37) ──
+
+/// A host sender's request reaches this host's agent (`atem:<this host>`
+/// matched against its own `host_id`): admitted into a task delegated as
+/// the sending host's, it starts once host senders' gate opens (the
+/// mailbox read to its head, the inbox drained), runs on the fake agent and
+/// awaits its result; the statuses come back to the sending host's mailbox
+/// (opened with the shared core): the resolution first, then the task's
+/// later states. The sending host's `complete` then completes it with its
+/// result, and that status comes back too.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_host_senders_request_runs_on_an_agent_and_its_statuses_come_back() {
+    let rig = Rig::admitting("");
+    rig.online();
+    let sid = rig.launch();
+    let to = rig.receiver(1);
+    let message = rig
+        .sender
+        .message(&to, &[&format!("atem:{HOST}")], 1, "HM_RUNS");
+    rig.put(&rig.sender.request_of(&to, rig.log.log.head(), &message));
+    let task = task_of(&message, &sid);
+    let first = rig.until_status("the resolution", |s| {
+        resolved_state(s, &message.message_id).is_some()
+    });
+    let ResultPlain::Status { recipients, .. } = &first else {
+        unreachable!()
+    };
+    let Delivery::Resolved { tasks } = &recipients[0].delivery else {
+        unreachable!()
+    };
+    assert_eq!(tasks[0].task_id, task.as_str().unwrap());
+    assert_eq!(
+        recipients[0].recipient_id,
+        message.recipients[0].recipient_id
+    );
+    support::delegated::in_turn(&rig, &task, "HM_RUNS");
+    support::delegated::complete_turn(&rig, &task);
+    rig.until_status("awaiting its result", |s| {
+        resolved_state(s, &message.message_id) == Some(WorkState::AwaitingResult)
+    });
+    let record = support::delegated::record(&rig, &task);
+    assert_eq!(record["principal"], format!("host:{SENDER}"));
+    assert_eq!(
+        record["delegated"]["host"]["consent"],
+        format!("project:{PROJECT}")
+    );
+    // The sending host completes it.
+    let result = atem_client::session::host_work::ContextSnapshot {
+        kind: atem_client::session::host_work::ContextKind::Memory,
+        id: "mem_hm".into(),
+        version: 1,
+        digest: atem_client::session::host_work::digest(b"done"),
+        text: "done".into(),
+    };
+    let complete = rig.sender.stop(
+        &to,
+        rig.log.log.head(),
+        task.as_str().unwrap(),
+        Some(result),
+    );
+    rig.put(&complete);
+    support::delegated::wait_stored(
+        &rig,
+        &task,
+        "completed",
+        "explicit correlated result published",
+    );
+    rig.until_status("completed", |s| {
+        resolved_state(s, &message.message_id) == Some(WorkState::Completed)
+    });
+}
+
+/// VII.B 31: a `cancel` from the sending host sits in this host's mailbox
+/// while its runtime is down, its task admitted and queued (host-work's
+/// scheduling held, so it hadn't started). Started again, the host reads
+/// the mailbox and admits the cancel before the task could start: it is
+/// `cancelled` and never ran. A later request then runs: the gate opened.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_cancel_waiting_while_the_host_is_down_is_applied_before_its_task_starts() {
+    let mut rig = Rig::admitting("");
+    rig.online();
+    let sid = rig.launch();
+    let to = rig.receiver(1);
+    rig.fault("hold_host_work");
+    let message = rig
+        .sender
+        .message(&to, &[&format!("atem:{HOST}")], 1, "HM_CANCELLED");
+    rig.put(&rig.sender.request_of(&to, rig.log.log.head(), &message));
+    let task = task_of(&message, &sid);
+    rig.within("admitted", || !rig.tasks_of(&message.message_id).is_empty());
+    rig.offline();
+    rig.kill();
+    let cancel = rig
+        .sender
+        .stop(&to, rig.log.log.head(), task.as_str().unwrap(), None);
+    rig.put(&cancel);
+    std::fs::remove_file(rig.faults().join("hold_host_work")).unwrap();
+    rig.start_again();
+    rig.online();
+    support::delegated::wait_stored(&rig, &task, "cancelled", "cancelled before submission");
+    support::delegated::never_ran(&rig, &task, "HM_CANCELLED");
+    rig.until_status("cancelled", |s| {
+        resolved_state(s, &message.message_id) == Some(WorkState::Cancelled)
+    });
+    let later = rig
+        .sender
+        .message(&to, &[&format!("atem:{HOST}")], 1, "HM_AFTER");
+    rig.put(&rig.sender.request_of(&to, rig.log.log.head(), &later));
+    support::delegated::in_turn(&rig, &task_of(&later, &sid), "HM_AFTER");
+}
+
+/// VII.B 31: the runtime is killed right after a request's admission
+/// committed (its task and its status), while the page's `mailbox_done`
+/// waits unanswered. Started again, the owed done goes, the status is put
+/// once (counted at the Station's door: it keeps an object once however
+/// often it is put), and nothing is applied twice: one message record.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_kill_after_admission_applies_nothing_twice() {
+    use std::os::unix::process::ExitStatusExt;
+    let mut rig = Rig::admitting("");
+    let to = rig.receiver(1);
+    rig.fault("crash_after_admission_commit");
+    let message = rig.sender.message(&to, &["tag:nobody"], 1, "HM_ONCE");
+    rig.put(&rig.sender.request_of(&to, rig.log.log.head(), &message));
+    rig.announce();
+    let (held, _) = rig.hold(is_done);
+    let deadline = Instant::now() + WAIT;
+    let status = loop {
+        rig.station().serve(rig.link());
+        if let Some(status) = rig.runtime.as_mut().unwrap().try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "no crash\n{}", rig.runtime_log());
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    drop(held);
+    rig.sandbox.track();
+    rig.runtime = None;
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    assert!(rig.has_message(&message.message_id));
+    assert_eq!(rig.count("mail_outbox"), 1, "its status committed with it");
+    assert_eq!(rig.owed().len(), 1, "the done unanswered");
+    rig.start_again();
+    rig.online();
+    rig.within("the owed done answered", || rig.owed().is_empty());
+    let status = rig.until_status("the status", |s| {
+        matches!(s, ResultPlain::Status { message_id, .. } if *message_id == message.message_id)
+    });
+    let ResultPlain::Status { recipients, .. } = status else {
+        unreachable!()
+    };
+    assert_eq!(recipients[0].delivery, Delivery::NoMatch {});
+    rig.two_passes();
+    assert_eq!(rig.put_ids().len(), 1, "put once: {:?}", rig.put_ids());
+    assert_eq!(rig.statuses().len(), 1);
+    assert_eq!(rig.count("messages"), 1);
+    assert_eq!(
+        rig.tasks_of(&message.message_id).len(),
+        0,
+        "no_match: no task"
+    );
+    assert!(rig.inbox().is_empty());
+}
+
+/// VII.B 30 at admission: a request opened before a revoke and a readmit
+/// of its sender (admission held meanwhile) is refused when admitted after
+/// them (`forbidden`: signed before the sender's current generation), and
+/// so is the same envelope read again after them, at its opening
+/// (`signed_at_head_before_generation`); a request signed after the
+/// readmit is admitted.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_request_signed_before_a_readmit_is_refused() {
+    use atem_client::membership::{host_sender_readmit, host_sender_revoke};
+    let mut rig = Rig::admitting("");
+    rig.online();
+    let to = rig.receiver(1);
+    let before = rig.log.log.head();
+    rig.fault("hold_admission");
+    let early = rig.sender.message(&to, &["tag:nobody"], 1, "HM_EARLY");
+    rig.put(&rig.sender.request_of(&to, before, &early));
+    rig.within("opened", || rig.inbox().len() == 1);
+    rig.log.append(
+        support::r9log::MAC,
+        host_sender_revoke(SENDER, false, 0).unwrap(),
+    );
+    rig.log
+        .append(support::r9log::MAC, host_sender_readmit(SENDER, 0).unwrap());
+    rig.station().set_log(&rig.log);
+    let head = rig.log.log.head().seq;
+    rig.within("the readmit applied", || {
+        rig.dump()["membership"]["head"]["seq"].as_u64() == Some(head)
+    });
+    std::fs::remove_file(rig.faults().join("hold_admission")).unwrap();
+    rig.until_status("the early request refused", |s| {
+        *s == ResultPlain::Refusal {
+            object_id: early.message_id.clone(),
+            refused: "forbidden".into(),
+        }
+    });
+    assert!(!rig.has_message(&early.message_id));
+    // The same bytes again: refused at their opening, unreported.
+    let replay = rig.sender.message(&to, &["tag:nobody"], 1, "HM_REPLAY");
+    rig.put(&rig.sender.request_of(&to, before, &replay));
+    rig.within("refused", || {
+        rig.refused()
+            .contains(&("signed_at_head_before_generation".into(), false))
+    });
+    let fresh = rig.sender.message(&to, &["tag:nobody"], 1, "HM_FRESH");
+    rig.put(&rig.sender.request_of(&to, rig.log.log.head(), &fresh));
+    rig.within("admitted", || rig.has_message(&fresh.message_id));
+}
+
+/// VII.B 28: the Station withholds the sending host's `host_sender_revoke`
+/// (it keeps serving the list before it) and keeps delivering its
+/// envelopes; the Mac connects to this host and carries the entry on its
+/// channel. The host applies it: the sender's queued task is `cancelled`,
+/// `sender revoked`, and its envelopes are refused (`revoked_sender`).
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_withheld_revoke_carried_by_a_native_cancels_and_refuses() {
+    use atem_client::membership::host_sender_revoke;
+    use support::delegated::{Dev, HostIds};
+    use support::r9::Router;
+    let mut rig = Rig::admitting("");
+    rig.online();
+    let sid = rig.launch();
+    let to = rig.receiver(1);
+    rig.fault("hold_host_work");
+    let before = rig.log.log.head();
+    let message = rig
+        .sender
+        .message(&to, &[&format!("atem:{HOST}")], 1, "HM_REVOKED");
+    rig.put(&rig.sender.request_of(&to, before, &message));
+    let task = task_of(&message, &sid);
+    rig.within("admitted", || !rig.tasks_of(&message.message_id).is_empty());
+    let entry = rig.log.append(
+        support::r9log::MAC,
+        host_sender_revoke(SENDER, false, 0).unwrap(),
+    );
+    let ids = HostIds {
+        account: ACCOUNT,
+        host: HOST,
+    };
+    let mut r = Router::on(&rig.astation, rig.link());
+    let mut mac = Dev::new_via(&mut r, "direct", ids, &rig.log, support::r9log::MAC, false);
+    mac.carry(&mut r, &[entry]);
+    support::delegated::wait_stored(&rig, &task, "cancelled", "sender revoked");
+    let late = rig
+        .sender
+        .message(&to, &[&format!("atem:{HOST}")], 1, "HM_LATE");
+    rig.put(&rig.sender.request_of(&to, before, &late));
+    rig.within("refused", || {
+        rig.refused().contains(&("revoked_sender".into(), false))
+    });
+    assert!(!rig.has_message(&late.message_id));
+}
+
+/// VII.B 35: the sending host puts the same request again after this host
+/// admitted it and marked it done (a lost acknowledgment): the Station
+/// stores it again, the host reads it and takes it as a duplicate, so it
+/// is admitted once (one record); its status goes again (ruling R45: the
+/// Station may have lost the first), the same receipts. An authenticated
+/// object with a bad time (made two minutes ahead of this host's clock) is
+/// reported back `refused`, `invalid_request`.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_resend_is_admitted_once_and_a_bad_time_is_reported() {
+    let rig = Rig::admitting("");
+    rig.online();
+    let to = rig.receiver(1);
+    let message = rig.sender.message(&to, &["tag:nobody"], 1, "HM_RESENT");
+    let request = rig.sender.request_of(&to, rig.log.log.head(), &message);
+    rig.put(&request);
+    rig.until_status("its status", |s| {
+        matches!(s, ResultPlain::Status { message_id, .. } if *message_id == message.message_id)
+    });
+    rig.within("marked done", || {
+        rig.station().mailbox_positions().is_empty()
+    });
+    rig.put(&request);
+    rig.within("read again and done", || {
+        rig.station().mailbox_positions().is_empty()
+    });
+    rig.within("its status sent again", || rig.statuses().len() == 2);
+    let statuses = rig.statuses();
+    let receipts = |s: &ResultPlain| match s {
+        ResultPlain::Status {
+            message_id,
+            recipients,
+        } if *message_id == message.message_id => recipients.clone(),
+        other => panic!("not its status: {other:?}"),
+    };
+    assert_eq!(receipts(&statuses[0]), receipts(&statuses[1]));
+    assert_eq!(rig.count("messages"), 1, "admitted once");
+    let mut ahead = rig.sender.message(&to, &["tag:nobody"], 1, "HM_AHEAD");
+    ahead.created_at += 120_000;
+    rig.put(&rig.sender.request_of(&to, rig.log.log.head(), &ahead));
+    rig.until_status("reported", |s| {
+        *s == ResultPlain::Refusal {
+            object_id: ahead.message_id.clone(),
+            refused: "invalid_request".into(),
+        }
+    });
+    assert!(!rig.has_message(&ahead.message_id));
+}
+
+/// VII.B 37: `per_workflow` on this host bounds a host sender's messages
+/// per workflow: with one allowed, the second message of a workflow is
+/// refused `busy`, recorded, and nothing of it is stored. Its resend (the
+/// same object, stored again once the first copy was done) gets `busy`
+/// again from the recorded refusal: the Station may have lost the first.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn per_workflow_bounds_a_host_senders_messages() {
+    let rig = Rig::admitting("[collab]\nper_workflow = 1\n");
+    rig.online();
+    let to = rig.receiver(1);
+    let first = rig.sender.message(&to, &["tag:nobody"], 1, "HM_FIRST");
+    let mut second = rig.sender.message(&to, &["tag:nobody"], 1, "HM_SECOND");
+    second.workflow_id = first.workflow_id.clone();
+    rig.put(&rig.sender.request_of(&to, rig.log.log.head(), &first));
+    rig.within("the first admitted", || rig.has_message(&first.message_id));
+    let request = rig.sender.request_of(&to, rig.log.log.head(), &second);
+    rig.put(&request);
+    let busy = ResultPlain::Refusal {
+        object_id: second.message_id.clone(),
+        refused: "busy".into(),
+    };
+    rig.until_status("busy", |s| *s == busy);
+    assert!(!rig.has_message(&second.message_id));
+    rig.within("marked done", || {
+        rig.station().mailbox_positions().is_empty()
+    });
+    rig.put(&request);
+    rig.within("its resend refused busy again", || {
+        rig.statuses().iter().filter(|s| **s == busy).count() == 2
+    });
+    assert!(!rig.has_message(&second.message_id));
 }

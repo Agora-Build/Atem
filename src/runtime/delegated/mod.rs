@@ -27,6 +27,7 @@
 //! Part II), behind `host.senders`, which the hook turns on only with
 //! `host.delegated`: [`host_senders`].
 pub mod acks;
+pub mod admit;
 pub mod alerts;
 pub mod attempts;
 pub mod authority;

@@ -1149,9 +1149,18 @@ impl FakeStation {
         // Host senders' mailbox calls (§11.5), told by their `op`: read by
         // the shared mailbox reader (one it refuses gets no answer).
         if mailbox_call(bytes) {
-            if let Ok(call) = MailboxToStation::decode(bytes.as_bytes())
-                && let Some(reply) = self.mailbox_reply(link, call)
-            {
+            let reply = match MailboxToStation::decode(bytes.as_bytes()) {
+                // The receiving host's own puts (its status objects back to
+                // a sending host, design II.4.4): stored as any host's,
+                // its link's association the calling host.
+                Ok(MailboxToStation::Put(_)) if self.serves(link) => {
+                    let (host_id, generation) = (self.host_id.clone(), self.host_trust_gen);
+                    self.put(&host_id, generation, bytes.as_bytes())
+                }
+                Ok(call) => self.mailbox_reply(link, call),
+                Err(_) => None,
+            };
+            if let Some(reply) = reply {
                 self.out.send(link, reply);
             }
             return ToStation::decode(bytes.as_bytes());
@@ -1398,6 +1407,18 @@ impl FakeStation {
     pub fn stored_for(&mut self, host_id: &str, host_trust_gen: u64) -> usize {
         let now = self.now();
         self.mailbox_of(host_id, host_trust_gen, now).stored.len()
+    }
+
+    /// The objects the mailbox of `host_id` in `host_trust_gen` stores now
+    /// (another receiving host's too: what the runtime under test put
+    /// there), by position.
+    pub fn stored_objects(&mut self, host_id: &str, host_trust_gen: u64) -> Vec<SignedObject> {
+        let now = self.now();
+        self.mailbox_of(host_id, host_trust_gen, now)
+            .stored
+            .values()
+            .map(|stored| stored.object.clone())
+            .collect()
     }
 
     /// `mailbox_put` from the sending host `host_id` in `host_trust_gen`
@@ -1726,7 +1747,7 @@ impl FakeStation {
                 }
                 Some(done_result(&done))
             }
-            // The receiving host puts nothing in this version.
+            // Answered by `reply` (the receiving host's own puts).
             MailboxToStation::Put(_) => None,
         }
     }

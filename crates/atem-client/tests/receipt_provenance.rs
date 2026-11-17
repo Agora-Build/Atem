@@ -146,6 +146,31 @@ fn receipt_provenance_optional_round_trip() {
         );
     }
     assert!(edit(&|d| drop(d.insert("task_id".into(), json!(7)))).is_err());
+    // A host sender's selector task is a UUID v5 (host-work-v1 §11.5): its
+    // provenance reads, with a `host:` sender only.
+    let selector = |d: &mut serde_json::Map<String, Value>| {
+        d.insert(
+            "task_id".into(),
+            json!("18f208d8-a1d7-5fba-8a53-7fb8f9bc5dc4"),
+        );
+    };
+    assert!(
+        edit(&|d| {
+            selector(d);
+            d.insert("sender".into(), json!("host:host-b"));
+        })
+        .is_ok()
+    );
+    for sender in ["service:svc-1", "member:dev-phone"] {
+        assert!(
+            edit(&|d| {
+                selector(d);
+                d.insert("sender".into(), json!(sender));
+            })
+            .is_err(),
+            "{sender}"
+        );
+    }
     // Only a delegated sender: never `local`, a browser, the host-work
     // principal itself, a bare id, an empty or oversized id.
     let long = format!("service:{}", "a".repeat(129));

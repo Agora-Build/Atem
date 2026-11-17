@@ -133,10 +133,12 @@ pub struct Provenance {
 }
 
 impl Provenance {
-    /// The receipt reader's rules (`atem_client::session::wire`): a UUID v4
-    /// task and a delegated sender.
+    /// The receipt reader's rules (`atem_client::session::wire`): a
+    /// delegated sender and its task's id (a UUID v4, or a host sender's
+    /// selector task's UUID v5: `is_delegated_task_id`).
     pub fn valid(&self) -> bool {
-        super::wire::is_uuid_v4(&self.task_id) && super::wire::is_delegated_sender(&self.sender)
+        super::wire::is_delegated_task_id(&self.task_id, &self.sender)
+            && super::wire::is_delegated_sender(&self.sender)
     }
 }
 

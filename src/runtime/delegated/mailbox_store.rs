@@ -6,7 +6,9 @@
 //!
 //! - **The cursor** (`mailbox_cursor`, one row): the mailbox read, its
 //!   last position processed and the furthest one ever read in it
-//!   (`read_to`: a rewind lowers the cursor, never this), the lowest
+//!   (`read_to`: a rewind lowers the cursor, never this; `seen_to`, past
+//!   which a copy is a new one: a reset under the same id doesn't lower it
+//!   either), the lowest
 //!   position left on the Station for want of room (below), and the host
 //!   identity it belongs to (account, device, trust generation and the
 //!   device list's genesis). A new
@@ -174,7 +176,7 @@ const TABLES: &str = "
         mailbox_id TEXT NOT NULL, cursor INTEGER NOT NULL, skip_at INTEGER,
         skip_freed INTEGER NOT NULL DEFAULT 0, freed INTEGER NOT NULL DEFAULT 0,
         skip_expires INTEGER, skip_inbox INTEGER, read_to INTEGER NOT NULL DEFAULT 0,
-        skip_inbox_now INTEGER) WITHOUT ROWID;
+        skip_inbox_now INTEGER, seen_to INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS mailbox_dones (
         mailbox_id TEXT NOT NULL, position INTEGER NOT NULL,
         PRIMARY KEY(mailbox_id, position)) WITHOUT ROWID;
@@ -185,7 +187,8 @@ const TABLES: &str = "
     CREATE TABLE IF NOT EXISTS mailbox_inbox (
         n INTEGER PRIMARY KEY, sender_host TEXT NOT NULL, object_id TEXT NOT NULL,
         kind TEXT NOT NULL, plain BLOB NOT NULL, object_hash TEXT NOT NULL,
-        at_ms INTEGER NOT NULL);
+        at_ms INTEGER NOT NULL, expires_at INTEGER, signed_seq INTEGER,
+        held INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS mailbox_refused (
         n INTEGER PRIMARY KEY, evidence TEXT NOT NULL UNIQUE, reason TEXT NOT NULL,
         sender_host TEXT, object_id TEXT, report INTEGER NOT NULL, bytes BLOB,
@@ -227,8 +230,12 @@ const TABLES: &str = "
 
 /// The columns the mailbox's tables gained after their first shape
 /// (review P5: a store made by an earlier build of this mailbox gets them
-/// when its tables are made): `(table, column, kind)`.
-const NEW_COLUMNS: [(&str, &str, &str); 8] = [
+/// when its tables are made): `(table, column, kind)`. An inbox row's
+/// object's expiry and `signed_at_head.seq` are admission's (an early stop
+/// is kept until its expiry; the sender's standing is checked again at
+/// admission); a row written before them has neither, and admission refuses
+/// it (it can't tell when it was signed).
+const NEW_COLUMNS: [(&str, &str, &str); 12] = [
     ("mailbox_cursor", "skip_at", "INTEGER"),
     ("mailbox_cursor", "skip_freed", "INTEGER NOT NULL DEFAULT 0"),
     ("mailbox_cursor", "freed", "INTEGER NOT NULL DEFAULT 0"),
@@ -237,6 +244,10 @@ const NEW_COLUMNS: [(&str, &str, &str); 8] = [
     ("mailbox_cursor", "read_to", "INTEGER NOT NULL DEFAULT 0"),
     ("mailbox_cursor", "skip_inbox_now", "INTEGER"),
     ("mailbox_pending", "no_room", "INTEGER NOT NULL DEFAULT 0"),
+    ("mailbox_inbox", "expires_at", "INTEGER"),
+    ("mailbox_inbox", "signed_seq", "INTEGER"),
+    ("mailbox_inbox", "held", "INTEGER NOT NULL DEFAULT 0"),
+    ("mailbox_cursor", "seen_to", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
 /// The mailbox's tables in `store`, made if missing (a table of an earlier
@@ -310,9 +321,20 @@ fn own_cursor(db: &rusqlite::Connection, identity: &HostIdentity) -> Result<Opti
 /// The store as the mailbox client observes it for `identity`.
 pub fn read(store: &Store, identity: &HostIdentity) -> Result<Observed> {
     let cursor = own_cursor(&store.db, identity)?;
+    // Rows admission holds (ruling R47) hold their own sender's task starts
+    // only, not the gate.
     let inbox = store
         .db
-        .query_row("SELECT count(*) FROM mailbox_inbox", [], |r| r.get(0))?;
+        .query_row("SELECT count(*) FROM mailbox_inbox WHERE held=0", [], |r| {
+            r.get(0)
+        })?;
+    let held = {
+        let mut q = store
+            .db
+            .prepare("SELECT DISTINCT sender_host FROM mailbox_inbox WHERE held=1")?;
+        q.query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
     let (skipped, rewind_due, skip_expires, skipped_inbox, read_to) = store
         .db
         .query_row(
@@ -349,21 +371,27 @@ pub fn read(store: &Store, identity: &HostIdentity) -> Result<Observed> {
         )?,
         rewind_due,
         skip_expires,
+        held,
     })
 }
 
 /// The cursor at `at` of `mailbox_id`, and the furthest position read in
 /// it (`read_to`, ruling R35: a rewind lowers the cursor, never this; a
-/// reset sets it to 0, [`mark_reset`]). SQLite reads every right-hand side
-/// on the row as it was.
+/// reset sets it to 0, [`mark_reset`]), and the furthest position ever
+/// read under that mailbox id (`seen_to`, review N4: neither a rewind nor
+/// a reset under the same id lowers it; another id starts it afresh), past
+/// which a copy is a new one. SQLite reads every right-hand side on the
+/// row as it was.
 fn set_cursor(tx: &Transaction, identity: &HostIdentity, mailbox_id: &str, at: u64) -> Result<()> {
     tx.execute(
-        "INSERT INTO mailbox_cursor(one, identity, mailbox_id, cursor, read_to)
-        VALUES(1, ?1, ?2, ?3, ?3)
+        "INSERT INTO mailbox_cursor(one, identity, mailbox_id, cursor, read_to, seen_to)
+        VALUES(1, ?1, ?2, ?3, ?3, ?3)
         ON CONFLICT(one) DO UPDATE SET identity=excluded.identity,
             mailbox_id=excluded.mailbox_id, cursor=excluded.cursor,
             read_to=CASE WHEN mailbox_id=excluded.mailbox_id
-                THEN max(read_to, excluded.cursor) ELSE excluded.cursor END",
+                THEN max(read_to, excluded.cursor) ELSE excluded.cursor END,
+            seen_to=CASE WHEN mailbox_id=excluded.mailbox_id
+                THEN max(seen_to, excluded.cursor) ELSE excluded.cursor END",
         params![identity_text(identity), mailbox_id, at],
     )?;
     Ok(())
@@ -547,6 +575,15 @@ pub fn commit_page(
     if !continues {
         return Ok(Commit::Stale);
     }
+    // The furthest position this mailbox was ever read to (review N4): a
+    // duplicate past it is a new copy, the sender's own resend.
+    let seen_to: u64 = if cursor.is_some() {
+        tx.query_row("SELECT seen_to FROM mailbox_cursor WHERE one=1", [], |r| {
+            r.get(0)
+        })?
+    } else {
+        0
+    };
     let mut decided = Vec::new();
     // The lowest position left on the Station, and when the last of them
     // expires; the highest of them that is a request, cancel or complete
@@ -557,7 +594,7 @@ pub fn commit_page(
         let Some(cx) = decide else {
             return Ok(Commit::Undecided);
         };
-        let Some(decision) = decide_entry(&tx, entry, cx, &page.mailbox_id)? else {
+        let Some(decision) = decide_entry(&tx, entry, cx, &page.mailbox_id, seen_to)? else {
             return Ok(Commit::Undecided);
         };
         match decision {
@@ -673,7 +710,18 @@ pub fn rejudge_pending(
                     ) {
                         continue;
                     }
-                    match record(&tx, cx, &object, &bytes, verdict, &mailbox_id, position)? {
+                    // A waiting object decided now is no new copy: its
+                    // duplicate re-owes nothing (review N4).
+                    match record(
+                        &tx,
+                        cx,
+                        &object,
+                        &bytes,
+                        verdict,
+                        &mailbox_id,
+                        position,
+                        false,
+                    )? {
                         None => continue,
                         // No room for it: it keeps waiting (never done), and
                         // holds the gate's mailbox part as a request, cancel
@@ -741,12 +789,14 @@ fn now_ms() -> u64 {
 
 /// One page object decided (none: it can't be now). An `atem-result` is
 /// kept for the sending host's own check (ruling R28), never judged as an
-/// envelope.
+/// envelope. `seen_to`: the furthest position this mailbox was read to
+/// before the page.
 fn decide_entry(
     tx: &Transaction,
     entry: &MailboxEntry,
     cx: &DecideCx,
     mailbox_id: &str,
+    seen_to: u64,
 ) -> Result<Option<Decision>> {
     let bytes = entry.bytes();
     let object = match entry.parse_object() {
@@ -775,7 +825,17 @@ fn decide_entry(
         return keep_result(tx, cx, &object, &body, bytes, mailbox_id, entry.position).map(Some);
     }
     let verdict = open_envelope(&object, cx.list, cx.recipient, cx.provider, cx.now_ms);
-    record(tx, cx, &object, bytes, verdict, mailbox_id, entry.position)
+    let new_copy = entry.position > seen_to;
+    record(
+        tx,
+        cx,
+        &object,
+        bytes,
+        verdict,
+        mailbox_id,
+        entry.position,
+        new_copy,
+    )
 }
 
 /// A copy arriving [`KEEP_MARGIN_MS`] or more after its object's expiry
@@ -874,7 +934,11 @@ fn keep_result(
     Ok(Decision::Result)
 }
 
-/// A verdict's rows (the module docs); none for `Unavailable`.
+/// A verdict's rows (the module docs); none for `Unavailable`. `new_copy`:
+/// the object is at a position past the furthest this mailbox was read to
+/// (the sender's own resend when it is a duplicate; never a re-read after
+/// a rewind or a reset under the same mailbox id).
+#[allow(clippy::too_many_arguments)]
 fn record(
     tx: &Transaction,
     cx: &DecideCx,
@@ -883,6 +947,7 @@ fn record(
     verdict: EnvelopeVerdict,
     mailbox_id: &str,
     position: u64,
+    new_copy: bool,
 ) -> Result<Option<Decision>> {
     let (_, body) = MailBody::from_object(object)?;
     let hash = object_hash(object);
@@ -906,6 +971,16 @@ fn record(
             bytes,
         )?,
         EnvelopeVerdict::Open { plain, .. } => match claimed(tx, cx, &body, &hash, bytes)? {
+            // The sender's resend of a request admission decided: its
+            // status goes again (ruling R45: the Station may have lost it),
+            // only for a new copy (review N4: a re-read after a rewind or a
+            // reset under the same mailbox id owes nothing).
+            Some(Decision::Duplicate) if matches!(plain, EnvelopePlain::Request { .. }) => {
+                if new_copy {
+                    super::admit::resend_status(tx, &body.sender.host_id, &body.id)?;
+                }
+                Decision::Duplicate
+            }
             Some(other) => other,
             // No room in its sender's share or in all: left on the Station,
             // unclaimed (ruling R31).
@@ -918,15 +993,17 @@ fn record(
                     EnvelopePlain::Complete { .. } => "complete",
                 };
                 tx.execute(
-                    "INSERT INTO mailbox_inbox(sender_host, object_id, kind, plain, object_hash, at_ms)
-                    VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO mailbox_inbox(sender_host, object_id, kind, plain, object_hash, at_ms,
+                        expires_at, signed_seq) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         body.sender.host_id,
                         body.id,
                         kind,
                         plain.to_bytes()?.as_slice(),
                         hash.to_hex(),
-                        now_ms()
+                        now_ms(),
+                        body.expires_at,
+                        body.signed_at_head.seq
                     ],
                 )?;
                 Decision::Opened

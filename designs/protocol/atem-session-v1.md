@@ -4680,7 +4680,7 @@ below. Item 8's request stays open.
 
    | Field | Value |
    |---|---|
-   | `task_id` | the delegated task this attempt runs (host-work-v1 §11.6): a UUID v4 |
+   | `task_id` | the delegated task this attempt runs (host-work-v1 §11.6): a UUID v4, or for a `host:` sender the UUID v5 of a selector's fixed resolution (host-work-v1 §11.5; Atem's reading, for Astation's agreement: this row named a UUID v4 before host senders' `select` existed) |
    | `sender` | the principal that enqueued the task: `member:<device_id>`, `service:<device_id>` or `host:<host_id>`, the id 1–128 bytes of `[A-Za-z0-9._:-]` |
 
    - **Both or neither, and only on a `prompt` receipt**, the one kind the

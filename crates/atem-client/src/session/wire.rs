@@ -360,6 +360,17 @@ pub fn is_delegated_sender(sender: &str) -> bool {
         .any(|prefix| sender.strip_prefix(prefix).is_some_and(is_opaque_id))
 }
 
+/// A delegated task's id as a receipt's provenance and an owner's alert
+/// name it (R9.14 item 2, host-work-v1 §11.3) for its `sender`: a UUID v4,
+/// or for a host sender (`host:<host_id>`) the UUID v5 of a `select`
+/// recipient's fixed resolution, the id its tasks get on the receiving host
+/// (host-work-v1 §11.5, "The selector task id"). Atem's reading of the two
+/// agreed texts together, for Astation's agreement: R9.14 named a UUID v4
+/// before host senders' `select` existed.
+pub fn is_delegated_task_id(task_id: &str, sender: &str) -> bool {
+    is_uuid_v4(task_id) || is_uuid_v5(task_id) && sender.starts_with("host:")
+}
+
 /// At most this many reply ids in a receipt's `result` (r8 §D).
 pub const MAX_REPLY_MESSAGE_IDS: usize = 32;
 /// A receipt with `result` stays within this (r8 §D).
@@ -921,7 +932,7 @@ impl Receipt {
                     self.kind == ReceiptKind::Prompt,
                     "provenance on a receipt other than a prompt",
                 )?;
-                uuid(task_id, "task_id")?;
+                check(is_delegated_task_id(task_id, sender), "task_id")?;
                 check(is_delegated_sender(sender), "sender")?;
             }
             _ => return Err("invalid provenance: task_id and sender go together".into()),

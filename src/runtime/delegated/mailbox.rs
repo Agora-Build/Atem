@@ -112,6 +112,10 @@ pub struct Observed {
     /// When every object left on the Station has expired (the Station drops
     /// them then): the rewind is due once `D` passes it, whatever the room.
     pub skip_expires: Option<u64>,
+    /// The senders of inbox rows admission holds (a `cancel` or `complete`
+    /// waiting for room among its sender's early stops, ruling R47): not
+    /// in `inbox`; each holds its own sender's task starts only.
+    pub held: std::collections::BTreeSet<String>,
 }
 
 /// What a page is to the live call ([`MailboxClient::on_page`]).
@@ -324,6 +328,14 @@ impl MailboxClient {
 
     /// The store as it is now for the host's current identity (`None`: not
     /// loaded). A reset found against the announcement waits for its mark.
+    /// The senders whose task starts a held inbox row holds (ruling R47).
+    pub fn held(&self) -> std::collections::BTreeSet<String> {
+        self.observed
+            .as_ref()
+            .map(|o| o.held.clone())
+            .unwrap_or_default()
+    }
+
     pub fn observe(&mut self, observed: Option<Observed>) {
         self.observed = observed;
         self.check_reset();

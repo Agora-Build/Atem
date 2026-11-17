@@ -52,6 +52,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// An unstarted task past its deadline: host-work v1's text (§4), the one
 /// delegated tasks keep (§11.6 adds none for it).
 pub const EXPIRED_BEFORE_SUBMISSION: &str = "expired before submission";
+/// A task its sender cancelled before it started (host-work-v1 §4,
+/// `work_cancel`; a host sender's `cancel`, design II.7).
+pub const CANCELLED_BEFORE_SUBMISSION: &str = "cancelled before submission";
 
 /// A task that waits for its (next) attempt: host-work v1's text (§4).
 pub const WAITING_FOR_A_READY_AGENT: &str = "waiting for a ready agent";
@@ -81,6 +84,9 @@ pub enum Event {
     Halted,
     /// The deadline passed on the delegated clock.
     Expired,
+    /// A host sender's own `cancel` (design II.7, II.8): an unstarted task
+    /// cancelled, a live attempt withdrawn first.
+    Cancelled,
 }
 
 impl Event {
@@ -97,6 +103,7 @@ impl Event {
             Event::ScopePending => (WorkState::Blocked, details::WAITING_FOR_UNLOCK),
             Event::Halted => (WorkState::Blocked, details::JOURNAL_HALTED),
             Event::Expired => (WorkState::Expired, EXPIRED_BEFORE_SUBMISSION),
+            Event::Cancelled => (WorkState::Cancelled, CANCELLED_BEFORE_SUBMISSION),
         }
     }
 
@@ -120,6 +127,9 @@ pub struct StartTask {
     pub target: Target,
     /// The route and profile it was accepted under (condition 4).
     pub accepted: Accepted,
+    /// Its host sender's `cancel` reached it while its attempt waited
+    /// (`WorkRecord::cancel_id`, review N1): it never starts.
+    pub cancelled: bool,
 }
 
 impl StartTask {
@@ -131,6 +141,7 @@ impl StartTask {
             deadline: r.task.expires_at,
             target: r.task.target.clone(),
             accepted: r.accepted(),
+            cancelled: r.cancel_id.is_some(),
         })
     }
 }
@@ -266,6 +277,15 @@ impl StartView {
         self.refused.get(attempt_id).copied()
     }
 
+    /// The task of the live attempt `attempt_id` was cancelled by its host
+    /// sender (review N1), in the transaction that just committed: the
+    /// session host's check refuses it from now on (`Event::Cancelled`).
+    pub fn cancel(&mut self, attempt_id: &str) {
+        if let Some(task) = self.live.get_mut(attempt_id) {
+            task.cancelled = true;
+        }
+    }
+
     /// `attempt_id` ended: forgotten, and the event a start refused it
     /// for, if one did.
     pub fn forget(&mut self, attempt_id: &str) -> Option<Event> {
@@ -291,7 +311,13 @@ impl StartView {
 ///    project scope pending (3): `blocked`.
 ///
 /// Expiry alone is ignored: a lapsed grant is judged as it stood (3).
+/// Before all of them, a task its host sender cancelled while its attempt
+/// waited never starts: `cancelled`, `cancelled before submission`
+/// (design II.8; review N1).
 pub fn may_start(view: &StartView, task: &StartTask, now_d_ms: Option<u64>) -> Result<(), Event> {
+    if task.cancelled {
+        return Err(Event::Cancelled);
+    }
     let adm = &task.admission;
     if matches!(adm.sender, DelegatedSender::Host { .. }) {
         return host_may_start(view, task, now_d_ms);

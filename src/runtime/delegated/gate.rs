@@ -55,6 +55,7 @@ pub struct Gates {
     caught_up: BTreeSet<String>,
     /// The mailbox part, host senders' only (design II.5).
     mailbox: bool,
+    mailbox_held: BTreeSet<String>,
 }
 
 impl Gates {
@@ -75,6 +76,12 @@ impl Gates {
     /// II.5).
     pub fn set_mailbox(&mut self, open: bool) {
         self.mailbox = open;
+    }
+
+    /// The host senders whose task starts a held inbox row holds (a
+    /// `cancel` or `complete` waiting for room, ruling R47).
+    pub fn set_mailbox_held(&mut self, held: BTreeSet<String>) {
+        self.mailbox_held = held;
     }
 
     /// Every Station's gate closed (design I.6.2 step 7, at a start's
@@ -141,8 +148,9 @@ impl GateView for Gates {
             // channel opens it: a host sender has none, and a native's
             // caught-up channel speaks for that native only.
             // And the mailbox part (design II.5).
-            DelegatedSender::Host { .. } => {
+            DelegatedSender::Host { host_id, .. } => {
                 self.mailbox
+                    && !self.mailbox_held.contains(host_id)
                     && self
                         .own
                         .as_deref()

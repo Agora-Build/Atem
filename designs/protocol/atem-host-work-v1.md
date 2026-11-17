@@ -1933,7 +1933,7 @@ alerts.)
 | `kind` | `outcome_unknown`, the one kind; a reader refuses any other |
 | `host_id` | the host's own `atem_device_id`, the `host` of the result; another host's is refused |
 | `session_id` | the task's target session (`ses-` and 12 characters) |
-| `task_id` | the task: a UUID v4 (a delegated task's id) |
+| `task_id` | the task: a UUID v4 (a delegated task's id), or a host sender's selector task's UUID v5 (§11.5, "On the receiving host"; Atem's reading, for Astation) |
 | `sender` | the delegated sender that enqueued the task: `member:<id>`, `service:<id>` or `host:<id>` (an id of 1-128 bytes of `[A-Za-z0-9._:-]`), as a receipt's provenance names it (session-v1 R9.14). Never `local` or `browser:` |
 | `reason` | why the outcome is unknown, for people: 1-256 bytes, not blank (something besides White_Space; amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**), no control or Cf character. Atem gives one of §11.6's `outcome_unknown` reasons as the task's receipt says (`agent exited`, `outcome could not be established`, `write interrupted`), with the note below at 32. Kept as raised: the task's `detail` changes at its deadline, the alert's `reason` doesn't |
 | `created_at` | Unix ms on the host's wall clock: when the task became `outcome_unknown`. For people only: it orders nothing |
@@ -3104,9 +3104,9 @@ II.4.4, III.1): an **`atem-envelope`** from the sending host (a request, a
 cancel or a complete) and an **`atem-result`** back from the host that ran
 the work (a status, a refusal or a result). They belong to `host.senders`,
 which no release build advertises (a debug build lists it only behind the
-debug-only hook): nothing sends them yet, and a receiving host fetches and
-judges them only behind that hook, admitting none yet ("The mailbox calls",
-"On the receiving host"). Types: `atem_client::host_mail` (the builders `seal_envelope` and
+debug-only hook): a host sends, fetches, judges and admits them only
+behind that hook ("The mailbox calls", "On the receiving host", "On the
+sending host"). Types: `atem_client::host_mail` (the builders `seal_envelope` and
 `seal_result`, the receiver's `open_envelope` and the sending host's
 `accept_result`); bindings: host role only (feature `host`,
 [atem-client-bindings.md](atem-client-bindings.md)); vectors:
@@ -3460,15 +3460,18 @@ and for the ceremony's fields. Each is **agreed with Astation 2026-11-16**.
 `result_id` with both of its checks; `select`'s channel rule; and a
 reference mailbox in the shared core, a sans-I/O model of the Station's
 side ("The mailbox calls" below). **Built on the receiving host, behind the
-debug-only hook:** its mailbox client ("The mailbox calls", "On the
-receiving host"). **Built on the sending host, behind the same hook:** its
-planning, sealing and puts ("On the sending host"), and `select`'s `launch`
-in the shared core. Nothing else in them is built (`cancel` and `complete`
-across hosts, the admission of what the mailbox delivers and the status
-objects and results back, a Station's side, the ceremony's fields). The
-status forms and the sending host's `result_id` check have their shared
-vectors in `fixtures/r9-vectors-host-envelope.json` (a result failing both
-the `result_id` check and the row's included); the mailbox calls' are
+debug-only hook:** its mailbox client, and the admission of what the
+mailbox opens: requests (step 7, `select` expanded into selector tasks),
+`cancel` and `complete`, and the status objects back ("The mailbox calls",
+"On the receiving host"). **Built on the sending host, behind the same
+hook:** its planning, sealing and puts ("On the sending host"), and
+`select`'s `launch` in the shared core. Nothing else in them is built
+(`cancel` and `complete` sent across hosts, the receiving host's launch for
+a `select`'s `launch`, the results back and the sending host's reading of
+the statuses, a Station's side, the ceremony's fields). The status forms
+and the sending host's `result_id` check have their shared vectors in
+`fixtures/r9-vectors-host-envelope.json` (a result failing both the
+`result_id` check and the row's included); the mailbox calls' are
 `fixtures/r9-vectors-mailbox-calls.json`.
 
 #### The mailbox calls (agreed with Astation 2026-11-16)
@@ -3497,8 +3500,8 @@ answer, every refused form, the `heads` mailbox head accepted and refused,
 mailbox (each event's outcome, exact answer and state), checked by the
 Rust runner (`crates/atem-client/tests/mailbox_calls.rs`) and
 independently by `scripts/check-r9-vectors.py`, which models the mailbox
-from these rules. Not built: admission on the receiving host, the results back on the
-sending host, and a Station's side.
+from these rules. Not built: the results back on the sending host, and a Station's
+side.
 
 **The reference mailbox's readings** (Atem's, **agreed with Astation
 2026-11-16, #120 comment 6930157163**; where the rules below leave a
@@ -3649,9 +3652,151 @@ exactly as without this section):
 - host senders' gate also needs the mailbox read to the announced head with
   no refusal, fault or reset waiting, no request, cancel or complete left
   on the Station, or waiting on this host, for want of room (a result left
-  there holds none), and every inbox row admitted (design II.5); until
-  admission is built an inbox row keeps it closed. `atem status`'s
-  `Control feeds:` line names this part.
+  there holds none), and every inbox row admitted (design II.5; a stop
+  waiting in the inbox for room among its sender's early stops holds only
+  that sender's task starts, below). `atem status`'s `Control feeds:` line
+  names this part.
+- **admission** (`runtime/delegated/admit.rs`, `admit_pass.rs`; design
+  II.4.2 step 7, II.4.4, II.6, II.7): while hosting runs, on the pass
+  after a mailbox commit decided an object, else on host work's 100 ms
+  cadence (never on every 16 ms pass), host senders' gate open or not (it
+  waits for the inbox, so admission never waits for it), the inbox's rows
+  are decided, at most 128 a pass, each in its own `BEGIN IMMEDIATE`
+  transaction of the host-work store, with the row's removal and the
+  status owed to its sender enqueued in the put engine (until stored);
+  nothing reaches an agent or is put before it commits (**Atem's reading,
+  for Astation:** "`select` from host senders" and design II.4.2 step 7
+  and II.6 commit the resolution with the object's verdict and its
+  cursor; here the opened object commits with the cursor as a durable
+  inbox row, which stands in for the verdict and holds its sender's task
+  starts, and the resolution commits in admission's later transaction,
+  after the done: it is decided before any task of the sender can start).
+  A row that can't be decided (a store fault, a record that doesn't read)
+  skips none of the others and is tried again at later passes; after 8
+  tries in a row and at least a minute since its first failure on the
+  monotonic clock (a passing fault settles nothing; the counts are the
+  store's, none kept across another store or host identity) it is
+  settled, as a task record that doesn't read is: refused
+  `busy` by its own id (a request's refusal recorded), removed, with a
+  runtime.log line. A row whose plaintext no longer reads (a stricter
+  reader than the one that wrote it) is refused `malformed`, reported
+  `invalid_request` as check 5's refusals are. While hosting is paused the
+  rows wait (nothing could start).
+  - **A request.** Deduplicated against this host's own permanent records,
+    never only the claims: a message record (never deleted) of the sender
+    with that `message_id` and digest gets its current status again,
+    nothing else; another digest, or an id another principal used here (a
+    message record, or a local send's), `request_id_reused`; a recorded
+    whole refusal of the same digest gets that refusal again. A message
+    already expired on `D` when admission takes it (a long pause, an
+    outage) is refused whole `busy` (never judged so under a clock
+    anchor): no task past its deadline. The
+    sender's standing is checked again on the committed list against the
+    head it signed at (**Atem's reading, for Astation:** a revoke and a
+    readmit, or a removal and a re-add, between its opening and its
+    admission refuse it `forbidden`, as check 3 would at that head). Then
+    step 7, with the sender's permit (design II.2.3) in place of a channel
+    scope, for the recipients whose `host` is this host's triple only (none:
+    `stale_target`): a host notice needs a shared project's `message`, a
+    project notice a consenting route and `message`, an agent recipient a
+    consenting route, a task's ops and its target session (`refused`
+    `forbidden` otherwise); each `select` is expanded once with stage 1's
+    resolution over this host's live agents on routes that consent to the
+    sender with a task's ops (its budget, no sending session left out,
+    `atem:` matched against this host's `host_id`), each task named by its
+    selector task id: `resolved`, `no_match`, or `refused{forbidden}` when
+    no project the sender shares with this host grants a task's ops. A task
+    that could never be dispatched refuses the message `invalid_request`,
+    and a task id already used here `request_id_reused`. The limits, as a
+    channel member's publish meets them, refuse it whole `busy`:
+    `per_workflow` messages per workflow (counted once per message admitted),
+    the 256 unfinished tasks and the store's records, the sender's
+    unresolved outcomes. Each whole refusal is recorded and reported as
+    `{"kind":"status","object_id":<message_id>,"refused":<code>}`
+    (**Atem's reading, for Astation:** `request_id_reused` and `busy` are
+    object refusals, since a recipient's receipt carries only `forbidden`
+    or `stale_target`; `busy` is final for that `message_id`, a resend
+    gets it again: the sender sends anew). A recorded refusal is kept 48
+    hours past its message's expiry (beyond any copy the mailbox can still
+    pass on, a day past it), at most 1,024 per sender (the oldest dropped
+    first), pruned by the mailbox's minute prune. Each task is a delegated
+    task of `host:<sender>`, its admission record from the permit, its
+    message frame.
+  - **`cancel` and `complete`** (design II.7). The sender's own task,
+    admitted at its current generation and epoch, from a sender that may
+    send now: a cancel reaches it while it hasn't started (design II.8):
+    `queued` or `blocked` it is cancelled at once (`cancelled before
+    submission`), and one whose attempt waits `accepted` is marked
+    cancelled on its record in that transaction and has the attempt
+    withdrawn after the commit, as a revoke withdraws it, the task settling
+    `cancelled` from that. The mark is durable: the start check refuses the
+    task before any other condition, so a crash, a receipt-database fault
+    or a halted journal before the withdrawal never lets it run (the
+    dispatch, the check at `executing` or the start's recovery withdraws
+    it then). When the attempt is found started after all, the task runs
+    and the cancel is answered `busy` by its own id, the mark cleared. A
+    complete finds it `awaiting_result` with a project still
+    covering a task and completes it with the snapshot, as `work_complete`
+    does. Otherwise it isn't reached. Either way the message's current
+    status goes, and one
+    not reached is also answered by its own id (**Atem's reading, for
+    Astation:** design II.8's "`busy` in the status", which a task's `work`
+    receipt can't carry, so that the sending host stops resending it):
+    `{"kind":"status","object_id":<the cancel's or complete's id>,
+    "refused":"busy"}` when the task's state doesn't allow it (running or
+    later; a complete of a task not awaiting its result), `"forbidden"`
+    when the sender has no authority over the task now (the project
+    narrowed since, the sender revoked, or a task admitted before a revoke
+    and a readmit, or a removal and a re-add: the owner's alone). One
+    whose task isn't here yet (a free between pages can open a later
+    object first) is kept as an early stop, bound to its sender at its
+    current generation and epoch (after a revoke and a readmit, or a
+    removal and a re-add, it no longer applies), its object and the task
+    it names, until its expiry (dropped by the mailbox's minute prune,
+    never under a clock anchor), at most 32 per sender (a 33rd stays in
+    the inbox, holding only its own sender's task starts, until a kept one
+    goes); its request's admission takes it in its own transaction: a
+    cancel cancels the task at once; a complete finds it queued, not
+    reached, `busy` by its own id; one kept before a revoke and a readmit,
+    or a removal and a re-add, no longer applies, `forbidden` by its own
+    id. One naming another sender's task changes nothing and gets no
+    status.
+  - **Status objects** (design II.4.4): `seal_result` to the sender's
+    current `host_enc_key`, signed with this host's `host_channel_key` at
+    the committed head, alive 24 h, with a fresh `id`, and only while this
+    host's list shows it a current host at its own trust generation (else
+    it is owed and waits). At acceptance, then at every later change of a
+    host sender's task's state: a trigger on `work` marks the message's
+    status owed in the statement that changes it (dispatch, settling,
+    expiry, a device-list entry's effects, a resolution), and each pass
+    seals the message's current status, every task's state, and enqueues
+    it in one transaction with the mark cleared. A newer status settles
+    one the Station hasn't stored yet (never put); each is its own object.
+    A sender with no current key, no longer a current host, or re-verified
+    since the message (another host key than the one it came under, its
+    old outbox gone) gets none: the record keeps the state for the owner.
+    The sender's resend of an admitted request that the mailbox reads as a
+    duplicate (its claim held) marks the message's status owed again, and
+    a resend of a request refused whole has its recorded refusal sent
+    again (**Atem's reading, for Astation:** the Station may have lost the
+    first; superseding keeps one status waiting). Only a new copy counts
+    as a resend: one at a position past the furthest the host ever read
+    under that mailbox id. The same copy read again after a rewind, or
+    after a reset under the same mailbox id, owes nothing. A refusal row marked for its
+    sender (check 5 or 6, after the copy was shown to be the sender's) is
+    reported `{"kind":"status","object_id","refused":"invalid_request"}`
+    once, its mark cleared in that transaction.
+  - **A host sender's selector task id** is a delegated task id
+    (**Atem's reading, for Astation:** session-v1 R9.14 item 2's
+    provenance and §11.3's alerts named a UUID v4 before host senders'
+    `select` existed): a receipt's provenance and an owner's alert take a
+    UUID v4, or the UUID v5 of a selector's resolution when the sender is
+    `host:<host_id>` (`wire::is_delegated_task_id`; the provenance vector
+    `receipt_provenance_host_selector_task`). The channel ops on a task
+    (`work_query`, `work_resolve`, `work_interrupt`) still take a UUID v4
+    only: the owner resolves such a task with `atem task resolve`.
+  - **Not built:** a `select`'s `launch` (the recipient resolves to the
+    running agents only, as when its route doesn't allow a launch).
 
 **On the sending host** (built behind the debug-only hook's
 `host.senders`, with `host.delegated`; `runtime/delegated/send_plan.rs`,
@@ -4326,9 +4471,8 @@ The sender's channel and online status are not conditions.
 
 As built behind the debug-only hook's `host.senders` (with
 `host.delegated`; a debug build only, advertised by no release build).
-Nothing sends as a host sender yet: the mailbox, its envelopes and their
-admission are planned (§11.5), so only these rules exist, for that
-admission to use and for the start check.
+The mailbox's admission (§11.5, "On the receiving host") records these
+rules into each host sender's task, and the start check asks them again.
 
 - **Who.** `host:<host_id>` is a delegated sender while it is a current
   host of the committed device list (an `add_host`, no `remove_host`
@@ -4356,7 +4500,7 @@ admission to use and for the start check.
   at its revision (`route changed`), and that entry's grant must still
   cover the task (`sender's authorization narrowed`). A host sender is
   never held. Its gate is the host's own Station's, both parts (design
-  II.5; the mailbox's part comes with the mailbox), which no channel
+  II.5; with its mailbox part), which no channel
   opens. With `host.senders` off its tasks wait, `revocations not yet
   checked` (their stops aren't read then); what settles a task still
   settles it. No launch of a host sender exists (a host opens no

@@ -139,6 +139,7 @@ fn task(log: &TestLog, principal: &str, deadline: u64) -> StartTask {
             profile_revision: 1,
             project: "local:project".into(),
         },
+        cancelled: false,
     }
 }
 
@@ -1023,6 +1024,7 @@ fn host_task(log: &TestLog, principals: &[&str], deadline: u64) -> StartTask {
             profile_revision: 1,
             project: "local:project".into(),
         },
+        cancelled: false,
     }
 }
 

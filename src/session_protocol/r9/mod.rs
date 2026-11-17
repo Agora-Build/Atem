@@ -228,6 +228,18 @@ impl HostKey {
     ) -> atem_client::Result<atem_client::SignedObject> {
         atem_client::host_mail::seal_envelope(&self.keys, &self.id, fields, plain, recipient_enc)
     }
+
+    /// An `atem-result` this host signs back to a host sender (delegated
+    /// host-work II.4.4): a status object sealed to `recipient_enc` (the
+    /// shared core's `seal_result`).
+    pub fn seal_result(
+        &self,
+        fields: &atem_client::host_mail::MailFields,
+        plain: &atem_client::host_mail::ResultPlain,
+        recipient_enc: &atem_client::PublicKey,
+    ) -> atem_client::Result<atem_client::SignedObject> {
+        atem_client::host_mail::seal_result(&self.keys, &self.id, fields, plain, recipient_enc)
+    }
 }
 
 impl std::fmt::Debug for HostKey {

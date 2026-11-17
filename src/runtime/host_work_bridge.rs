@@ -53,6 +53,8 @@ const TURN_INTERRUPTED: &str = "turn interrupted";
 mod collab_bridge;
 #[path = "collab_launch_bridge.rs"]
 mod collab_launch_bridge;
+#[path = "delegated/admit_pass.rs"]
+mod delegated_admit_pass;
 #[path = "delegated/dispatch.rs"]
 mod delegated_dispatch;
 #[path = "delegated/feed_pass.rs"]
@@ -262,6 +264,14 @@ pub(super) struct State {
     /// What the mailbox keeps at most (`mailbox_store::Limits`; tests lower
     /// them).
     mail_limits: crate::runtime::delegated::mailbox_store::Limits,
+    /// Admission's rows and reports that failed, by key: their tries in a
+    /// row so far and when the first of them failed, on the session host's
+    /// monotonic clock (reviews M2, N2: one is settled after a bound of
+    /// both). This store's: cleared when another opens.
+    admit_failures: HashMap<String, (u32, u64)>,
+    /// The mailbox committed objects since admission last ran: it runs on
+    /// the next pass (review L1; else on the scheduling pass's cadence).
+    admit_due: bool,
     /// Tests: at the mailbox's crash point (after a page's commit, before
     /// its dones), the dones the store owed and the positions of the dones
     /// live then.
@@ -367,6 +377,8 @@ impl State {
             mail_rejudge_failed: false,
             mail_pruned_at: None,
             mail_limits: Default::default(),
+            admit_failures: HashMap::new(),
+            admit_due: true,
             #[cfg(test)]
             mail_crash_probe: Vec::new(),
             ack_failures: 0,
@@ -600,6 +612,9 @@ impl HostBridge {
                     let prepared = !(self.features.delegated && self.work.config.enabled)
                         || FeedStore::prepare(&store).is_ok();
                     self.work.store = Some(store);
+                    // Admission's failure counts are a store's (its rows'
+                    // numbers; review N2).
+                    self.work.admit_failures.clear();
                     // Read once it opened (with the hook only: off, nothing
                     // reads it, as on main).
                     self.work.kept = (!prepared).then_some(KeptControls::Unreadable);
@@ -1187,6 +1202,11 @@ impl HostBridge {
                 if identity.account_id != UNPAIRED {
                     self.paused_stops(cx);
                 }
+                // Host senders' statuses owed (the device list's effects
+                // change their tasks while paused too).
+                if self.features.delegated && self.kept_here() {
+                    self.mail_statuses();
+                }
             }
             return;
         }
@@ -1285,6 +1305,14 @@ impl HostBridge {
             );
         }
         self.work_fence_launches();
+        // Host senders' mail the mailbox committed (with `host.senders`):
+        // every inbox row decided, gate open or not, before anything of
+        // this pass is dispatched; on the pass a page committed, else on
+        // the scheduling pass's cadence (review L1).
+        if self.work.admit_due || Instant::now() >= self.work.scheduled {
+            self.work.admit_due = false;
+            self.admit_mail(cx);
+        }
         if Instant::now() >= self.work.scheduled {
             self.work.scheduled = Instant::now() + Duration::from_millis(100);
             let inputs = self.work_inputs(cx.sessions);
@@ -1312,6 +1340,8 @@ impl HostBridge {
             if passed.is_err() {
                 self.work_fail();
             }
+            // The statuses owed to host senders for their tasks' changes.
+            self.mail_statuses();
         }
     }
 
@@ -1436,6 +1466,9 @@ impl HostBridge {
                     clock.moved(&store);
                 }
                 self.work.store = Some(store);
+                // The new store numbers its inbox rows afresh: no failure
+                // count of the old one's carries over (review N2).
+                self.work.admit_failures.clear();
                 true
             }
             Err(_) => false,
@@ -1743,6 +1776,7 @@ impl HostBridge {
                 let mut record = WorkRecord {
                     delegated: None,
                     deadline_passed: false,
+                    cancel_id: None,
                     attachment_owner: attachment_owner(&a),
                     principal,
                     control_gen: self.host.control_gen(&a.name()),
@@ -2112,6 +2146,7 @@ impl HostBridge {
                 let mut record = WorkRecord {
                     delegated: None,
                     deadline_passed: false,
+                    cancel_id: None,
                     attachment_owner: attachment_owner(a),
                     principal: a.name(),
                     control_gen: self.host.control_gen(&a.name()),
@@ -2914,6 +2949,7 @@ mod local_tests {
         include!("delegated/host_effects_tests.rs");
         include!("delegated/mail_pass_tests.rs");
         include!("delegated/send_pass_tests.rs");
+        include!("delegated/admit_tests.rs");
     }
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::broker::{InProcess, Launcher};
@@ -3547,6 +3583,7 @@ principals = ["local"]
         let record = WorkRecord {
             delegated: None,
             deadline_passed: false,
+            cancel_id: None,
             principal: principal.into(),
             attachment_owner: String::new(),
             control_gen,
@@ -4077,6 +4114,7 @@ principals = ["local"]
             let record = WorkRecord {
                 delegated: None,
                 deadline_passed: false,
+                cancel_id: None,
                 principal: "member:owner".into(),
                 attachment_owner: String::new(),
                 control_gen: 0,
@@ -5784,6 +5822,7 @@ launch = "on_message"
             let record = WorkRecord {
                 delegated: None,
                 deadline_passed: false,
+                cancel_id: None,
                 principal: "local".into(),
                 attachment_owner: Sender::Local.owner(),
                 control_gen,
@@ -6549,6 +6588,7 @@ launch = "on_message"
                     .enqueue(&WorkRecord {
                         delegated: None,
                         deadline_passed: false,
+                        cancel_id: None,
                         principal: "browser:b".into(),
                         attachment_owner: String::new(),
                         control_gen: 2,

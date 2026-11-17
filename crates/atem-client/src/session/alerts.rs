@@ -58,7 +58,9 @@ pub struct Alert {
 /// A task id as an alert names it: a UUID v4. Only a delegated sender's
 /// task raises an alert (design I.1.3, I.4.6), and a remote
 /// task's id is a UUID v4. A local selector's UUID v5 task keeps v1, whose
-/// unknown outcomes expire.
+/// unknown outcomes expire. A host sender's selector task (its UUID v5) is
+/// delegated too: an alert checks its task id with its sender
+/// ([`super::wire::is_delegated_task_id`]).
 pub fn valid_task_id(task_id: &str) -> bool {
     is_uuid_v4(task_id)
 }
@@ -91,7 +93,7 @@ impl Alert {
             && (1..=MAX_SAFE_INTEGER).contains(&self.seq)
             && is_opaque_id(&self.host_id)
             && is_session_id(&self.session_id)
-            && valid_task_id(&self.task_id)
+            && super::wire::is_delegated_task_id(&self.task_id, &self.sender)
             && valid_sender(&self.sender)
             && valid_reason(&self.reason)
             && self.created_at <= MAX_SAFE_INTEGER
@@ -493,6 +495,25 @@ mod tests {
                 "{field} {value}"
             );
         }
+        // A UUID v5 task is a host sender's selector task (host-work-v1
+        // §11.5): taken from a `host:` sender only.
+        let v5 = alert(1, 0);
+        assert!(
+            Alert {
+                task_id: "80160896-4fcd-5e6e-adac-98bac5497321".into(),
+                sender: "host:host-b".into(),
+                ..v5.clone()
+            }
+            .valid()
+        );
+        assert!(
+            !Alert {
+                task_id: "80160896-4fcd-5e6e-adac-98bac5497321".into(),
+                sender: "member:dev-phone".into(),
+                ..v5
+            }
+            .valid()
+        );
         // A reason with a Cf character (bidi controls, zero-width
         // characters) is refused, as a failed resolution's detail is.
         for reason in ["a\u{202E}b", "\u{200B}agent exited", "x\u{2066}"] {

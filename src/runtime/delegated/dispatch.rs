@@ -387,12 +387,18 @@ impl HostBridge {
     /// The live attempt `a` of `r` started (its receipt `executing` or past
     /// it): the task's attempts are over, and it follows that receipt. One
     /// `BEGIN IMMEDIATE` transaction writes the reconciled task and ends the
-    /// attempt `started`.
+    /// attempt `started`. A host sender's cancel that reached it while it
+    /// waited (`cancel_id`) wasn't reached after all: it is answered `busy`
+    /// by its own id in that transaction, and its mark goes (reviews N1,
+    /// N3).
     pub(super) fn end_started(&mut self, r: &mut WorkRecord, a: &Attempt) -> anyhow::Result<()> {
         let mut next = r.clone();
         self.reconcile_work(&mut next)?;
         let store = self.work.store.as_ref().unwrap();
         let tx = store.immediate()?;
+        if let Some(cancel) = next.cancel_id.take() {
+            self.cancel_unreached(&tx, &next.principal, &cancel)?;
+        }
         store.save_work(&next)?;
         store.end_attempt(&tx, &r.task.task_id, &a.attempt_id, AttemptEnd::Started)?;
         tx.commit()?;

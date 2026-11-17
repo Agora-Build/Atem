@@ -637,6 +637,16 @@ pub struct WorkRecord {
     /// whose record is as before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deadline_passed: bool,
+    /// A host sender's `cancel` that reached the task while its attempt
+    /// waited `accepted` (design II.8; review N1): the cancel's object id,
+    /// written in the admission's transaction. The start check refuses the
+    /// task (`Event::Cancelled`), so the attempt's withdrawal, whoever makes
+    /// it (the admission's followup, the dispatch, the start's recovery),
+    /// settles it `cancelled`; an attempt found started instead runs, and
+    /// the cancel is answered `busy` by this id, the mark cleared. None on
+    /// every other task, whose record is as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_id: Option<String>,
 }
 
 /// What a message's task renders around its text: the message's id and
@@ -780,6 +790,44 @@ const TRACKED: [(&str, &str); 4] = [
 /// records are never stepped over.
 pub(super) fn open_records(db: &Connection, table: &str) -> Result<usize> {
     Ok(db.query_row(OPEN_COUNT, [table], |r| r.get(0))?)
+}
+
+/// Whether the store `db` writes (in the caller's transaction) has room
+/// for one more message with `work`: open messages and tasks within
+/// [`MAX_RECORDS`], unfinished tasks within [`MAX_QUEUED`] (a task
+/// inserted already settled, as a host sender's task an early stop
+/// cancelled, takes no queue slot). Every message's acceptance checks it.
+pub(super) fn message_room(db: &Connection, work: &[WorkRecord]) -> Result<bool> {
+    let active: usize = db.query_row(UNFINISHED, [], |r| r.get(0))?;
+    let queued = work.iter().filter(|t| !t.status.state.terminal()).count();
+    Ok(open_records(db, "messages")? < MAX_RECORDS
+        && open_records(db, "work")? + work.len() <= MAX_RECORDS
+        && active + queued <= MAX_QUEUED)
+}
+
+/// `record` and its tasks `work` inserted (in the caller's transaction),
+/// each task's `state` its record's: every message's acceptance.
+pub(super) fn insert_message(
+    db: &Connection,
+    record: &MessageRecord,
+    work: &[WorkRecord],
+) -> Result<()> {
+    db.execute(
+        "INSERT INTO messages(id,record) VALUES(?1,?2)",
+        params![record.message.message_id, serde_json::to_string(record)?],
+    )?;
+    for r in work {
+        let state = serde_json::to_value(r.status.state)?;
+        db.execute(
+            "INSERT INTO work(id,record,state) VALUES(?1,?2,?3)",
+            params![
+                r.task.task_id,
+                serde_json::to_string(r)?,
+                state.as_str().unwrap_or_default()
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 const OPEN_COUNT: &str = "SELECT count(*) FROM open_records WHERE kind=?1";
@@ -1593,25 +1641,10 @@ impl Store {
         extra: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
     ) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;
-        let count = open_records(&tx, "messages")?;
-        let tasks = open_records(&tx, "work")?;
-        let active: usize = tx.query_row(UNFINISHED, [], |r| r.get(0))?;
-        if count >= MAX_RECORDS
-            || tasks + work.len() > MAX_RECORDS
-            || active + work.len() > MAX_QUEUED
-        {
+        if !message_room(&tx, work)? {
             bail!("message receipt capacity reached");
         }
-        tx.execute(
-            "INSERT INTO messages(id,record) VALUES(?1,?2)",
-            params![record.message.message_id, serde_json::to_string(record)?],
-        )?;
-        for r in work {
-            tx.execute(
-                "INSERT INTO work(id,record,state) VALUES(?1,?2,'queued')",
-                params![r.task.task_id, serde_json::to_string(r)?],
-            )?;
-        }
+        insert_message(&tx, record, work)?;
         extra(&tx)?;
         tx.commit()?;
         Ok(())
@@ -2634,6 +2667,7 @@ mod tests {
         WorkRecord {
             delegated: None,
             deadline_passed: false,
+            cancel_id: None,
             principal: "member:phone".into(),
             attachment_owner: String::new(),
             control_gen: 1,

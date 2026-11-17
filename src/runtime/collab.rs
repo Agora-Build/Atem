@@ -1098,6 +1098,7 @@ mod tests {
         WorkRecord {
             delegated: None,
             deadline_passed: false,
+            cancel_id: None,
             principal: principal.into(),
             attachment_owner: String::new(),
             control_gen: 1,

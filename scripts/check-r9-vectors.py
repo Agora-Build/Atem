@@ -1399,10 +1399,13 @@ UUID_V4 = r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
 def delegated_task(facts):
     """Only a delegated sender's task raises an alert (host-work-v1 §11.3):
     a UUID v4 task of a `member:`, `service:` or `host:` sender (an id of
-    1-128 bytes of [A-Za-z0-9._:-])."""
-    return (
-        re.fullmatch(UUID_V4, facts["task_id"]) is not None
-        and re.fullmatch(r"(member|service|host):[A-Za-z0-9._:-]{1,128}", facts["sender"]) is not None
+    1-128 bytes of [A-Za-z0-9._:-]), or a host sender's selector task (its
+    UUID v5, host-work-v1 §11.5)."""
+    sender_ok = re.fullmatch(r"(member|service|host):[A-Za-z0-9._:-]{1,128}", facts["sender"]) is not None
+    task = facts["task_id"]
+    return sender_ok and (
+        re.fullmatch(UUID_V4, task) is not None
+        or facts["sender"].startswith("host:") and re.fullmatch(UUID_V5, task) is not None
     )
 
 
@@ -1694,10 +1697,18 @@ def check_delegated_wire(file, data, report, context):
         if has != [True, True] or data_.get("kind") != "prompt":
             return False
         sender = data_["sender"]
+        # A UUID v4 task, or a host sender's selector task (its UUID v5,
+        # host-work-v1 §11.5).
+        task = data_["task_id"]
         return (
-            uuid4(data_["task_id"])
-            and isinstance(sender, str)
+            isinstance(sender, str)
             and re.fullmatch(r"(member|service|host):" + ID, sender) is not None
+            and (
+                uuid4(task)
+                or sender.startswith("host:")
+                and isinstance(task, str)
+                and re.fullmatch(UUID_V5, task) is not None
+            )
         )
 
     def nat(v):

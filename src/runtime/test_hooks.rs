@@ -455,6 +455,10 @@ mod imp {
         faults_dir().is_some_and(|dir| dir.join("hold_host_work").exists())
     }
 
+    pub fn admission_held() -> bool {
+        faults_dir().is_some_and(|dir| dir.join("hold_admission").exists())
+    }
+
     pub fn crash_held() -> bool {
         faults_dir().is_some_and(|dir| dir.join("hold_crash").exists())
     }
@@ -886,6 +890,16 @@ pub fn reopen_hold() {
 pub fn host_work_held() -> bool {
     #[cfg(debug_assertions)]
     return imp::host_work_held();
+    #[cfg(not(debug_assertions))]
+    false
+}
+
+/// Host senders' admission waits (`<pty faults>/hold_admission`): no inbox
+/// row is decided, no refusal reported and no status sealed while it
+/// exists, so a test sees the mailbox's own rows. Release builds: never.
+pub fn admission_held() -> bool {
+    #[cfg(debug_assertions)]
+    return imp::admission_held();
     #[cfg(not(debug_assertions))]
     false
 }
