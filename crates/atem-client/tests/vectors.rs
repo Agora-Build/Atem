@@ -10135,6 +10135,23 @@ fn mail_message(fields: &MailFields) -> atem_client::session::messages::Message 
 }
 
 /// A Memory snapshot of `text`.
+/// A `result` snapshot naming task `task`'s own reply (host-work-v1 §11.5):
+/// its id `result:<result_id>`, its text the reply's ids.
+fn mail_naming(task: &str) -> atem_client::session::host_work::ContextSnapshot {
+    use atem_client::session::host_work::{ContextKind, ContextSnapshot, digest, result_id};
+    let text = format!(
+        r#"{{"result_id":"{}","task_id":"{task}"}}"#,
+        result_id(task)
+    );
+    ContextSnapshot {
+        kind: ContextKind::Result,
+        id: format!("result:{}", result_id(task)),
+        version: 1,
+        digest: digest(text.as_bytes()),
+        text,
+    }
+}
+
 fn mail_snapshot(id: &str, text: String) -> atem_client::session::host_work::ContextSnapshot {
     use atem_client::session::host_work::{ContextKind, ContextSnapshot, digest};
     ContextSnapshot {
@@ -10329,6 +10346,36 @@ fn host_envelope_vectors(book: &Book) -> Value {
         "a complete of the request's task with a result snapshot",
         f,
         MailPlain::Envelope(complete),
+        "host-b-enc-1",
+    );
+    // A complete naming the reply the sending host got back: a `result`
+    // snapshot whose id is the task's own `result:<result_id>` (Atem's
+    // reading, for Astation); one naming another task's reply is refused.
+    let f = ab(&g, "complete_names_reply");
+    let complete = EnvelopePlain::Complete {
+        task_id: task.clone(),
+        result: mail_naming(&task),
+    };
+    g.seal(
+        "complete_names_reply",
+        "a complete of the request's task naming the reply it got back: a result snapshot whose id is the task's own result:<result_id>",
+        f,
+        MailPlain::Envelope(complete),
+        "host-b-enc-1",
+    );
+    let f = ab(&g, "complete_names_another_reply");
+    let text = jcs(&serde_json::json!({
+        "kind": "complete",
+        "result": serde_json::to_value(mail_naming(&mail_id("another task"))).unwrap(),
+        "task_id": task,
+    }))
+    .unwrap();
+    g.seal_raw(
+        "complete_names_another_reply",
+        "a complete of the request's task whose result snapshot names another task's reply; no builder seals it",
+        MailKind::Envelope,
+        f,
+        text.as_bytes(),
         "host-b-enc-1",
     );
     let f = ab(&g, "request_max");
@@ -10804,6 +10851,7 @@ fn host_envelope_vectors(book: &Book) -> Value {
         ("request_opens", "request"),
         ("cancel_opens", "cancel"),
         ("complete_opens", "complete"),
+        ("complete_names_reply_opens", "complete_names_reply"),
         ("request_max_opens", "request_max"),
     ] {
         at(
@@ -11278,6 +11326,15 @@ fn host_envelope_vectors(book: &Book) -> Value {
         &b,
         e,
         "a null in the plaintext",
+    );
+    let e = g.refused_authenticated("complete_names_another_reply", "plaintext_malformed");
+    at(
+        &mut g,
+        "complete_names_another_reply",
+        "complete_names_another_reply",
+        &b,
+        e,
+        "a result snapshot names only its own task's reply",
     );
     let e = g.refused_authenticated("plaintext_not_canonical", "plaintext_malformed");
     at(

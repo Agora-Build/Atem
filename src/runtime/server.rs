@@ -1445,7 +1445,7 @@ impl Server {
                     .ok_or_else(|| anyhow::anyhow!("session host unavailable"))
                     .and_then(|b| b.collab_complete(caller.as_ref(), &task_id, &self.sessions));
                 match result {
-                    Ok(()) => self.send(id, &RuntimeMsg::MessageCompleted { task_id }),
+                    Ok(host) => self.send(id, &RuntimeMsg::MessageCompleted { task_id, host }),
                     Err(e) => self.error(id, e.to_string(), "message_complete"),
                 }
             }
@@ -1475,7 +1475,7 @@ impl Server {
                     .ok_or_else(|| anyhow::anyhow!("session host unavailable"))
                     .and_then(|b| b.collab_cancel(caller.as_ref(), &task_id));
                 match result {
-                    Ok(()) => self.send(id, &RuntimeMsg::MessageCancelled { task_id }),
+                    Ok(host) => self.send(id, &RuntimeMsg::MessageCancelled { task_id, host }),
                     Err(e) => self.error(id, e.to_string(), "message_cancel"),
                 }
             }

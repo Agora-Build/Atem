@@ -1943,11 +1943,18 @@ def has_null(value):
     return False
 
 
-def snapshot_ok(s):
+def snapshot_ok(s, task_id=None):
+    """A context snapshot as work_complete takes one (memory or vault); with
+    `task_id`, a complete's, also a `result` snapshot naming that task's own
+    reply: its id `result:<result_id(task_id)>` (host-work-v1 §11.5, Atem's
+    reading for Astation)."""
+    kinds = ("memory", "vault")
+    if task_id is not None and isinstance(s, dict) and s.get("id") == "result:" + result_id_of(task_id):
+        kinds = ("memory", "vault", "result")
     return (
         isinstance(s, dict)
         and sorted(s) == ["digest", "id", "kind", "text", "version"]
-        and s["kind"] in ("memory", "vault")
+        and s["kind"] in kinds
         and safe_int(s["version"], 1)
         and isinstance(s["text"], str)
         and s["digest"] == sha256(s["text"].encode()).hex()
@@ -1996,10 +2003,14 @@ def work_receipt_ok(w):
     if ("result" in w) != (w["state"] == "completed"):
         return False
     r = w.get("result")
+    # A task its host sender completed with the reply it got back carries
+    # that `result` snapshot's reference, naming its own reply (host-work-v1
+    # §11.5).
+    own = isinstance(r, dict) and r.get("id") == "result:" + result_id_of(w["task_id"])
     return r is None or (
         isinstance(r, dict)
         and sorted(r) == ["digest", "id", "kind", "version"]
-        and r["kind"] in ("memory", "vault")
+        and r["kind"] in (("memory", "vault", "result") if own else ("memory", "vault"))
         and safe_int(r["version"], 1)
         and isinstance(r["digest"], str)
         and re.fullmatch(HEX64, r["digest"]) is not None
@@ -2076,7 +2087,7 @@ def mail_plaintext(kind, plain):
                 return "plaintext_too_large", None
         elif k == "cancel" and shape == ["kind", "task_id"] and task_ok(value["task_id"]):
             pass
-        elif k == "complete" and shape == ["kind", "result", "task_id"] and task_ok(value["task_id"]) and snapshot_ok(value["result"]):
+        elif k == "complete" and shape == ["kind", "result", "task_id"] and task_ok(value["task_id"]) and snapshot_ok(value["result"], value["task_id"]):
             pass
         else:
             return "plaintext_malformed", None

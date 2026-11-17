@@ -449,6 +449,21 @@ pub struct RemoteTaskView {
     pub state: String,
     pub detail: String,
     pub reply: Option<RemoteReplyView>,
+    /// The `cancel` and `complete` this host sent for it, as their rows
+    /// stand (`atem message cancel` and `complete` of a task on another
+    /// host).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stops: Vec<RemoteStopView>,
+}
+
+/// A `cancel` or `complete` this host sent for a task on another host: its
+/// row's state, the Station's or the host's code, and why.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteStopView {
+    pub kind: String,
+    pub state: String,
+    pub code: Option<String>,
+    pub detail: String,
 }
 
 /// A task's reply from the host that ran it, and whether it was delivered

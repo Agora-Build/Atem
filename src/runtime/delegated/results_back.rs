@@ -29,7 +29,7 @@
 //!   judged first (`accept_result_among`, in the bridge) against
 //!   [`candidates`]: the rows a result from that host may answer.
 use super::remote_send;
-use crate::runtime::collab::{RemoteReplyView, RemoteTaskView, RemoteView};
+use crate::runtime::collab::{RemoteReplyView, RemoteStopView, RemoteTaskView, RemoteView};
 use crate::runtime::host_work::Store;
 use anyhow::Result;
 use atem_client::host_mail::{ExpectedResult, HostRef, MailBody, Recipient, accept_result_among};
@@ -81,6 +81,7 @@ const TABLES: &str = "
         WHERE work_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS remote_tasks_replies ON remote_tasks(expires_at)
         WHERE reply IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS remote_tasks_by_task ON remote_tasks(task_id);
     CREATE INDEX IF NOT EXISTS remote_deliveries_host
         ON remote_deliveries(host_id, host_trust_gen, created_ms);
     CREATE TRIGGER IF NOT EXISTS mail_result_submitted AFTER UPDATE OF state ON results
@@ -355,11 +356,96 @@ pub fn apply_status(
             )?;
         }
     }
+    // A stop of a task whose effect this status shows is done (design
+    // II.4.4: put until a status shows it).
+    for task in &tasks {
+        remote_send::stops_shown(
+            tx,
+            &c.message_id,
+            &c.host_id,
+            &task.task_id,
+            &state_name(task.state),
+        )?;
+    }
     tx.execute(
         "UPDATE remote_tasks SET at_ms=?3 WHERE message_id=?1 AND host_id=?2",
         params![c.message_id, c.host_id, at],
     )?;
     Ok(true)
+}
+
+/// A task on another host this host's message reached, as its newest
+/// status has it: what `atem message cancel` and `complete` of it need.
+#[derive(Debug, Clone)]
+pub struct RemoteTask {
+    pub message_id: String,
+    pub host_id: String,
+    /// The generation its message's envelope went to.
+    pub host_trust_gen: u64,
+    pub recipient_id: String,
+    pub task_id: String,
+    pub state: String,
+    /// The message's expiry.
+    pub expires_at: u64,
+    /// Its reply, once its result came (whether delivered or kept).
+    pub reply: Option<ResultReply>,
+    /// The local task delivering that reply, once queued.
+    pub work_id: Option<String>,
+}
+
+/// The tasks on other hosts named `task_id` (a status recorded them): one,
+/// unless two hosts named a task alike. None in a store without these
+/// tables.
+pub fn remote_task(db: &Connection, task_id: &str) -> Result<Vec<RemoteTask>> {
+    if task_id.is_empty() || !made(db)? {
+        return Ok(Vec::new());
+    }
+    let mut q = db.prepare(
+        "SELECT t.message_id, t.host_id, d.host_trust_gen, t.recipient_id, t.task_id, t.state,
+            t.expires_at, t.reply, t.work_id
+        FROM remote_tasks t JOIN remote_deliveries d
+            ON d.object_id=t.message_id AND d.host_id=t.host_id AND d.kind='request'
+        WHERE t.task_id=?1",
+    )?;
+    let rows = q.query_map([task_id], |r| {
+        Ok(RemoteTask {
+            message_id: r.get(0)?,
+            host_id: r.get(1)?,
+            host_trust_gen: r.get(2)?,
+            recipient_id: r.get(3)?,
+            task_id: r.get(4)?,
+            state: r.get(5)?,
+            expires_at: r.get(6)?,
+            reply: r
+                .get::<_, Option<String>>(7)?
+                .and_then(|text| serde_json::from_str(&text).ok()),
+            work_id: r.get(8)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// What a `complete` of `task_id` carries as its result (host-work-v1
+/// §11.5; Atem's reading, for Astation): a `result` snapshot naming the
+/// task's own reply, its id `result:<result_id>`, its text the ids and,
+/// with the reply this host got back, that reply's digest
+/// (`{"digest","result_id","task_id"}`): the reply as the result, as stage
+/// 1's `atem message complete` completes with the reply, named, never
+/// copied back. With no reply, the ids alone: completed without one.
+pub fn naming(task_id: &str, reply: Option<&ResultReply>) -> ContextSnapshot {
+    let result_id = atem_client::session::host_work::result_id(task_id);
+    let mut named = serde_json::json!({"result_id": result_id, "task_id": task_id});
+    if let Some(reply) = reply {
+        named["digest"] = serde_json::json!(reply.digest);
+    }
+    let text = named.to_string();
+    ContextSnapshot {
+        kind: ContextKind::Result,
+        id: format!("result:{result_id}"),
+        version: 1,
+        digest: digest(text.as_bytes()),
+        text,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -710,13 +796,34 @@ pub fn views(db: &Connection, message_id: &str, announced: bool) -> Result<Vec<R
         FROM remote_tasks t LEFT JOIN work w ON w.id=t.work_id
         WHERE t.message_id=?1 AND t.host_id=?2 ORDER BY t.rowid",
     )?;
-    remote_send::rows(db, message_id)?
-        .into_iter()
+    let rows = remote_send::rows(db, message_id)?;
+    // Each task's stops (`cancel`, `complete`), in the order they were made.
+    let stops_of = |host: &str, task: &str| -> Vec<RemoteStopView> {
+        rows.iter()
+            .filter(|s| s.kind != "request" && s.host_id == host)
+            .filter(|s| s.task_id.as_deref() == Some(task))
+            .map(|s| RemoteStopView {
+                kind: s.kind.clone(),
+                state: s.state.clone(),
+                code: s.code.clone(),
+                detail: if s.state == "ready" && !announced {
+                    WAITING_FOR_MAILBOX.into()
+                } else {
+                    s.detail.clone()
+                },
+            })
+            .collect()
+    };
+    rows.iter()
         .filter(|row| row.kind == "request")
+        .cloned()
         .map(|row| {
-            let tasks = tasks
+            let mut tasks = tasks
                 .query_map([message_id, &row.host_id], task_view)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            for task in &mut tasks {
+                task.stops = stops_of(&row.host_id, &task.task_id);
+            }
             Ok(RemoteView {
                 status_pending: tasks.is_empty()
                     && !matches!(row.state.as_str(), "skipped" | "refused" | "expired"),
@@ -754,6 +861,7 @@ fn task_view(r: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteTaskView> {
         work.as_ref().map(|(s, d)| (s.as_str(), d.as_str())),
     );
     Ok(RemoteTaskView {
+        stops: Vec::new(),
         recipient_id: r.get(0)?,
         task_id: r.get(1)?,
         state: r.get(2)?,

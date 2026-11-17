@@ -581,12 +581,21 @@ pub enum RuntimeMsg {
     },
     MessageCompleted {
         task_id: String,
+        /// The host a task on another host was asked to complete on: a
+        /// `complete` sent, its effect shown by `atem message status`
+        /// (host senders, behind the debug-only hook).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<String>,
     },
     MessageStatus {
         messages: Vec<super::collab::MessageView>,
     },
     MessageCancelled {
         task_id: String,
+        /// The host a task on another host was asked to cancel on: a
+        /// `cancel` sent, its effect shown by `atem message status`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<String>,
     },
     MessageDirectory {
         rows: Vec<super::collab::DirectoryRow>,

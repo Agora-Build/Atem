@@ -29,6 +29,12 @@
 //!   the sending host reads with the results back (`results_back.rs`):
 //!   [`accepted`] and [`refused_by_receiver`], each settling the engine row
 //!   too.
+//! - **Stops** (`atem message cancel` and `complete` of a task on another
+//!   host, `remote_stops.rs`): a `cancel` or `complete` envelope's own row
+//!   ([`stop_row`]), kind and task id with it, put by the same engine
+//!   ([`Policy::Repeat`]) until a status shows its effect
+//!   ([`stops_shown`]: `accepted`), the host refuses it by its own id
+//!   ([`refused_by_receiver`]), or it expires.
 use super::outbox::{self, Policy};
 use super::send_plan::{Me, Plan, Skipped, signs};
 use crate::runtime::host_work::Store;
@@ -473,6 +479,84 @@ fn settle_row(
         outbox::settle(tx, n)?;
     }
     Ok(true)
+}
+
+/// The `cancel` or `complete` (`kind`) envelope `object_id` of `task` (a
+/// task on another host this host's message reached), sealed and enqueued
+/// as the engine's row `n`: its own delivery row, `ready`, in `tx`
+/// (design II.4.4: put every 10 minutes until a status shows its effect,
+/// the host answers it by its own id, or it expires).
+pub fn stop_row(
+    tx: &Transaction,
+    task: &super::results_back::RemoteTask,
+    kind: &str,
+    object_id: &str,
+    n: i64,
+    now_ms: u64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO remote_deliveries(object_id, host_id, host_trust_gen, message_id, kind,
+            recipient_id, task_id, outbox_n, state, detail, created_ms)
+        VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ready', 'waiting to be put in the host''s mailbox',
+            ?9)",
+        params![
+            object_id,
+            task.host_id,
+            task.host_trust_gen,
+            task.message_id,
+            kind,
+            task.recipient_id,
+            task.task_id,
+            n,
+            now_ms
+        ],
+    )?;
+    Ok(())
+}
+
+/// Whether a `kind` stop of `task` still stands (not refused or expired):
+/// another would add nothing.
+pub fn stop_stands(
+    db: &rusqlite::Connection,
+    task: &super::results_back::RemoteTask,
+    kind: &str,
+) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM remote_deliveries WHERE message_id=?1 AND host_id=?2
+            AND task_id=?3 AND kind=?4 AND state IN ('ready', 'sent', 'accepted'))",
+        params![task.message_id, task.host_id, task.task_id, kind],
+        |r| r.get(0),
+    )?)
+}
+
+/// A status of `host_id` shows task `task_id` of `message_id` `state`: a
+/// stop whose effect that is (`cancelled` for a cancel, `completed` for a
+/// complete) is `accepted`, its engine row settled (design II.4.4: "until a
+/// status shows their effect"), in `tx`.
+pub fn stops_shown(
+    tx: &Transaction,
+    message_id: &str,
+    host_id: &str,
+    task_id: &str,
+    state: &str,
+) -> Result<()> {
+    let kind = match state {
+        "cancelled" => "cancel",
+        "completed" => "complete",
+        _ => return Ok(()),
+    };
+    let ids: Vec<String> = tx
+        .prepare(
+            "SELECT object_id FROM remote_deliveries WHERE message_id=?1 AND host_id=?2
+            AND task_id=?3 AND kind=?4 AND state IN ('ready', 'sent')",
+        )?
+        .query_map(params![message_id, host_id, task_id, kind], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let detail = format!("the host's status shows the task {state}");
+    for id in ids {
+        settle_row(tx, &id, host_id, "accepted", None, &detail)?;
+    }
+    Ok(())
 }
 
 /// One delivery row, as `atem message status` shows it.

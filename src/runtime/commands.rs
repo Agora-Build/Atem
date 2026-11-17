@@ -149,8 +149,24 @@ pub async fn message(command: crate::cli::MessageCommands) -> Result<()> {
                 "{task_id}: reply refused: {detail}; send a corrected reply (result {result_id})"
             ),
         },
-        RuntimeMsg::MessageCompleted { task_id } => println!("{task_id}: completed"),
-        RuntimeMsg::MessageCancelled { task_id } => println!("{task_id}: cancelled"),
+        RuntimeMsg::MessageCompleted {
+            task_id,
+            host: None,
+        } => println!("{task_id}: completed"),
+        RuntimeMsg::MessageCancelled {
+            task_id,
+            host: None,
+        } => println!("{task_id}: cancelled"),
+        // A task on another host: the stop is sent; the host's status shows
+        // its effect.
+        RuntimeMsg::MessageCompleted {
+            task_id,
+            host: Some(host),
+        } => println!("{task_id}: complete sent to host {host}; `atem message status` shows it"),
+        RuntimeMsg::MessageCancelled {
+            task_id,
+            host: Some(host),
+        } => println!("{task_id}: cancel sent to host {host}; `atem message status` shows it"),
         RuntimeMsg::MessageDirectory { rows } => {
             for row in rows {
                 println!(
@@ -328,6 +344,13 @@ fn status_lines(messages: Vec<super::collab::MessageView>) -> Result<Vec<String>
                         ));
                     }
                     lines.push(format!("      {}", reply.delivery));
+                }
+                for stop in task.stops {
+                    let state = match &stop.code {
+                        Some(code) => format!("{} ({})", stop.state, escaped(code)),
+                        None => stop.state,
+                    };
+                    lines.push(format!("      {}  {state}  {}", stop.kind, stop.detail));
                 }
             }
         }
@@ -538,7 +561,7 @@ mod tests {
     #[test]
     fn status_shows_rows_to_other_hosts_and_what_came_back() {
         use super::super::collab::{
-            MessageView, RemoteReplyView, RemoteTaskView, RemoteView, TaskView,
+            MessageView, RemoteReplyView, RemoteStopView, RemoteTaskView, RemoteView, TaskView,
         };
         use atem_client::session::host_work::WorkState;
         let task = |id: &str, state: &str, detail: &str, reply| RemoteTaskView {
@@ -547,6 +570,7 @@ mod tests {
             state: state.into(),
             detail: detail.into(),
             reply,
+            stops: vec![],
         };
         let view = MessageView {
             message_id: "m-1".into(),
@@ -604,6 +628,24 @@ mod tests {
                                 delivery: "result not delivered: sender revoked".into(),
                             }),
                         ),
+                        // The stops this host sent for a task there.
+                        RemoteTaskView {
+                            stops: vec![
+                                RemoteStopView {
+                                    kind: "cancel".into(),
+                                    state: "refused".into(),
+                                    code: Some("busy".into()),
+                                    detail: "refused by the host (busy)".into(),
+                                },
+                                RemoteStopView {
+                                    kind: "complete".into(),
+                                    state: "sent".into(),
+                                    code: None,
+                                    detail: "stored in the host's mailbox".into(),
+                                },
+                            ],
+                            ..task("t-3", "awaiting_result", "turn ended", None)
+                        },
                     ],
                 },
                 RemoteView {
@@ -638,6 +680,9 @@ mod tests {
                 "    t-2  awaiting_result  reply submitted",
                 "      reply res-2: (text no longer kept)",
                 "      result not delivered: sender revoked",
+                "    t-3  awaiting_result  turn ended",
+                "      cancel  refused (busy)  refused by the host (busy)",
+                "      complete  sent  stored in the host's mailbox",
                 "  host host-d  accepted  accepted by the host",
                 "    recipient r-1  no_match",
                 "  host host-e  refused (forbidden)  refused by the host (forbidden)",
@@ -665,6 +710,7 @@ mod tests {
                 detail: "accepted by the host".into(),
                 status_pending: false,
                 tasks: vec![RemoteTaskView {
+                    stops: vec![],
                     recipient_id: "r-1".into(),
                     task_id: "t-1".into(),
                     state: "awaiting_result".into(),

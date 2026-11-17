@@ -425,7 +425,9 @@ pub enum EnvelopePlain {
     Request { message: Message },
     /// Cancel the task of that id.
     Cancel { task_id: String },
-    /// The sender completes the task with a result snapshot.
+    /// The sender completes the task with a result snapshot: a `memory` or
+    /// `vault` one, as `work_complete` takes, or one naming the task's own
+    /// reply ([`ContextSnapshot::names_reply_of`]).
     Complete {
         task_id: String,
         result: ContextSnapshot,
@@ -435,7 +437,8 @@ pub enum EnvelopePlain {
 impl EnvelopePlain {
     /// What a sender may seal and a receiver reads: ids in their grammar, a
     /// Message of at most [`MAX_PLAINTEXT_BYTES`] (its own validity is the
-    /// receiver's), a snapshot as `work_complete` takes one.
+    /// receiver's), a snapshot as `work_complete` takes one or one naming
+    /// the task's own reply.
     fn check(&self) -> Result<()> {
         match self {
             EnvelopePlain::Request { message } => {
@@ -450,7 +453,7 @@ impl EnvelopePlain {
                 }
             }
             EnvelopePlain::Complete { task_id, result } => {
-                if !task_id_ok(task_id) || !result.valid() {
+                if !task_id_ok(task_id) || !(result.valid() || result.names_reply_of(task_id)) {
                     return Err(Error::Malformed("complete"));
                 }
             }
@@ -1275,6 +1278,55 @@ mod tests {
             result: snapshot(0, 128 * 1024),
         };
         assert!(complete.to_bytes().unwrap().len() < MAX_PLAINTEXT_BYTES);
+    }
+
+    /// A host sender completes a task with the reply it got back by naming
+    /// that reply: a `result`-kind snapshot whose id is the task's own
+    /// `result:<result_id>` (host-work-v1 §11.5; Atem's reading, for
+    /// Astation). Any other `result` snapshot stays local only.
+    #[test]
+    fn a_complete_may_name_its_tasks_own_reply() {
+        use crate::session::host_work::{ContextKind, digest, result_id};
+        let text = format!(r#"{{"result_id":"{}","task_id":"{ID2}"}}"#, result_id(ID2));
+        let naming = ContextSnapshot {
+            kind: ContextKind::Result,
+            id: format!("result:{}", result_id(ID2)),
+            version: 1,
+            digest: digest(text.as_bytes()),
+            text,
+        };
+        let complete = EnvelopePlain::Complete {
+            task_id: ID2.into(),
+            result: naming.clone(),
+        };
+        let bytes = complete.to_bytes().unwrap();
+        assert_eq!(EnvelopePlain::parse(&bytes).unwrap(), complete);
+        // Another task's reply, or one whose digest isn't its text's.
+        let other = EnvelopePlain::Complete {
+            task_id: REPLY_ID.into(),
+            result: naming.clone(),
+        };
+        let mut wrong = naming.clone();
+        wrong.digest = "00".repeat(32);
+        let wrong = EnvelopePlain::Complete {
+            task_id: ID2.into(),
+            result: wrong,
+        };
+        for refused in [other, wrong] {
+            assert_eq!(refused.to_bytes(), Err(Error::Malformed("complete")));
+            let raw = jcs(&json!({"kind": "complete", "task_id": match &refused {
+                EnvelopePlain::Complete { task_id, .. } => task_id.clone(),
+                _ => unreachable!(),
+            }, "result": match &refused {
+                EnvelopePlain::Complete { result, .. } => serde_json::to_value(result).unwrap(),
+                _ => unreachable!(),
+            }}))
+            .unwrap();
+            assert_eq!(
+                EnvelopePlain::parse(raw.as_bytes()),
+                Err(Error::Malformed("complete"))
+            );
+        }
     }
 
     #[test]

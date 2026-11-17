@@ -80,6 +80,18 @@ impl ContextSnapshot {
         self.kind != ContextKind::Result && self.valid_local()
     }
 
+    /// A `result`-kind snapshot that names task `task_id`'s own reply: its
+    /// id `result:<result_id(task_id)>`, otherwise valid as a local one. A
+    /// host sender's `complete` may carry one in place of a `memory` or
+    /// `vault` snapshot, to complete the task with the reply it got back
+    /// (host-work-v1 §11.5; Atem's reading, for Astation). No other
+    /// `result` snapshot leaves its host.
+    pub fn names_reply_of(&self, task_id: &str) -> bool {
+        self.kind == ContextKind::Result
+            && self.id == format!("result:{}", result_id(task_id))
+            && self.valid_local()
+    }
+
     pub fn valid_local(&self) -> bool {
         is_opaque_id(&self.id)
             && self.version > 0
