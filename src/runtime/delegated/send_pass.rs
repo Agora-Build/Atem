@@ -28,8 +28,14 @@ use atem_client::session::messages::Message;
 use atem_client::session::select::{Label, Selector};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Why a publication that completed can't seal its envelopes yet (no
-/// committed list or host key): it waits and is tried again.
+/// Why a message's envelopes can't be sealed now (no committed device
+/// list or host key): a send is refused with it; a publication that
+/// completed waits and is tried again ([`OUTBOX_UNAVAILABLE`]).
+pub(crate) const SEAL_UNAVAILABLE: &str =
+    "host senders' outbox unavailable (no device list or host key); see `atem status`";
+
+/// The publication's state while its envelopes can't be sealed yet: it
+/// waits and is tried again.
 pub(crate) const OUTBOX_UNAVAILABLE: &str =
     "host senders' outbox unavailable; publication will retry";
 
@@ -174,7 +180,8 @@ impl HostBridge {
     /// The envelopes of `message` (accepted, its context frozen) to `part`'s
     /// hosts, sealed and enqueued in the accepting transaction `tx`. With
     /// `host.senders` off now, its rows are refused with why; with no
-    /// committed list or host key, it waits ([`OUTBOX_UNAVAILABLE`]).
+    /// committed list or host key, [`SEAL_UNAVAILABLE`] (a send refused; a
+    /// publication waiting, [`OUTBOX_UNAVAILABLE`]).
     pub(super) fn remote_seal(
         &self,
         tx: &rusqlite::Transaction,
@@ -186,7 +193,7 @@ impl HostBridge {
             return remote_send::refuse_unsealed(tx, message, part, SENDERS_OFF);
         }
         let (Some(list), Some(key)) = (self.send_list(), self.host_key.clone()) else {
-            bail!(OUTBOX_UNAVAILABLE);
+            bail!(SEAL_UNAVAILABLE);
         };
         let host = self.work_host();
         let sealer = Sealer {

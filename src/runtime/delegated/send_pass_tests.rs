@@ -801,7 +801,8 @@ fn a_failed_seal_rolls_the_whole_send_back() {
             sp_send(&mut rig, &["atem:atem-host", "atem:host-b"])
                 .unwrap_err()
                 .to_string(),
-            "host senders' outbox unavailable; publication will retry"
+            // Refused now, and nothing retries it (review L-N1).
+            "host senders' outbox unavailable (no device list or host key); see `atem status`"
         );
         let after: Vec<i64> = [
             "outbox",
