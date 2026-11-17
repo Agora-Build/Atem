@@ -602,8 +602,15 @@ fn a_message_to_another_host_runs_there_and_its_reply_comes_back() {
         input.contains(&line) && input.contains("HS_REPLY")
     });
     let result_id = atem_client::session::host_work::result_id(&tid);
-    pair.a
-        .message_status(&id, &[format!("      reply {result_id}: HS_REPLY")]);
+    // B's status showing the task awaiting its result has reached A too
+    // (it may come after the reply), so the complete goes at once.
+    pair.a.message_status(
+        &id,
+        &[
+            format!("    {tid}  awaiting_result  *"),
+            format!("      reply {result_id}: HS_REPLY"),
+        ],
+    );
     // The result's last line, run by A's agent in that turn.
     let out = pair.a.agent(2, &["message", "complete", &tid]);
     assert_eq!(out["code"], 0, "{out}");
