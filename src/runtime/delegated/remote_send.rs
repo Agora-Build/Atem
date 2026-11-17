@@ -19,8 +19,11 @@
 //!   generation, no key) has its row `refused` with the reason; this host
 //!   no longer signing refuses every row.
 //! - **The engine moves the rows** (a trigger, in the engine's own
-//!   transaction): stored → `sent`, refused → `refused` with the Station's
-//!   code, expired → `expired`.
+//!   statement), each state with its detail: a `ready` row stored is
+//!   `sent`, refused is `refused` with the Station's code; a `sent` row
+//!   stays `sent` when the Station refuses a later copy (the first was
+//!   stored and may be running on the receiver), its code recorded, but a
+//!   Station `expired` is its expiry; an expired object's row `expired`.
 //! - **Acceptance** is the receiver's status naming its resolution, which
 //!   the sending host reads with the results back (not built here):
 //!   [`accepted`] is its seam, settling the engine row too.
@@ -48,10 +51,30 @@ const TABLES: &str = "
         PRIMARY KEY(object_id, host_id)) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS remote_deliveries_message ON remote_deliveries(message_id);
     CREATE INDEX IF NOT EXISTS remote_deliveries_outbox ON remote_deliveries(outbox_n);
-    CREATE TRIGGER IF NOT EXISTS remote_deliveries_put AFTER UPDATE OF state ON mail_outbox
-    WHEN NEW.state IN ('stored', 'refused', 'expired') BEGIN
+    CREATE TRIGGER IF NOT EXISTS remote_deliveries_put AFTER UPDATE ON mail_outbox
+    WHEN NEW.state IS NOT OLD.state OR NEW.code IS NOT OLD.code BEGIN
         UPDATE remote_deliveries SET
-            state=CASE NEW.state WHEN 'stored' THEN 'sent' ELSE NEW.state END, code=NEW.code
+            state=CASE
+                WHEN NEW.state='expired' THEN 'expired'
+                WHEN state='sent' AND NEW.state='refused' AND NEW.code='expired' THEN 'expired'
+                WHEN state='ready' AND NEW.state='refused' THEN 'refused'
+                WHEN state='ready' AND NEW.state IN ('stored', 'done') THEN 'sent'
+                ELSE state END,
+            code=NEW.code,
+            detail=CASE
+                WHEN NEW.state='expired'
+                    OR state='sent' AND NEW.state='refused' AND NEW.code='expired'
+                    THEN 'expired before it was accepted'
+                WHEN state='ready' AND NEW.state='refused'
+                    THEN 'the Station refused it (' || NEW.code || ')'
+                WHEN (state='sent' OR NEW.state IN ('stored', 'done')) AND NEW.code IS NULL
+                    THEN 'stored in the host''s mailbox; put again every 10 minutes until accepted'
+                WHEN state='sent' OR NEW.state IN ('stored', 'done')
+                    THEN 'stored in the host''s mailbox; the Station refused a later copy ('
+                        || NEW.code || ')'
+                WHEN NEW.code='quota'
+                    THEN 'the Station''s quota is full; put again after a backoff'
+                ELSE 'waiting to be put in the host''s mailbox' END
         WHERE outbox_n=NEW.n AND state IN ('ready', 'sent');
     END;
     CREATE TRIGGER IF NOT EXISTS remote_deliveries_publication AFTER UPDATE OF state ON outbox

@@ -172,11 +172,12 @@ pub fn due(
 }
 
 /// `mailbox_stored` for row `n` at `now_ms`: a repeat row `stored`, put
-/// again in [`RESEND_MS`]; an until-stored row `done`. A row settled,
+/// again in [`RESEND_MS`]; an until-stored row `done`; its last refusal's
+/// code cleared. A row settled,
 /// refused or expired meanwhile stays so.
 pub fn stored(store: &Store, n: i64, now_ms: u64) -> Result<()> {
     store.db.execute(
-        "UPDATE mail_outbox SET puts=puts+1, quota=0,
+        "UPDATE mail_outbox SET puts=puts+1, quota=0, code=NULL,
             state=CASE policy WHEN 'repeat' THEN 'stored' ELSE 'done' END,
             next_put_ms=?2
         WHERE n=?1 AND state IN ('queued','stored')",
@@ -192,7 +193,8 @@ pub fn quota_backoff_ms(count: u32) -> u64 {
 }
 
 /// `mailbox_put_refused` of row `n` at `now_ms`: `quota` puts it again
-/// after the backoff; any other code refuses it for good, with the code.
+/// after the backoff (the code kept until it is stored); any other code
+/// refuses it for good, with the code.
 pub fn refused(store: &Store, n: i64, code: PutRefusal, now_ms: u64) -> Result<()> {
     if code == PutRefusal::Quota {
         let count: Option<u32> = store
@@ -202,7 +204,7 @@ pub fn refused(store: &Store, n: i64, code: PutRefusal, now_ms: u64) -> Result<(
             })
             .optional()?;
         store.db.execute(
-            "UPDATE mail_outbox SET quota=quota+1, next_put_ms=?2
+            "UPDATE mail_outbox SET quota=quota+1, next_put_ms=?2, code='quota'
             WHERE n=?1 AND state IN ('queued','stored')",
             params![
                 n,

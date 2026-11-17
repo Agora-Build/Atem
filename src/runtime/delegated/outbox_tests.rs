@@ -205,8 +205,9 @@ fn quota_backs_off_and_other_refusals_are_final() {
         assert_eq!(due_now(&store, now + wait), [n], "{wait}");
         now += wait;
     }
-    assert_eq!(state(&store, n), ("queued".into(), None));
+    assert_eq!(state(&store, n), ("queued".into(), Some("quota".into())));
     stored(&store, n, now).unwrap();
+    assert_eq!(state(&store, n), ("stored".into(), None));
     refused(&store, n, PutRefusal::Quota, now + RESEND_MS).unwrap();
     assert_eq!(due_now(&store, now + RESEND_MS + 30_000), [n]);
     for code in [

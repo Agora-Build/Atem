@@ -276,7 +276,13 @@ fn the_engine_moves_the_rows_and_acceptance_settles_them() {
     };
     outbox::stored(&store, b, T0).unwrap();
     outbox::refused(&store, c, PutRefusal::Quota, T0).unwrap();
-    assert_eq!(states(), [("sent".into(), None), ("ready".into(), None)]);
+    assert_eq!(
+        states(),
+        [
+            ("sent".into(), None),
+            ("ready".into(), Some("quota".into()))
+        ]
+    );
     outbox::stored(&store, b, T0 + outbox::RESEND_MS).unwrap();
     outbox::refused(&store, c, PutRefusal::Forbidden, T0).unwrap();
     assert_eq!(
@@ -306,5 +312,82 @@ fn the_engine_moves_the_rows_and_acceptance_settles_them() {
         rows_of(&store, &other.message_id)
             .iter()
             .all(|r| r.1 == "expired")
+    );
+}
+
+/// A Station refusal of a resend says only that this copy wasn't stored
+/// again (review M2): a `sent` row stays `sent`, the code recorded, and
+/// the results back may still accept it; a Station `expired` on a stored
+/// object is the row's expiry. Each state says what it is (review L2).
+#[test]
+fn a_refused_resend_keeps_a_sent_row_and_each_state_says_why() {
+    let (_dir, store) = store();
+    let log = list();
+    let p = plan(&log.log, ME, &["atem:b".into(), "atem:c".into()], false).unwrap();
+    let part = RemotePart::of(&p, "acct");
+    let message = local(vec![]);
+    commit(&store, &log, ME, &message, &part).unwrap();
+    let (b, _) = engine_bytes(&store, "b", &message.message_id);
+    let (c, _) = engine_bytes(&store, "c", &message.message_id);
+    let row = |host: &str| {
+        rows_of(&store, &message.message_id)
+            .into_iter()
+            .find(|r| r.0 == host)
+            .unwrap()
+    };
+    outbox::refused(&store, b, PutRefusal::Quota, T0).unwrap();
+    assert_eq!(
+        row("b").3,
+        "the Station's quota is full; put again after a backoff"
+    );
+    for n in [b, c] {
+        outbox::stored(&store, n, T0).unwrap();
+    }
+    assert_eq!(
+        row("b"),
+        (
+            "b".into(),
+            "sent".into(),
+            None,
+            "stored in the host's mailbox; put again every 10 minutes until accepted".into()
+        )
+    );
+    outbox::refused(&store, b, PutRefusal::IdReused, T0 + outbox::RESEND_MS).unwrap();
+    assert_eq!(
+        row("b"),
+        (
+            "b".into(),
+            "sent".into(),
+            Some("id_reused".into()),
+            "stored in the host's mailbox; the Station refused a later copy (id_reused)".into()
+        )
+    );
+    let tx = store.db.unchecked_transaction().unwrap();
+    assert!(accepted(&tx, &message.message_id, "b").unwrap());
+    tx.commit().unwrap();
+    assert_eq!(row("b").1, "accepted");
+    outbox::refused(&store, c, PutRefusal::Expired, T0 + outbox::RESEND_MS).unwrap();
+    assert_eq!(
+        row("c"),
+        (
+            "c".into(),
+            "expired".into(),
+            Some("expired".into()),
+            "expired before it was accepted".into()
+        )
+    );
+    // Never stored: refused, with the code.
+    let other = local(vec![]);
+    commit(&store, &log, ME, &other, &part).unwrap();
+    let (n, _) = engine_bytes(&store, "b", &other.message_id);
+    outbox::refused(&store, n, PutRefusal::IdReused, T0).unwrap();
+    assert_eq!(
+        rows_of(&store, &other.message_id)[0],
+        (
+            "b".into(),
+            "refused".into(),
+            Some("id_reused".into()),
+            "the Station refused it (id_reused)".into()
+        )
     );
 }
