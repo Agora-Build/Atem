@@ -2284,8 +2284,9 @@ fn a_withheld_revoke_carried_by_a_native_cancels_and_refuses() {
 /// VII.B 35: the sending host puts the same request again after this host
 /// admitted it and marked it done (a lost acknowledgment): the Station
 /// stores it again, the host reads it and takes it as a duplicate, so it
-/// is admitted once (one record, one status). An authenticated object
-/// with a bad time (made two minutes ahead of this host's clock) is
+/// is admitted once (one record); its status goes again (ruling R45: the
+/// Station may have lost the first), the same receipts. An authenticated
+/// object with a bad time (made two minutes ahead of this host's clock) is
 /// reported back `refused`, `invalid_request`.
 #[test]
 #[cfg_attr(
@@ -2309,9 +2310,17 @@ fn a_resend_is_admitted_once_and_a_bad_time_is_reported() {
     rig.within("read again and done", || {
         rig.station().mailbox_positions().is_empty()
     });
-    rig.two_passes();
-    assert_eq!(rig.count("messages"), 1);
-    assert_eq!(rig.statuses().len(), 1, "admitted once");
+    rig.within("its status sent again", || rig.statuses().len() == 2);
+    let statuses = rig.statuses();
+    let receipts = |s: &ResultPlain| match s {
+        ResultPlain::Status {
+            message_id,
+            recipients,
+        } if *message_id == message.message_id => recipients.clone(),
+        other => panic!("not its status: {other:?}"),
+    };
+    assert_eq!(receipts(&statuses[0]), receipts(&statuses[1]));
+    assert_eq!(rig.count("messages"), 1, "admitted once");
     let mut ahead = rig.sender.message(&to, &["tag:nobody"], 1, "HM_AHEAD");
     ahead.created_at += 120_000;
     rig.put(&rig.sender.request_of(&to, rig.log.log.head(), &ahead));

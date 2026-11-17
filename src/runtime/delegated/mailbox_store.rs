@@ -926,6 +926,12 @@ fn record(
             bytes,
         )?,
         EnvelopeVerdict::Open { plain, .. } => match claimed(tx, cx, &body, &hash, bytes)? {
+            // The sender's resend of a request admission decided: its
+            // status goes again (ruling R45: the Station may have lost it).
+            Some(Decision::Duplicate) if matches!(plain, EnvelopePlain::Request { .. }) => {
+                super::admit::resend_status(tx, &body.sender.host_id, &body.id)?;
+                Decision::Duplicate
+            }
             Some(other) => other,
             // No room in its sender's share or in all: left on the Station,
             // unclaimed (ruling R31).

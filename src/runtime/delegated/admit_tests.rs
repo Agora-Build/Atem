@@ -1443,3 +1443,30 @@ fn a_cancel_withdraws_an_attempt_waiting_accepted() {
         assert!(!input(&rig).contains("AD_ACCEPTED"));
     });
 }
+
+/// Ruling R45: the sender's resend of an admitted request, read while the
+/// mailbox's claim holds (a duplicate there, never reaching admission),
+/// marks the message's status owed again, so a status the Station lost
+/// goes again; superseding keeps one waiting to be put.
+#[test]
+fn a_duplicate_of_an_admitted_request_sends_its_status_again() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        let message = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
+        let object = ad_request(&rig, &host, &message);
+        ad_deliver(&mut rig, &mut host, std::slice::from_ref(&object));
+        ad_admit(&mut rig);
+        assert_eq!(ad_statuses(&rig).len(), 1);
+        ad_deliver(&mut rig, &mut host, &[object]);
+        assert_eq!(ad_inbox_rows(&rig), 0, "a duplicate at the mailbox");
+        rig.bridge.mail_statuses();
+        let statuses = ad_statuses(&rig);
+        assert_eq!(statuses.len(), 2, "sent again");
+        assert_eq!(statuses[0].0, "done", "superseded, never put");
+        assert_eq!(statuses[1].0, "queued");
+        assert_eq!(ad_receipts(&rig, &message).len(), 1);
+        assert_eq!(ad_tasks(&rig, &message).len(), 1, "nothing admitted twice");
+    });
+}

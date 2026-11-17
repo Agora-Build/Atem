@@ -3735,7 +3735,11 @@ exactly as without this section):
     it in one transaction with the mark cleared. A newer status settles
     one the Station hasn't stored yet (never put); each is its own object.
     A sender with no current key, or no longer a current host, gets none:
-    the record keeps the state for the owner. A refusal row marked for its
+    the record keeps the state for the owner. The sender's resend of an
+    admitted request that the mailbox reads as a duplicate (its claim
+    held) marks the message's status owed again (**Atem's reading, for
+    Astation:** the Station may have lost the first; superseding keeps one
+    waiting). A refusal row marked for its
     sender (check 5 or 6, after the copy was shown to be the sender's) is
     reported `{"kind":"status","object_id","refused":"invalid_request"}`
     once, its mark cleared in that transaction.
