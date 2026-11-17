@@ -654,7 +654,9 @@ impl HostBridge {
             }
         }
         // The limits (II.9), as a channel member's publish meets them.
-        if (!tasks.is_empty() && store.over_capacity(&principal)?) || !room(tx, &tasks)? {
+        if (!tasks.is_empty() && store.over_capacity(&principal)?)
+            || !crate::runtime::host_work::message_room(tx, &tasks)?
+        {
             return refuse("busy", true);
         }
         if let Err(error) = crate::runtime::collab::count_received(
@@ -692,21 +694,7 @@ impl HostBridge {
                 recipients,
             },
         };
-        tx.execute(
-            "INSERT INTO messages(id,record) VALUES(?1,?2)",
-            rusqlite::params![id, serde_json::to_string(&record)?],
-        )?;
-        for task in &tasks {
-            let state = serde_json::to_value(task.status.state)?;
-            tx.execute(
-                "INSERT INTO work(id,record,state) VALUES(?1,?2,?3)",
-                rusqlite::params![
-                    task.task.task_id,
-                    serde_json::to_string(task)?,
-                    state.as_str().unwrap_or_default()
-                ],
-            )?;
-        }
+        crate::runtime::host_work::insert_message(tx, &record, &tasks)?;
         signing.status(tx, store, &record)
     }
 
@@ -805,14 +793,8 @@ impl HostBridge {
                 // The agents of routes that consent to the sender and whose
                 // grant covers a task (II.6, "The receiver decides"): no
                 // sending session to leave out.
-                let candidates: Vec<crate::runtime::collab::Candidate> = self
-                    .work
-                    .config
-                    .routes
-                    .iter()
-                    .filter(|route| permits(route, HostOp::Task))
-                    .flat_map(|route| self.route_candidates(route, sessions))
-                    .collect();
+                let candidates =
+                    self.candidates_where(sessions, |route| permits(route, HostOp::Task));
                 let resolved = crate::runtime::collab::resolve(
                     &me,
                     &candidates,
@@ -860,45 +842,6 @@ impl HostBridge {
                 }
             }
         }
-    }
-
-    /// The agents of `route` a selector may match: its profile's live
-    /// sessions, with this host's labels, the route's and their own tags
-    /// (stage 1's candidates, `collab_candidates`).
-    fn route_candidates(
-        &self,
-        route: &crate::runtime::host_work::Route,
-        sessions: &BTreeMap<SessionId, BrokerSession>,
-    ) -> Vec<crate::runtime::collab::Candidate> {
-        let Some(profile) = self.work.config.profile(&route.profile_id) else {
-            return Vec::new();
-        };
-        sessions
-            .values()
-            .filter(|s| {
-                s.is_live()
-                    && s.cwd == profile.cwd
-                    && s.provider == profile.provider
-                    && self.projects.key_of(s.id.as_str()) == Some(profile.project.as_str())
-            })
-            .map(|session| crate::runtime::collab::Candidate {
-                route_id: route.id.clone(),
-                route_revision: route.revision,
-                session_id: session.id.to_string(),
-                process_gen: session.process_gen.clone(),
-                started_ms: session.created_at_ms,
-                labels: self
-                    .work
-                    .config
-                    .instance
-                    .labels
-                    .iter()
-                    .chain(&route.labels)
-                    .chain(session.self_tags())
-                    .filter_map(|s| s.parse().ok())
-                    .collect(),
-            })
-            .collect()
     }
 
     /// The task `task` of a host sender's message through `route_id` at
@@ -1116,20 +1059,4 @@ impl HostBridge {
                 ) == Some(AttemptEnd::Started)
             })
     }
-}
-
-/// Whether the store has room for a message with `tasks` (host work's
-/// bounds, as `accept_message` checks them): open messages and tasks
-/// within `MAX_RECORDS`, unfinished tasks within `MAX_QUEUED`.
-fn room(tx: &Transaction, tasks: &[WorkRecord]) -> anyhow::Result<bool> {
-    use crate::runtime::host_work::{MAX_QUEUED, MAX_RECORDS, open_records};
-    let queued = tasks.iter().filter(|t| !t.status.state.terminal()).count();
-    let unfinished: usize = tx.query_row(
-        "SELECT count(*) FROM work WHERE state IN ('queued','blocked','submitting','submitted')",
-        [],
-        |r| r.get(0),
-    )?;
-    Ok(open_records(tx, "messages")? < MAX_RECORDS
-        && open_records(tx, "work")? + tasks.len() <= MAX_RECORDS
-        && unfinished + queued <= MAX_QUEUED)
 }

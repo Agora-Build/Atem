@@ -1293,9 +1293,23 @@ impl HostBridge {
         &self,
         sessions: &BTreeMap<SessionId, BrokerSession>,
     ) -> Vec<Candidate> {
+        self.candidates_where(sessions, |route| {
+            route.principals.iter().any(|p| p == "local")
+        })
+    }
+
+    /// The agents a selector may match on the routes `take` keeps: each
+    /// route's profile's live sessions, with this host's labels, the
+    /// route's and their own tags (`local`'s routes for stage 1, the
+    /// routes consenting to a host sender for its `select`).
+    pub(super) fn candidates_where(
+        &self,
+        sessions: &BTreeMap<SessionId, BrokerSession>,
+        take: impl Fn(&crate::runtime::host_work::Route) -> bool,
+    ) -> Vec<Candidate> {
         let mut candidates = Vec::new();
         for route in &self.work.config.routes {
-            if !route.principals.iter().any(|p| p == "local") {
+            if !take(route) {
                 continue;
             }
             let Some(profile) = self.work.config.profile(&route.profile_id) else {
