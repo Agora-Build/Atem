@@ -446,10 +446,13 @@ pub fn sent(tx: &Transaction, message_id: &str, n: i64) -> Result<()> {
 
 /// `sender_host`'s resend of its request `message_id`, read as a duplicate
 /// by the mailbox (ruling R45): the admitted message's status is owed
-/// again, so one the Station lost goes again (superseding keeps one
-/// waiting), and so is a whole refusal recorded for it ([`owed_refusals`]).
-/// Nothing for a message neither admitted nor refused from that sender, or
-/// in a store without admission's tables.
+/// again, so one the Station lost goes again, and so is a whole refusal
+/// recorded for it ([`owed_refusals`]). Only once the latest status was
+/// stored (review L7): one still waiting to be stored is put again anyway,
+/// the same object, never superseded by a copy of itself (whose first
+/// might be stored already, its answer lost). Nothing for a message
+/// neither admitted nor refused from that sender, or in a store without
+/// admission's tables.
 pub fn resend_status(tx: &Transaction, sender_host: &str, message_id: &str) -> Result<()> {
     let made: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='mail_status_owed')",
@@ -460,7 +463,10 @@ pub fn resend_status(tx: &Transaction, sender_host: &str, message_id: &str) -> R
         tx.execute(
             "INSERT OR IGNORE INTO mail_status_owed(message_id)
             SELECT id FROM messages WHERE id=?1
-                AND json_extract(record, '$.message.sender')=?2",
+                AND json_extract(record, '$.message.sender')=?2
+                AND NOT EXISTS(SELECT 1 FROM mail_status_sent s
+                    JOIN mail_outbox o ON o.n=s.outbox_n
+                    WHERE s.message_id=?1 AND o.state='queued')",
             params![
                 message_id,
                 atem_client::host_principal::host_principal(sender_host)

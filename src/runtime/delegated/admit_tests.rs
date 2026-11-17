@@ -1670,7 +1670,10 @@ fn a_cancel_whose_attempt_started_is_answered_busy() {
 /// Ruling R45: the sender's resend of an admitted request, read while the
 /// mailbox's claim holds (a duplicate there, never reaching admission),
 /// marks the message's status owed again, so a status the Station lost
-/// goes again; superseding keeps one waiting to be put.
+/// goes again. Only once the latest status was stored (the Station may
+/// have lost it since): one still waiting to be stored is put again
+/// anyway, the same object, and isn't superseded by a copy of itself
+/// (review L7).
 #[test]
 fn a_duplicate_of_an_admitted_request_sends_its_status_again() {
     local_test(async |root| {
@@ -1682,16 +1685,35 @@ fn a_duplicate_of_an_admitted_request_sends_its_status_again() {
         ad_deliver(&mut rig, &mut host, std::slice::from_ref(&object));
         ad_admit(&mut rig);
         assert_eq!(ad_statuses(&rig).len(), 1);
-        ad_deliver(&mut rig, &mut host, &[object]);
+        // Not stored yet: it goes on being put; no new status.
+        ad_deliver(&mut rig, &mut host, std::slice::from_ref(&object));
         assert_eq!(ad_inbox_rows(&rig), 0, "a duplicate at the mailbox");
         rig.bridge.mail_statuses();
         let statuses = ad_statuses(&rig);
+        assert_eq!(statuses.len(), 1, "the waiting one goes on");
+        assert_eq!(statuses[0].0, "queued");
+        // Stored, then the sender resends: its status goes again.
+        ad_stored_all(&rig);
+        ad_deliver(&mut rig, &mut host, &[object]);
+        rig.bridge.mail_statuses();
+        let statuses = ad_statuses(&rig);
         assert_eq!(statuses.len(), 2, "sent again");
-        assert_eq!(statuses[0].0, "done", "superseded, never put");
         assert_eq!(statuses[1].0, "queued");
         assert_eq!(ad_receipts(&rig, &message).len(), 1);
         assert_eq!(ad_tasks(&rig, &message).len(), 1, "nothing admitted twice");
     });
+}
+
+/// Every status and result put so far stored at the Station.
+fn ad_stored_all(rig: &LocalRig) {
+    rig.bridge
+        .work
+        .store
+        .as_ref()
+        .unwrap()
+        .db
+        .execute_batch("UPDATE mail_outbox SET state='done' WHERE policy='until_stored'")
+        .unwrap();
 }
 
 /// Review N4: ruling R45 re-owes a status only for the sender's own resend,
@@ -1751,7 +1773,9 @@ fn a_reread_of_an_admitted_request_owes_no_status() {
         assert_eq!(mb_store(&rig).cursor.map(|(_, at)| at), Some(1));
         rig.bridge.mail_statuses();
         assert_eq!(ad_statuses(&rig).len(), 1, "a reset's re-read owes none");
-        // The sender's own resend, stored again at a new position.
+        // The sender's own resend, stored again at a new position, once its
+        // status was stored.
+        ad_stored_all(&rig);
         ad_deliver(&mut rig, &mut host, &[object]);
         assert_eq!(mb_store(&rig).cursor.map(|(_, at)| at), Some(2));
         rig.bridge.mail_statuses();

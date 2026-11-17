@@ -373,6 +373,20 @@ results = true
         }
     }
 
+    /// Waits for two passes of the broker begun after now (its state
+    /// dump's `pass`).
+    fn two_passes(&self) {
+        let pass = |host: &Host| {
+            std::fs::read(host.sandbox.dir.path().join("state.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .and_then(|v| v["pass"].as_u64())
+                .unwrap_or(0)
+        };
+        let now = pass(self);
+        self.within("two passes", || pass(self) >= now + 2);
+    }
+
     /// The host-work store.
     fn db(&self) -> rusqlite::Connection {
         support::delegated::host_db(self)
@@ -712,7 +726,11 @@ fn a_queued_task_on_another_host_is_cancelled() {
         ],
     );
     support::delegated::complete_turn(&pair.b, &t1);
-    std::thread::sleep(Duration::from_millis(500));
+    // A later task of A's runs on that session: the cancelled one, ahead
+    // of it in the queue, never did (review L7: an anchor, no fixed wait).
+    let third = pair.send(3, &format!("atem:{B}"), "HS_THIRD", false);
+    let t3 = pair.b.task_of(&third);
+    support::delegated::in_turn(&pair.b, &t3, "HS_THIRD");
     support::delegated::never_ran(&pair.b, &t2, "HS_SECOND");
 }
 
@@ -757,19 +775,25 @@ fn a_launch_on_message_starts_an_agent_on_the_other_host() {
 )]
 fn a_lost_stored_on_either_side_is_put_again_and_applied_once() {
     let pair = Pair::start(Hook::On, "");
+    let twice = |host: &Host, id: &str| host.put_ids().iter().filter(|p| *p == id).count() == 2;
+    // A's side: B admits nothing meanwhile, so A's row waits for its own
+    // retry (review L7: no race with B's status accepting the row).
+    private(&pair.b.faults().join("hold_admission"), "");
     pair.a.station().drop_stored(1);
     pair.b.station().drop_stored(1);
     let id = pair.send(1, "atem:host-b/nowhere", "HS_LOST", false);
     pair.a.within("A's put", || pair.a.put_ids().contains(&id));
+    pair.a.clock.add_mono(RETRY_MS);
+    pair.a
+        .within("A's envelope put again", || twice(&pair.a, &id));
+    // B's side: admitted once, its status's answer lost, put again 35 s
+    // later on B's clock.
+    std::fs::remove_file(pair.b.faults().join("hold_admission")).unwrap();
     pair.b
         .within("B's status put", || !pair.b.put_ids().is_empty());
     assert_eq!(pair.b.count("messages", &format!("id='{id}'")), 1);
     let status = pair.b.put_ids()[0].clone();
-    pair.a.clock.add_mono(RETRY_MS);
     pair.b.clock.add_mono(RETRY_MS);
-    let twice = |host: &Host, id: &str| host.put_ids().iter().filter(|p| *p == id).count() == 2;
-    pair.a
-        .within("A's envelope put again", || twice(&pair.a, &id));
     pair.b
         .within("B's status put again", || twice(&pair.b, &status));
     pair.a.message_status(
@@ -825,6 +849,17 @@ fn a_kill_of_the_receiving_host_after_admission_applies_once() {
     );
     assert_eq!(pair.b.count("messages", &format!("id='{id}'")), 1);
     assert!(pair.b.put_ids().is_empty(), "nothing put before the kill");
+    // The status committed with the admission, by its object (review L8).
+    let committed: String = pair
+        .b
+        .db()
+        .query_row(
+            "SELECT o.object_id FROM mail_status_sent s JOIN mail_outbox o ON o.n=s.outbox_n
+            WHERE s.message_id=?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
     pair.b.start_again();
     pair.b.within("the owed done answered", || {
         pair.b.count("mailbox_dones", "1") == 0
@@ -836,11 +871,21 @@ fn a_kill_of_the_receiving_host_after_admission_applies_once() {
         .message_status(&id, &[format!("    {tid}  submitted  *")]);
     assert_eq!(pair.b.count("messages", &format!("id='{id}'")), 1);
     assert_eq!(pair.b.tasks_of(&id).len(), 1);
-    let first = pair.b.put_ids()[0].clone();
-    assert_eq!(
-        pair.b.put_ids().iter().filter(|p| **p == first).count(),
-        1,
-        "the status committed with the admission put once"
+    // Put once, or superseded by a newer status before it was put (never
+    // put twice).
+    let puts = pair.b.put_ids().iter().filter(|p| **p == committed).count();
+    let (state, tries): (String, i64) = pair
+        .b
+        .db()
+        .query_row(
+            "SELECT state, puts FROM mail_outbox WHERE object_id=?1",
+            [&committed],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(
+        puts == 1 || (puts == 0 && state == "done" && tries == 0),
+        "the committed status: {puts} puts, {state}"
     );
     support::delegated::complete_turn(&pair.b, &task);
 }
@@ -949,7 +994,24 @@ fn with_the_hook_off_a_send_reaches_no_other_host() {
         1,
         &["message", "send", "--to", &format!("atem:{B}"), "HS_OFF"],
     );
-    std::thread::sleep(Duration::from_secs(2));
+    // Stage 1's send: accepted, its selector matching no agent here.
+    assert_eq!(out["code"], 0, "{out}");
+    let id = out["stdout"].as_str().unwrap().trim().to_owned();
+    assert!(
+        pair.a
+            .message_status(&id, &[format!("{id}  accepted  *")])
+            .lines()
+            .count()
+            == 1,
+        "no task, no row to another host"
+    );
+    // Two passes of each host after it (review L7: an anchor, no fixed
+    // wait; the pass count is the debug state dump's, and a release build,
+    // which compiles host senders out, has none): nothing was put.
+    if cfg!(debug_assertions) {
+        pair.a.two_passes();
+        pair.b.two_passes();
+    }
     assert!(pair.a.put_ids().is_empty(), "{out}");
     assert!(pair.b.put_ids().is_empty());
     assert!(!support::delegated::input(&pair.b).contains("HS_OFF"));
