@@ -3518,7 +3518,10 @@ fn a_record_against_a_live_attempt() {
         std::thread::spawn(move || {
             let db = rusqlite::Connection::open(db).unwrap();
             db.busy_timeout(Duration::from_secs(5)).unwrap();
-            while !stop.load(Ordering::SeqCst) {
+            // One sample after the stop is seen, so the last state the
+            // test waited for is always among them.
+            loop {
+                let stopping = stop.load(Ordering::SeqCst);
                 let state: String = db
                     .query_row("SELECT state FROM work WHERE id=?1", [&id], |r| r.get(0))
                     .unwrap();
@@ -3527,6 +3530,9 @@ fn a_record_against_a_live_attempt() {
                     seen.push(state);
                 }
                 drop(seen);
+                if stopping {
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(5));
             }
         })
