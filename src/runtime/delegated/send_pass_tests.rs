@@ -927,6 +927,89 @@ fn a_send_to_other_hosts_only_counts_once_toward_the_limits() {
     });
 }
 
+/// The sender's limits (collaboration §6; design II.9, "On the sending
+/// host") refuse a send to other hosts at send, as stage 1 refuses a local
+/// one, before anything is reserved or sealed for it. A context send is
+/// refused while the session's earlier sends, those still publishing
+/// included, fill `per_hour` (stage 1 counts them at send); a send without
+/// context once the counted ones do (a mixed send, one to other hosts only,
+/// a `project:` fan-out). A refused send leaves no delivery row and no
+/// envelope.
+#[test]
+fn a_remote_send_over_the_senders_limits_is_refused_at_send() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let _host = sp_host(&mut rig, root, &os);
+        rig.bridge.work.config.collab.per_hour = 2;
+        let first = sp_send(&mut rig, &["atem:atem-host", "atem:host-b"]).unwrap();
+        let session = rig.sid.to_string();
+        assert_eq!(counted(&rig, &format!("hour:{session}")), 1);
+        // A context send: publishing, counted at send toward the hour.
+        let publishing = sp_context_send(&mut rig, root, &["atem:host-b"]);
+        assert_eq!(sp_outbox(&rig, &publishing).0, "publishing");
+        let context_send = |rig: &mut LocalRig| {
+            let mut request = send_request(&["atem:host-b"]);
+            request.memory = vec!["mem_c0ffee02".into()];
+            request.expires_ms = HOUR;
+            rig.bridge
+                .collab_send("atem-host", &rig.sid, request, &rig.sessions)
+        };
+        let reserved = rows(&rig, "remote_deliveries");
+        assert_eq!(
+            context_send(&mut rig).unwrap_err().to_string(),
+            "limit: 2 messages per hour"
+        );
+        assert_eq!(rows(&rig, "remote_deliveries"), reserved, "none reserved");
+        // A send without context counts what was accepted: the second goes,
+        // then every kind of send to other hosts is refused.
+        sp_send(&mut rig, &["atem:host-b"]).unwrap();
+        assert_eq!(counted(&rig, &format!("hour:{session}")), 2);
+        let (rows_before, sealed_before) = (
+            rows(&rig, "remote_deliveries"),
+            rows_where(&rig, "mail_outbox", "kind='atem-envelope'"),
+        );
+        for to in [
+            &["atem:atem-host", "atem:host-b"][..],
+            &["atem:host-b"][..],
+            &["project:build"][..],
+        ] {
+            assert_eq!(
+                sp_send(&mut rig, to).unwrap_err().to_string(),
+                "limit: 2 messages per hour",
+                "{to:?}"
+            );
+        }
+        assert_eq!(
+            context_send(&mut rig).unwrap_err().to_string(),
+            "limit: 2 messages per hour"
+        );
+        assert_eq!(rows(&rig, "remote_deliveries"), rows_before, "no row");
+        assert_eq!(
+            rows_where(&rig, "mail_outbox", "kind='atem-envelope'"),
+            sealed_before,
+            "nothing sealed"
+        );
+        assert_eq!(sp_local(&rig, &first).0, "accepted");
+    });
+}
+
+/// The rows of `table` where `filter` holds.
+fn rows_where(rig: &LocalRig, table: &str, filter: &str) -> i64 {
+    rig.bridge
+        .work
+        .store
+        .as_ref()
+        .unwrap()
+        .db
+        .query_row(
+            &format!("SELECT count(*) FROM {table} WHERE {filter}"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
 /// A publication of a send to other hosts only, completing with
 /// `host.senders` off now, is refused whole: it has no other part.
 #[test]
