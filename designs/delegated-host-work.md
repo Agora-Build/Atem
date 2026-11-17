@@ -2196,7 +2196,13 @@ most 24 h retention, quotas, acknowledgments and deduplication").
 **Status objects built behind the debug-only hook** (host-work-v1 §11.5, "On the receiving host": sent at
 acceptance and at every later change of a task's state, a newer one superseding one the Station hasn't stored, none
 to a sender with no current key or re-verified since its message; a resend the mailbox reads as a duplicate gets the
-status, or the whole refusal, again). Results back and the sending host's check are not built.
+status, or the whole refusal, again). **Results back and the sending host's check built behind the same hook**
+(host-work-v1 §11.5, "On the receiving host" and "On the sending host"): an agent's submitted reply sealed as one
+result, owed in the reply's own commit; the sending host judges every status and result with `accept_result` against
+its rows to that host, applies each with its removal from the mailbox's results in one transaction, records the
+resolution and each task's newest state (a status made before the recorded one changes nothing), and delivers a reply
+as this section says, or keeps it as data with why. A delivered result's first line names the host only (its plaintext
+names no session; the example in III.2 names one, Atem's reading for Astation).
 
 The host that ran the work sends **`atem-result`** objects back to the sending host through the same mailbox. They
 have the envelope's shape with type `atem-result`, signing label `atem-result-v1` and seal label

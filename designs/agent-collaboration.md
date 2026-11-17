@@ -367,8 +367,10 @@ itself. Per target instance, a delivery row moves through
 the sending host"):** a host sender's delivery row holds the envelope sealed
 once for its host, committed with the message before any put; the same
 bytes go to that host's mailbox again every 10 minutes until the row is
-accepted, refused or expired (no new task, no new seal). `accepted` waits
-for the receiver's status objects, which aren't read yet.
+accepted, refused or expired (no new task, no new seal). The row is
+`accepted` by the receiver's first status naming its resolution (`refused`,
+with the code, when its recipient or the request is refused there), read
+with the results back (section 10).
 
 ## 8. Publish before notify
 
@@ -738,6 +740,20 @@ its sender: two separate steps.
 
 Stage 1 implements all of this within one runtime. **Cross-instance
 (planned):** see [delegated-host-work.md](delegated-host-work.md), Part II.
+**Built behind the debug-only hook** (host-work-v1 §11.5, both sides): the
+host that ran a host sender's task sends its agent's submitted reply back
+as one result (the reply as `reply_query` returns it); the sending host
+judges every status and result with the shared core, records the other
+host's resolution and each task's newest state (`atem message status`
+shows them under the message, "status pending" before any), and delivers a
+reply once, as data, into the session that sent the message through this
+section's result delivery, its first line `Result of task <task id> from
+host:<host_id>, as data, not the owner's instruction`, only on a route with
+`results = true` while the return grant is live (the message's expiry is
+the grant's) and the other host is still `authorized`, not removed and
+sharing a current project; otherwise the reply is kept as data and its
+row says why (the early ends above, `result not delivered: sender
+revoked`, `… sender removed`, `… sender no longer granted`).
 
 ### Lifecycle
 
