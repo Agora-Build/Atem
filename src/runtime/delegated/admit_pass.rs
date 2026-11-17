@@ -166,7 +166,7 @@ impl Signing {
 
 /// A report or an inbox row admission failed to decide (review M2).
 enum Failed {
-    Row(InboxRow, String),
+    Row(Box<InboxRow>, String),
     Report {
         evidence: String,
         sender: String,
@@ -349,7 +349,7 @@ impl HostBridge {
                             row.sender_host, row.object_id
                         )
                     });
-                    failed.push(Failed::Row(row, format!("{error:#}")));
+                    failed.push(Failed::Row(Box::new(row), format!("{error:#}")));
                 }
             }
         }
