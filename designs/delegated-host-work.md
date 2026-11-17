@@ -1,7 +1,8 @@
 # Delegated host work and host-to-host senders: one design
 
-Status: **agreed; step 4 (Part I's host side) built behind a debug-only hook and advertised by no release build;
-the rest planned** (2026-11-14; "Step 4 built" below). Agreed by Atem, Astation and Auth/Portal on 2026-11-08
+Status: **agreed; step 4 (Part I's host side) and Atem's side of Part II (host senders) built behind a debug-only
+hook and advertised by no release build; the rest planned** (2026-11-17; "Step 4 built" and "Part II built on
+Atem's side" below). Agreed by Atem, Astation and Auth/Portal on 2026-11-08
 (revision 6b); the owner decided every choice (Appendix A, and owner choice 20 on 2026-11-08). Astation's
 confirmation is [Atem #120](https://github.com/Agora-Build/Atem/issues/120#issuecomment-6715069931); Portal PR #31
 records the agreement as D29. Nothing activates (features unadvertised, the signing gate closed) until the
@@ -105,17 +106,7 @@ re-signing; host-work-v1 §11.4 wire rule 10). The design text below is unchange
 Only a debug build's `atem runtime` started with `ATEM_TEST_HOST_FEATURES=host.delegated[,host.alerts]` in its own
 environment runs any of it, and only such a runtime lists `host.delegated` and `host.alerts` in its `welcome`. Release
 builds compile the hook out: no feature, no Station call, hosting as before. The same hook takes `host.senders` (only
-with `host.delegated`): a debug build then lists it with hosting on, holds its host encryption key (II.4.1) and answers
-`host_enc_key_get`, and on the receiving host it classifies host senders, takes the route consents of II.2.3, holds a
-host sender's task to both locks in the start check, writes the device list's effects on its tasks with host-work's
-applied device-list `seq` (II.2.2, II.3.1, II.8) and serves `control_records` (host-work-v1 §11.6 "Host senders on the
-receiving host", with Atem's readings for Astation: those effects written in host-work's own pass, and project entries
-judged once per catch-up against the head). Behind the same hook the mailbox is built on both hosts (host-work-v1
-§11.5, "On the receiving host" and "On the sending host"): the receiving host's mailbox client and its admission of
-what the mailbox opens (requests through step 7 with `select` expanded and its `launch` starting an agent, `cancel` and
-`complete`, the status objects and the results back), and the sending host's planning, sealing and puts, its reading
-of the statuses and results, and its `cancel` and `complete` of a task on another host; two real hosts run end to end
-behind the hook. Not built: a Station's side and the ceremony's fields (host-work-v1 §11.5). The signing gate stays
+with `host.delegated`) for Atem's side of Part II ("Part II built on Atem's side" below). The signing gate stays
 closed. Activation is a later owner decision, after the joint check (V.2 step 7,
 VII.A); a dev host turns the features on as [agent-hosting.md](agent-hosting.md) section 14 says ("Delegated work
 on a dev host"). The contracts say what is built: host-work-v1 §11 (its "as built in step 4" passages) and session-v1
@@ -171,6 +162,33 @@ proposals (2026-11-15, agreed with Astation 2026-11-16)".
 
 **Agreed with Astation, 2026-11-16 ([#120 comment 6903887341](https://github.com/Agora-Build/Atem/issues/120#issuecomment-6903887341)).** Astation agreed to the 2026-11-15 amendments and Atem's proposals of the same day, as marked, on the design only: no implementation, joint check or rollout is implied. Before the Station adopts the mailbox wire, the shared core provides its strict readers and builders, the feature handling and conformance vectors; the joint tests also exercise account, trust and socket replacement behind queued replies, a done for the wrong mailbox, lost commit replies, concurrent duplicate puts, overflow and resend, a reset, the key made durable before it is revealed, both signing-gate states and each partial commit of the pairing. Unknown or incomplete verifier inventory keeps new signing off. VII.B follows VII.A.
 
+**Part II built on Atem's side, behind the same debug-only hook (2026-11-17).** With `host.senders` (only with
+`host.delegated`), a debug build's `atem runtime` lists `host.senders` in its `welcome` while hosting is on and runs
+Atem's side of host senders, as the sending host and as the receiving host. With the hook off, and in every
+release build, none of it runs, and a `runtime.toml` that names a host-sender principal doesn't load. Each Part II
+section opens with what of it is built; in short:
+- the host encryption key and `host_enc_key_get` (II.4.1);
+- on the receiving host: who `host:<host_id>` is, the route consents and both locks (II.2), the device list's effects
+  on its tasks and a native's later `interrupt_running` (II.3.1, II.8), the mailbox client and host senders' gate
+  (II.4.3, II.5), and the admission of requests, with `select` expanded and launch on message, `cancel` and `complete`
+  (II.4.2, II.6, II.7), with the statuses and results back (II.4.4);
+- on the sending host: planning from the device list, sealing and the puts (II.6, II.4.3), the statuses and results
+  read back, a reply delivered as data, and `atem message cancel` and `complete` of a task on another host (II.4.4,
+  II.7);
+- in the shared core: the objects, their checks, the mailbox wire and a reference mailbox of the Station's side, with
+  shared vectors (host-work-v1 §11.5).
+
+Two real hosts run it end to end against a fake Station (`tests/host_senders_binary.rs`); VII.B, "Covered by Atem's
+tests (fake Station)", maps the joint tests onto Atem's. **Not built:** a Station's side of the mailbox and the native
+app's part (Astation's, the five device-list actions signed only behind the signing gate, still closed); the host
+encryption key in the ceremony (Atem's side is draft PR #176, held for Astation's, II.4.1); a host sender's revoke
+reported to the Station as applied, and a later answer on its channel for a carried record left `pending`
+(II.3.1); the directory (II.6). Astation agreed the wire on 2026-11-16 (#120
+comment 6903887341) and the receiving host's mailbox readings on 2026-11-17 (#120 comment 6938206284); the readings
+still waiting are listed in host-work-v1 §11.5, "Readings waiting for Astation". Activation is a later owner
+decision, after VII.A's and VII.B's joint checks; a dev host turns host senders on as
+[agent-hosting.md](agent-hosting.md) section 14 says ("Host senders on a dev host").
+
 **Record of the agreed text.** This file is the proposal as agreed. Its text is
 `proposals/delegated-host-work/delegated-host-work-and-host-senders.md` (outside this repository, frozen; SHA-256
 `cc180912cd8d3afc11c20f77a3ebc4e8a81989ede1327afc90df52d09c39eb83`), changed only by this status block, Appendix B, the link to
@@ -180,7 +198,10 @@ host-mail and clock amendments above, the marks of step 3's agreements, IX.1 Q7'
 step 4"), I.5.5 step 2's fence sentence (marked "changed to match Atem's spec"), the note on step 4's status in the
 paragraph that says nothing here is built, the owner's amendments of 2026-11-15 above (marked "Amended by owner
 decision, 2026-11-15"), and Atem's proposed refinements and tests of the same day, agreed with Astation 2026-11-16 (marked
-"Proposed refinement (2026-11-15, Atem's proposal, agreed with Astation 2026-11-16)", "Atem's proposal, agreed with Astation 2026-11-16" or "Proposed tests for the proposals (2026-11-15, agreed with Astation 2026-11-16)"). The diagram is
+"Proposed refinement (2026-11-15, Atem's proposal, agreed with Astation 2026-11-16)", "Atem's proposal, agreed with Astation 2026-11-16" or "Proposed tests for the proposals (2026-11-15, agreed with Astation 2026-11-16)"), and
+what is built of Part II: the paragraph "Part II built on Atem's side" above, the marks that open each Part II section
+and V.2's steps 3 and 9 (each starting "Built" or "Not built"), V.1's note on `host.senders`, and VII.B's "Covered by
+Atem's tests (fake Station)", which says what Atem's tests show of each joint test and changes none. The diagram is
 `delegated-host-work-flows.html` (frozen `flows.html`, SHA-256
 `587a4c74ca9c2645dd3a2c79908813da573451479c0a0a846896fd3ff909cf6a`), changed only in the phone's login in figures 1
 and 2, marked the same way, and, after step 3's agreements, in figure 1 (both hosts use the same Station) and
@@ -201,8 +222,9 @@ design; next to it stays only the diagram of the flows. It merges two designs:
 - Atem's host-to-host senders: stages 2 and 3 of agent collaboration ([agent-collaboration.md](agent-collaboration.md) on Atem's
   branch `feat/agent-collaboration`, `3e60fcc`).
 
-Nothing here is built. (**Status since agreement:** the prompt framing is built, and so is step 4, Part I's host side,
-behind a debug-only hook and advertised by no release build; see the status block.) The owner has decided every
+Nothing here is built. (**Status since agreement:** the prompt framing is built, and so are step 4, Part I's host side,
+and Atem's side of Part II, behind a debug-only hook and advertised by no release build; see the status block.) The
+owner has decided every
 choice: those of Appendix A on 2026-11-07, and owner choice 20,
 which Astation's review raised, on 2026-11-08 (VIII.2). Nothing is built from this design until Atem, Astation and
 Auth/Portal have reviewed it independently and agreed the cross-team contract, and nothing is merged or deployed
@@ -251,6 +273,7 @@ planned only (agent-collaboration.md §17, "Known limits"). Atem doesn't track w
 | **Owner decision 2026-11-07** | A change that applies the owner's decisions (Appendix A) |
 | **Owner decision 2026-11-08** | A change that applies the owner's decision on owner choice 20 (VIII.2) |
 | **Changed after Astation's review** | A change from Astation's review of revision 5b (revision 6) |
+| **Built**, **Not built** (and "As built in step 4") | What of a section Atem has built since the agreement, behind the debug-only hook unless it says otherwise; the design text after it is unchanged |
 
 Atem facts are cited by file and section. Atem files are on `feat/agent-collaboration` (`3e60fcc`). Short names:
 **session-v1** is `designs/protocol/atem-session-v1.md` (R9.x is its r9 appendix), **host-work-v1** is
@@ -1658,7 +1681,9 @@ step 2.
 # Part II. Host-to-host senders on that lifecycle
 
 Collaboration §2 defines three stages. Stage 1 (`local`, one runtime) is implemented and stays as it is: never
-delegated (I.1.3). This part puts stages 2 and 3 on Part I. The source's section 15 named four join points:
+delegated (I.1.3). This part puts stages 2 and 3 on Part I. Each section below opens with what of it is built (Atem's
+side, behind the debug-only hook; the status block, "Part II built on Atem's side"). The source's section 15 named
+four join points:
 
 | The source's join point | Answered in |
 |---|---|
@@ -1668,6 +1693,9 @@ delegated (I.1.3). This part puts stages 2 and 3 on Part I. The source's section
 | 15.4 One signed-object scheme | III.1 |
 
 ## II.1 Stage 2: an instance enrolled as a Station integration
+
+**Not built, by decision:** none of this section is built for Atem hosts, and none will be (the amendment below).
+Part I's covered integrations, for senders that aren't Atem hosts, are step 4's (status block).
 
 **Amended by owner decision, 2026-11-15 (agreed with Astation 2026-11-16): not used between Atem hosts.** Every verified
 Atem host already has a host identity in the signed device list, and stage 3's host senders (II.2 to II.9) use it
@@ -1709,6 +1737,12 @@ delegated sender like any other (I.1.3). What follows from that:
 
 ### II.2.1 The principal
 
+**Built:** the principal in the shared core (`atem_client::host_principal`, step 3); behind the debug-only hook
+(`host.senders`, with `host.delegated`), a receiving host takes `host:<host_id>` as a delegated sender while it is a
+current host of its committed device list and authorized, at the generation and membership epoch its tasks record,
+never v1 (host-work-v1 §11.6, "Host senders on the receiving host"), and a sending host signs its envelopes and
+results with its `host_channel_key` (§11.5).
+
 - **Identity.** `host:<host_id>`, the host's `host_id` in the device list: the `atem_device_id` its `add_host` names
   (session-v1 R9.2, "Pairing"). Its key is the newest `add_host`'s `host_key`, Ed25519: the `host_channel_key` the
   host already signs channel acceptances, push hints and route proofs with (R9.3, R9.6, R9.7b, R9.9). Its principal
@@ -1738,6 +1772,11 @@ delegated sender like any other (I.1.3). What follows from that:
   re-verified or removed; a revoke stops what it signs being accepted (VI, "Plain host keys").
 
 ### II.2.2 The grant: a signed project in the device list
+
+**Built:** `project_set` and `project_remove` in the shared core's verifier and `check_change` (step 3); behind the
+debug-only hook, the receiving host's use of them: a project's ops in admission and the start check, and a project
+entry's effects on unstarted tasks, judged once per catch-up against the head (Atem's reading, for Astation;
+host-work-v1 §11.6). **Not built:** signing them, which is Astation's, behind the signing gate, still closed.
 
 **Owner decision 2026-11-07 (choice 6); needs agreement.** A project is a device-list entry signed by a native
 manager, so grants share the device list's signing, carriage, durable head, deferred entries, fences and freeze rules
@@ -1794,6 +1833,11 @@ list, with its own sequence, head, carriage, rollback protection and fork rule.
 
 ### II.2.3 Route consent
 
+**Built behind the debug-only hook:** a route's `principals` take `project:<name>` and `host:<host_id>` only with
+`host.senders` (without it, and in every release build, a file that names one doesn't load); `atem runtime check`
+prints a route's principals apart from its labels; admission and the start check need both locks (host-work-v1 §11.6,
+"Both locks"; hosting §2).
+
 `runtime.toml`'s `principals` (hosting §2) gains two forms. **Needs agreement.**
 
 | Entry | Accepts | Account permission |
@@ -1821,6 +1865,9 @@ launch = "on_message"                       # also needs the project's `launch` 
 
 ## II.3 Stops for host senders: Revoke and Readmit
 
+**Built:** on the receiving host, behind the debug-only hook, every stop in the table below that reaches it (II.3.1,
+II.7, II.8). **Not built:** signing them, which is Astation's (II.3.1).
+
 **Owner decision 2026-11-07** (choice 7 replaced). A host sender has no pause and no resume. It is stopped by
 **Revoke**, admitted again only by an explicit **Readmit**, bounded by its **project grants** (II.2.2), and the
 receiving route must consent to it (II.2.3). A host sender is delegated only because every way to stop it reaches the
@@ -1843,6 +1890,17 @@ receiving host as signed data (I.1.3):
   key that could make one (III.4).
 
 ### II.3.1 Revoke and Readmit: the representation
+
+**Built:** the two actions and the state machine in the shared core's verifier (step 3), with `signed_at_head` in
+the objects' checks; behind the debug-only hook, on the receiving host: the effects of `host_sender_revoke`,
+`remove_host` and project entries on its tasks, written with host-work's applied device-list `seq` in one transaction
+and replayed after a crash (in host-work's own pass, a pass after the device list's commit, while the start check
+already refuses from the committed list: Atem's reading, for Astation), the start check's standing (a revoke, a removal
+or a readmit since admission), and a native's later `interrupt_running` about a host principal, from a feed or a
+native's channel (`control_records`) (host-work-v1 §11.6, §11.1). **Not built:** the host's report of a host sender's
+revoke as applied to its Station (the entry form, with the applied `seq`, "Reporting a revoke as applied" below), and
+a later answer on its channel for a carried record left `pending`; signing the actions, which is Astation's, behind the
+signing gate.
 
 **Owner decision 2026-11-07. Atem's recommendation; needs agreement.**
 
@@ -1963,6 +2021,15 @@ gives all of that.
 
 ### II.4.1 The host encryption key
 
+**Built:** the `host_enc_key` entry in the shared core's verifier, `enc_sig` and its check (step 3); behind the
+debug-only hook (`host.senders`), the host's key, `pairing/host_enc_key`, made with the device list's pin and at a
+start of a pinned host that holds none for its generation, the record of the key ids it made
+(`pairing/host_enc_generated`, written before a key is handed out), and `host_enc_key_get` (session-v1 R9.14 item 8).
+**Not built:** the key in the ceremony (the amendment below): Atem's side is draft PR #176, held until Astation's
+native ceremony is ready (#120 comment 6938206284), so a key gets its entry only through `host_enc_key_get` and a
+manager's own fresh confirmation; and a new key on request, for rotation and `retire_previous` (an open point,
+session-v1 R9.13 item 8). Signing the entry is Astation's, behind the signing gate.
+
 **No host key can receive HPKE today** (session-v1 R9.2, R9.3, R9.6; account-trust §2 lists only the native
 devices' keys):
 - A host's only key in the device list is `host_key`, Ed25519, which signs (`add_host`; R9.6, the `host` row). Only
@@ -2016,6 +2083,12 @@ document calls the key `enc_key`.
   confirmation that covers both entries (session-v1 R9.6 rule 4).
 
 ### II.4.2 The envelope object
+
+**Built:** the objects, their seals and the receiver's checks in the shared core (`seal_envelope`, `open_envelope`,
+step 3 and its step-4 amendments, with the host-envelope vectors); behind the debug-only hook, the sending host seals
+its requests, cancels and completes, and the receiving host judges each object its mailbox serves and runs step 7 at
+admission (host-work-v1 §11.5). A `complete` may also name the task's own reply (host-work-v1 §11.5, "A `complete`
+naming the reply"; Atem's reading, for Astation).
 
 **Needs agreement.** An envelope from a host sender is origin-signed with its `host_key` and sealed to the receiving
 host's `enc_key`. It follows R9.9's push hint: a signed body that names both hosts and the hash of the sealed part,
@@ -2145,6 +2218,15 @@ with the sealed part beside it.
 
 ### II.4.3 The mailbox
 
+**Built:** the mailbox wire in the shared core (its readers and builders, `object_hash`, `heads`' mailbox head) and a
+reference mailbox, a model of the Station's side, with shared vectors (host-work-v1 §11.5, "The mailbox calls");
+behind the debug-only hook, both hosts' sides over the host's Station link (the relay, a routed link or Astation's
+`:8080`): the receiving host's sync, dones, resets and back-pressure, and the sending host's puts and resends. **Not
+built:** a Station's side,
+which is Astation's (Atem's tests use a fake Station); and the sender's outbox showing a reset's delivery uncertainty
+("Reset" below): the sending host gets no signal of a reset of another host's mailbox, and its 10-minute resend is
+what repairs one (host-work-v1 §11.5, "On the sending host").
+
 **Needs agreement** (Astation agreed the shape in collaboration §15 question 3: "sealed envelopes per instance, at
 most 24 h retention, quotas, acknowledgments and deduplication").
 
@@ -2256,6 +2338,13 @@ readable by the owner (I.4.5), and the sending host's task view says the result 
 
 ## II.5 The gate covers the mailbox
 
+**Built behind the debug-only hook** (host-work-v1 §11.5, "On the receiving host"): host senders' gate has this
+mailbox part beside the feed's and the device list's: the mailbox read to the announced head with no refusal, fault or
+reset waiting, no request, cancel or complete left on the Station or waiting on this host for want of room (a result
+holds none; an object pending for a newer sender generation holds none, as below), and every inbox row admitted (a stop
+waiting for room among its sender's early stops holds only that sender's starts). `atem status`'s `Control feeds:` line
+names it. Its readings on back-pressure are agreed with Astation (2026-11-17, #120 comment 6938206284).
+
 Before a host starts any unstarted remote task of a host sender, it has, for its own Station:
 
 1. applied that Station's control feed up to the announced head (I.5.8);
@@ -2278,6 +2367,13 @@ sender then never starts ahead of a stop that was waiting for its host (the sour
 the Station to announce complete heads, as I.5.8 does for the feed (VI).
 
 ## II.6 Directory: how selectors reach other instances
+
+**Built behind the debug-only hook** (host-work-v1 §11.5, "`select` from host senders", "On the sending host" and "On
+the receiving host"): the sending host's planning from its committed device list (`project:` and `atem:` terms, a
+current `host_enc_key`, a project granting a task's ops, one budget of 32 agents across the local part and each host;
+a `project:` fan-out skips a host that can't take the work and says why), and each receiving host's expansion of a
+`select` into selector tasks (`resolved` or `no_match`) and its launch on message. **Not built:** the directory below
+(its records, their signature, discovery and display), which stays planned.
 
 **Amended by owner decision, 2026-11-15 (agreed with Astation 2026-11-16): the first version addresses hosts through the
 device list, without the directory.** A project already lists its hosts in the signed device list, so the sending
@@ -2354,7 +2450,8 @@ opened before its request kept until its request comes. **The sending host's sid
 (host-work-v1 §11.5, "On the sending host"): `atem message cancel` and `complete` of a task another host's status
 named seal a `cancel` or `complete` of their own, put until a status shows its effect, the host refuses it by its own
 id, or it expires; a complete names the reply that host sent back (a `result` snapshot of the task's own
-`result:<result_id>`, Atem's reading, for Astation).
+`result:<result_id>`, Atem's reading, for Astation). The table's last row stays as it says: no query, interrupt or
+resolution from a host sender in this version.
 
 A host sender has no channel (II.2.1), so the source's interaction authority (I.3.1) maps onto objects:
 
@@ -2373,6 +2470,10 @@ or before a removal and re-add, belongs to the owner alone: only a native member
 I.4.5).
 
 ## II.8 Events for host senders
+
+**Built behind the debug-only hook:** each row's effect on a host sender's tasks on the receiving host, through the
+start check, the device list's effects and the admission of a sender's `cancel` (host-work-v1 §11.6, "Host senders on
+the receiving host", and §11.5, "On the receiving host"), and, on the asking host, results kept as data (II.4.4).
 
 I.3.3 for host senders. Projects have no expiry (II.2.2), so the expiry and renewal rows don't apply.
 
@@ -2396,6 +2497,10 @@ On the **asking** host, results follow II.4.4: from a host it holds revoked, tha
 a project with it, a result is kept as data and never delivered into a session.
 
 ## II.9 Limits
+
+**Built behind the debug-only hook:** the receiving host's limits at admission (a message over them refused whole
+`busy`) and its mailbox's own shares (host-work-v1 §11.5, "On the receiving host"), and the sending host's limits at
+send. **Not built:** the Station's limits, which are Astation's (Atem's fake Station models them).
 
 - **On the receiving host.** Every limit of host work and collaboration applies to host senders as to any sender: at
   most 32 agents per message and `per_workflow` messages accepted per workflow (collaboration §6), the 256 unfinished
@@ -2946,7 +3051,9 @@ I.9) and Astation.
   senders, within the typed boundary (II.6). **Amended by owner decision, 2026-11-15 (agreed with Astation 2026-11-16):**
   within the device-list addressing of II.6 (`project:<name>` and `atem:<atem_id>[/<route_id>]` choose the hosts,
   each host expands the labels and answers `no_match`), and only inside host-sender envelopes: no channel carries
-  `select` (host-work-v1 §11.5). The directory record that would show `host.senders` comes later (II.6).
+  `select` (host-work-v1 §11.5). The directory record that would show `host.senders` comes later (II.6). **Built:**
+  only a debug build's runtime with the debug-only hook's `host.senders` lists it, with hosting on; no release build
+  does (the status block, "Part II built on Atem's side").
 - **Observable behaviour behind `host.delegated`.**
   - `receipt_id` is per attempt.
   - `outcome_unknown` doesn't expire, and a running turn is interrupted at its deadline.
@@ -2984,7 +3091,9 @@ Nothing is merged or deployed before step 1.
    > suspends the built-in Station's relay and mailbox service for that account's hosts, and revokes nothing."
 3. **Atem: specs, vectors and the shared core.** Session-v1 and host-work v1 revisions (Part I), the r9 appendix
    additions (project actions, the host encryption key, the `host:` principal, host principals' records and their
-   session ops, the new objects), the framing, vectors and bindings (III.1).
+   session ops, the new objects), the framing, vectors and bindings (III.1). **Built** (merged 2026-11-12, PRs #145 to
+   #150), and for host senders since: the mailbox wire, the status forms, `result_id` and `select` from host senders,
+   agreed with Astation 2026-11-16, and the reference mailbox (host-work-v1 §11.5).
 4. **Atem: the host, Part I.** `host.delegated` and `host.alerts`, the host's own relay fetch of the device list
    (I.5.8), the framing.
 5. **Astation:** the control feed, heads and acknowledgments, the adapters, native records and the app (I.8).
@@ -2994,7 +3103,12 @@ Nothing is merged or deployed before step 1.
    joint online check (collaboration §14). **Amended by owner decision, 2026-11-15 (agreed with Astation 2026-11-16):**
    not used between Atem hosts (II.1), so Astation builds none of it for Atem-to-Atem; step 9 follows step 7.
 9. **Stage 3:** every strict verifier of the test account upgraded first, then project grants, host encryption keys,
-   host-sender revoke and readmit, the mailbox and `host.senders` (Part II), then a joint check (VII.B).
+   host-sender revoke and readmit, the mailbox and `host.senders` (Part II), then a joint check (VII.B). **Built on
+   Atem's side, behind the debug-only hook (2026-11-17):** both hosts' sides of every item, run end to end by two real
+   hosts against a fake Station (the status block, "Part II built on Atem's side"; VII.B, "Covered by Atem's tests").
+   **Not built:** Astation's side (the Station's mailbox, the signing of the five actions behind the gate, the native
+   app's parts), the host encryption key in the ceremony on both sides (Atem's is draft PR #176, held), and Atem's
+   report of a host sender's revoke as applied. The joint check (VII.B) follows VII.A's.
 10. **Disabled-account enforcement:** Auth/Portal and Astation define III.5 jointly; it is built only once that design
     is agreed, then checked (VII.D). **Changed after Astation's review:** first Astation builds the service-owner
     lookup and the ownership lifecycle and migrates existing rooms (VII.E, tests 46 and 47); only then does
@@ -3303,6 +3417,69 @@ Nothing is merged or deployed before step 1.
 37l. **`launch` needs a route selector.** A host-sender Message whose `select` recipient carries `launch: true` and no
      `atem:<atem_id>/<route_id>` selector naming that host is invalid: the shared core refuses to build it, and a
      receiving host refuses it (`invalid_request`) and starts nothing.
+
+**Covered by Atem's tests (fake Station)** (2026-11-17; the tests above are unchanged). What Atem's binaries already
+show of each test, behind the debug-only hook, against a fake Station speaking only the shared builders:
+`tests/host_mail_binary.rs` (one real receiving host, the sending host played by the test) and
+`tests/host_senders_binary.rs` (two real hosts, their fake Stations joined as one), named `mail::` and `senders::`
+below; where no binary covers a test, the unit tests or shared vectors that do. "Joint" is what only the check with a
+real Station and Astation can show.
+
+- **22.** `mail::a_cancel_waiting_while_the_host_is_down_is_applied_before_its_task_starts` and
+  `senders::a_kill_of_the_receiving_host_after_admission_applies_once`: the receiving host down while its mail waits.
+  Not shown: the sending host offline while its task runs (both hosts stay up). Joint: the real Station keeping mail
+  for a host away up to 24 h, and a result reaching a sending host that comes back.
+- **23.** `mail::reads_its_mailbox_to_the_head_on_relay_local_and_routed_links` (a forged copy refused, one sealed to
+  another host's key refused); a re-signed, a redirected and an older-generation copy in the host-envelope vectors;
+  `mail::a_waiting_object_is_kept_not_done_and_decided_once_the_device_list_advances` (a newer generation waits, then
+  opens once). Joint: the copies made against a real Station and device list.
+- **24.** The seals and `sealed_hash` in the host-envelope vectors; the fake Station keeps bodies and ciphertext only.
+  Joint: what the real Station's store and logs hold.
+- **25.** No binary; host_effects_tests.rs (`a_narrowing_fails_unstarted_tasks_and_keeps_awaiting_ones`,
+  `project_entries_are_judged_once_per_catch_up_against_the_head`). Joint: Astation signing the project entries.
+- **26.** No binary; host_effects_tests.rs (`a_remove_host_cancels_unstarted_tasks`,
+  `a_replay_leaves_tasks_admitted_after_a_readmit_or_a_re_add`) and the membership vectors (`P9_remove_host_b`,
+  `P10_readd_host_b`, `P11_set_again`, `P9_reverify_a`). Joint: a real removal and re-add, and `atem unpair`, then
+  `atem pair` (the 2026-11-15 amendment's reading of re-verification).
+- **27.** `senders::a_revoked_sender_is_refused_and_its_unstarted_tasks_cancelled` (queued cancelled, the running turn
+  goes on, a later envelope refused); the task waiting `accepted`, `interrupt_running` and a later native record in
+  host_effects_tests.rs. Joint: Astation signing the revoke and the record, and a native takeover.
+- **28.** `mail::a_withheld_revoke_carried_by_a_native_cancels_and_refuses`. Joint: a real native device carrying the
+  entry while the real Station withholds it.
+- **29.** `mail::a_request_signed_before_a_readmit_is_refused` (work signed after the readmit admitted);
+  host_effects_tests.rs's `a_readmit_and_a_new_key_change_nothing`; the verifiers' refusals in the membership vectors.
+  Joint: Astation's and the Station's verifiers refusing them too.
+- **30.** `mail::a_request_signed_before_a_readmit_is_refused` (a replay refused at opening and at admission); a wrong
+  hash and a head beyond B's in the host-envelope vectors. Joint: replays through the real Station.
+- **31.** `mail::a_cancel_waiting_while_the_host_is_down_is_applied_before_its_task_starts`,
+  `mail::a_kill_between_commit_and_done_sends_the_owed_done_once_after_restart`,
+  `mail::a_kill_after_admission_applies_nothing_twice`,
+  `mail::a_waiting_object_is_kept_not_done_and_decided_once_the_device_list_advances` (no gate held) and
+  `mail::an_object_over_the_pending_limits_is_marked_done` (the 65th dropped undecided and marked done, II.4.2's agreed
+  refinement, where the test still says "refused"); bad body times in the host-envelope vectors; another link's sync
+  or done refused in the reference mailbox's vectors only. Joint: the real Station refusing another link.
+- **32.** No binary; host_effects_tests.rs (`a_readmit_and_a_new_key_change_nothing`), and each key change alone in
+  the host-envelope vectors (a re-verification, a rotation with and without `retire_previous`, a removal, a readmit).
+  Joint: a real `atem unpair`, then `atem pair`, and a key rotation (a new key on request isn't built).
+- **33.** `mail::a_reply_from_a_host_revoked_meanwhile_is_kept_as_data`; a result from a host the row didn't go to in
+  the host-envelope vectors; results_tests.rs for an ungranted host, one that moved in the list and a route without
+  results. Not shown in a test: a result after its return grant ended. Joint: results through the real Station.
+- **34.** No binary; the host-envelope vectors (`attachments_not_allowed`), and no sending path builds one. Joint:
+  none beyond the vectors.
+- **35.** `mail::a_resend_is_admitted_once_and_a_bad_time_is_reported`,
+  `senders::a_lost_stored_on_either_side_is_put_again_and_applied_once`. Joint: the real Station losing a stored
+  object.
+- **36.** Atem's verifier knows the five actions (the membership vectors). Joint only: Astation's signing gate, and an
+  old verifier stopping in a test account.
+- **37.** `mail::per_workflow_bounds_a_host_senders_messages`, `senders::per_workflow_bounds_a_chain_across_hosts`;
+  the mailbox quotas only on the fake Station (`mail::the_fake_mailbox_follows_the_put_rules`,
+  `mail::the_fake_mailbox_charges_the_wire_bytes_and_limits_the_account`). Joint: the real Station's quotas.
+- **37a to 37l.** 37a and 37b: not built (draft PR #176). 37c: `senders::a_launch_on_message_starts_an_agent_on_the_other_host`
+  and host_launch_tests.rs (no launch without every condition). 37d: send_plan_tests.rs and
+  admit_tests.rs (no binary sends a `project:` fan-out). 37e, 37i to 37k: the shared core's vectors and the reference
+  mailbox's scenarios. 37f: `mail::an_object_over_the_pending_limits_is_marked_done`. 37g: `mail::`'s reset, lost-done
+  and late-page tests. 37h: `mail::without_host_senders_heads_mailbox_is_refused_and_no_mailbox_table_is_made`. 37l:
+  send_plan_tests.rs and the shared core. Joint for each: the real Station and Astation's app.
 
 ### VII.C Framing and vectors
 
