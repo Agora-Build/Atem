@@ -112,7 +112,8 @@ impl Signing {
 
     /// The current status of `record` (a host sender's message) to its
     /// sender, enqueued in `tx` (the one before it superseded), or none
-    /// owed when the sender can't receive one.
+    /// owed when the sender can't receive one (no key, no longer a current
+    /// host, or another key than the one the message came under).
     fn status(
         &self,
         tx: &Transaction,
@@ -124,7 +125,15 @@ impl Signing {
             message_id: message_id.clone(),
             recipients: admit::receipts(store, record)?,
         };
+        // Only to the sender at the key it was admitted under (review L4,
+        // design II.2.1): re-verified since, its old outbox is gone, so
+        // the new generation gets none.
         let sealed = parse_host_principal(&record.message.sender)
+            .filter(|sender| {
+                self.list.host(sender).is_some_and(|h| {
+                    record.sender_key == json!(host_principal_key(&h.host_key).to_hex())
+                })
+            })
             .and_then(|sender| self.seal(sender, &plain));
         match sealed {
             Some((bytes, to)) => {

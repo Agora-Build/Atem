@@ -1624,3 +1624,53 @@ fn an_unreadable_inbox_row_is_refused_and_reported() {
         );
     });
 }
+
+/// Review L4 (design II.2.1): B re-verified since its task was admitted (a
+/// newer `add_host`, its encryption key signed for the new generation):
+/// that task's results can't reach B's old outbox, so its later states owe
+/// no status to B's new generation: the mark is cleared, nothing sealed.
+#[test]
+fn no_status_goes_to_a_sender_re_verified_since() {
+    use crate::session_protocol::membership::r9log::secret;
+    use atem_client::KeyProvider;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        let message = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
+        ad_inbox_request(&rig, &message);
+        ad_admit(&mut rig);
+        assert_eq!(ad_statuses(&rig).len(), 1);
+        // B at trust generation 2: a new host key, and its encryption key
+        // for that generation.
+        let entry = host.s.log.add_host("host-b", 2, &secret("host b, gen 2"));
+        carry(&mut rig, &host.s.log, entry);
+        let mut keys = atem_client::SoftwareKeys::new();
+        let (host_key, enc) = (
+            atem_client::KeyId::new("b2"),
+            atem_client::KeyId::new("b2 enc"),
+        );
+        keys.insert_ed25519(host_key.clone(), &secret("host b, gen 2"));
+        keys.insert_x25519(enc.clone(), &secret("host b enc, gen 2"));
+        let enc_key = keys.public_key(&enc).unwrap();
+        let sig = atem_client::membership::sign_host_enc_key(
+            &keys,
+            &host_key,
+            "acct",
+            &host.s.log.genesis_hash(),
+            "host-b",
+            2,
+            enc_key.as_32().unwrap(),
+        )
+        .unwrap();
+        let action =
+            atem_client::membership::host_enc_key("host-b", 2, &enc_key, &sig, false, 0).unwrap();
+        sign_and_carry(&mut rig, &mut host.s, action);
+        rig.bridge.sync_list_view();
+        ad_set_state(&rig, &ad_tasks(&rig, &message)[0], WorkState::Blocked);
+        assert_eq!(rows(&rig, "mail_status_owed"), 1);
+        rig.bridge.mail_statuses();
+        assert_eq!(rows(&rig, "mail_status_owed"), 0);
+        assert_eq!(rows(&rig, "mail_outbox"), 1, "none to the new generation");
+    });
+}
