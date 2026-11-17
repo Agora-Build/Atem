@@ -2007,8 +2007,7 @@ unconfirmed verifier keeps signing off, removing an obsolete verifier is
 an explicit manager action, and no feature flag alone is proof
 (delegated host work II.2.2 "The signing gate", I.8).
 
-*How a verifier reports itself* (**Atem's proposal, for Astation's
-agreement**). A verifier describes itself with an inventory
+*How a verifier reports itself* (**Atem's proposal, agreed with Astation (2026-11-13, #120 comment 6848326392)**). A verifier describes itself with an inventory
 `{version, actions}`, so a signer's gate can tell which verifiers accept
 which entries:
 
@@ -2063,8 +2062,8 @@ which entries:
   update. The signer's gate keeps its rules: an unknown, offline or
   unconfirmed verifier keeps signing off, and a host whose welcome carries
   no `verifier` is unconfirmed.
-- *How the signing gate uses it* (**Atem's proposal, for Astation's
-  agreement**). This says when a verifier is confirmed, and it extends the
+- *How the signing gate uses it* (**Atem's proposal, agreed with Astation (2026-11-13, #120 comment 6848326392), its adoption
+  closed until the shared `required_version` helper exists**). This says when a verifier is confirmed, and it extends the
   gate to three scope ops (below). It removes none of the rules above.
   - Versions only widen. Version N lists every action of version N − 1,
     and it accepts every entry N − 1 accepts, with the same derived state.
@@ -3790,7 +3789,7 @@ replaced key, also for a proof at an ancestor head; `relay_replies`:
 | op | dir | fields |
 |---|---|---|
 | `hello` | C→H (the `finish` plaintext) | `revision: 9` (required), `proof{principal, sig}` (`sig` = `sig_c`, b64u), `membership{head{seq,hash}, entries, more?}`, `grant?` (signed grant, browser only); no `resume` |
-| `welcome` | H→C (first record) | r8 fields (`revision: 9`, `features`) plus `principal` (string), `client_kind` (`native`/`service`/`browser`), `permissions`, `scope?` (service/browser: `{ops, sessions?, projects?}`), `head{seq,hash}` (after the carriage), `pending_recovery` (always present, possibly empty: `[{entry_hash, seq, action, subject, effective_at}]`, R9.5), `channel_id`, `authorization_ms_left`, `verifier?` (`{version, actions}`, the host verifier's inventory, read strictly, absent rather than `null`; R9.2 "How a verifier reports itself"; **Atem's proposal, for Astation's agreement**) |
+| `welcome` | H→C (first record) | r8 fields (`revision: 9`, `features`) plus `principal` (string), `client_kind` (`native`/`service`/`browser`), `permissions`, `scope?` (service/browser: `{ops, sessions?, projects?}`), `head{seq,hash}` (after the carriage), `pending_recovery` (always present, possibly empty: `[{entry_hash, seq, action, subject, effective_at}]`, R9.5), `channel_id`, `authorization_ms_left`, `verifier?` (`{version, actions}`, the host verifier's inventory, read strictly, absent rather than `null`; R9.2 "How a verifier reports itself"; **Atem's proposal, agreed with Astation (2026-11-13, #120 comment 6848326392)**) |
 | `membership` | C→H | `entries` (R9.3) → `membership_head{re, head}` |
 | `membership_head` | H→C | `head`, `pending_recovery` (event when Atem's head moves or a pending entry changes state; reply with `re`) |
 | `revoke_grant` | C→H | `grant_id` → `grant_revoked{re}` (issuer or a member with `control`) |
