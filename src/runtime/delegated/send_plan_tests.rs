@@ -115,7 +115,8 @@ fn each_selector_form_plans_its_hosts() {
         p,
         Plan {
             local: Some(32),
-            remote: vec![]
+            remote: vec![],
+            skipped: vec![],
         }
     );
     // A project that doesn't list this host reaches no other host.
@@ -142,20 +143,51 @@ fn an_unknown_host_is_refused() {
     );
 }
 
+/// A host without a current key: an `atem:` selector naming it refuses
+/// the send; a `project:` fan-out skips it and says why (ruling R40), the
+/// budget split across the hosts it reaches.
 #[test]
-fn a_host_without_a_key_is_refused() {
-    let log = list();
-    for selectors in [&["atem:d"][..], &["project:docs"]] {
-        assert_eq!(
-            plan(&log.log, ME, &to(selectors), false),
-            Err("host d has no encryption key in the device list yet; it can't receive messages from other hosts".into()),
-            "{selectors:?}"
-        );
-    }
+fn a_host_without_a_key_is_refused_by_name_and_skipped_by_a_fan_out() {
+    let mut log = list();
+    const NO_KEY: &str = "host d has no encryption key in the device list yet; it can't receive messages from other hosts";
+    assert_eq!(
+        plan(&log.log, ME, &to(&["atem:d"]), false),
+        Err(NO_KEY.into())
+    );
+    let p = plan(&log.log, ME, &to(&["project:docs"]), false).unwrap();
+    assert_eq!((p.local, p.remote.len()), (Some(32), 0));
+    assert_eq!(
+        p.skipped,
+        [Skipped {
+            host_id: "d".into(),
+            host_trust_gen: 1,
+            reason: NO_KEY.into(),
+        }]
+    );
+    log.append(
+        MAC,
+        project_set(
+            "wide",
+            ["a", "b", "d"],
+            [ProjectOp::Message, ProjectOp::Notify, ProjectOp::Prompt],
+            0,
+        )
+        .unwrap(),
+    );
+    let p = plan(&log.log, ME, &to(&["project:wide"]), false).unwrap();
+    assert_eq!(remote(&p), [("b", vec!["project:wide"], 16, false)]);
+    assert_eq!((p.local, p.skipped.len()), (Some(16), 1));
+    // Named as well as fanned out to: the name refuses.
+    assert_eq!(
+        plan(&log.log, ME, &to(&["project:wide", "atem:d"]), false),
+        Err(NO_KEY.into())
+    );
 }
 
+/// A host no shared project grants a task: refused when named, skipped by
+/// a fan-out (ruling R40).
 #[test]
-fn a_host_no_project_covers_is_refused() {
+fn a_host_no_project_covers_is_refused_by_name_and_skipped_by_a_fan_out() {
     let mut log = list();
     for host in ["e", "f"] {
         log.add_host(host, 1, &secret(host));
@@ -166,17 +198,29 @@ fn a_host_no_project_covers_is_refused() {
         MAC,
         project_set("memo", ["a", "f"], [ProjectOp::Message], 0).unwrap(),
     );
-    for (selector, host) in [("atem:e", "e"), ("atem:f/r", "f"), ("project:memo", "f")] {
+    let why = |host: &str| {
+        format!("no signed project of this host and {host} grants message, notify and prompt")
+    };
+    for (selector, host) in [("atem:e", "e"), ("atem:f/r", "f")] {
         assert_eq!(
             plan(&log.log, ME, &to(&[selector]), false),
-            Err(format!(
-                "no signed project of this host and {host} grants message, notify and prompt"
-            )),
+            Err(why(host)),
             "{selector}"
         );
     }
+    let p = plan(&log.log, ME, &to(&["project:memo"]), false).unwrap();
+    assert_eq!(p.remote.len(), 0);
+    assert_eq!(
+        p.skipped,
+        [Skipped {
+            host_id: "f".into(),
+            host_trust_gen: 1,
+            reason: why("f"),
+        }]
+    );
     // b's `notes` grants only `message`, but `build` grants a task.
-    assert!(plan(&log.log, ME, &to(&["project:notes"]), false).is_ok());
+    let p = plan(&log.log, ME, &to(&["project:notes"]), false).unwrap();
+    assert_eq!((p.remote.len(), p.skipped.len()), (1, 0));
 }
 
 /// `--launch` needs an `atem:<id>/<route>` naming this host or a planned

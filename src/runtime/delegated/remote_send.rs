@@ -4,7 +4,8 @@
 //! user of the put engine ([`super::outbox`]).
 //!
 //! - **States:** `publishing` → `ready` → `sent` → `accepted` | `refused`
-//!   | `expired`. A send with context has its rows `publishing` from the
+//!   | `expired`; and `skipped`, a host a `project:` fan-out planned but
+//!   can't send to (ruling R40), with why, never put. A send with context has its rows `publishing` from the
 //!   send on (committed with its stage-1 outbox row), until the context is
 //!   published and frozen; a refused or expired publication takes them
 //!   with it (a trigger on the stage-1 outbox row).
@@ -29,7 +30,7 @@
 //!   [`accepted`] and [`refused_by_receiver`] are its seams, each settling
 //!   the engine row too.
 use super::outbox::{self, Policy};
-use super::send_plan::{Me, Plan, signs};
+use super::send_plan::{Me, Plan, Skipped, signs};
 use crate::runtime::host_work::Store;
 use crate::session_protocol::r9::HostKey;
 use anyhow::{Result, bail};
@@ -102,6 +103,10 @@ pub fn prepare(store: &Store) -> Result<()> {
 pub struct RemotePart {
     pub local: bool,
     pub recipients: Vec<Recipient>,
+    /// The hosts a `project:` fan-out skipped, and why (ruling R40): rows
+    /// of their own, never put.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<Skipped>,
 }
 
 impl RemotePart {
@@ -127,6 +132,7 @@ impl RemotePart {
                     },
                 })
                 .collect(),
+            skipped: plan.skipped.clone(),
         }
     }
 
@@ -151,6 +157,7 @@ pub const PUBLISHING: &str = "waiting for verified context publication";
 /// Rows of `part` for the message `message_id`, `publishing`, in the
 /// transaction that reserves its context.
 pub fn reserve(tx: &Transaction, message_id: &str, part: &RemotePart, now_ms: u64) -> Result<()> {
+    write_skipped(tx, message_id, part, now_ms)?;
     for r in &part.recipients {
         upsert(
             tx,
@@ -188,6 +195,11 @@ pub fn commit_request(
     local: &Message,
     part: &RemotePart,
 ) -> Result<()> {
+    write_skipped(tx, &local.message_id, part, local.created_at)?;
+    // A fan-out that skipped every host it planned seals nothing.
+    if part.recipients.is_empty() {
+        return Ok(());
+    }
     let message = part.message(local, sealer.me.host_id);
     if !message.valid_from_host(sealer.me.host_id) {
         bail!("invalid message content");
@@ -248,6 +260,37 @@ pub fn commit_request(
         }
     }
     Ok(())
+}
+
+/// The rows of the hosts `part`'s fan-out skipped (ruling R40): `skipped`,
+/// their reason as detail, never put (written once).
+fn write_skipped(tx: &Transaction, message_id: &str, part: &RemotePart, now_ms: u64) -> Result<()> {
+    for s in &part.skipped {
+        tx.execute(
+            "INSERT INTO remote_deliveries(object_id, host_id, host_trust_gen, message_id, kind,
+                recipient_id, state, detail, created_ms)
+            VALUES(?1, ?2, ?3, ?1, 'request', '', 'skipped', ?4, ?5)
+            ON CONFLICT(object_id, host_id) DO NOTHING",
+            params![message_id, s.host_id, s.host_trust_gen, s.reason, now_ms],
+        )?;
+    }
+    Ok(())
+}
+
+/// The hosts the fan-out of `message_id` skipped, each `<host>: <why>`.
+pub fn skipped(db: &rusqlite::Connection, message_id: &str) -> Result<Vec<String>> {
+    let mut q = db.prepare(
+        "SELECT host_id, detail FROM remote_deliveries WHERE message_id=?1 AND state='skipped'
+        ORDER BY host_id",
+    )?;
+    let rows = q.query_map([message_id], |r| {
+        Ok(format!(
+            "{}: {}",
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// The rows of `local` to `part`'s hosts not sealed yet, refused with

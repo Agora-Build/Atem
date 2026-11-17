@@ -3596,9 +3596,11 @@ exactly as without this section):
   device list ("`select` from host senders", "Planning"). A planned host
   must be a current host with a current `host_enc_key` whose shared
   projects grant `message`, `notify` and `prompt` (and `launch` for a
-  launch on message); one that isn't refuses the send with the reason
-  (Atem's reading: a send never leaves part of its audience out silently).
-  A `project:` term reaches another host only through projects that list
+  launch on message). A host an `atem:` selector names that isn't one
+  refuses the send with the reason; a `project:` fan-out skips one ("in
+  each case only hosts with a current `host_enc_key`"), and the send's
+  output and the message's record (a `skipped` row with why, never put)
+  name it. A `project:` term reaches another host only through projects that list
   this host too. This host sends only while its own list shows it a current
   host at its trust generation, `authorized`. The local part keeps stage
   1's path with its share of the 32 agents (local first, then each host by

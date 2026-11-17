@@ -566,6 +566,10 @@ pub enum RuntimeMsg {
     },
     MessageSent {
         message_id: String,
+        /// The hosts a `project:` fan-out skipped, each `<host>: <why>`
+        /// (host senders, behind the debug-only hook).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skipped: Vec<String>,
     },
     /// The task's one reply as recorded: `publishing`, `submitted`, or
     /// `refused` (`detail` says why; a corrected reply replaces it).

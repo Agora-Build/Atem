@@ -124,7 +124,17 @@ pub async fn message(command: crate::cli::MessageCommands) -> Result<()> {
     })
     .await?;
     match response {
-        RuntimeMsg::MessageSent { message_id } => println!("{message_id}"),
+        RuntimeMsg::MessageSent {
+            message_id,
+            skipped,
+        } => {
+            println!("{message_id}");
+            // The hosts a `project:` fan-out skipped: on stderr, so the
+            // output stays the message id.
+            for host in skipped {
+                eprintln!("not sent to host {host}");
+            }
+        }
         RuntimeMsg::MessageReplied {
             task_id,
             result_id,

@@ -854,3 +854,43 @@ fn a_context_send_seals_to_the_list_at_acceptance() {
         assert!(atem_client::host_mail::unseal_envelope(&keys, &enc, &verified).is_ok());
     });
 }
+
+/// A `project:` fan-out skips a host that can't be a target (no key yet)
+/// and says why, in the send's output and as the message's own row; the
+/// others go (ruling R40). The local part keeps its share.
+#[test]
+fn a_fan_out_skips_a_host_without_a_key_and_says_why() {
+    local_test(async |root| {
+        use crate::session_protocol::membership::r9log::secret;
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        let entry = host.s.log.add_host("host-c", 1, &secret("host c"));
+        carry(&mut rig, &host.s.log, entry);
+        sign_and_carry(
+            &mut rig,
+            &mut host.s,
+            project_set("wide", ["host", "host-b", "host-c"], task_ops(), 0).unwrap(),
+        );
+        let id = sp_send(&mut rig, &["project:wide"]).unwrap();
+        const WHY: &str = "host host-c has no encryption key in the device list yet; it can't receive messages from other hosts";
+        assert_eq!(rig.bridge.remote_skipped(&id), [format!("host-c: {WHY}")]);
+        let rows = crate::runtime::delegated::remote_send::rows(
+            &rig.bridge.work.store.as_ref().unwrap().db,
+            &id,
+        )
+        .unwrap();
+        let states: Vec<_> = rows
+            .iter()
+            .map(|r| (r.host_id.as_str(), r.state.as_str(), r.detail.as_str()))
+            .collect();
+        assert_eq!(
+            states,
+            [
+                ("host-b", "ready", "waiting to be put in the host's mailbox"),
+                ("host-c", "skipped", WHY),
+            ]
+        );
+        assert_eq!(sp_local(&rig, &id).2, 16);
+    });
+}

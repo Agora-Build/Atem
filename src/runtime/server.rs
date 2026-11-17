@@ -1392,15 +1392,23 @@ impl Server {
                     .as_mut()
                     .ok_or_else(|| anyhow::anyhow!("session host unavailable"))
                     .and_then(|b| {
-                        b.collab_send(
+                        let message_id = b.collab_send(
                             &self.app.astation_client.device_atem_id(),
                             &sid,
                             request,
                             &self.sessions,
-                        )
+                        )?;
+                        let skipped = b.remote_skipped(&message_id);
+                        Ok((message_id, skipped))
                     });
                 match result {
-                    Ok(message_id) => self.send(id, &RuntimeMsg::MessageSent { message_id }),
+                    Ok((message_id, skipped)) => self.send(
+                        id,
+                        &RuntimeMsg::MessageSent {
+                            message_id,
+                            skipped,
+                        },
+                    ),
                     Err(e) => self.error(id, e.to_string(), "message_send"),
                 }
             }

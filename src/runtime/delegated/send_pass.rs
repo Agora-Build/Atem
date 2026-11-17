@@ -43,6 +43,17 @@ impl HostBridge {
         self.features.delegated && self.features.senders
     }
 
+    /// The hosts a `project:` fan-out of `message_id` skipped, each as
+    /// `<host>: <why>` (ruling R40), for the send's output.
+    pub fn remote_skipped(&self, message_id: &str) -> Vec<String> {
+        if !self.senders_on() {
+            return Vec::new();
+        }
+        self.outbox_store()
+            .and_then(|store| remote_send::skipped(&store.db, message_id).ok())
+            .unwrap_or_default()
+    }
+
     /// The committed device list, when it serves.
     fn send_list(&self) -> Option<std::sync::Arc<atem_client::membership::Membership>> {
         self.start_view()
@@ -86,7 +97,7 @@ impl HostBridge {
             host_trust_gen: host.host_trust_gen,
         };
         let plan = send_plan::plan(&list, me, to, launch).map_err(|e| anyhow!("{e}"))?;
-        if plan.remote.is_empty() {
+        if plan.remote.is_empty() && plan.skipped.is_empty() {
             return Ok(None);
         }
         self.mail_observe();

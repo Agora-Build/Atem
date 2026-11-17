@@ -15,12 +15,15 @@
 //!   along for each receiver to expand against its own labels.
 //! - **Who can be a target:** a current host with a current `host_enc_key`
 //!   whose shared projects grant `message`, `notify` and `prompt` (and
-//!   `launch` for a launch on message, II.2.3). A planned host that isn't
-//!   one refuses the send with the reason (Atem's reading: a send never
-//!   leaves part of its audience out silently).
+//!   `launch` for a launch on message, II.2.3). A host an `atem:` selector
+//!   names that isn't one refuses the send with the reason; a `project:`
+//!   fan-out skips one, the reason kept for the send's output and its
+//!   message's record (ruling R40; §11.5: "in each case only hosts with a
+//!   current `host_enc_key`").
 //! - **This host signs only while its own list shows it** a current host
 //!   at its trust generation and `authorized` (§11.5's sender rule).
-//! - **One budget of 32 agents** across every part, local and remote: the
+//! - **One budget of 32 agents** across every part, local and remote (the
+//!   hosts skipped take none): the
 //!   local part (when a selector can reach this host's agents) first, then
 //!   each planned host by `host_id`, each the same share, the remainder one
 //!   each to the first.
@@ -60,12 +63,23 @@ pub struct Target {
     pub launch: bool,
 }
 
+/// A host a `project:` fan-out planned but can't send to (ruling R40),
+/// and why.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Skipped {
+    pub host_id: String,
+    pub host_trust_gen: u64,
+    pub reason: String,
+}
+
 /// A send's plan: the local part's budget (none: no selector can reach
-/// this host's agents) and the other hosts' recipients.
+/// this host's agents), the other hosts' recipients, and the hosts a
+/// fan-out skipped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     pub local: Option<u32>,
     pub remote: Vec<Target>,
+    pub skipped: Vec<Skipped>,
 }
 
 /// The stage-1 refusal of `--launch` without a route to start one on.
@@ -85,6 +99,9 @@ pub fn plan(list: &Membership, me: Me<'_>, to: &[String], launch: bool) -> Resul
         .map_err(str::to_owned)?;
     let mut local = false;
     let mut hosts: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    // Hosts an `atem:` selector names (refused when unusable; a fan-out's
+    // are skipped).
+    let mut named = std::collections::BTreeSet::new();
     for (i, selector) in selectors.iter().enumerate() {
         match selector {
             Selector::Instance { atem_id, .. } if me.is(atem_id) => local = true,
@@ -95,6 +112,7 @@ pub fn plan(list: &Membership, me: Me<'_>, to: &[String], launch: bool) -> Resul
                     ));
                 }
                 hosts.entry(atem_id.clone()).or_default().push(i);
+                named.insert(atem_id.clone());
             }
             Selector::All(labels) => {
                 local = true;
@@ -116,10 +134,27 @@ pub fn plan(list: &Membership, me: Me<'_>, to: &[String], launch: bool) -> Resul
         return Ok(Plan {
             local: Some(MAX_AGENTS),
             remote: Vec::new(),
+            skipped: Vec::new(),
         });
     }
     signs(list, me)?;
-    let parts = usize::from(local) + hosts.len();
+    // Each planned host as a target, or skipped (a fan-out's that can't be
+    // one; ruling R40), or the send refused (a named one that can't).
+    let mut targets = Vec::new();
+    let mut skipped = Vec::new();
+    for (host_id, picked) in hosts {
+        let launch = launch && route_named(&host_id);
+        match target(list, me, &host_id, launch) {
+            Ok(t) => targets.push(t.with(picked.iter().map(|&i| to[i].clone()).collect(), 0)),
+            Err(reason) if !named.contains(&host_id) => skipped.push(Skipped {
+                host_trust_gen: list.host(&host_id).map_or(0, |h| h.host_trust_gen),
+                host_id,
+                reason,
+            }),
+            Err(reason) => return Err(reason),
+        }
+    }
+    let parts = usize::from(local) + targets.len();
     if parts > MAX_AGENTS as usize {
         return Err(format!(
             "a message reaches the agents of at most {MAX_AGENTS} hosts; this one plans {parts}"
@@ -128,15 +163,16 @@ pub fn plan(list: &Membership, me: Me<'_>, to: &[String], launch: bool) -> Resul
     let mut shares = (0..parts)
         .map(|i| MAX_AGENTS / parts as u32 + u32::from((i as u32) < MAX_AGENTS % parts as u32));
     let local = local.then(|| shares.next().unwrap());
-    let mut remote = Vec::new();
-    for ((host_id, picked), budget) in hosts.into_iter().zip(shares) {
-        let launch = launch && route_named(&host_id);
-        remote.push(
-            target(list, me, &host_id, launch)?
-                .with(picked.iter().map(|&i| to[i].clone()).collect(), budget),
-        );
-    }
-    Ok(Plan { local, remote })
+    let remote = targets
+        .into_iter()
+        .zip(shares)
+        .map(|(t, budget)| Target { budget, ..t })
+        .collect();
+    Ok(Plan {
+        local,
+        remote,
+        skipped,
+    })
 }
 
 /// The hosts a label selector's `project:` terms reach: those every named
