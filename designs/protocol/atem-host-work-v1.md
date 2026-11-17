@@ -3194,16 +3194,22 @@ addition, and `atem message complete` completes a local task with its
 reply). A host sender completes a task on another host with the reply
 that host sent back, as stage 1's `atem message complete` completes a
 local task with its reply: its `result` may be a `result` snapshot whose
-`id` is the task's own `result:<result_id>` ("`result_id`" below), valid
-as a local snapshot (its `digest` its `text`'s), beside the `memory` and
-`vault` snapshots `work_complete` takes; any other `result` snapshot stays
-local only (`ContextSnapshot::names_reply_of`; a vector of each, opened and
-refused `plaintext_malformed`). Its `text` names the reply, never copies
-it: `{"digest","result_id","task_id"}`, the digest of the reply the
-sending host received, or the ids alone when none came (completed without
-one). The receiving host stores it as the task's result, as
-`work_complete` stores one, and its status's `work.result` names it
-(kind `result`). Plaintexts are **strict I-JSON with no
+`id` is the task's own `result:<result_id>` ("`result_id`" below),
+beside the `memory` and `vault` snapshots `work_complete` takes; any other
+`result` snapshot stays local only. It names the reply, never copies it:
+`version` 1, its `text` exactly `jcs({"digest","result_id","task_id"})`
+with the digest (lowercase SHA-256 hex) of the reply the sending host
+received, or `jcs({"result_id","task_id"})` when none came (completed
+without one), its `digest` its `text`'s
+(`ContextSnapshot::naming_reply`, `names_reply_of`; vectors: one opened,
+and one naming another task's reply and one copying the reply's text,
+each refused `plaintext_malformed`). The receiving host stores it as the
+task's result, as `work_complete` stores one, and its status's
+`work.result` names it with kind `result`: a status's `work.result` of
+kind `result` names only that task's own reply (`result:<result_id>` of
+its `task_id`), in the core's receipt check as in the independent checker
+(vectors: a status naming its task's own reply, accepted; one naming
+another's, refused). Plaintexts are **strict I-JSON with no
 `null`**: the seal drops every member whose value is `null` (§5's own wire
 types write `null` for an absent value, such as `work.result`, and a missing
 one reads as absent) and refuses an array holding one; the open refuses any
@@ -3798,7 +3804,9 @@ exactly as without this section):
     duplicate (its claim held) marks the message's status owed again, and
     a resend of a request refused whole has its recorded refusal sent
     again (**Atem's reading, for Astation:** the Station may have lost the
-    first; superseding keeps one status waiting). Only a new copy counts
+    first; superseding keeps one status waiting), once the latest status
+    was stored: one still waiting to be stored is put again anyway, the
+    same object, never superseded by a copy of itself. Only a new copy counts
     as a resend: one at a position past the furthest the host ever read
     under that mailbox id. The same copy read again after a rewind, or
     after a reset under the same mailbox id, owes nothing. A refusal row marked for its
@@ -3843,9 +3851,12 @@ exactly as without this section):
     (`launch = "on_message"`), that consents to the sender with a project
     granting `launch` as well as a task's ops (one entry's ops, never
     summed across entries), and where no agent runs. A launch under way on
-    that route (reserved by an earlier request and still starting, or
-    started with its session not yet the route's agent) is shared; else one
-    is reserved, one per profile, in the admission transaction with the
+    that route of the same sender (reserved by an earlier request of its
+    and still starting, or started while its session's launch project
+    isn't known yet) is shared, as stage 1 shares one (**Atem's reading,
+    for Astation:** never another sender's, whose admission and expiry it
+    carries); else one is reserved, one per profile per message, in the
+    admission transaction with the
     tasks that wait for it, within the launch records' limit (else the
     message is refused `busy`), and started once that commits as a
     delegated sender's launch: checked at the spawn boundary (design I.4.3,
@@ -3854,7 +3865,9 @@ exactly as without this section):
     approved then, the project's `launch` op, its expiry, the waits), a
     reason that can clear waiting, one that can't failing it, never
     `outcome_unknown`. Its tasks wait for it (`blocked`, `launching the
-    approved route`, holding its session); a launch that failed, or whose
+    approved route`, holding its session); a launch that failed (the
+    detail its spawn check gave, `approved route launch not started:
+    <detail>`, as the launcher's reason), or whose
     outcome is unknown after a restart, fails them (**Atem's reading, for
     Astation:** they never started, so their own outcome is known; stage
     1's local task becomes `outcome_unknown` there). Without every
@@ -4033,12 +4046,26 @@ exactly as without this section):
   its own id (`busy`, `forbidden`: `refused` with the code), or it expires.
   As stage 1: only the task's sending session (for a complete, its process
   too) or the owner outside any session. **Atem's readings, for
-  Astation:** what the newest status shows decides only what can't change,
-  so a cancel of a task it shows started or ended is refused here, as is a
-  complete of one it shows failed, cancelled or expired (one it shows
-  completed is done), and anything else goes (a status may lag behind its
-  task, and the host answers a stop it doesn't reach); a stop of the task
-  that still stands isn't sent again. A complete names the reply this host
+  Astation:** what the newest status shows decides what can't change, so a
+  cancel of a task it shows started or ended is refused here, as is a
+  complete of one it shows failed, cancelled, expired or of unknown outcome
+  (that host's owner resolves those); one it shows completed is done. A
+  **complete waits for its task**: while the newest status shows the task
+  before `awaiting_result` (its turn may still run, and the receiving host
+  completes only a task awaiting its result), the complete is held,
+  durable with the command (its row `held`, its result frozen), nothing
+  sealed or put; the status that shows `awaiting_result` makes it due in
+  the transaction that applies it, and the next pass seals it under its own
+  `id` and enqueues it. A status showing the task ended otherwise
+  (cancelled, failed, expired, completed, of unknown outcome) drops it,
+  with why; its message's expiry expires it. A `busy` answer by its own id
+  to a complete on its way (a race: the task wasn't awaiting its result
+  there) holds it again under a fresh `id`, the first object put no more,
+  or drops it when the newest status shows the task ended. A stop of the
+  task that still stands isn't sent again, and the command says what
+  became of it (sent, queued until the task awaits its result, an earlier
+  one still on its way, or already done), never "sent" when nothing was. A
+  complete names the reply this host
   got back ("A `complete` naming the reply" above), and a delivery of that
   reply still queued is cancelled in that transaction (`not delivered: its
   task was completed by its sender`), as stage 1's completion ends its

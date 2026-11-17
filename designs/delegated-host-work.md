@@ -2206,8 +2206,9 @@ as this section says, or keeps it as data with why. A delivered result's first l
 names no session; the example in III.2 names one, Atem's reading for Astation). **`cancel` and `complete` across
 hosts built behind the same hook** (host-work-v1 §11.5, "On the sending host"): each its own envelope and delivery
 row, resent with the same bytes every 10 minutes until a status shows its effect, the host answers it by its own id,
-or it expires; so the delivered result's last line, `atem message complete <task id>`, completes the task on the host
-that ran it.
+or it expires; a `complete` waits, held on the sending host, until a status shows the task awaiting its result (a
+`busy` answer holds it again); so the delivered result's last line, `atem message complete <task id>`, completes the
+task on the host that ran it.
 
 The host that ran the work sends **`atem-result`** objects back to the sending host through the same mailbox. They
 have the envelope's shape with type `atem-result`, signing label `atem-result-v1` and seal label
