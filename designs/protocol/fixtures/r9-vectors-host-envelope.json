@@ -97,6 +97,34 @@
         "sender": "host:host-a",
         "verdict": "open"
       },
+      "label": "complete_names_reply_opens",
+      "note": "checks 1 to 6 pass",
+      "now": 1793620801000,
+      "object": "complete_names_reply",
+      "receiver": {
+        "generated": [
+          "host-b-enc-1",
+          "host-b-enc-2"
+        ],
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "keys": [
+          "host-b-enc-1"
+        ]
+      }
+    },
+    {
+      "call": "open_envelope",
+      "chain": [
+        "M7_add_host_b",
+        "M8_enc_a",
+        "M9_enc_b",
+        "M10_add_host_evil"
+      ],
+      "expect": {
+        "sender": "host:host-a",
+        "verdict": "open"
+      },
       "label": "request_max_opens",
       "note": "checks 1 to 6 pass",
       "now": 1793620801000,
@@ -1573,6 +1601,72 @@
         "M10_add_host_evil"
       ],
       "expect": {
+        "object_id": "3d96f512-163c-41e8-a134-e83e47962e24",
+        "reason": "plaintext_malformed",
+        "sender": {
+          "host_id": "host-a",
+          "host_trust_gen": 1
+        },
+        "verdict": "refused_authenticated"
+      },
+      "label": "complete_names_another_reply",
+      "note": "a result snapshot names only its own task's reply",
+      "now": 1793620801000,
+      "object": "complete_names_another_reply",
+      "receiver": {
+        "generated": [
+          "host-b-enc-1",
+          "host-b-enc-2"
+        ],
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "keys": [
+          "host-b-enc-1"
+        ]
+      }
+    },
+    {
+      "call": "open_envelope",
+      "chain": [
+        "M7_add_host_b",
+        "M8_enc_a",
+        "M9_enc_b",
+        "M10_add_host_evil"
+      ],
+      "expect": {
+        "object_id": "77bbe314-a3f0-4841-8869-521269f9bb25",
+        "reason": "plaintext_malformed",
+        "sender": {
+          "host_id": "host-a",
+          "host_trust_gen": 1
+        },
+        "verdict": "refused_authenticated"
+      },
+      "label": "complete_copies_the_reply",
+      "note": "a result snapshot names the reply, never copies it",
+      "now": 1793620801000,
+      "object": "complete_copies_the_reply",
+      "receiver": {
+        "generated": [
+          "host-b-enc-1",
+          "host-b-enc-2"
+        ],
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "keys": [
+          "host-b-enc-1"
+        ]
+      }
+    },
+    {
+      "call": "open_envelope",
+      "chain": [
+        "M7_add_host_b",
+        "M8_enc_a",
+        "M9_enc_b",
+        "M10_add_host_evil"
+      ],
+      "expect": {
         "object_id": "535c5e71-b172-40f5-a957-507851288c0f",
         "reason": "plaintext_malformed",
         "sender": {
@@ -2375,6 +2469,45 @@
         "M10_add_host_evil"
       ],
       "expect": {
+        "sender": "host:host-b",
+        "verdict": "accepted"
+      },
+      "label": "status_completed_names_reply_accepted",
+      "note": "a status of a task completed with its reply named: accepted",
+      "now": 1793620801000,
+      "object": "status_completed_names_reply",
+      "outbox": {
+        "cancel_complete_ids": [],
+        "message_id": "3f1e2d4c-5b6a-4978-8a9b-0c1d2e3f4a5b",
+        "recipient": {
+          "host_id": "host-b",
+          "host_trust_gen": 1
+        },
+        "task_ids": [
+          "80160896-4fcd-5e6e-adac-98bac5497321"
+        ]
+      },
+      "receiver": {
+        "generated": [
+          "host-a-enc-1",
+          "host-a-enc-2"
+        ],
+        "host_id": "host-a",
+        "host_trust_gen": 1,
+        "keys": [
+          "host-a-enc-1"
+        ]
+      }
+    },
+    {
+      "call": "accept_result",
+      "chain": [
+        "M7_add_host_b",
+        "M8_enc_a",
+        "M9_enc_b",
+        "M10_add_host_evil"
+      ],
+      "expect": {
         "object_id": "fc26e093-76b9-4dfa-ad88-0e1aee4ee8dd",
         "reason": "plaintext_malformed",
         "sender": {
@@ -2431,6 +2564,50 @@
       "note": "resolved naming a task by the recipient's own id isn't a status plaintext",
       "now": 1793620801000,
       "object": "status_resolved_v4_task",
+      "outbox": {
+        "cancel_complete_ids": [],
+        "message_id": "3f1e2d4c-5b6a-4978-8a9b-0c1d2e3f4a5b",
+        "recipient": {
+          "host_id": "host-b",
+          "host_trust_gen": 1
+        },
+        "task_ids": [
+          "80160896-4fcd-5e6e-adac-98bac5497321"
+        ]
+      },
+      "receiver": {
+        "generated": [
+          "host-a-enc-1",
+          "host-a-enc-2"
+        ],
+        "host_id": "host-a",
+        "host_trust_gen": 1,
+        "keys": [
+          "host-a-enc-1"
+        ]
+      }
+    },
+    {
+      "call": "accept_result",
+      "chain": [
+        "M7_add_host_b",
+        "M8_enc_a",
+        "M9_enc_b",
+        "M10_add_host_evil"
+      ],
+      "expect": {
+        "object_id": "042a1f98-6951-4292-8dd9-24b0b17f1349",
+        "reason": "plaintext_malformed",
+        "sender": {
+          "host_id": "host-b",
+          "host_trust_gen": 1
+        },
+        "verdict": "refused_authenticated"
+      },
+      "label": "status_completed_names_another_reply",
+      "note": "a work result naming another task's reply isn't a status plaintext",
+      "now": 1793620801000,
+      "object": "status_completed_names_another_reply",
       "outbox": {
         "cancel_complete_ids": [],
         "message_id": "3f1e2d4c-5b6a-4978-8a9b-0c1d2e3f4a5b",
@@ -3196,6 +3373,141 @@
       },
       "signed_with": "host-a",
       "signing_input_hex": "000000106174656d2d656e76656c6f70652d7631000002267b226163636f756e745f6964223a22616363742d746573742d31222c22637265617465645f6174223a313739333632303830303030302c22657870697265735f6174223a313739333632343430303030302c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226964223a2264303431363965642d363063382d343931352d383937382d313266393761323762386139222c22726563697069656e74223a7b22656e635f6b6964223a2235313131616161323537383930396538222c22686f73745f6964223a22686f73742d62222c22686f73745f74727573745f67656e223a317d2c227365616c65645f68617368223a2239303033343235333965623061363665666165626433653864373639633561663731313936623131303735336635353664346235376436623761323163633539222c2273656e646572223a7b22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a317d2c227369676e65645f61745f68656164223a7b2268617368223a2233343933386334333063653136636130636265333564366231663762626166303733623139353136656231313461396136353261386362396130633638323865222c22736571223a31307d2c2274797065223a226174656d2d656e76656c6f7065222c2276223a317d"
+    },
+    {
+      "built": true,
+      "jcs": "{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"292e5737-188c-4b23-8d26-f5a15d2707f9\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"479633f3d383a99faa298919da1695afe5c7a4dbc51b9bd07c337972837bf75b\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"34938c430ce16ca0cbe35d6b1f7bbaf073b19516eb114a9a652a8cb9a0c6828e\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1}",
+      "kind": "envelope",
+      "label": "complete_names_reply",
+      "note": "a complete of the request's task naming the reply it got back: a result snapshot whose id is the task's own result:<result_id>",
+      "object": {
+        "body": {
+          "account_id": "acct-test-1",
+          "created_at": 1793620800000,
+          "expires_at": 1793624400000,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "id": "292e5737-188c-4b23-8d26-f5a15d2707f9",
+          "recipient": {
+            "enc_kid": "5111aaa2578909e8",
+            "host_id": "host-b",
+            "host_trust_gen": 1
+          },
+          "sealed_hash": "479633f3d383a99faa298919da1695afe5c7a4dbc51b9bd07c337972837bf75b",
+          "sender": {
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "signed_at_head": {
+            "hash": "34938c430ce16ca0cbe35d6b1f7bbaf073b19516eb114a9a652a8cb9a0c6828e",
+            "seq": 10
+          },
+          "type": "atem-envelope",
+          "v": 1
+        },
+        "ct": "Wu6VJRKLh3RGGjolQVGIQdOO1F4u9WbrGraPCQ8BRhYs9gqJHZA9iQi9-bLIQDsl8IEyz5AUXLqKGH2CzxWhh1DzNqHg1wYH0-upW7F_hyglqDWCKMA1BhxdtubMU32fjH816XEJh4Sw0wbZ7a6vAK8j6Eq6O1niCk8f2cEaosNVjK5pBNQ3y7iA9h_lD37Jn9bhkHOrvHyb3JllFcRccicZjRz2XYSzWJ4ry6HVAG1-yYxW1uKBZP7m4I1_tWJpqbRlXqZDw5VHfV38GKUrVmRTQ4c5U0cyvqi8IyfzBxHBoGo8Cztl0f7Z3_4khpL_oahKh-gKNm4zJHcGy7lU0l1UyNYTrwIsRbn9upyOexXZKSMtSl6jQmOu0kcy-qR8o4I54stCLd0v3qDrJ8lqA-839tGVVQ6J_mbrNDYoEsSO37PI2bdUycoUrpDAXHsV6t2kavGAUThZcaPY_jE04XFrZEGNQAmnr3cmM8HZp_2J5N2ijipgPM-j0boovLSyQ0jhEsJwEkp5C_fvHCFIlLDUcpEzZT_-d4avgVTE1kI50qwzfb9IaKS7g8A2PT7TQrg5B4jCeFW2EyjuCUZ1OJc",
+        "enc": "FAPs92a1mANKP2uQRz0A-8oni51ulvPmCJBgMT95TCE",
+        "sig": "2g-K_b9n6SDKqN6G6stHEO-r52EDa6UEnUohNQHG6RNEA1L0A1S79dmDjiHTc9rLSh6Bxs1iBSpLLtK7K-NAAg"
+      },
+      "sealed": {
+        "ikmE_hex": "d9bd860a7211856407c2a63366bc765c7203a6149bbd5801a717b9fa74a9cad5",
+        "ikm_label": "host-envelope complete_names_reply",
+        "info_hex": "000000156174656d2d656e76656c6f70652d7365616c2d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d6100000008000000000000000100000006686f73742d6200000008000000000000000100000010353131316161613235373839303965380000002432393265353733372d313838632d346232332d386432362d66356131356432373037663900000008000001a19c21720000000008000001a19c586080",
+        "plaintext": "{\"kind\":\"complete\",\"result\":{\"digest\":\"c6ded0d097fb7ff050d876e00efa5a6fd86c4bbc9c4cc6a6826e5f6047fcf864\",\"id\":\"result:5fbfe2da-6b57-5bde-a151-5c2abcca1a00\",\"kind\":\"result\",\"text\":\"{\\\"digest\\\":\\\"658c31f014eb6586f6b5867f1d2458d092c2166398e11d32d8638f88bc92de2e\\\",\\\"result_id\\\":\\\"5fbfe2da-6b57-5bde-a151-5c2abcca1a00\\\",\\\"task_id\\\":\\\"2f72a9f3-a5a6-449c-b712-744927dcb0dd\\\"}\",\"version\":1},\"task_id\":\"2f72a9f3-a5a6-449c-b712-744927dcb0dd\"}",
+        "sealed_hash": "479633f3d383a99faa298919da1695afe5c7a4dbc51b9bd07c337972837bf75b",
+        "to": "host-b-enc-1"
+      },
+      "signed_with": "host-a",
+      "signing_input_hex": "000000106174656d2d656e76656c6f70652d7631000002267b226163636f756e745f6964223a22616363742d746573742d31222c22637265617465645f6174223a313739333632303830303030302c22657870697265735f6174223a313739333632343430303030302c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226964223a2232393265353733372d313838632d346232332d386432362d663561313564323730376639222c22726563697069656e74223a7b22656e635f6b6964223a2235313131616161323537383930396538222c22686f73745f6964223a22686f73742d62222c22686f73745f74727573745f67656e223a317d2c227365616c65645f68617368223a2234373936333366336433383361393966616132393839313964613136393561666535633761346462633531623962643037633333373937323833376266373562222c2273656e646572223a7b22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a317d2c227369676e65645f61745f68656164223a7b2268617368223a2233343933386334333063653136636130636265333564366231663762626166303733623139353136656231313461396136353261386362396130633638323865222c22736571223a31307d2c2274797065223a226174656d2d656e76656c6f7065222c2276223a317d"
+    },
+    {
+      "built": false,
+      "jcs": "{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"3d96f512-163c-41e8-a134-e83e47962e24\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"34060dfb7d122b9de3c00ae3c3a0f8f3e5e85399aeda58fc27cb9c4e93b2516c\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"34938c430ce16ca0cbe35d6b1f7bbaf073b19516eb114a9a652a8cb9a0c6828e\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1}",
+      "kind": "envelope",
+      "label": "complete_names_another_reply",
+      "note": "a complete of the request's task whose result snapshot names another task's reply; no builder seals it",
+      "object": {
+        "body": {
+          "account_id": "acct-test-1",
+          "created_at": 1793620800000,
+          "expires_at": 1793624400000,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "id": "3d96f512-163c-41e8-a134-e83e47962e24",
+          "recipient": {
+            "enc_kid": "5111aaa2578909e8",
+            "host_id": "host-b",
+            "host_trust_gen": 1
+          },
+          "sealed_hash": "34060dfb7d122b9de3c00ae3c3a0f8f3e5e85399aeda58fc27cb9c4e93b2516c",
+          "sender": {
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "signed_at_head": {
+            "hash": "34938c430ce16ca0cbe35d6b1f7bbaf073b19516eb114a9a652a8cb9a0c6828e",
+            "seq": 10
+          },
+          "type": "atem-envelope",
+          "v": 1
+        },
+        "ct": "wAN8MbYmXHy25NT24OHTuK17GOnEshcJS7vX647PmZEbPn6pT0tK5G4-GzoUdaSZVK9-odoytHDT5fAQOsOb4SQVulRFHyV62AmSJ82CDurDfEh8trVk3Pc-w4mypUsWGhT_7vR8hITJuByCPDl5Nge6p0IKqsQAL1beepXOFKB7OScdUY5Dn2ZoGO34GjzxGSJtJAX8uMSRnJeL6zG9hDO1HOnhfMXOobok4538IUYYrr2LahB4KO308gENEdmoIVu2u8MiPL6AgIVa16hL22JXsAzAOlqfANujxHgcRNGDw6zWBCUyHFE6BdEs1thwn-E67rIEE0I6GLZwAWKNElRzrKG2uHRahRTevb6t3JTt5NQlDI4fJH4AXsaElMQ4J0c7NhSCcFeWPR1G01XNl_mA_eSsZLCRLT-igN9yCXsRdfjMTh31nMZ1tPHwAOgMf7iWQfDtC5nZUd6_6w5UwLcV7QcI_1PLUcAKE661eagsdApHXUw9BZ-myJibbWbyKbcDhPS-tJeVM0xeEq7kAcVd13IX1AqwB8JWti0o9A64rlFBntMMdiMmZ-8caF8EjzWFBhGGELZDdbW45Pv4A_U",
+        "enc": "eHJh4AIb1vEhjCDw_IU1um2faDZRmCw4PzZosixDpFc",
+        "sig": "tn1RKnNm4bcIrFsMz_9pm7-PQU4VNFxsYujGAgVoK9xKaPnuPKVJ9jkOCz8Oy_iwxK0Gu4Txc5MnfDjRtW4QAA"
+      },
+      "sealed": {
+        "ikmE_hex": "dfec4b216139f0425fceda0fc0fe549d1b7b03655420f1b3265e0405b5e22516",
+        "ikm_label": "host-envelope complete_names_another_reply",
+        "info_hex": "000000156174656d2d656e76656c6f70652d7365616c2d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d6100000008000000000000000100000006686f73742d6200000008000000000000000100000010353131316161613235373839303965380000002433643936663531322d313633632d343165382d613133342d65383365343739363265323400000008000001a19c21720000000008000001a19c586080",
+        "plaintext": "{\"kind\":\"complete\",\"result\":{\"digest\":\"045df861f2bba536a5d249a0ba79ddc93234f08635d2467e78c6179a2c6308b9\",\"id\":\"result:da2d2949-a7cb-556b-82ea-d1dfdbaf340f\",\"kind\":\"result\",\"text\":\"{\\\"digest\\\":\\\"658c31f014eb6586f6b5867f1d2458d092c2166398e11d32d8638f88bc92de2e\\\",\\\"result_id\\\":\\\"da2d2949-a7cb-556b-82ea-d1dfdbaf340f\\\",\\\"task_id\\\":\\\"e8ed07b0-8add-4025-8618-c4d56996f9f0\\\"}\",\"version\":1},\"task_id\":\"2f72a9f3-a5a6-449c-b712-744927dcb0dd\"}",
+        "sealed_hash": "34060dfb7d122b9de3c00ae3c3a0f8f3e5e85399aeda58fc27cb9c4e93b2516c",
+        "to": "host-b-enc-1"
+      },
+      "signed_with": "host-a",
+      "signing_input_hex": "000000106174656d2d656e76656c6f70652d7631000002267b226163636f756e745f6964223a22616363742d746573742d31222c22637265617465645f6174223a313739333632303830303030302c22657870697265735f6174223a313739333632343430303030302c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226964223a2233643936663531322d313633632d343165382d613133342d653833653437393632653234222c22726563697069656e74223a7b22656e635f6b6964223a2235313131616161323537383930396538222c22686f73745f6964223a22686f73742d62222c22686f73745f74727573745f67656e223a317d2c227365616c65645f68617368223a2233343036306466623764313232623964653363303061653363336130663866336535653835333939616564613538666332376362396334653933623235313663222c2273656e646572223a7b22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a317d2c227369676e65645f61745f68656164223a7b2268617368223a2233343933386334333063653136636130636265333564366231663762626166303733623139353136656231313461396136353261386362396130633638323865222c22736571223a31307d2c2274797065223a226174656d2d656e76656c6f7065222c2276223a317d"
+    },
+    {
+      "built": false,
+      "jcs": "{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"77bbe314-a3f0-4841-8869-521269f9bb25\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"bfa339455c23bac3149ea01b2a5017e0978be1dc9532437558de1c06fd555ad9\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"34938c430ce16ca0cbe35d6b1f7bbaf073b19516eb114a9a652a8cb9a0c6828e\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1}",
+      "kind": "envelope",
+      "label": "complete_copies_the_reply",
+      "note": "a complete whose result snapshot has the task's reply id but copies the reply's text instead of naming it; no builder seals it",
+      "object": {
+        "body": {
+          "account_id": "acct-test-1",
+          "created_at": 1793620800000,
+          "expires_at": 1793624400000,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "id": "77bbe314-a3f0-4841-8869-521269f9bb25",
+          "recipient": {
+            "enc_kid": "5111aaa2578909e8",
+            "host_id": "host-b",
+            "host_trust_gen": 1
+          },
+          "sealed_hash": "bfa339455c23bac3149ea01b2a5017e0978be1dc9532437558de1c06fd555ad9",
+          "sender": {
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "signed_at_head": {
+            "hash": "34938c430ce16ca0cbe35d6b1f7bbaf073b19516eb114a9a652a8cb9a0c6828e",
+            "seq": 10
+          },
+          "type": "atem-envelope",
+          "v": 1
+        },
+        "ct": "DKW2wsUBWNj6xVpCwVpWelN9XPo14iS_M_KwKgFWIW17MOXKwMgamVKWLOKbzFPwJ9bQikA3sc-wIklFPWHd-XR6u0hhJBoFiTP6tZlND6ysThLDBPX6p6v-dI-0v7LF5L5FviudcZ2eY50MtmQGZ85QtGiOZhjO2qyPhFqlA4YL7-PtEwAW2m9-2vlkUBLXlPa5JWKvBMt-dvOx17sPSbA71vU5gDWNJhMF_ZzS9BWJCEMx4vlKRkHNEBCKpaVajljuST1NKjHRj9AfItfzAtpjF6U0RIFk_ghi8rzOb3kLnvMqJakpkOJbCjwxyzJZ7KdDqgZFznQajLfkbjbDCRaAVdbrCebH7VWrk8ArjuJjXrLSXDN3IgZBC6D9Y1KgN2kt9Q",
+        "enc": "pioqQTos7wwdVr47cxg9VF8_EoYvoH8nNYp-a4UY2i4",
+        "sig": "2UgYev8-yr-3G5NtBHZcytX-aPoOrxc9yel6T0TES75bUM9caUTvbLirYWDanMrkyD6U0cqE39bSiBm8S_HhAQ"
+      },
+      "sealed": {
+        "ikmE_hex": "2c1a155c2785b627e7d089d141e0236517b7ab4278b10f4f4eafac817aa60dd0",
+        "ikm_label": "host-envelope complete_copies_the_reply",
+        "info_hex": "000000156174656d2d656e76656c6f70652d7365616c2d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d6100000008000000000000000100000006686f73742d6200000008000000000000000100000010353131316161613235373839303965380000002437376262653331342d613366302d343834312d383836392d35323132363966396262323500000008000001a19c21720000000008000001a19c586080",
+        "plaintext": "{\"kind\":\"complete\",\"result\":{\"digest\":\"658c31f014eb6586f6b5867f1d2458d092c2166398e11d32d8638f88bc92de2e\",\"id\":\"result:5fbfe2da-6b57-5bde-a151-5c2abcca1a00\",\"kind\":\"result\",\"text\":\"Done: the client uses /v2/orders\",\"version\":1},\"task_id\":\"2f72a9f3-a5a6-449c-b712-744927dcb0dd\"}",
+        "sealed_hash": "bfa339455c23bac3149ea01b2a5017e0978be1dc9532437558de1c06fd555ad9",
+        "to": "host-b-enc-1"
+      },
+      "signed_with": "host-a",
+      "signing_input_hex": "000000106174656d2d656e76656c6f70652d7631000002267b226163636f756e745f6964223a22616363742d746573742d31222c22637265617465645f6174223a313739333632303830303030302c22657870697265735f6174223a313739333632343430303030302c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226964223a2237376262653331342d613366302d343834312d383836392d353231323639663962623235222c22726563697069656e74223a7b22656e635f6b6964223a2235313131616161323537383930396538222c22686f73745f6964223a22686f73742d62222c22686f73745f74727573745f67656e223a317d2c227365616c65645f68617368223a2262666133333934353563323362616333313439656130316232613530313765303937386265316463393533323433373535386465316330366664353535616439222c2273656e646572223a7b22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a317d2c227369676e65645f61745f68656164223a7b2268617368223a2233343933386334333063653136636130636265333564366231663762626166303733623139353136656231313461396136353261386362396130633638323865222c22736571223a31307d2c2274797065223a226174656d2d656e76656c6f7065222c2276223a317d"
     },
     {
       "built": true,
@@ -4796,6 +5108,51 @@
     },
     {
       "built": true,
+      "jcs": "{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"eaf54f68-66f6-4d28-8890-a74ec38d407c\",\"recipient\":{\"enc_kid\":\"f7b299b3a3dc69cc\",\"host_id\":\"host-a\",\"host_trust_gen\":1},\"sealed_hash\":\"8ad3f8f11b01428e107b3fd5a993f015913ae14390eec5edfce836a57d2bb89f\",\"sender\":{\"host_id\":\"host-b\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"34938c430ce16ca0cbe35d6b1f7bbaf073b19516eb114a9a652a8cb9a0c6828e\",\"seq\":10},\"type\":\"atem-result\",\"v\":1}",
+      "kind": "result",
+      "label": "status_completed_names_reply",
+      "note": "host-b's status of a select task its sender completed naming the reply: the work result's reference is the task's own reply (kind result, id result:<result_id>)",
+      "object": {
+        "body": {
+          "account_id": "acct-test-1",
+          "created_at": 1793620800000,
+          "expires_at": 1793624400000,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "id": "eaf54f68-66f6-4d28-8890-a74ec38d407c",
+          "recipient": {
+            "enc_kid": "f7b299b3a3dc69cc",
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "sealed_hash": "8ad3f8f11b01428e107b3fd5a993f015913ae14390eec5edfce836a57d2bb89f",
+          "sender": {
+            "host_id": "host-b",
+            "host_trust_gen": 1
+          },
+          "signed_at_head": {
+            "hash": "34938c430ce16ca0cbe35d6b1f7bbaf073b19516eb114a9a652a8cb9a0c6828e",
+            "seq": 10
+          },
+          "type": "atem-result",
+          "v": 1
+        },
+        "ct": "JAL62VFv2qmDZ-awVVlWSq_m_YCqRBCL1x7sK8UWwzr88LtgISV6ZGWcalFKKZ156V31zX-10YK6cWwyQPg6lvx5dMY6jt2azjiNzve2a9UBuffsyKf39FSdMnGvQGE7ag8Pvp5vX6U3ODll1RnFp9yfvXTaDvEoJTiw-Eo83mOEhw5rBBniaA2Dj7Q-h136DShgYGUzdCAkyC803Qv3oemQhz1DbLf1oyKQcOCbIPLOII-Tei-fYAwP9v9VTu9t7OAa3kvAhT1bv9qht-yZTpEwEdhPEXlhQAqjCYgmploP8ydBllmGx5Bg0W9IkN4SB_bp0TCm5WM91XcDnMhtYRxjfQz215u_FdH5-LdaewEJ7VTMVADxfjXSBOJ8--6-Rm9qa4XLpgqsV50eAf1FxUOZCn7Fe0JBAGo4dwOE452LHyg5AxK5Pkw8BhdjERnCFvpf_aa_cCW6tjbIAgUB1gD5FrALtT8FmSW4FWNxViiGDMJy6j2Osgl39rZef98kzAIAOybmGAqo0fY0QcpDAph9cG7v5mSz8fnUPcwCOzR5ggvDECCsEE50abF9SbT5ehQNjCKKu2UP2R8HqUyC-WKHY9NEFGjaCPoZ4LMWvrXw9-HrHSBXLq9tRX4vn9WpNDuK1aGUCIwjXu_D08pk-d9MNlSVupE1IV7lJONdX8xWLQPLSKe1h_d8TYT7wMD9rjfBpQZ5Nw",
+        "enc": "--IXOvKrlS8m3wSh3TLxcXc2qaK7KF0yCNbKb-q9bQ0",
+        "sig": "wBiC4sqntQwthBNHPkI4rO-KQV2QsJYfhlF6Z38B8ZBEHu3sw_eljLiJNZsFmWJW4eCLMUOhJRmrST6QoO4qAA"
+      },
+      "sealed": {
+        "ikmE_hex": "a9c277391a27c787b0252805a2eed7e389905707b808816243560d0fe0490d74",
+        "ikm_label": "host-envelope status_completed_names_reply",
+        "info_hex": "000000136174656d2d726573756c742d7365616c2d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d6200000008000000000000000100000006686f73742d6100000008000000000000000100000010663762323939623361336463363963630000002465616635346636382d363666362d346432382d383839302d61373465633338643430376300000008000001a19c21720000000008000001a19c586080",
+        "plaintext": "{\"kind\":\"status\",\"message_id\":\"3f1e2d4c-5b6a-4978-8a9b-0c1d2e3f4a5b\",\"recipients\":[{\"delivery\":{\"state\":\"resolved\",\"tasks\":[{\"detail\":\"explicit correlated result published\",\"receipt_id\":\"79404b10-9aa1-4764-b3a2-b76e12f0af8c\",\"result\":{\"digest\":\"c231ba1de8af11979b830788fd2dc534f2e4c3f1a1d364a64c34c187a686781c\",\"id\":\"result:996a448a-cf99-5e86-aa67-7f9a582a7eaa\",\"kind\":\"result\",\"version\":1},\"state\":\"completed\",\"task_id\":\"80160896-4fcd-5e6e-adac-98bac5497321\"}]},\"recipient_id\":\"7c6b5a49-3827-4e16-9d05-f4e3d2c1b0a9\"}]}",
+        "sealed_hash": "8ad3f8f11b01428e107b3fd5a993f015913ae14390eec5edfce836a57d2bb89f",
+        "to": "host-a-enc-1"
+      },
+      "signed_with": "host-b",
+      "signing_input_hex": "0000000e6174656d2d726573756c742d7631000002247b226163636f756e745f6964223a22616363742d746573742d31222c22637265617465645f6174223a313739333632303830303030302c22657870697265735f6174223a313739333632343430303030302c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226964223a2265616635346636382d363666362d346432382d383839302d613734656333386434303763222c22726563697069656e74223a7b22656e635f6b6964223a2266376232393962336133646336396363222c22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a317d2c227365616c65645f68617368223a2238616433663866313162303134323865313037623366643561393933663031353931336165313433393065656335656466636538333661353764326262383966222c2273656e646572223a7b22686f73745f6964223a22686f73742d62222c22686f73745f74727573745f67656e223a317d2c227369676e65645f61745f68656164223a7b2268617368223a2233343933386334333063653136636130636265333564366231663762626166303733623139353136656231313461396136353261386362396130633638323865222c22736571223a31307d2c2274797065223a226174656d2d726573756c74222c2276223a317d"
+    },
+    {
+      "built": true,
       "jcs": "{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"883ae6da-ca27-4cb0-ba5f-c74fb5a50235\",\"recipient\":{\"enc_kid\":\"f7b299b3a3dc69cc\",\"host_id\":\"host-a\",\"host_trust_gen\":1},\"sealed_hash\":\"9609de9bf20a8a38604551ae8faea42aaa0e6d3cc9cfda2f5e07e5f003473677\",\"sender\":{\"host_id\":\"host-b\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"34938c430ce16ca0cbe35d6b1f7bbaf073b19516eb114a9a652a8cb9a0c6828e\",\"seq\":10},\"type\":\"atem-result\",\"v\":1}",
       "kind": "result",
       "label": "status_resolved",
@@ -4973,6 +5330,51 @@
       },
       "signed_with": "host-b",
       "signing_input_hex": "0000000e6174656d2d726573756c742d7631000002247b226163636f756e745f6964223a22616363742d746573742d31222c22637265617465645f6174223a313739333632303830303030302c22657870697265735f6174223a313739333632343430303030302c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226964223a2239313137303765332d366631362d343730342d616364622d386133326663653364643565222c22726563697069656e74223a7b22656e635f6b6964223a2266376232393962336133646336396363222c22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a317d2c227365616c65645f68617368223a2238666266623239356535356461353065323738356536346132333234323064303566663836313132626565623232383939316132393964333365323964393337222c2273656e646572223a7b22686f73745f6964223a22686f73742d62222c22686f73745f74727573745f67656e223a317d2c227369676e65645f61745f68656164223a7b2268617368223a2233343933386334333063653136636130636265333564366231663762626166303733623139353136656231313461396136353261386362396130633638323865222c22736571223a31307d2c2274797065223a226174656d2d726573756c74222c2276223a317d"
+    },
+    {
+      "built": false,
+      "jcs": "{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"042a1f98-6951-4292-8dd9-24b0b17f1349\",\"recipient\":{\"enc_kid\":\"f7b299b3a3dc69cc\",\"host_id\":\"host-a\",\"host_trust_gen\":1},\"sealed_hash\":\"0ac6f2e7eb29fd1c71a66851ee4d84f7dfd2955dd0fc7d7d027cc79740158646\",\"sender\":{\"host_id\":\"host-b\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"34938c430ce16ca0cbe35d6b1f7bbaf073b19516eb114a9a652a8cb9a0c6828e\",\"seq\":10},\"type\":\"atem-result\",\"v\":1}",
+      "kind": "result",
+      "label": "status_completed_names_another_reply",
+      "note": "a completed task whose work result's reference names another task's reply; no builder seals it",
+      "object": {
+        "body": {
+          "account_id": "acct-test-1",
+          "created_at": 1793620800000,
+          "expires_at": 1793624400000,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "id": "042a1f98-6951-4292-8dd9-24b0b17f1349",
+          "recipient": {
+            "enc_kid": "f7b299b3a3dc69cc",
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "sealed_hash": "0ac6f2e7eb29fd1c71a66851ee4d84f7dfd2955dd0fc7d7d027cc79740158646",
+          "sender": {
+            "host_id": "host-b",
+            "host_trust_gen": 1
+          },
+          "signed_at_head": {
+            "hash": "34938c430ce16ca0cbe35d6b1f7bbaf073b19516eb114a9a652a8cb9a0c6828e",
+            "seq": 10
+          },
+          "type": "atem-result",
+          "v": 1
+        },
+        "ct": "sfdclc87CMVYxMf7PNTeEs-0enXC832iv3O1E6_mM0tbqGVwT8xoHPE8GpKKCUYoS39H2gmlDNCUXBGmAWpC6nl2B9SrDrotJHh4LaEsTlqL5pOdo7OJnPrLb0cpblTJLTC3KJ2UNnAlh3irOPgWu7ON4t4JiWtXVh0jK3lmX3koLXTsLAWSua2yhrV0Ivtxx3v-H0DC82OgHzlGE3IVL8RyaJhjktexXUtj3yo1T7bqjCcsFmbXPK4U7UMyYG3VbydVHga0feYknSFVeHL79Jn6tJqleZghLizBL0OK2Y_FVjfEUNaGYuKLMXKbo6wHGsCoheGNy9veWOhKUR-nbydMKyxW6HiGINgg3Z4RAo8PDbQL0nvCW7f64KT5CjbGpdqQMu41X4OXjprLRvZc84qMtrAK0_EatNuhiQ4JTBRqrqHu4NeLH1M9CyZbzdSDPsAAQfMm7D6sfHxDQgDSG3hH5vavGqyNcEvuMzpbRVPzPqmMw5gvjz7t2-X4e9hNygU1kC8X5Fj8hIFV7FncEI5UZAbnzMDYgmDEaE8S0YmAYNprGTfirJ0V3wcHXCWZQ7WW9ld8D9PdEV-ZbCzf7ER_T35KvWnYWMQyOpQ6kefMTvGEwEUrQ2wz-GLVigW7k6VrUVPp35SMK1tTIg2Mixw2n_QB7YcNWtqQiq0VMg7w2kMSC9OuMJT5Mc-niTt0wGf-B3ANBA",
+        "enc": "CNH0woAUVIEuVcBv_hndS6E8iYYax4f0tb0cZoGRiX0",
+        "sig": "NBWs-2tzqsT3MTGpvPpwC6yJgjEKswwkptAPJIU5NbWDyjCLB8_AB69KdjGRgs-OWEVyCP0N5taL1T0qtckFCQ"
+      },
+      "sealed": {
+        "ikmE_hex": "f21d23f587adef62c057632fd4980a87f2f3661cf83f1ecbb769a00b0eee6ded",
+        "ikm_label": "host-envelope status_completed_names_another_reply",
+        "info_hex": "000000136174656d2d726573756c742d7365616c2d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d6200000008000000000000000100000006686f73742d6100000008000000000000000100000010663762323939623361336463363963630000002430343261316639382d363935312d343239322d386464392d32346230623137663133343900000008000001a19c21720000000008000001a19c586080",
+        "plaintext": "{\"kind\":\"status\",\"message_id\":\"3f1e2d4c-5b6a-4978-8a9b-0c1d2e3f4a5b\",\"recipients\":[{\"delivery\":{\"state\":\"resolved\",\"tasks\":[{\"detail\":\"explicit correlated result published\",\"receipt_id\":\"79404b10-9aa1-4764-b3a2-b76e12f0af8c\",\"result\":{\"digest\":\"045df861f2bba536a5d249a0ba79ddc93234f08635d2467e78c6179a2c6308b9\",\"id\":\"result:da2d2949-a7cb-556b-82ea-d1dfdbaf340f\",\"kind\":\"result\",\"version\":1},\"state\":\"completed\",\"task_id\":\"80160896-4fcd-5e6e-adac-98bac5497321\"}]},\"recipient_id\":\"7c6b5a49-3827-4e16-9d05-f4e3d2c1b0a9\"}]}",
+        "sealed_hash": "0ac6f2e7eb29fd1c71a66851ee4d84f7dfd2955dd0fc7d7d027cc79740158646",
+        "to": "host-a-enc-1"
+      },
+      "signed_with": "host-b",
+      "signing_input_hex": "0000000e6174656d2d726573756c742d7631000002247b226163636f756e745f6964223a22616363742d746573742d31222c22637265617465645f6174223a313739333632303830303030302c22657870697265735f6174223a313739333632343430303030302c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226964223a2230343261316639382d363935312d343239322d386464392d323462306231376631333439222c22726563697069656e74223a7b22656e635f6b6964223a2266376232393962336133646336396363222c22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a317d2c227365616c65645f68617368223a2230616336663265376562323966643163373161363638353165653464383466376466643239353564643066633764376430323763633739373430313538363436222c2273656e646572223a7b22686f73745f6964223a22686f73742d62222c22686f73745f74727573745f67656e223a317d2c227369676e65645f61745f68656164223a7b2268617368223a2233343933386334333063653136636130636265333564366231663762626166303733623139353136656231313461396136353261386362396130633638323865222c22736571223a31307d2c2274797065223a226174656d2d726573756c74222c2276223a317d"
     }
   ],
   "requires": "r9"

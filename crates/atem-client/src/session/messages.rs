@@ -389,7 +389,9 @@ impl WorkProgress {
         is_uuid_v4(&self.task_id) && self.valid_progress()
     }
 
-    /// Everything but the task id's form.
+    /// Everything but the task id's form. A `result` reference names only
+    /// the task's own reply (`result:<result_id>`: a task its host sender
+    /// completed with the reply named, host-work-v1 §11.5).
     fn valid_progress(&self) -> bool {
         is_uuid_v4(&self.receipt_id)
             && self.detail.len() <= 1024
@@ -398,6 +400,8 @@ impl WorkProgress {
                     && r.version > 0
                     && r.version <= MAX_SAFE_INTEGER
                     && is_digest(&r.digest)
+                    && (r.kind != ContextKind::Result
+                        || r.id == format!("result:{}", host_work::result_id(&self.task_id)))
             })
             && (self.state == WorkState::Completed) == self.result.is_some()
     }

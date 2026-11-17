@@ -10134,6 +10134,14 @@ fn mail_message(fields: &MailFields) -> atem_client::session::messages::Message 
     }
 }
 
+/// A `result` snapshot naming task `task`'s own reply (host-work-v1 §11.5):
+/// its id `result:<result_id>`, its text the reply's ids and digest.
+fn mail_naming(task: &str) -> atem_client::session::host_work::ContextSnapshot {
+    use atem_client::session::host_work::{ContextSnapshot, digest};
+    let reply = digest(b"Done: the client uses /v2/orders");
+    ContextSnapshot::naming_reply(task, Some(&reply))
+}
+
 /// A Memory snapshot of `text`.
 fn mail_snapshot(id: &str, text: String) -> atem_client::session::host_work::ContextSnapshot {
     use atem_client::session::host_work::{ContextKind, ContextSnapshot, digest};
@@ -10329,6 +10337,56 @@ fn host_envelope_vectors(book: &Book) -> Value {
         "a complete of the request's task with a result snapshot",
         f,
         MailPlain::Envelope(complete),
+        "host-b-enc-1",
+    );
+    // A complete naming the reply the sending host got back: a `result`
+    // snapshot whose id is the task's own `result:<result_id>` (Atem's
+    // reading, for Astation); one naming another task's reply is refused.
+    let f = ab(&g, "complete_names_reply");
+    let complete = EnvelopePlain::Complete {
+        task_id: task.clone(),
+        result: mail_naming(&task),
+    };
+    g.seal(
+        "complete_names_reply",
+        "a complete of the request's task naming the reply it got back: a result snapshot whose id is the task's own result:<result_id>",
+        f,
+        MailPlain::Envelope(complete),
+        "host-b-enc-1",
+    );
+    let f = ab(&g, "complete_names_another_reply");
+    let text = jcs(&serde_json::json!({
+        "kind": "complete",
+        "result": serde_json::to_value(mail_naming(&mail_id("another task"))).unwrap(),
+        "task_id": task,
+    }))
+    .unwrap();
+    g.seal_raw(
+        "complete_names_another_reply",
+        "a complete of the request's task whose result snapshot names another task's reply; no builder seals it",
+        MailKind::Envelope,
+        f,
+        text.as_bytes(),
+        "host-b-enc-1",
+    );
+    // A `result` snapshot carrying the reply's text, not its naming
+    // (review L2): refused too.
+    let f = ab(&g, "complete_copies_the_reply");
+    let mut copied = mail_naming(&task);
+    copied.text = "Done: the client uses /v2/orders".into();
+    copied.digest = atem_client::session::host_work::digest(copied.text.as_bytes());
+    let text = jcs(&serde_json::json!({
+        "kind": "complete",
+        "result": serde_json::to_value(&copied).unwrap(),
+        "task_id": task,
+    }))
+    .unwrap();
+    g.seal_raw(
+        "complete_copies_the_reply",
+        "a complete whose result snapshot has the task's reply id but copies the reply's text instead of naming it; no builder seals it",
+        MailKind::Envelope,
+        f,
+        text.as_bytes(),
         "host-b-enc-1",
     );
     let f = ab(&g, "request_max");
@@ -10751,7 +10809,30 @@ fn host_envelope_vectors(book: &Book) -> Value {
     // them, and two resolutions no builder seals.
     let resolved_text = r#"{"kind":"status","message_id":"3f1e2d4c-5b6a-4978-8a9b-0c1d2e3f4a5b","recipients":[{"delivery":{"state":"resolved","tasks":[{"detail":"waiting for a ready agent","receipt_id":"79404b10-9aa1-4764-b3a2-b76e12f0af8c","state":"queued","task_id":"80160896-4fcd-5e6e-adac-98bac5497321"}]},"recipient_id":"7c6b5a49-3827-4e16-9d05-f4e3d2c1b0a9"}]}"#;
     let no_match_text = r#"{"kind":"status","message_id":"3f1e2d4c-5b6a-4978-8a9b-0c1d2e3f4a5b","recipients":[{"delivery":{"state":"no_match"},"recipient_id":"7c6b5a49-3827-4e16-9d05-f4e3d2c1b0a9"}]}"#;
+    // A task its host sender completed with the reply named (host-work-v1
+    // §11.5): its `work.result` names the task's own reply; one naming
+    // another task's reply isn't a status (review L1).
+    let completed = |task: &str| {
+        let named = mail_naming(task);
+        resolved_text
+            .replace("waiting for a ready agent", "explicit correlated result published")
+            .replace(
+                r#""receipt_id":"79404b10-9aa1-4764-b3a2-b76e12f0af8c","#,
+                &format!(
+                    r#""receipt_id":"79404b10-9aa1-4764-b3a2-b76e12f0af8c","result":{{"digest":"{}","id":"{}","kind":"result","version":1}},"#,
+                    named.digest, named.id
+                ),
+            )
+            .replace(r#""state":"queued""#, r#""state":"completed""#)
+    };
+    let completed_text = completed("80160896-4fcd-5e6e-adac-98bac5497321");
+    let completed_other = completed(&mail_id("another task"));
     for (label, text, note) in [
+        (
+            "status_completed_names_reply",
+            completed_text.as_str(),
+            "host-b's status of a select task its sender completed naming the reply: the work result's reference is the task's own reply (kind result, id result:<result_id>)",
+        ),
         (
             "status_resolved",
             resolved_text,
@@ -10785,6 +10866,11 @@ fn host_envelope_vectors(book: &Book) -> Value {
             ),
             "a resolution whose task is named by the recipient's own UUID v4 id, not a selector task id; no builder seals it",
         ),
+        (
+            "status_completed_names_another_reply",
+            completed_other,
+            "a completed task whose work result's reference names another task's reply; no builder seals it",
+        ),
     ] {
         assert!(ResultPlain::parse(text.as_bytes()).is_err(), "{label}");
         let f = ba(&g, label);
@@ -10804,6 +10890,7 @@ fn host_envelope_vectors(book: &Book) -> Value {
         ("request_opens", "request"),
         ("cancel_opens", "cancel"),
         ("complete_opens", "complete"),
+        ("complete_names_reply_opens", "complete_names_reply"),
         ("request_max_opens", "request_max"),
     ] {
         at(
@@ -11279,6 +11366,24 @@ fn host_envelope_vectors(book: &Book) -> Value {
         e,
         "a null in the plaintext",
     );
+    let e = g.refused_authenticated("complete_names_another_reply", "plaintext_malformed");
+    at(
+        &mut g,
+        "complete_names_another_reply",
+        "complete_names_another_reply",
+        &b,
+        e,
+        "a result snapshot names only its own task's reply",
+    );
+    let e = g.refused_authenticated("complete_copies_the_reply", "plaintext_malformed");
+    at(
+        &mut g,
+        "complete_copies_the_reply",
+        "complete_copies_the_reply",
+        &b,
+        e,
+        "a result snapshot names the reply, never copies it",
+    );
     let e = g.refused_authenticated("plaintext_not_canonical", "plaintext_malformed");
     at(
         &mut g,
@@ -11504,6 +11609,12 @@ fn host_envelope_vectors(book: &Book) -> Value {
             "a status carrying a select recipient's no_match: accepted, final for that message",
             select_row(&[]),
         ),
+        (
+            "status_completed_names_reply_accepted",
+            "status_completed_names_reply",
+            "a status of a task completed with its reply named: accepted",
+            resolved_row.clone(),
+        ),
     ] {
         g.check(
             label,
@@ -11524,6 +11635,10 @@ fn host_envelope_vectors(book: &Book) -> Value {
         (
             "status_resolved_v4_task",
             "resolved naming a task by the recipient's own id isn't a status plaintext",
+        ),
+        (
+            "status_completed_names_another_reply",
+            "a work result naming another task's reply isn't a status plaintext",
         ),
     ] {
         let e = g.refused_authenticated(label, "plaintext_malformed");

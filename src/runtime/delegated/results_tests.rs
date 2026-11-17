@@ -311,6 +311,7 @@ fn rb_reply(task_id: &str, text: &str) -> ResultPlain {
 /// replies delivered.
 fn rb_pass(rig: &mut LocalRig) {
     rig.bridge.results_drain();
+    rig.bridge.remote_stops_pass();
     rig.bridge.remote_deliveries(&rig.sessions);
 }
 

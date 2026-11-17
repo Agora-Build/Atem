@@ -186,7 +186,12 @@ impl HostBridge {
         Ok(Resolution { tasks, launches })
     }
 
-    fn launch_candidate(&self, route: &Route, record: &LaunchRecord, now: u64) -> Candidate {
+    pub(super) fn launch_candidate(
+        &self,
+        route: &Route,
+        record: &LaunchRecord,
+        now: u64,
+    ) -> Candidate {
         Candidate {
             route_id: route.id.clone(),
             route_revision: route.revision,

@@ -36,8 +36,9 @@ use crate::runtime::delegated::host_senders::{
     HostOp, HostSender, host_sender_permits, host_standing, host_task_covered,
 };
 use crate::runtime::delegated::outbox::{self, Policy};
-use crate::runtime::delegated::start::{CANCELLED_BEFORE_SUBMISSION, Event};
+use crate::runtime::delegated::start::{CANCELLED_BEFORE_SUBMISSION, Event, StartLaunch};
 use crate::runtime::host_work::MessageRecord;
+use crate::runtime::host_work::{Route, RouteLaunch};
 use crate::session_protocol::r9::HostKey;
 use atem_client::host_mail::{EnvelopePlain, HostRef, MailFields, ResultPlain};
 use atem_client::host_principal::{host_principal, host_principal_key, parse_host_principal};
@@ -47,7 +48,7 @@ use atem_client::session::messages::{
 };
 use atem_client::session::select::Selector;
 use rusqlite::Transaction;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::AtomicU64;
 
 /// Tries of a row, or a report, that can't be decided before it is settled
@@ -228,6 +229,28 @@ impl Failed {
     }
 }
 
+/// A launch on message a host sender's request reserved (design II.6;
+/// host-work-v1 §11.5, "`select` from host senders"): its record, the
+/// route it launches on and what its spawn-boundary check reads. Reserved
+/// in the admission transaction; started once that commits.
+pub(super) struct HostLaunch {
+    record: LaunchRecord,
+    route: Route,
+    start: StartLaunch,
+}
+
+/// What one request's `select` recipients launch: the launches reserved
+/// now, and each task that waits for a launch (its own, or one already
+/// under way it shares): (task, launch request id, route, revision).
+#[derive(Default)]
+struct Launching {
+    new: Vec<HostLaunch>,
+    links: Vec<(String, String, String, u64)>,
+    /// The profiles launched or shared for this request: one launch per
+    /// profile per message (stage 1's; review L6).
+    profiles: HashSet<String>,
+}
+
 /// The ops of every project in effect that lists both `sender` and this
 /// host (`me`): a host sender's account permission toward it (design
 /// II.2.3), whatever the route.
@@ -324,17 +347,18 @@ impl HostBridge {
         let Some(signing) = self.signing() else {
             return;
         };
-        let (mut decided, failed, followups) = match self.admit_with(&signing, cx.sessions) {
-            Ok(done) => done,
-            Err(error) => {
-                super::delegated_mail_pass::log_limited(&UNADMITTED, || {
-                    format!(
-                        "atem runtime: host senders' mail not admitted ({error:#}); tried again"
-                    )
-                });
-                return;
-            }
-        };
+        let (mut decided, failed, followups, launches) =
+            match self.admit_with(&signing, cx.sessions) {
+                Ok(done) => done,
+                Err(error) => {
+                    super::delegated_mail_pass::log_limited(&UNADMITTED, || {
+                        format!(
+                            "atem runtime: host senders' mail not admitted ({error:#}); tried again"
+                        )
+                    });
+                    return;
+                }
+            };
         // Review M2: one that failed is tried again on the next passes; one
         // still failing after `MAX_ADMIT_FAILURES` tries in a row and
         // `SETTLE_AFTER_MS` since its first failure on the monotonic clock
@@ -378,20 +402,75 @@ impl HostBridge {
             self.work.followups.extend(followups);
             self.effects_pass(cx);
         }
+        // Launches on message, reserved with their requests (committed):
+        // handed to the launcher, each checked at the spawn boundary.
+        for launch in launches {
+            self.start_host_launch(launch);
+        }
+    }
+
+    /// `launch`, reserved and committed with its request, handed to the
+    /// launcher as a delegated sender's (design I.4.3, "Launches"): its
+    /// guard fences it after the spawn, its check ([`launch_check`], the
+    /// host sender's standing, the route and the project's `launch` op)
+    /// runs at the spawn boundary, a reason that can clear waiting and one
+    /// that can't failing it, never `outcome_unknown`.
+    ///
+    /// [`launch_check`]: crate::runtime::delegated::start::launch_check
+    fn start_host_launch(&mut self, launch: HostLaunch) {
+        let HostLaunch { record, start, .. } = launch;
+        // Its profile was approved in the pass that reserved it; one gone
+        // since fails it, nothing started (its tasks fail with it).
+        let Some(profile) = self.work.config.profile(&record.profile_id).cloned() else {
+            let mut failed = record;
+            failed.status.state = LaunchState::Failed;
+            let saved = self.work.store.as_ref().map(|s| s.save_launch(&failed));
+            if matches!(saved, Some(Err(_))) {
+                self.work_fail();
+            }
+            return;
+        };
+        let permit = Arc::new(AtomicBool::new(true));
+        let (guard, check) = self.delegated_spawn(&start, &permit);
+        let status = record.status;
+        let handout = RemoteLaunch {
+            request_id: status.request_id.clone(),
+            profile: profile.clone(),
+            session_id: status.session_id,
+            process_gen: status.process_gen,
+            guard,
+            check: Some(check),
+        };
+        self.work.pending.insert(
+            status.request_id,
+            PendingLaunch {
+                attachment: String::new(),
+                control_gen: self.host.control_gen(&record.principal),
+                principal: record.principal,
+                profile,
+                expires_at: record.expires_at,
+                permit,
+                local_route: None,
+                delegated: Some(Self::delegated_pending(start, &handout)),
+            },
+        );
+        self.work.launches.push_back(handout);
     }
 
     /// Every report and inbox row decided, each on its own: whether a row
     /// was taken, and what failed (each logged; review M2: one failing
     /// skips none of the others).
+    #[allow(clippy::type_complexity)]
     fn admit_with(
         &self,
         signing: &Signing,
         sessions: &BTreeMap<SessionId, BrokerSession>,
-    ) -> anyhow::Result<(bool, Vec<Failed>, Vec<Followup>)> {
+    ) -> anyhow::Result<(bool, Vec<Failed>, Vec<Followup>, Vec<HostLaunch>)> {
         let Some(store) = self.outbox_store() else {
-            return Ok((false, Vec::new(), Vec::new()));
+            return Ok((false, Vec::new(), Vec::new(), Vec::new()));
         };
         let mut followups = Vec::new();
+        let mut launches = Vec::new();
         let mut failed = Vec::new();
         // II.4.4: an authenticated object refused at check 5 or 6 is
         // reported to its sender, `invalid_request`, its mark cleared in
@@ -423,9 +502,10 @@ impl HostBridge {
             // closed) until it is settled; the rows after it are decided all
             // the same.
             match self.admit_row(store, signing, &row, sessions) {
-                Ok((taken, after)) => {
+                Ok((taken, after, launched)) => {
                     decided |= taken;
                     followups.extend(after);
+                    launches.extend(launched);
                 }
                 Err(error) => {
                     super::delegated_mail_pass::log_limited(&UNADMITTED, || {
@@ -438,7 +518,7 @@ impl HostBridge {
                 }
             }
         }
-        Ok((decided, failed, followups))
+        Ok((decided, failed, followups, launches))
     }
 
     /// A row that failed `tries` times settled, as an unreadable task
@@ -502,12 +582,13 @@ impl HostBridge {
         signing: &Signing,
         row: &InboxRow,
         sessions: &BTreeMap<SessionId, BrokerSession>,
-    ) -> anyhow::Result<(bool, Vec<Followup>)> {
+    ) -> anyhow::Result<(bool, Vec<Followup>, Vec<HostLaunch>)> {
         let tx = store.immediate()?;
         let mut followups = Vec::new();
+        let mut launches = Vec::new();
         let decided = match &row.plain {
             Some(EnvelopePlain::Request { message }) => {
-                self.admit_request(&tx, store, signing, row, message, sessions)?;
+                self.admit_request(&tx, store, signing, row, message, sessions, &mut launches)?;
                 true
             }
             Some(EnvelopePlain::Cancel { task_id }) => {
@@ -533,11 +614,11 @@ impl HostBridge {
             // A stop waiting for room among its sender's early stops: held,
             // holding only that sender's task starts (ruling R47).
             if row.held {
-                return Ok((false, Vec::new()));
+                return Ok((false, Vec::new(), Vec::new()));
             }
             admit::hold_row(&tx, row.n)?;
             tx.commit()?;
-            return Ok((true, Vec::new()));
+            return Ok((true, Vec::new(), Vec::new()));
         }
         admit::take_row(&tx, row.n)?;
         tx.commit()?;
@@ -550,7 +631,7 @@ impl HostBridge {
                 "after a host sender's request was admitted, before its status was put",
             );
         }
-        Ok((true, followups))
+        Ok((true, followups, launches))
     }
 
     /// The statuses owed (a host sender's task changed state: [`admit`]'s
@@ -715,7 +796,9 @@ impl HostBridge {
 
     /// A host sender's request (design II.4.2 step 7, "Duplicates"; the
     /// module docs), decided in `tx`: its message record and tasks, or a
-    /// refusal, and the status to its sender.
+    /// refusal, and the status to its sender. The launches on message it
+    /// reserved go to `launched`, to start once `tx` commits.
+    #[allow(clippy::too_many_arguments)]
     fn admit_request(
         &self,
         tx: &Transaction,
@@ -724,6 +807,7 @@ impl HostBridge {
         row: &InboxRow,
         message: &Message,
         sessions: &BTreeMap<SessionId, BrokerSession>,
+        launched: &mut Vec<HostLaunch>,
     ) -> anyhow::Result<()> {
         let sender = row.sender_host.as_str();
         let principal = host_principal(sender);
@@ -796,13 +880,24 @@ impl HostBridge {
             return refuse("stale_target", true);
         }
         let mut tasks = Vec::new();
-        let recipients: Vec<RecipientReceipt> = mine
-            .into_iter()
-            .map(|r| RecipientReceipt {
+        let mut launching = Launching::default();
+        let mut recipients = Vec::new();
+        for r in mine {
+            let delivery = self.deliver(
+                list,
+                message,
+                &digest,
+                r,
+                sender,
+                sessions,
+                &mut tasks,
+                &mut launching,
+            )?;
+            recipients.push(RecipientReceipt {
                 recipient_id: r.recipient_id.clone(),
-                delivery: self.deliver(list, message, &digest, r, sender, sessions, &mut tasks),
-            })
-            .collect();
+                delivery,
+            });
+        }
         // A task that could never be dispatched refuses the message (its
         // text and context are every task's).
         if tasks
@@ -816,9 +911,12 @@ impl HostBridge {
                 return refuse("request_id_reused", true);
             }
         }
-        // The limits (II.9), as a channel member's publish meets them.
+        // The limits (II.9), as a channel member's publish meets them; the
+        // launches reserved count toward the launch records', as stage 1's.
         if (!tasks.is_empty() && store.over_capacity(&principal)?)
             || !crate::runtime::host_work::message_room(tx, &tasks)?
+            || crate::runtime::host_work::open_records(tx, "launches")? + launching.new.len()
+                > crate::runtime::host_work::MAX_RECORDS
         {
             return refuse("busy", true);
         }
@@ -869,7 +967,23 @@ impl HostBridge {
             },
         };
         crate::runtime::host_work::insert_message(tx, &record, &tasks)?;
-        signing.status(tx, store, &record)
+        // The launches on message, reserved with the tasks that wait for
+        // them, in this transaction (design II.6; stage 1's reservation).
+        for launch in &launching.new {
+            tx.execute(
+                "INSERT INTO launches(id,record) VALUES(?1,?2)",
+                rusqlite::params![
+                    launch.record.status.request_id,
+                    serde_json::to_string(&launch.record)?
+                ],
+            )?;
+        }
+        for (task_id, request_id, route_id, revision) in &launching.links {
+            admit::link_launch(tx, task_id, request_id, route_id, *revision)?;
+        }
+        signing.status(tx, store, &record)?;
+        launched.extend(launching.new);
+        Ok(())
     }
 
     /// One recipient of a host sender's request for this host (step 7),
@@ -887,7 +1001,8 @@ impl HostBridge {
         sender: &str,
         sessions: &BTreeMap<SessionId, BrokerSession>,
         tasks: &mut Vec<WorkRecord>,
-    ) -> Delivery {
+        launching: &mut Launching,
+    ) -> anyhow::Result<Delivery> {
         let forbidden = || Delivery::Refused {
             code: "forbidden".into(),
         };
@@ -905,7 +1020,7 @@ impl HostBridge {
             };
             host_sender_permits(list, &me, &sender, route, op).is_ok()
         };
-        match &r.destination {
+        Ok(match &r.destination {
             // A host notice: the account's `message` op (II.2.3).
             Destination::Host => {
                 if shared_ops(list, &me, sender).contains(&ProjectOp::Message) {
@@ -950,25 +1065,43 @@ impl HostBridge {
                 }
             }
             Destination::Select {
-                selectors, budget, ..
+                selectors,
+                budget,
+                launch,
             } => {
                 // No project it shares with this host grants a task's ops.
                 let ops = shared_ops(list, &me, sender);
                 if !HostOp::Task.needs().iter().all(|op| ops.contains(op)) {
-                    return forbidden();
+                    return Ok(forbidden());
                 }
                 let Ok(selectors) = selectors
                     .iter()
                     .map(|s| s.parse::<Selector>())
                     .collect::<Result<Vec<_>, _>>()
                 else {
-                    return forbidden();
+                    return Ok(forbidden());
                 };
                 // The agents of routes that consent to the sender and whose
                 // grant covers a task (II.6, "The receiver decides"): no
                 // sending session to leave out.
-                let candidates =
+                let mut candidates =
                     self.candidates_where(sessions, |route| permits(route, HostOp::Task));
+                // Launch on message: only with `launch`, on the routes its
+                // conditions name (`host_launches`); the sessions launched
+                // for it, by session id.
+                let mut waiting = HashMap::new();
+                if *launch {
+                    self.host_launches(
+                        list,
+                        sender,
+                        &selectors,
+                        message,
+                        sessions,
+                        &mut candidates,
+                        &mut waiting,
+                        launching,
+                    )?;
+                }
                 let resolved = crate::runtime::collab::resolve(
                     &me,
                     &candidates,
@@ -981,6 +1114,7 @@ impl HostBridge {
                 let host = self.work_host();
                 let mut progress = Vec::new();
                 for t in resolved {
+                    let launched = waiting.get(&t.session_id).cloned();
                     let task = hw::WorkTask {
                         task_id: t.task_id,
                         workflow_id: message.workflow_id.clone(),
@@ -1005,9 +1139,30 @@ impl HostBridge {
                         t.route_revision,
                         task,
                     ) {
+                        if let Some(request_id) = launched {
+                            launching.links.push((
+                                record.task.task_id.clone(),
+                                request_id,
+                                t.route_id.clone(),
+                                t.route_revision,
+                            ));
+                        }
                         progress.push((&record.status).into());
                         tasks.push(record);
                     }
+                }
+                // A launch no task took isn't reserved (stage 1's).
+                let (taken, dropped): (Vec<_>, Vec<_>) = std::mem::take(&mut launching.new)
+                    .into_iter()
+                    .partition(|l| {
+                        launching
+                            .links
+                            .iter()
+                            .any(|link| link.1 == l.record.status.request_id)
+                    });
+                launching.new = taken;
+                for l in dropped {
+                    launching.profiles.remove(&l.record.profile_id);
                 }
                 if progress.is_empty() {
                     Delivery::NoMatch {}
@@ -1015,7 +1170,153 @@ impl HostBridge {
                     Delivery::Resolved { tasks: progress }
                 }
             }
+        })
+    }
+
+    /// The launches a host sender's `select` with `launch` may make or
+    /// share (design II.6; host-work-v1 §11.5, "`select` from host
+    /// senders"; collaboration §5, "When no agent runs"): on each route, in
+    /// route id order, that one of its `atem:<this host>/<route_id>`
+    /// selectors names, whose owner allows it (`launch = "on_message"`),
+    /// that consents to the sender with a project granting `launch` as well
+    /// as a task's ops (`HostOp::LaunchOnMessage`), and that has no agent
+    /// among `candidates`. A launch already under way on that route (one a
+    /// host sender's earlier request reserved, still starting, or started
+    /// with its session not yet the route's agent) is shared; else one is
+    /// reserved (`launching.new`, one per profile), its session a
+    /// candidate. `waiting`: each such session, by id, with its launch.
+    #[allow(clippy::too_many_arguments)]
+    fn host_launches(
+        &self,
+        list: &Membership,
+        sender: &str,
+        selectors: &[Selector],
+        message: &Message,
+        sessions: &BTreeMap<SessionId, BrokerSession>,
+        candidates: &mut Vec<crate::runtime::collab::Candidate>,
+        waiting: &mut HashMap<String, String>,
+        launching: &mut Launching,
+    ) -> anyhow::Result<()> {
+        let me = self.work_host().atem_device_id;
+        let store = self.work.store.as_ref().unwrap();
+        let mut routes: Vec<&Route> = self.work.config.routes.iter().collect();
+        routes.sort_by(|a, b| a.id.cmp(&b.id));
+        for route in routes {
+            let named = selectors.iter().any(|s| {
+                matches!(s, Selector::Instance { atem_id, route_id: Some(id) }
+                    if *atem_id == me && *id == route.id)
+            });
+            if !named
+                || route.launch != RouteLaunch::OnMessage
+                || candidates.iter().any(|c| c.route_id == route.id)
+            {
+                continue;
+            }
+            let host_sender = HostSender {
+                host_id: sender,
+                admitted: None,
+            };
+            let Ok(permit) =
+                host_sender_permits(list, &me, &host_sender, route, HostOp::LaunchOnMessage)
+            else {
+                continue;
+            };
+            let Some(profile) = self.work.config.profile(&route.profile_id) else {
+                continue;
+            };
+            // Under way: reserved by this request's other recipient, or by
+            // an earlier request of the same sender (still starting, or
+            // started and not yet its route's agent).
+            let shared = launching
+                .new
+                .iter()
+                .find(|l| l.route.id == route.id)
+                .map(|l| l.record.clone())
+                .or(self.host_launch_under_way(store, route, sender, sessions)?);
+            if let Some(record) = shared {
+                launching.profiles.insert(record.profile_id.clone());
+                candidates.push(self.launch_candidate(route, &record, message.created_at));
+                waiting.insert(record.status.session_id, record.status.request_id);
+                continue;
+            }
+            if !launching.profiles.insert(profile.id.clone()) {
+                continue;
+            }
+            let Some(admission) =
+                Admission::for_host(list, sender, &permit, &route.id, route.revision)
+            else {
+                continue;
+            };
+            let record = LaunchRecord {
+                principal: host_principal(sender),
+                profile_id: profile.id.clone(),
+                profile_revision: profile.revision,
+                expires_at: message.expires_at,
+                digest: hw::digest(&serde_json::to_vec(&(
+                    &message.message_id,
+                    &route.id,
+                    route.revision,
+                ))?),
+                status: LaunchStatus {
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    session_id: SessionId::new().to_string(),
+                    process_gen: uuid::Uuid::new_v4().to_string(),
+                    state: LaunchState::Starting,
+                },
+            };
+            candidates.push(self.launch_candidate(route, &record, message.created_at));
+            waiting.insert(
+                record.status.session_id.clone(),
+                record.status.request_id.clone(),
+            );
+            launching.new.push(HostLaunch {
+                start: StartLaunch {
+                    admission,
+                    profile: profile.clone(),
+                    expires_at: message.expires_at,
+                },
+                record,
+                route: route.clone(),
+            });
         }
+        Ok(())
+    }
+
+    /// A launch an earlier request of host sender `sender` made on `route`
+    /// that is still under way (review L6, as stage 1 shares one): not
+    /// started yet (the launcher has it), or started with its session live
+    /// but its launch project not read yet (not yet the route's agent).
+    /// Never another sender's: a launch carries its own sender's admission
+    /// and expiry. Its record.
+    fn host_launch_under_way(
+        &self,
+        store: &Store,
+        route: &Route,
+        sender: &str,
+        sessions: &BTreeMap<SessionId, BrokerSession>,
+    ) -> anyhow::Result<Option<LaunchRecord>> {
+        let principal = host_principal(sender);
+        for request_id in admit::launches_on(&store.db, &route.id, route.revision)? {
+            let Some(record) = store.launch(&request_id)? else {
+                continue;
+            };
+            if record.principal != principal {
+                continue;
+            }
+            let session = &record.status.session_id;
+            let live = SessionId::parse(session)
+                .and_then(|id| sessions.get(&id))
+                .is_some_and(|s| s.is_live() && s.process_gen == record.status.process_gen);
+            let under_way = match record.status.state {
+                LaunchState::Starting => self.work.pending.contains_key(&request_id),
+                LaunchState::Started => live && self.projects.key_of(session).is_none(),
+                _ => false,
+            };
+            if under_way {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
     }
 
     /// The task `task` of a host sender's message through `route_id` at

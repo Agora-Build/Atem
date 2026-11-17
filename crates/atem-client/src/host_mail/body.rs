@@ -425,7 +425,9 @@ pub enum EnvelopePlain {
     Request { message: Message },
     /// Cancel the task of that id.
     Cancel { task_id: String },
-    /// The sender completes the task with a result snapshot.
+    /// The sender completes the task with a result snapshot: a `memory` or
+    /// `vault` one, as `work_complete` takes, or one naming the task's own
+    /// reply ([`ContextSnapshot::names_reply_of`]).
     Complete {
         task_id: String,
         result: ContextSnapshot,
@@ -435,7 +437,8 @@ pub enum EnvelopePlain {
 impl EnvelopePlain {
     /// What a sender may seal and a receiver reads: ids in their grammar, a
     /// Message of at most [`MAX_PLAINTEXT_BYTES`] (its own validity is the
-    /// receiver's), a snapshot as `work_complete` takes one.
+    /// receiver's), a snapshot as `work_complete` takes one or one naming
+    /// the task's own reply.
     fn check(&self) -> Result<()> {
         match self {
             EnvelopePlain::Request { message } => {
@@ -450,7 +453,7 @@ impl EnvelopePlain {
                 }
             }
             EnvelopePlain::Complete { task_id, result } => {
-                if !task_id_ok(task_id) || !result.valid() {
+                if !task_id_ok(task_id) || !(result.valid() || result.names_reply_of(task_id)) {
                     return Err(Error::Malformed("complete"));
                 }
             }
@@ -1275,6 +1278,87 @@ mod tests {
             result: snapshot(0, 128 * 1024),
         };
         assert!(complete.to_bytes().unwrap().len() < MAX_PLAINTEXT_BYTES);
+    }
+
+    /// A host sender completes a task with the reply it got back by naming
+    /// that reply: a `result`-kind snapshot whose id is the task's own
+    /// `result:<result_id>` (host-work-v1 §11.5; Atem's reading, for
+    /// Astation). Any other `result` snapshot stays local only.
+    #[test]
+    fn a_complete_may_name_its_tasks_own_reply() {
+        use crate::session::host_work::{ContextKind, digest, result_id};
+        let text = format!(r#"{{"result_id":"{}","task_id":"{ID2}"}}"#, result_id(ID2));
+        let naming = ContextSnapshot {
+            kind: ContextKind::Result,
+            id: format!("result:{}", result_id(ID2)),
+            version: 1,
+            digest: digest(text.as_bytes()),
+            text,
+        };
+        let complete = EnvelopePlain::Complete {
+            task_id: ID2.into(),
+            result: naming.clone(),
+        };
+        let bytes = complete.to_bytes().unwrap();
+        assert_eq!(EnvelopePlain::parse(&bytes).unwrap(), complete);
+        // Another task's reply, or one whose digest isn't its text's.
+        let other = EnvelopePlain::Complete {
+            task_id: REPLY_ID.into(),
+            result: naming.clone(),
+        };
+        let mut wrong = naming.clone();
+        wrong.digest = "00".repeat(32);
+        let wrong = EnvelopePlain::Complete {
+            task_id: ID2.into(),
+            result: wrong,
+        };
+        // The contract's naming only (review L2): its text exactly
+        // `jcs({"digest"?, "result_id", "task_id"})`, version 1; a copy of
+        // the reply, another version or a digest that isn't one are refused.
+        let named = |text: String, version: u64| EnvelopePlain::Complete {
+            task_id: ID2.into(),
+            result: ContextSnapshot {
+                kind: ContextKind::Result,
+                id: format!("result:{}", result_id(ID2)),
+                version,
+                digest: digest(text.as_bytes()),
+                text,
+            },
+        };
+        let with_digest = format!(
+            r#"{{"digest":"{}","result_id":"{}","task_id":"{ID2}"}}"#,
+            "ab".repeat(32),
+            result_id(ID2)
+        );
+        let ok = named(with_digest.clone(), 1);
+        assert_eq!(EnvelopePlain::parse(&ok.to_bytes().unwrap()).unwrap(), ok);
+        assert_eq!(
+            ok,
+            EnvelopePlain::Complete {
+                task_id: ID2.into(),
+                result: ContextSnapshot::naming_reply(ID2, Some(&"ab".repeat(32))),
+            }
+        );
+        let copied = named("Done: the client uses /v2/orders".into(), 1);
+        let version = named(with_digest.clone(), 2);
+        let not_a_digest = named(with_digest.replace(&"ab".repeat(32), "AB"), 1);
+        let spaced = named(with_digest.replace(':', ": "), 1);
+        let extra = named(with_digest.replace('}', r#","x":1}"#), 1);
+        for refused in [other, wrong, copied, version, not_a_digest, spaced, extra] {
+            assert_eq!(refused.to_bytes(), Err(Error::Malformed("complete")));
+            let raw = jcs(&json!({"kind": "complete", "task_id": match &refused {
+                EnvelopePlain::Complete { task_id, .. } => task_id.clone(),
+                _ => unreachable!(),
+            }, "result": match &refused {
+                EnvelopePlain::Complete { result, .. } => serde_json::to_value(result).unwrap(),
+                _ => unreachable!(),
+            }}))
+            .unwrap();
+            assert_eq!(
+                EnvelopePlain::parse(raw.as_bytes()),
+                Err(Error::Malformed("complete"))
+            );
+        }
     }
 
     #[test]

@@ -75,6 +75,8 @@ mod delegated_interrupts;
 mod delegated_launches;
 #[path = "delegated/recovery.rs"]
 mod delegated_recovery;
+#[path = "delegated/remote_stops.rs"]
+mod delegated_remote_stops;
 #[path = "delegated/requests.rs"]
 mod delegated_requests;
 #[path = "delegated/results_pass.rs"]
@@ -3012,6 +3014,8 @@ mod local_tests {
         include!("delegated/send_pass_tests.rs");
         include!("delegated/admit_tests.rs");
         include!("delegated/results_tests.rs");
+        include!("delegated/remote_stops_tests.rs");
+        include!("delegated/host_launch_tests.rs");
     }
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::broker::{InProcess, Launcher};

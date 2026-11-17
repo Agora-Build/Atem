@@ -1,4 +1,5 @@
 //! Same-runtime collaboration, using the host's ordinary receipt scheduler.
+use super::delegated_remote_stops::Stop;
 use super::delegated_send_pass::{OUTBOX_UNAVAILABLE, SEAL_UNAVAILABLE};
 use super::*;
 use crate::runtime::collab::results::{
@@ -9,6 +10,7 @@ use crate::runtime::collab::{self, Candidate, DirectoryRow, MessageView, SendReq
 use crate::runtime::collab_context::{self, ContextSpec, VaultRef};
 use crate::runtime::delegated::remote_send::RemotePart;
 use crate::runtime::host_work::MessageRecord;
+use crate::runtime::protocol::RemoteStop;
 use anyhow::{Result, anyhow, bail};
 use atem_client::session::messages::{
     Delivery, Destination, Message, MessageKind, MessageReceipt, Recipient, RecipientReceipt,
@@ -724,18 +726,23 @@ impl HostBridge {
     /// with its submitted reply as the result, if any (spec section 10).
     /// Inside a session only the task's sending session may; from outside
     /// any session, the owner. A remote sender completes its tasks with
-    /// `work_complete`.
+    /// `work_complete`. A task on another host this host's message reached
+    /// (host senders, behind the debug-only hook) gets a sealed `complete`
+    /// ([`HostBridge::remote_stop`]): `Some(its host)`.
     pub fn collab_complete(
         &mut self,
         caller: Option<&SessionId>,
         task_id: &str,
         sessions: &BTreeMap<SessionId, BrokerSession>,
-    ) -> Result<()> {
+    ) -> Result<Option<RemoteStop>> {
         self.collab_store_ready()?;
         let store = self.work.store.as_ref().unwrap();
-        let mut task = store
-            .work(task_id)?
-            .ok_or_else(|| anyhow!("no task {task_id} in this runtime"))?;
+        let Some(mut task) = store.work(task_id)? else {
+            return match self.remote_stop(caller, task_id, Stop::Complete, Some(sessions))? {
+                Some(stop) => Ok(Some(stop)),
+                None => bail!("no task {task_id} in this runtime"),
+            };
+        };
         if task.principal != "local" {
             bail!(
                 "task {task_id} was sent by {}; its sender completes it with work_complete",
@@ -753,7 +760,7 @@ impl HostBridge {
             bail!("only the task's sending session completes it");
         }
         if task.status.state == WorkState::Completed {
-            return Ok(());
+            return Ok(None);
         }
         if !matches!(
             task.status.state,
@@ -802,11 +809,11 @@ impl HostBridge {
             )
         {
             delivery.status.state = WorkState::Cancelled;
-            delivery.status.detail = "not delivered: its task was completed by its sender".into();
+            delivery.status.detail = collab::COMPLETED_BY_SENDER.into();
             store.save_work(&delivery)?;
         }
         tx.commit()?;
-        Ok(())
+        Ok(None)
     }
 
     /// The return grants (spec section 10) due for a look (`grant_dues`: a
@@ -1921,14 +1928,23 @@ impl HostBridge {
     /// host's current authority with the store readable, as a reply or a
     /// completion (`collab_store_ready`); the task and its return grant end
     /// in one transaction, and a write that fails stops hosting until a
-    /// restart (`work_fail`), as a pass's does.
-    pub fn collab_cancel(&mut self, caller: Option<&SessionId>, id: &str) -> Result<()> {
+    /// restart (`work_fail`), as a pass's does. A task on another host
+    /// this host's message reached (host senders, behind the debug-only
+    /// hook) gets a sealed `cancel` ([`HostBridge::remote_stop`]):
+    /// `Some(its host)`.
+    pub fn collab_cancel(
+        &mut self,
+        caller: Option<&SessionId>,
+        id: &str,
+    ) -> Result<Option<RemoteStop>> {
         self.collab_store_ready()?;
         let store = self.work.store.as_ref().unwrap();
-        let mut task = store
-            .work(id)?
-            .filter(|r| r.principal == "local")
-            .ok_or_else(|| anyhow!("no local collaboration task"))?;
+        let Some(mut task) = store.work(id)?.filter(|r| r.principal == "local") else {
+            return match self.remote_stop(caller, id, Stop::Cancel, None)? {
+                Some(stop) => Ok(Some(stop)),
+                None => bail!("no local collaboration task"),
+            };
+        };
         if let Some(caller) = caller
             && collab::sender_of(store, id)?.as_deref() != Some(caller.as_str())
         {
@@ -1954,7 +1970,7 @@ impl HostBridge {
         if written.is_err() {
             self.work_fail();
         }
-        written
+        written.map(|()| None)
     }
 }
 

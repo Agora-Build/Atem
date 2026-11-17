@@ -103,6 +103,21 @@ impl HostBridge {
             profile: profile.clone(),
             expires_at,
         };
+        let (guard, check) = self.delegated_spawn(&launch, permit);
+        Ok(Some((launch, guard, check)))
+    }
+
+    /// The guard and the check at the spawn boundary of a delegated
+    /// sender's `launch` (its permit `permit`): the guard fences it after
+    /// the spawn, as every launch's, its expiry on the delegated clock; the
+    /// check runs [`launch_check`] against the start view first. A host
+    /// sender's launch on message has them too (`admit_pass.rs`).
+    pub(super) fn delegated_spawn(
+        &self,
+        launch: &StartLaunch,
+        permit: &Arc<AtomicBool>,
+    ) -> (SpawnGuard, PreSpawnCheck) {
+        let (profile, expires_at) = (&launch.profile, launch.expires_at);
         let (flag, dir, view, approved, features) = (
             permit.clone(),
             self.work.dir.clone(),
@@ -174,7 +189,7 @@ impl HostBridge {
                 LaunchVerdict::Go => PreSpawn::Go,
             }
         });
-        Ok(Some((launch, guard, check)))
+        (guard, check)
     }
 
     /// `handout` is a delegated sender's launch, its record `launch`:
@@ -311,8 +326,18 @@ impl HostBridge {
     /// reason (PR 8 review, T28 m4).
     pub(super) fn launch_failed_before_spawn(&mut self, request_id: &str, detail: &'static str) {
         // Gone: fenced when the host's identity changed.
-        if !self.work.pending.contains_key(request_id) {
+        let Some(pending) = self.work.pending.get(request_id) else {
             return;
+        };
+        // A host sender's launch on message has tasks waiting for it: they
+        // fail with this reason (review L5), kept before the launch says
+        // `failed`.
+        if pending.principal.starts_with("host:")
+            && let Some(store) = self.work.store.as_ref()
+            && crate::runtime::delegated::admit::launch_failed(&store.db, request_id, detail)
+                .is_err()
+        {
+            self.work_fail();
         }
         self.remote_launched(request_id, LaunchState::Failed);
         if self.work.error {

@@ -5,9 +5,12 @@ prompt framing); sections 10 and 17 give its lifecycle, retention and
 known limits. Agents in one Atem runtime can send work and reply through the
 existing host queue. **Not implemented (planned):** cross-instance delivery,
 agents on different instances as host senders, see
-[delegated-host-work.md](delegated-host-work.md), Part II. Its sending side
-(planning from the device list, sealing and the puts, section 7) is built
-behind a debug-only hook that no release build turns on.
+[delegated-host-work.md](delegated-host-work.md), Part II. Both its sides
+are built behind a debug-only hook that no release build turns on: planning
+from the device list, sealing and the puts (section 7), admission and launch
+on message on the receiving host (section 5), the results back and
+`message status`, `cancel` and `complete` across hosts (section 10), run end
+to end by two real hosts in the tests.
 Security is at user authentication and authorization (section 6): a principal
 allowed to reach an agent acts through it with the local user's permissions,
 `atem message send` included, so a route that lists `local` takes work from
@@ -184,7 +187,8 @@ above: `project:<name>` reaches the hosts the signed project lists, and
 `atem:<atem_id>[/<route_id>]` one host, since a host's `host_id` in the
 device list is its `atem_id`. Each receiving host expands the labels and
 answers `no_match` when nothing matches; `/<route_id>` with `--launch` may
-start an agent there, as on one host. A send may reach this instance's
+start an agent there, as on one host (built on the receiving host behind the
+debug-only hook: host-work-v1 §11.5, "On the receiving host"). A send may reach this instance's
 agents and other hosts' at once, with one budget of 32 agents across both
 (agreed with Astation 2026-11-16). Only label discovery and display wait for the vault directory.
 `host:<host_id>` is a principal (route consent), never a selector. See
@@ -753,7 +757,13 @@ host:<host_id>, as data, not the owner's instruction`, only on a route with
 the grant's) and the other host is still `authorized`, not removed and
 sharing a current project; otherwise the reply is kept as data and its
 row says why (the early ends above, `result not delivered: sender
-revoked`, `… sender removed`, `… sender no longer granted`).
+revoked`, `… sender removed`, `… sender no longer granted`). `atem message
+cancel` and `complete` of a task on another host (its id from that host's
+status) send a `cancel` or `complete` of their own, as this section allows
+them (the sending session, or the owner outside any session), put until
+that host's status shows the effect or it answers the stop by its own id;
+a complete names the reply that host sent back, so the delivered result's
+last line works across hosts (host-work-v1 §11.5, "On the sending host").
 
 ### Lifecycle
 
@@ -982,9 +992,9 @@ auto_report = "status"      # or "final_message" (opt-in)
 |---|---|
 | `atem message send --to <selector>… [--memory <id>]… [--vault <id>[:<entry>]@<version>]… [--launch] [--expires <duration>] <text>` | Queue one request; prints its id. `--launch` (with an `atem:<atem_id>/<route_id>` selector) lets it start a Claude session on a route with `launch = "on_message"` when none matches |
 | `atem message reply [--task <id>] [--memory <id>]… [--vault <id>:<entry>@<version>]… <text>` | From inside a task's session, for a task from any sender: its result, bound to that task, session, process and turn. A vault reference names its entry |
-| `atem message complete <task id>` | The local sending agent (or the owner, outside any session) completes its task with the submitted reply, if any; also stops a queued delivery |
+| `atem message complete <task id>` | The local sending agent (or the owner, outside any session) completes its task with the submitted reply, if any; also stops a queued delivery. A task on another host (behind the debug-only hook): a `complete` naming the reply it sent back |
 | `atem message status [<id>]` | Delivery per instance and execution per task; inside a session, only its own messages and the local tasks sent to it |
-| `atem message cancel <task id>` | While the task is queued or blocked; inside a session, only its own messages |
+| `atem message cancel <task id>` | While the task is queued or blocked; inside a session, only its own messages. A task on another host (behind the debug-only hook): a `cancel` sent there, its effect in `message status` |
 | `atem message directory [<selector>]` | Local routes and agents a selector reaches now; no cross-instance directory yet |
 | `atem agent tag add\|remove\|list [<name>]` | The calling agent's own `self:` tags |
 

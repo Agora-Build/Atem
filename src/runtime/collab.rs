@@ -263,6 +263,9 @@ pub(super) fn check_send(
     count_send(&tx, config, from, workflow, now)
 }
 
+/// A delivery still queued when its task's sender completed the task.
+pub const COMPLETED_BY_SENDER: &str = "not delivered: its task was completed by its sender";
+
 const TASK_TOO_LARGE: &str = "the prompt with its context is over 32 KiB";
 const TASK_CONTROL_CHARACTERS: &str = "context has control characters";
 const TASK_TOO_MANY_SNAPSHOTS: &str = "at most 8 context snapshots";
@@ -449,6 +452,21 @@ pub struct RemoteTaskView {
     pub state: String,
     pub detail: String,
     pub reply: Option<RemoteReplyView>,
+    /// The `cancel` and `complete` this host sent for it, as their rows
+    /// stand (`atem message cancel` and `complete` of a task on another
+    /// host).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stops: Vec<RemoteStopView>,
+}
+
+/// A `cancel` or `complete` this host sent for a task on another host: its
+/// row's state, the Station's or the host's code, and why.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteStopView {
+    pub kind: String,
+    pub state: String,
+    pub code: Option<String>,
+    pub detail: String,
 }
 
 /// A task's reply from the host that ran it, and whether it was delivered

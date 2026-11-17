@@ -1943,14 +1943,46 @@ def has_null(value):
     return False
 
 
-def snapshot_ok(s):
-    return (
+def snapshot_ok(s, task_id=None):
+    """A context snapshot as work_complete takes one (memory or vault); with
+    `task_id`, a complete's, also a `result` snapshot naming that task's own
+    reply: its id `result:<result_id(task_id)>` (host-work-v1 §11.5, Atem's
+    reading for Astation)."""
+    if not (
         isinstance(s, dict)
         and sorted(s) == ["digest", "id", "kind", "text", "version"]
-        and s["kind"] in ("memory", "vault")
         and safe_int(s["version"], 1)
         and isinstance(s["text"], str)
         and s["digest"] == sha256(s["text"].encode()).hex()
+    ):
+        return False
+    if s["kind"] in ("memory", "vault"):
+        return True
+    return task_id is not None and s["kind"] == "result" and names_reply(s, task_id)
+
+
+def names_reply(s, task_id):
+    """A `result` snapshot naming task `task_id`'s own reply (host-work-v1
+    §11.5): id `result:<result_id>`, version 1, its text exactly
+    jcs({"digest"?, "result_id", "task_id"}), the digest a SHA-256 hex."""
+    rid = result_id_of(task_id)
+    try:
+        named = json.loads(s["text"])
+    except ValueError:
+        return False
+    if not isinstance(named, dict):
+        return False
+    keys = sorted(named)
+    if keys not in (["result_id", "task_id"], ["digest", "result_id", "task_id"]):
+        return False
+    if "digest" in named and not (isinstance(named["digest"], str) and re.fullmatch(HEX64, named["digest"])):
+        return False
+    return (
+        s["id"] == "result:" + rid
+        and s["version"] == 1
+        and named["result_id"] == rid
+        and named["task_id"] == task_id
+        and s["text"] == jcs(named)
     )
 
 
@@ -1996,10 +2028,14 @@ def work_receipt_ok(w):
     if ("result" in w) != (w["state"] == "completed"):
         return False
     r = w.get("result")
+    # A task its host sender completed with the reply it got back carries
+    # that `result` snapshot's reference, naming its own reply (host-work-v1
+    # §11.5).
+    own = isinstance(r, dict) and r.get("id") == "result:" + result_id_of(w["task_id"])
     return r is None or (
         isinstance(r, dict)
         and sorted(r) == ["digest", "id", "kind", "version"]
-        and r["kind"] in ("memory", "vault")
+        and r["kind"] in (("memory", "vault", "result") if own else ("memory", "vault"))
         and safe_int(r["version"], 1)
         and isinstance(r["digest"], str)
         and re.fullmatch(HEX64, r["digest"]) is not None
@@ -2076,7 +2112,7 @@ def mail_plaintext(kind, plain):
                 return "plaintext_too_large", None
         elif k == "cancel" and shape == ["kind", "task_id"] and task_ok(value["task_id"]):
             pass
-        elif k == "complete" and shape == ["kind", "result", "task_id"] and task_ok(value["task_id"]) and snapshot_ok(value["result"]):
+        elif k == "complete" and shape == ["kind", "result", "task_id"] and task_ok(value["task_id"]) and snapshot_ok(value["result"], value["task_id"]):
             pass
         else:
             return "plaintext_malformed", None
