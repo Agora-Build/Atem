@@ -1702,3 +1702,43 @@ fn a_message_already_expired_is_not_admitted() {
         );
     });
 }
+
+/// Review L11: recorded whole refusals are bounded: at most
+/// [`admit::MAX_REFUSALS_PER_SENDER`] per sender (the oldest go), and each
+/// is kept only until no copy of its object can still reach admission (a
+/// margin past the mailbox's own: 48 h after its expiry), pruned by the
+/// mailbox's minute prune.
+#[test]
+fn recorded_refusals_are_bounded() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        let now = host_now().wall_ms;
+        {
+            let store = rig.bridge.work.store.as_ref().unwrap();
+            let tx = store.immediate().unwrap();
+            for i in 0..=admit::MAX_REFUSALS_PER_SENDER {
+                admit::refuse(
+                    &tx,
+                    "host-b",
+                    &uuid::Uuid::new_v4().to_string(),
+                    "digest",
+                    "busy",
+                    now + i,
+                    now + HOUR,
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        assert_eq!(
+            rows(&rig, "mail_refusals") as u64,
+            admit::MAX_REFUSALS_PER_SENDER
+        );
+        sp_d(&rig, now + HOUR + 48 * HOUR);
+        rig.bridge.work.mail_pruned_at = None;
+        mb_tick(&mut rig, &mut host, 1_000);
+        assert_eq!(rows(&rig, "mail_refusals"), 0);
+    });
+}

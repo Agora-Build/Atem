@@ -377,6 +377,7 @@ impl HostBridge {
                             &message.digest(),
                             "busy",
                             signing.now_d,
+                            message.expires_at,
                         )?;
                     }
                     signing.refusal(&tx, &row.sender_host, &row.object_id, "busy")?;
@@ -542,7 +543,15 @@ impl HostBridge {
         // (a resend is answered the same), reported to its sender.
         let refuse = |code: &str, record: bool| -> anyhow::Result<()> {
             if record {
-                admit::refuse(tx, sender, id, &digest, code, signing.now_d)?;
+                admit::refuse(
+                    tx,
+                    sender,
+                    id,
+                    &digest,
+                    code,
+                    signing.now_d,
+                    message.expires_at,
+                )?;
             }
             signing.refusal(tx, sender, id, code)
         };

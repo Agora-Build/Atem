@@ -35,6 +35,8 @@ use atem_client::host_mail::EnvelopePlain;
 use atem_client::session::messages::{Delivery, RecipientReceipt, WorkProgress};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
+/// Recorded whole refusals kept per sender host, at most (review L11).
+pub const MAX_REFUSALS_PER_SENDER: u64 = 1024;
 /// Early stops kept per sender host, at most (ruling R38).
 pub const MAX_EARLY_STOPS: u64 = 32;
 
@@ -50,8 +52,10 @@ const TABLES: &str = "
     CREATE INDEX IF NOT EXISTS mail_stops_task ON mail_stops(sender_host, task_id);
     CREATE TABLE IF NOT EXISTS mail_refusals (
         sender_host TEXT NOT NULL, message_id TEXT NOT NULL, digest TEXT NOT NULL,
-        code TEXT NOT NULL, at_ms INTEGER NOT NULL,
+        code TEXT NOT NULL, at_ms INTEGER NOT NULL, keep_until INTEGER NOT NULL,
         PRIMARY KEY(sender_host, message_id)) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS mail_refusals_keep ON mail_refusals(keep_until);
+    CREATE INDEX IF NOT EXISTS mail_refusals_sender ON mail_refusals(sender_host, at_ms);
     CREATE TABLE IF NOT EXISTS mail_status_owed (message_id TEXT PRIMARY KEY) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS mailbox_refused_report ON mailbox_refused(n) WHERE report=1;
     CREATE TABLE IF NOT EXISTS mail_status_sent (
@@ -240,8 +244,17 @@ pub fn refusal(
         .optional()?)
 }
 
+/// How long past its message's expiry a whole refusal is kept: beyond the
+/// mailbox's own margin, so no copy of the message can still reach
+/// admission once it goes (a copy a day past its expiry is refused
+/// `expired` by the mailbox itself, and nothing is pruned under a clock
+/// anchor).
+const REFUSAL_MARGIN_MS: u64 = 2 * super::mailbox_store::KEEP_MARGIN_MS;
+
 /// Records the whole refusal of `sender_host`'s message `message_id`
-/// (`digest`) with `code`, for good.
+/// (`digest`, expiring at `expires_at`) with `code` (review L11: kept until
+/// [`REFUSAL_MARGIN_MS`] past its expiry, at most
+/// [`MAX_REFUSALS_PER_SENDER`] per sender, the oldest dropped).
 pub fn refuse(
     tx: &Transaction,
     sender_host: &str,
@@ -249,13 +262,33 @@ pub fn refuse(
     digest: &str,
     code: &str,
     at_ms: u64,
+    expires_at: u64,
 ) -> Result<()> {
     tx.execute(
-        "INSERT OR IGNORE INTO mail_refusals(sender_host, message_id, digest, code, at_ms)
-        VALUES(?1, ?2, ?3, ?4, ?5)",
-        params![sender_host, message_id, digest, code, at_ms],
+        "INSERT OR IGNORE INTO mail_refusals(sender_host, message_id, digest, code, at_ms,
+            keep_until) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            sender_host,
+            message_id,
+            digest,
+            code,
+            at_ms,
+            expires_at.max(at_ms).saturating_add(REFUSAL_MARGIN_MS)
+        ],
+    )?;
+    tx.execute(
+        "DELETE FROM mail_refusals WHERE sender_host=?1 AND message_id NOT IN
+        (SELECT message_id FROM mail_refusals WHERE sender_host=?1
+            ORDER BY at_ms DESC LIMIT ?2)",
+        params![sender_host, MAX_REFUSALS_PER_SENDER],
     )?;
     Ok(())
+}
+
+/// Whole refusals past their time (on `D`), dropped: the mailbox's minute
+/// prune, never under a clock anchor.
+pub fn prune_refusals(db: &Connection, now_ms: u64) -> Result<usize> {
+    Ok(db.execute("DELETE FROM mail_refusals WHERE keep_until <= ?1", [now_ms])?)
 }
 
 /// The messages whose status is owed, at most `limit`.
