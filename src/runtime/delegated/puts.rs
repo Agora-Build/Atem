@@ -154,10 +154,7 @@ impl PutClient {
                 self.unreadable.push(row.n);
                 continue;
             };
-            let call = MailboxPut {
-                request_id: super::mailbox::fresh_request_id(),
-                object,
-            };
+            let call = MailboxPut::new(super::mailbox::fresh_request_id(), object);
             self.live.push(Live {
                 call: call.clone(),
                 n: row.n,

@@ -91,7 +91,7 @@ fn at_most_eight_puts_are_live() {
     let puts = c.take(due.clone(), AT);
     assert_eq!(puts.len(), MAX_LIVE_PUTS);
     for (put, row) in puts.iter().zip(&due) {
-        assert_eq!(put.object.to_json().to_string().into_bytes(), row.bytes);
+        assert_eq!(put.object().to_json().to_string().into_bytes(), row.bytes);
         assert!(atem_client::session::wire::is_uuid_v4(&put.request_id));
     }
     let ids: std::collections::BTreeSet<_> = puts.iter().map(|p| &p.request_id).collect();
@@ -137,7 +137,7 @@ fn an_unanswered_put_goes_again_with_a_fresh_id() {
     assert!(c.live_rows().is_empty());
     let again = c.take(due, AT).remove(0);
     assert_ne!(again.request_id, first.request_id);
-    assert_eq!(again.object, first.object);
+    assert_eq!(again.object(), first.object());
     assert_eq!(c.on_stored(&stored(&first)), Answer::Drained);
     assert_eq!(c.on_stored(&stored(&again)), Answer::Row(0, AT));
 }

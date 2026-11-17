@@ -149,7 +149,7 @@ fn a_send_to_another_host_commits_its_sealed_envelope_before_any_put() {
         assert_eq!(state, "queued");
         assert_eq!(bytes, committed.1);
         let put = sp_out(&mut rig).remove(0);
-        assert_eq!(put.object.to_json().to_string().into_bytes(), committed.1);
+        assert_eq!(put.object().to_json().to_string().into_bytes(), committed.1);
         let atem_client::host_mail::EnvelopePlain::Request { message } = sp_open(&rig, &bytes)
         else {
             panic!("not a request");
@@ -340,7 +340,7 @@ fn a_put_carries_the_sealed_bytes_and_repeats_every_ten_minutes() {
         let puts = sp_out(&mut rig);
         assert_eq!(puts.len(), 1);
         let (_, _, bytes) = sp_engine(&rig, &id);
-        assert_eq!(puts[0].object.to_json().to_string().into_bytes(), bytes);
+        assert_eq!(puts[0].object().to_json().to_string().into_bytes(), bytes);
         assert!(sp_out(&mut rig).is_empty(), "live");
         sp_stored(&mut rig, &puts[0]);
         assert_eq!(sp_rows(&rig, &id), [("host-b".into(), "sent".into(), None)]);
@@ -351,7 +351,7 @@ fn a_put_carries_the_sealed_bytes_and_repeats_every_ten_minutes() {
         let again = sp_out(&mut rig);
         assert_eq!(again.len(), 1);
         assert_ne!(again[0].request_id, puts[0].request_id);
-        assert_eq!(again[0].object.to_json().to_string().into_bytes(), bytes);
+        assert_eq!(again[0].object().to_json().to_string().into_bytes(), bytes);
         sp_stored(&mut rig, &again[0]);
         assert_eq!(sp_rows(&rig, &id)[0].1, "sent");
         assert_eq!(sp_engine(&rig, &id).2, bytes, "never sealed again");
@@ -374,7 +374,7 @@ fn a_lost_stored_is_put_again_with_the_same_bytes() {
         mb_tick(&mut rig, &mut host, 1);
         let second = sp_out(&mut rig).remove(0);
         assert_ne!(second.request_id, first.request_id);
-        assert_eq!(second.object, first.object);
+        assert_eq!(second.object(), first.object());
         sp_stored(&mut rig, &first);
         assert_eq!(sp_rows(&rig, &id)[0].1, "ready", "drained");
         sp_stored(&mut rig, &second);
@@ -480,7 +480,7 @@ fn an_identity_change_retires_the_puts() {
         );
         mb_heads(&mut rig, MB_MAILBOX, 0);
         let again = sp_out(&mut rig).remove(0);
-        assert_eq!(again.object, first.object);
+        assert_eq!(again.object(), first.object());
     });
 }
 
@@ -543,7 +543,7 @@ fn a_status_object_is_put_until_stored_never_after() {
         let n = outbox::enqueue(&tx, &bytes, &fields.recipient, Policy::UntilStored).unwrap();
         tx.commit().unwrap();
         let first = sp_out(&mut rig).remove(0);
-        assert_eq!(first.object.to_json().to_string().into_bytes(), bytes);
+        assert_eq!(first.object().to_json().to_string().into_bytes(), bytes);
         // Reconnected, unanswered: put again (once the new generation's
         // `heads` came).
         rig.bridge.station.as_mut().unwrap().sync_link(
@@ -973,7 +973,7 @@ fn a_list_move_between_a_put_and_its_forbidden_counts() {
         assert_eq!(sp_rows(&rig, &id)[0].2.as_deref(), Some("forbidden"));
         let again = sp_out(&mut rig);
         assert_eq!(again.len(), 1, "the move came after the put");
-        assert_eq!(again[0].object, put.object);
+        assert_eq!(again[0].object(), put.object());
         // Refused again with no move since: held.
         sp_refused(&mut rig, &again[0], PutRefusal::Forbidden);
         assert!(sp_out(&mut rig).is_empty());
