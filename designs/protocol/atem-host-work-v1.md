@@ -3801,18 +3801,34 @@ exactly as without this section):
     since the message (another host key than the one it came under, its
     old outbox gone) gets none: the record keeps the state for the owner.
     The sender's resend of an admitted request that the mailbox reads as a
-    duplicate (its claim held) marks the message's status owed again, and
-    a resend of a request refused whole has its recorded refusal sent
-    again (**Atem's reading, for Astation:** the Station may have lost the
-    first; superseding keeps one status waiting), once the latest status
-    was stored: one still waiting to be stored is put again anyway, the
-    same object, never superseded by a copy of itself. Only a new copy counts
-    as a resend: one at a position past the furthest the host ever read
-    under that mailbox id. The same copy read again after a rewind, or
-    after a reset under the same mailbox id, owes nothing. A refusal row marked for its
-    sender (check 5 or 6, after the copy was shown to be the sender's) is
-    reported `{"kind":"status","object_id","refused":"invalid_request"}`
-    once, its mark cleared in that transaction.
+    duplicate (its claim held) marks the message's status owed again
+    (**Atem's reading, for Astation:** the Station may have lost the
+    first), but only once the latest status was stored: one still waiting
+    to be stored is put again anyway, the same object, never superseded by
+    a copy of itself, so that resend owes nothing. A resend of a request
+    refused whole marks its recorded refusal owed again on every such
+    resend, whether the earlier copy was stored or not: each goes as an
+    object of its own (a fresh `id`, put until stored), none superseding
+    another, and a repeat changes nothing at the sender, whose request's
+    row is already `refused`. Only a new copy counts as a resend: one at a
+    position past the furthest the host ever read under that mailbox id.
+    The same copy read again after a rewind, or after a reset under the
+    same mailbox id, owes nothing; nor does a copy of a `cancel` or
+    `complete`. **Atem's reading, for Astation:** what remains is a
+    status the Station loses after it stored it. The sender resends its
+    request only until it has recorded a status of the message, so once
+    it has, a later status lost that way isn't repaired: nothing owes it
+    again until the task's state changes here (the next status carries the
+    whole current state). Until then the sender's `atem message status`
+    shows the state it last recorded, a stop it sent is put again until
+    its message expires, and a complete it holds for the task to await its
+    result expires with the message. The damage ends at the message's
+    expiry (at most 24 h). It is a Station fault, since a stored object
+    should be durable, and Atem adds no trigger of its own for it. A
+    refusal row marked for its sender (check 5 or 6, after the copy was
+    shown to be the sender's) is reported
+    `{"kind":"status","object_id","refused":"invalid_request"}` once, its
+    mark cleared in that transaction.
   - **A host sender's selector task id** is a delegated task id
     (**Atem's reading, for Astation:** session-v1 R9.14 item 2's
     provenance and §11.3's alerts named a UUID v4 before host senders'
