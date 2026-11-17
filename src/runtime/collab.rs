@@ -293,6 +293,10 @@ pub(super) enum Frame {
         task_id: String,
         from_session: String,
     },
+    /// Another host's reply to `task_id`, a task of a message this session
+    /// sent there, delivered to it as data (delegated host-work design
+    /// II.4.4): `sender` is that host's principal, `host:<host_id>`.
+    HostResult { task_id: String, sender: String },
 }
 
 /// What the agent reads for `record` (delegated host-work design III.2):
@@ -321,6 +325,11 @@ pub(super) fn task_prompt<'a>(
                 sender: "local",
                 session: from_session,
             },
+            None,
+            Some(Closing::Complete { task_id }),
+        ),
+        Some(Frame::HostResult { task_id, sender }) => (
+            Header::HostResult { task_id, sender },
             None,
             Some(Closing::Complete { task_id }),
         ),
@@ -362,10 +371,11 @@ pub(super) fn task_prompt<'a>(
         // A local task's context and a local reply's were read back by this
         // runtime itself (a memory after publishing it, a vault entry twice);
         // a remote sender's are its own claim, whose text matches the digest
-        // it gave. A delivery of another host's reply (the cross-instance
-        // return grant, not built) will need its own choice: its context is
-        // that host's snapshot, though the delivery record is `local`.
-        snapshots: if record.principal == "local" {
+        // it gave, and so are another host's reply's, though its delivery
+        // record is `local`.
+        snapshots: if record.principal == "local"
+            && !matches!(frame, Some(Frame::HostResult { .. }))
+        {
             Snapshots::ReadBack
         } else {
             Snapshots::FromSender
@@ -407,6 +417,52 @@ pub struct MessageView {
     pub delivery: String,
     pub detail: String,
     pub tasks: Vec<TaskView>,
+    /// Its delivery rows to other hosts (host senders, behind the
+    /// debug-only hook) and what came back: shown with the message's own
+    /// tasks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote: Vec<RemoteView>,
+}
+
+/// A message's delivery row to another host (delegated host-work design
+/// II.4.4): its state, the Station's or the host's refusal code, why, and
+/// the host's resolution once a status came.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteView {
+    pub host_id: String,
+    pub state: String,
+    pub code: Option<String>,
+    pub detail: String,
+    /// No status from the host yet.
+    #[serde(default)]
+    pub status_pending: bool,
+    pub tasks: Vec<RemoteTaskView>,
+}
+
+/// One recipient's part of a host's resolution: a task (its state and
+/// detail as the host's newest status says), or a recipient with none
+/// (`no_match`, `stored`, `refused`; `task_id` empty).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteTaskView {
+    pub recipient_id: String,
+    pub task_id: String,
+    pub state: String,
+    pub detail: String,
+    pub reply: Option<RemoteReplyView>,
+}
+
+/// A task's reply from the host that ran it, and whether it was delivered
+/// into the session that sent the message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteReplyView {
+    pub result_id: String,
+    pub text: String,
+    pub dropped: bool,
+    pub context: Vec<atem_client::session::messages::ContextReference>,
+    pub delivered: bool,
+    /// How its delivery stands: delivered, being delivered, pending, or
+    /// kept as data with why.
+    pub delivery: String,
 }
 
 /// A task's reply: its one result row.
@@ -657,6 +713,7 @@ pub(super) fn views(
     store: &Store,
     id: Option<&str>,
     scope: Option<&str>,
+    mailbox_announced: bool,
 ) -> Result<Vec<MessageView>> {
     let mut query = store.db.prepare(if id.is_some() {
         STATUS_BY_ID
@@ -716,12 +773,22 @@ pub(super) fn views(
                     })
                 })
                 .collect::<Result<_>>()?;
+            // Its rows to other hosts, with the message's own tasks.
+            let remote = match only {
+                None => crate::runtime::delegated::results_back::views(
+                    &store.db,
+                    &message_id,
+                    mailbox_announced,
+                )?,
+                Some(_) => Vec::new(),
+            };
             Ok(MessageView {
                 message_id,
                 workflow_id: message.workflow_id,
                 delivery,
                 detail,
                 tasks,
+                remote,
             })
         })
         .collect::<Result<Vec<_>>>()?;

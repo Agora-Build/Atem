@@ -105,6 +105,12 @@ impl PutClient {
         }
     }
 
+    /// Whether puts may go on this link: its latest `heads` announced this
+    /// host's mailbox (rule 1), and its identity hasn't moved.
+    pub fn announced(&self) -> bool {
+        self.link.is_some() && !self.moved && self.announced
+    }
+
     /// The host's identity changed on the live link: every live put
     /// retired, nothing more put on that socket.
     pub fn on_identity_moved(&mut self) {

@@ -82,11 +82,13 @@ impl HostBridge {
         if let Some((store, identity)) = self.mail_store()
             && self.work.mail_prepared.as_ref() != Some(&identity.host)
         {
-            // The sending host's outbox tables too (`remote_send`), and
-            // admission's (`admit`).
+            // The sending host's outbox tables too (`remote_send`),
+            // admission's (`admit`) and the results back's
+            // (`results_back`).
             match mailbox_store::prepare(store)
                 .and_then(|()| crate::runtime::delegated::remote_send::prepare(store))
                 .and_then(|()| crate::runtime::delegated::admit::prepare(store))
+                .and_then(|()| crate::runtime::delegated::results_back::prepare(store))
             {
                 Ok(()) => self.work.mail_prepared = Some(identity.host),
                 Err(error) => log_limited(&UNPREPARED, || {
@@ -164,7 +166,7 @@ impl HostBridge {
     /// (`host_enc::recipient_at`), and the delegated clock's `D`. None
     /// while the list doesn't serve or `D` can't be read: nothing is
     /// decided then.
-    fn mail_receiver(
+    pub(super) fn mail_receiver(
         &self,
     ) -> Option<(
         crate::session_protocol::membership::ListState,
@@ -235,6 +237,8 @@ impl HostBridge {
         // Admission takes what the page opened on the next pass.
         if matches!(&committed, Ok(Commit::Committed(c)) if !c.decided.is_empty()) {
             self.work.admit_due = true;
+            // And the sending host's results back what it kept.
+            self.work.results_due = true;
         }
         let Some(station) = self.station.as_mut() else {
             return;
@@ -415,7 +419,10 @@ impl HostBridge {
         // no longer come (review M1: here, never under an anchor).
         let pruned = mailbox_store::prune(store, now_ms)
             .and_then(|_| crate::runtime::delegated::admit::prune_stops(&store.db, now_ms))
-            .and_then(|_| crate::runtime::delegated::admit::prune_refusals(&store.db, now_ms));
+            .and_then(|_| crate::runtime::delegated::admit::prune_refusals(&store.db, now_ms))
+            .and_then(|_| {
+                crate::runtime::delegated::results_back::prune_replies(&store.db, now_ms)
+            });
         if let Err(error) = pruned {
             log_limited(&UNPRUNED, || {
                 format!("atem runtime: host senders' mailbox records not pruned ({error:#})")

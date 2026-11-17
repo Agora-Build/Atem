@@ -26,9 +26,9 @@
 //!   stored and may be running on the receiver), its code recorded, but a
 //!   Station `expired` is its expiry; an expired object's row `expired`.
 //! - **Acceptance** is the receiver's status naming its resolution, which
-//!   the sending host reads with the results back (not built here):
-//!   [`accepted`] and [`refused_by_receiver`] are its seams, each settling
-//!   the engine row too.
+//!   the sending host reads with the results back (`results_back.rs`):
+//!   [`accepted`] and [`refused_by_receiver`], each settling the engine row
+//!   too.
 use super::outbox::{self, Policy};
 use super::send_plan::{Me, Plan, Skipped, signs};
 use crate::runtime::host_work::Store;
@@ -417,7 +417,6 @@ fn upsert(
 /// The receiver's status named the envelope `object_id`'s effect at
 /// `host_id` (the results back feed it): the row `accepted`, its engine
 /// row settled (put no more). Whether a `ready` or `sent` row moved.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn accepted(tx: &Transaction, object_id: &str, host_id: &str) -> Result<bool> {
     settle_row(
         tx,
@@ -433,7 +432,6 @@ pub fn accepted(tx: &Transaction, object_id: &str, host_id: &str) -> Result<bool
 /// (`refused{code}`, or `invalid_request` for its checks 5 and 6; the
 /// results back feed it): the row `refused` with `code`, its engine row
 /// settled. Whether a `ready` or `sent` row moved.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn refused_by_receiver(
     tx: &Transaction,
     object_id: &str,
@@ -447,7 +445,6 @@ pub fn refused_by_receiver(
 /// A `ready` or `sent` row's final state from the receiver, its engine
 /// row settled (the row moves first: the engine's trigger then finds it
 /// final and leaves it).
-#[cfg_attr(not(test), allow(dead_code))]
 fn settle_row(
     tx: &Transaction,
     object_id: &str,
@@ -478,9 +475,8 @@ fn settle_row(
     Ok(true)
 }
 
-/// One delivery row, as `atem message status` will show it (not built yet).
+/// One delivery row, as `atem message status` shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct Row {
     pub host_id: String,
     pub kind: String,
@@ -493,7 +489,6 @@ pub struct Row {
 }
 
 /// The rows of the message `message_id`, in the order they were made.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn rows(db: &rusqlite::Connection, message_id: &str) -> Result<Vec<Row>> {
     let mut q = db.prepare(
         "SELECT host_id, kind, task_id, state, code, detail, outbox_n FROM remote_deliveries

@@ -164,36 +164,8 @@ pub async fn message(command: crate::cli::MessageCommands) -> Result<()> {
             }
         }
         RuntimeMsg::MessageStatus { messages } => {
-            for m in messages {
-                println!(
-                    "{}  {}  {}  workflow {}",
-                    m.message_id, m.delivery, m.detail, m.workflow_id
-                );
-                for task in m.tasks {
-                    println!(
-                        "  {}  {}  {}",
-                        task.task_id,
-                        serde_json::to_value(task.state)?.as_str().unwrap(),
-                        task.detail
-                    );
-                    if let Some(result) = task.result {
-                        println!(
-                            "    reply {} ({}): {}",
-                            result.result_id,
-                            serde_json::to_value(result.state)?.as_str().unwrap(),
-                            reply_text(&result)
-                        );
-                        if !result.detail.is_empty() {
-                            println!("    {}", result.detail);
-                        }
-                        for reference in result.context {
-                            println!(
-                                "    {:?}:{}@{} sha256 {}",
-                                reference.kind, reference.id, reference.version, reference.digest
-                            );
-                        }
-                    }
-                }
+            for line in status_lines(messages)? {
+                println!("{line}");
             }
         }
         _ => unreachable!(),
@@ -279,6 +251,103 @@ pub fn resolved_line(task_id: &str, state: &str, by: &str) -> String {
     } else {
         format!("{task_id}: resolved as {how} (by {by})")
     }
+}
+
+/// What `atem message status` prints for `messages`: each message, its
+/// tasks here with their replies, and its rows to other hosts with what
+/// came back.
+fn status_lines(messages: Vec<super::collab::MessageView>) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    for m in messages {
+        lines.push(format!(
+            "{}  {}  {}  workflow {}",
+            m.message_id, m.delivery, m.detail, m.workflow_id
+        ));
+        for task in m.tasks {
+            lines.push(format!(
+                "  {}  {}  {}",
+                task.task_id,
+                serde_json::to_value(task.state)?.as_str().unwrap(),
+                task.detail
+            ));
+            if let Some(result) = task.result {
+                lines.push(format!(
+                    "    reply {} ({}): {}",
+                    result.result_id,
+                    serde_json::to_value(result.state)?.as_str().unwrap(),
+                    reply_text(&result)
+                ));
+                if !result.detail.is_empty() {
+                    lines.push(format!("    {}", result.detail));
+                }
+                for reference in result.context {
+                    lines.push(format!(
+                        "    {:?}:{}@{} sha256 {}",
+                        reference.kind, reference.id, reference.version, reference.digest
+                    ));
+                }
+            }
+        }
+        // What another host sent reaches the terminal with its controls
+        // escaped (review L6).
+        for host in m.remote {
+            let state = match &host.code {
+                Some(code) => format!("{} ({})", host.state, escaped(code)),
+                None => host.state,
+            };
+            lines.push(format!("  host {}  {state}  {}", host.host_id, host.detail));
+            if host.status_pending {
+                lines.push("    status pending".into());
+            }
+            for task in host.tasks {
+                if task.task_id.is_empty() {
+                    lines.push(format!(
+                        "    recipient {}  {}",
+                        task.recipient_id,
+                        escaped(&task.state)
+                    ));
+                    continue;
+                }
+                lines.push(format!(
+                    "    {}  {}  {}",
+                    task.task_id,
+                    escaped(&task.state),
+                    escaped(&task.detail)
+                ));
+                if let Some(reply) = task.reply {
+                    let text = if reply.dropped {
+                        "(text no longer kept)".to_string()
+                    } else {
+                        escaped(&reply.text)
+                    };
+                    lines.push(format!("      reply {}: {text}", reply.result_id));
+                    for reference in reply.context {
+                        lines.push(format!(
+                            "      {:?}:{}@{} sha256 {}",
+                            reference.kind, reference.id, reference.version, reference.digest
+                        ));
+                    }
+                    lines.push(format!("      {}", reply.delivery));
+                }
+            }
+        }
+    }
+    Ok(lines)
+}
+
+/// `text` another host sent, its control characters (C0 other than
+/// newline and tab, DEL, C1) escaped (`\u{1b}`), so none reaches the
+/// terminal as a sequence.
+fn escaped(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' {
+                c.escape_unicode().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 /// A reply's text as `atem message status` shows it.
@@ -460,6 +529,172 @@ pub async fn stop(sid: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `atem message status` across hosts: each row to another host (its
+    /// state, a refusal's code, why; a row waiting for the Station's
+    /// announcement says so), "status pending" before any status, then the
+    /// host's resolution: each task with its state and detail, its reply
+    /// and whether it was delivered, and a recipient with no task.
+    #[test]
+    fn status_shows_rows_to_other_hosts_and_what_came_back() {
+        use super::super::collab::{
+            MessageView, RemoteReplyView, RemoteTaskView, RemoteView, TaskView,
+        };
+        use atem_client::session::host_work::WorkState;
+        let task = |id: &str, state: &str, detail: &str, reply| RemoteTaskView {
+            recipient_id: "r-1".into(),
+            task_id: id.into(),
+            state: state.into(),
+            detail: detail.into(),
+            reply,
+        };
+        let view = MessageView {
+            message_id: "m-1".into(),
+            workflow_id: "w-1".into(),
+            delivery: "accepted".into(),
+            detail: "to other hosts only".into(),
+            tasks: vec![TaskView {
+                task_id: "t-local".into(),
+                receipt_id: "rc".into(),
+                session_id: "ses-aaaaaaaaaaaa".into(),
+                route_id: "r".into(),
+                state: WorkState::Queued,
+                detail: "waiting for a ready agent".into(),
+                result: None,
+            }],
+            remote: vec![
+                RemoteView {
+                    host_id: "host-b".into(),
+                    state: "ready".into(),
+                    code: None,
+                    detail: "waiting for the Station to announce this host's mailbox".into(),
+                    status_pending: true,
+                    tasks: vec![],
+                },
+                RemoteView {
+                    host_id: "host-c".into(),
+                    state: "accepted".into(),
+                    code: None,
+                    detail: "accepted by the host".into(),
+                    status_pending: false,
+                    tasks: vec![
+                        task(
+                            "t-1",
+                            "awaiting_result",
+                            "reply submitted",
+                            Some(RemoteReplyView {
+                                result_id: "res-1".into(),
+                                text: "done there".into(),
+                                dropped: false,
+                                context: vec![],
+                                delivered: true,
+                                delivery: "delivered".into(),
+                            }),
+                        ),
+                        task(
+                            "t-2",
+                            "awaiting_result",
+                            "reply submitted",
+                            Some(RemoteReplyView {
+                                result_id: "res-2".into(),
+                                text: String::new(),
+                                dropped: true,
+                                context: vec![],
+                                delivered: false,
+                                delivery: "result not delivered: sender revoked".into(),
+                            }),
+                        ),
+                    ],
+                },
+                RemoteView {
+                    host_id: "host-d".into(),
+                    state: "accepted".into(),
+                    code: None,
+                    detail: "accepted by the host".into(),
+                    status_pending: false,
+                    tasks: vec![task("", "no_match", "", None)],
+                },
+                RemoteView {
+                    host_id: "host-e".into(),
+                    state: "refused".into(),
+                    code: Some("forbidden".into()),
+                    detail: "refused by the host (forbidden)".into(),
+                    status_pending: false,
+                    tasks: vec![],
+                },
+            ],
+        };
+        assert_eq!(
+            status_lines(vec![view]).unwrap(),
+            [
+                "m-1  accepted  to other hosts only  workflow w-1",
+                "  t-local  queued  waiting for a ready agent",
+                "  host host-b  ready  waiting for the Station to announce this host's mailbox",
+                "    status pending",
+                "  host host-c  accepted  accepted by the host",
+                "    t-1  awaiting_result  reply submitted",
+                "      reply res-1: done there",
+                "      delivered",
+                "    t-2  awaiting_result  reply submitted",
+                "      reply res-2: (text no longer kept)",
+                "      result not delivered: sender revoked",
+                "  host host-d  accepted  accepted by the host",
+                "    recipient r-1  no_match",
+                "  host host-e  refused (forbidden)  refused by the host (forbidden)",
+            ]
+        );
+    }
+
+    /// Review L6: text another host sent (its status's detail, its reply)
+    /// reaches the owner's terminal with its control characters escaped
+    /// (C0, DEL and C1), never as terminal sequences; newlines and tabs in
+    /// a reply stay.
+    #[test]
+    fn another_hosts_text_is_printed_with_its_controls_escaped() {
+        use super::super::collab::{MessageView, RemoteReplyView, RemoteTaskView, RemoteView};
+        let view = MessageView {
+            message_id: "m-1".into(),
+            workflow_id: "w-1".into(),
+            delivery: "accepted".into(),
+            detail: "to other hosts only".into(),
+            tasks: vec![],
+            remote: vec![RemoteView {
+                host_id: "host-b".into(),
+                state: "accepted".into(),
+                code: None,
+                detail: "accepted by the host".into(),
+                status_pending: false,
+                tasks: vec![RemoteTaskView {
+                    recipient_id: "r-1".into(),
+                    task_id: "t-1".into(),
+                    state: "awaiting_result".into(),
+                    detail: "on B \u{1b}[2J\u{7f}\u{9b}31m".into(),
+                    reply: Some(RemoteReplyView {
+                        result_id: "res-1".into(),
+                        text: "line one\n\tline \u{1b}]0;title\u{7}two".into(),
+                        dropped: false,
+                        context: vec![],
+                        delivered: false,
+                        delivery: "delivery pending".into(),
+                    }),
+                }],
+            }],
+        };
+        let lines = status_lines(vec![view]).unwrap();
+        assert_eq!(
+            lines[2],
+            "    t-1  awaiting_result  on B \\u{1b}[2J\\u{7f}\\u{9b}31m"
+        );
+        assert_eq!(
+            lines[3],
+            "      reply res-1: line one\n\tline \\u{1b}]0;title\\u{7}two"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|l| !l.chars().any(|c| c.is_control() && c != '\n' && c != '\t'))
+        );
+    }
 
     /// A reply whose text the runtime dropped (a day after its task
     /// settled past its deadline) says so rather than show nothing.

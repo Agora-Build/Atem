@@ -311,7 +311,9 @@ impl HostBridge {
         {
             bail!("mismatch: task {id} was not sent to this session");
         }
-        if results::delivered_by(&store.db, &id)?.is_some() {
+        if results::delivered_by(&store.db, &id)?.is_some()
+            || crate::runtime::delegated::results_back::delivery_of(&store.db, &id)?.is_some()
+        {
             bail!("task {id} delivers a result as data; it takes no reply");
         }
         // An identical retry returns the reply recorded, whatever happened
@@ -397,6 +399,11 @@ impl HostBridge {
             if task.task.target.session_id != from.as_str()
                 || task.task.target.process_gen != session.process_gen
                 || results::delivered_by(&store.db, &task.task.task_id)?.is_some()
+                || crate::runtime::delegated::results_back::delivery_of(
+                    &store.db,
+                    &task.task.task_id,
+                )?
+                .is_some()
             {
                 continue;
             }
@@ -688,6 +695,18 @@ impl HostBridge {
         }
         if let Some((_, row)) = self.collab_result_delivery(record)? {
             return Ok(Some(results::delivery_frame(row.task_id(), &row.reply)));
+        }
+        if let Some(store) = self.work.store.as_ref()
+            && let Some((task_id, host_id, _)) =
+                crate::runtime::delegated::results_back::delivery_of(
+                    &store.db,
+                    &record.task.task_id,
+                )?
+        {
+            return Ok(Some(collab::Frame::HostResult {
+                task_id,
+                sender: atem_client::host_principal::host_principal(&host_id),
+            }));
         }
         match self.work.store.as_ref() {
             Some(store) => collab::message_frame(store, &record.task.task_id),
@@ -1079,7 +1098,7 @@ impl HostBridge {
     /// process replaced), or it runs but its route no longer takes results.
     /// None while it takes them, and when `local`'s authority changed (the
     /// task then fails, `work_lost`).
-    fn collab_origin_end(
+    pub(super) fn collab_origin_end(
         &self,
         origin: &Origin,
         sessions: &BTreeMap<SessionId, BrokerSession>,
@@ -1888,7 +1907,13 @@ impl HostBridge {
         let Some(store) = self.work.store.as_ref() else {
             return Ok(vec![]);
         };
-        collab::views(store, id, caller.map(SessionId::as_str))
+        // Whether this host's puts may go (host senders): rows waiting for
+        // the Station's `heads` say so.
+        let announced = self
+            .station
+            .as_ref()
+            .is_some_and(|station| station.puts.announced());
+        collab::views(store, id, caller.map(SessionId::as_str), announced)
     }
 
     /// `atem message cancel`: inside a session (`caller`), a task of a

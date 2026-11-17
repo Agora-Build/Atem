@@ -14,18 +14,23 @@
 //! (its re-verified `add_host`), objects of a newer sender generation.
 //! With an encryption key of its own ([`SenderHost::with_enc`], its
 //! `host_enc_key` entry signed into the test's list), it opens the status
-//! objects a receiving host sends back ([`SenderHost::open`]).
+//! objects a receiving host sends back ([`SenderHost::open`]) and checks
+//! them as a sending host does ([`SenderHost::accept`]); playing the host
+//! that ran the work for a runtime that sent it some, it opens that
+//! runtime's envelopes ([`SenderHost::open_envelope`]) and sends statuses
+//! and results back ([`SenderHost::result_of`]).
 
 use super::r9log::{TestLog, secret};
 use super::station::FakeStation;
 use atem_client::encoding::{Hash32, b64u_decode};
 use atem_client::host_mail::mailbox::{MailboxPut, MailboxToHost, PutRefusal};
 use atem_client::host_mail::{
-    EnvelopePlain, HostRef, MailFields, ResultPlain, VerifiedMail, seal_envelope, seal_result,
-    unseal_result,
+    EnvelopePlain, ExpectedResult, HostRef, MailFields, ResultPlain, ResultVerdict, VerifiedMail,
+    accept_result, seal_envelope, seal_result, unseal_envelope, unseal_result,
 };
 use atem_client::host_principal::host_principal;
 use atem_client::membership::Head;
+use atem_client::membership::Membership;
 use atem_client::membership::entry::Action;
 use atem_client::session::host_work::{ContextSnapshot, HostTarget};
 use atem_client::session::messages::{Destination, Message, MessageKind, Recipient};
@@ -226,6 +231,43 @@ impl SenderHost {
     pub fn open(&self, object: &SignedObject, from: &PublicKey) -> ResultPlain {
         let verified = VerifiedMail::verify(object, from).expect("signed by the receiving host");
         unseal_result(&self.keys, &Self::enc(), &verified).expect("sealed to this host")
+    }
+
+    /// An envelope a sending host put into this host's mailbox, verified
+    /// with `from` (that host's `host_key`) and opened with this host's
+    /// encryption key.
+    pub fn open_envelope(&self, object: &SignedObject, from: &PublicKey) -> EnvelopePlain {
+        let verified = VerifiedMail::verify(object, from).expect("signed by the sending host");
+        unseal_envelope(&self.keys, &Self::enc(), &verified).expect("sealed to this host")
+    }
+
+    /// `plain` (a status, or a task's reply) back to `to`, the host whose
+    /// work this host ran, signed at `signed_at`.
+    pub fn result_of(&self, to: &Receiver, signed_at: Head, plain: &ResultPlain) -> SignedObject {
+        let fields = self.fields(to, signed_at);
+        seal_result(&self.keys, &Self::key(), &fields, plain, &to.enc_pub).unwrap()
+    }
+
+    /// The shared core's check of `object`, a result from the host this
+    /// host's outbox row `expected` went to, on `list` (the sending host's
+    /// `accept_result`, II.4.4).
+    pub fn accept(
+        &self,
+        object: &SignedObject,
+        list: &Membership,
+        expected: &ExpectedResult,
+    ) -> ResultVerdict {
+        let enc_pub = self.keys.public_key(&Self::enc()).unwrap();
+        let me = atem_client::host_mail::Recipient {
+            host_id: self.host_id.clone(),
+            host_trust_gen: self.host_trust_gen,
+            keys: vec![(
+                Self::enc(),
+                atem_client::keys::enc_kid_bytes(&enc_pub).unwrap(),
+            )],
+            generated: vec![],
+        };
+        accept_result(object, list, &me, expected, &self.keys, now_ms())
     }
 
     /// An object's body fields to `to`, signed at `signed_at` (a head that

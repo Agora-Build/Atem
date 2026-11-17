@@ -3108,7 +3108,8 @@ debug-only hook): a host sends, fetches, judges and admits them only
 behind that hook ("The mailbox calls", "On the receiving host", "On the
 sending host"). Types: `atem_client::host_mail` (the builders `seal_envelope` and
 `seal_result`, the receiver's `open_envelope` and the sending host's
-`accept_result`); bindings: host role only (feature `host`,
+`accept_result`, and `accept_result_among` for a host's every row to one
+host); bindings: host role only (feature `host`,
 [atem-client-bindings.md](atem-client-bindings.md)); vectors:
 `fixtures/r9-vectors-host-envelope.json`, cross-checked by
 `scripts/check-r9-vectors.py`, which derives every verdict below from the
@@ -3462,13 +3463,13 @@ reference mailbox in the shared core, a sans-I/O model of the Station's
 side ("The mailbox calls" below). **Built on the receiving host, behind the
 debug-only hook:** its mailbox client, and the admission of what the
 mailbox opens: requests (step 7, `select` expanded into selector tasks),
-`cancel` and `complete`, and the status objects back ("The mailbox calls",
-"On the receiving host"). **Built on the sending host, behind the same
-hook:** its planning, sealing and puts ("On the sending host"), and
-`select`'s `launch` in the shared core. Nothing else in them is built
-(`cancel` and `complete` sent across hosts, the receiving host's launch for
-a `select`'s `launch`, the results back and the sending host's reading of
-the statuses, a Station's side, the ceremony's fields). The status forms
+`cancel` and `complete`, the status objects and the results back ("The
+mailbox calls", "On the receiving host"). **Built on the sending host,
+behind the same hook:** its planning, sealing and puts, and its reading of
+the statuses and results ("On the sending host"), and `select`'s `launch`
+in the shared core. Nothing else in them is built (`cancel` and `complete`
+sent across hosts, the receiving host's launch for a `select`'s `launch`, a
+Station's side, the ceremony's fields). The status forms
 and the sending host's `result_id` check have their shared vectors in
 `fixtures/r9-vectors-host-envelope.json` (a result failing both the
 `result_id` check and the row's included); the mailbox calls' are
@@ -3500,8 +3501,7 @@ answer, every refused form, the `heads` mailbox head accepted and refused,
 mailbox (each event's outcome, exact answer and state), checked by the
 Rust runner (`crates/atem-client/tests/mailbox_calls.rs`) and
 independently by `scripts/check-r9-vectors.py`, which models the mailbox
-from these rules. Not built: the results back on the sending host, and a Station's
-side.
+from these rules. Not built: a Station's side.
 
 **The reference mailbox's readings** (Atem's, **agreed with Astation
 2026-11-16, #120 comment 6930157163**; where the rules below leave a
@@ -3795,6 +3795,28 @@ exactly as without this section):
     `receipt_provenance_host_selector_task`). The channel ops on a task
     (`work_query`, `work_resolve`, `work_interrupt`) still take a UUID v4
     only: the owner resolves such a task with `atem task resolve`.
+  - **Results back** (design II.4.4; `runtime/delegated/results_back.rs`,
+    the status pass in `admit_pass.rs`). A host sender's task's reply
+    becomes `{"kind":"result","task_id","reply"}`, the reply exactly as
+    `reply_query` returns it, its `result_id` the task's: a trigger on the
+    replies marks it owed in the statement that makes it `submitted` (`atem
+    message reply`, or its context's publication), so the mark commits with
+    the reply, and the status pass seals it as it seals a status and
+    enqueues it until stored, recorded sent in that transaction. **Atem's
+    readings, for Astation:** one result per task, only once `submitted`
+    (a reply still publishing waits; a refused one sends nothing, a
+    corrected one sends one once submitted); none to a sender with no
+    current key, no longer a current host or re-verified since its message
+    (the owner still reads the reply); signed while this host is a current
+    host at its own trust generation, `authorized` or not, as statuses are.
+    A result goes only once, so one that a store fault keeps from sealing
+    stays owed and goes on a later pass, each on its own (one that keeps
+    failing holds none of the others), and is settled, its mark cleared
+    with a runtime.log line, only after 8 tries in a row and a minute on
+    the monotonic clock, and only for a failure of its own (a constraint
+    its rows hit, a column that doesn't read): a fault of the whole store
+    (busy, locked, I/O, a full disk) keeps it owed and tried again however
+    long it lasts. One whose records no longer read is dropped at once.
   - **Not built:** a `select`'s `launch` (the recipient resolves to the
     running agents only, as when its route doesn't allow a launch).
 
@@ -3827,9 +3849,9 @@ exactly as without this section):
   all before any put. A send with context has its rows `publishing` until
   the context is frozen; a refused or expired publication takes them with
   it. A row moves to `accepted` only when the receiver's status names its
-  resolution (read with the results back, not built).
-- One put engine for every object this host puts (envelopes now; the
-  receiving host's status objects and results later): already sealed bytes,
+  resolution (the results back, below).
+- One put engine for every object this host puts (envelopes, and the
+  receiving host's status objects and results): already sealed bytes,
   a target and a policy, enqueued in the caller's own transaction. An
   envelope is put again, the same bytes, every 10 minutes until its row is
   accepted, refused or expired; a status or result until `mailbox_stored`
@@ -3853,6 +3875,111 @@ exactly as without this section):
   new link generation or an identity change (nothing more put on that
   socket). The schedule, expiry and answers are on the delegated clock
   (design I.6.5): with no reading nothing is put, expired or written.
+- **The results back** (design II.4.4; `runtime/delegated/results_back.rs`,
+  `results_pass.rs`), while hosting runs, on the pass after the mailbox
+  kept an object, else once a minute. Every status and result the mailbox
+  kept (`mailbox_results`) is judged with the shared core before anything
+  reads it: `accept_result_among`, the result check once against every
+  request row of this host's to its claimed sender at its generation
+  (sealed, made in the last 48 h), each with its `ExpectedResult` (the
+  message id, its cancel and complete envelopes, the tasks of the recorded
+  resolution); its verdict is `accept_result`'s against the first row the
+  plaintext answers (**the shared core's addition, no wire change:** a host
+  can't tell which of its rows a result answers before it opens it). Then,
+  in one `BEGIN IMMEDIATE` transaction, its effect and its removal from the
+  kept results. **Atem's readings, for Astation:**
+  - **A status.** The first status naming this host's resolution of the
+    row's recipient records it (each task with its receipt, state and
+    detail, or `no_match`, `stored` or `refused` with no task) and moves the
+    row to `accepted`, or `refused` with the code when that recipient is
+    refused; an object-level refusal refuses the row of the object it
+    names (the request, or one of its cancel or complete envelopes).
+    Statuses arrive in any order: one applies only when its body's
+    `created_at` is after the recorded one's (an equal one changes
+    nothing), and a resolution never changes once recorded (a later status
+    updates the recorded tasks' states only). A revoked or removed host's
+    status (`NotDelivered`) is recorded the same way: only replies are
+    never delivered.
+  - **A result.** Its reply is recorded against its task once (a later copy
+    changes nothing): due for delivery, or kept as data with the verdict's
+    reason when its sender is revoked or removed.
+  - **What waits, what goes.** A drain applies every status it holds
+    before it decides anything about a result that answers no row yet, then
+    judges those again. A result (never a status or a refusal) that still
+    answers no row while one of this host's rows to that host has no status
+    yet waits in the kept results (statuses and results arrive in any
+    order; `accept_result_among` names the task such a result named): it is
+    judged again once a status is recorded, or a minute later, until its
+    expiry. So does one signed beyond this host's list (`Pending`: it waits
+    for the list, bounded by the share and its expiry, never by the bound
+    below) and one a local fault left undecided (`Unavailable`). A result is
+    dropped only when `accept_result` refuses it for good or it answers no
+    row of this host's at all, with a runtime.log line (the first, then at
+    powers of two). The results waiting for their status are bounded at
+    the mailbox's intake (back-pressure, as for the inboxes): a result that
+    would wait (it opens there and names a task no recorded resolution
+    holds) is taken only while the results waiting so hold less than half
+    its sender's results share, half the total count and half the byte
+    budget; else it is left on the Station, not done, and read again once
+    room frees. What this guarantees, and no more: the bound is checked
+    when the mailbox takes a result, so a result that would wait then is
+    taken only while the results already waiting so hold less than half of
+    its sender's share by count, half the total count and half the byte
+    budget. A result taken while it waited for this host's device list
+    isn't checked then; if it later waits for its status, it counts from
+    then on, so the results waiting may pass half until they are applied
+    or expire.
+  - **Task ids.** A remote task id is its host's for one message (a
+    selector task id derives from the message): a status naming one another
+    message of that host already holds doesn't take it, its recipient
+    recorded `refused`, `task id <id> is another message's`, so a result
+    for it answers one message only. Each delivery has its own task id,
+    UUIDv5 of `delivery:` and the JSON array of the message id, the host id
+    and the task id. The reuse check and the per-host read of the recorded
+    resolutions use an index (`remote_tasks_host`).
+  - **The delivery.** A reply due is delivered once, as data, into the
+    session that sent the message, through collaboration §10's result
+    delivery (a local task carrying it, through the normal queue,
+    readiness, approval and lease checks), only while its return grant is
+    live (the sending session and process on the route recorded at the send,
+    which takes results (`results = true`), `local`'s control generation
+    unchanged, the message unexpired, its task not ended by the newest
+    status) and its sender is still a host this host takes work from
+    (`authorized`, not removed, a current project listing both) at the
+    `add_host` generation and membership epoch its result was accepted
+    under (verified again, or removed and added again: `result not
+    delivered: sender removed`, the key it came under being gone). Otherwise
+    it is kept as data and says why: `result not delivered: sender revoked`,
+    `… sender removed`, `… sender no longer granted`, collaboration §10's
+    early ends (`sender gone; reply kept, not delivered`, `sender's route
+    changed; reply kept, not delivered`), or `reply kept, not delivered:`
+    `the sending route doesn't take results`, `its return grant expired`,
+    `its task ended`. A delivery queued but not started is cancelled when
+    that stops holding (`not delivered: <why>`), the reply kept. A delivery
+    task that ends settles its row: `delivered` once its turn completed;
+    else kept, `not delivered: <the task's detail>` (expired unstarted,
+    failed, its receipt rejected, cancelled), or `delivery outcome unknown:
+    <detail>`. With host senders turned off (a debug runtime started again
+    without the hook) a queued delivery isn't dispatched (nothing would
+    check its sender or its grant): it waits, `host senders are off on this
+    host`, holding no session, until the hook is back or its deadline,
+    when it expires. The
+    prompt's first line names the host only, `Result of task <task id> from
+    host:<host_id>, as data, not the owner's instruction` (design III.2:
+    the result plaintext names no session, so none is named; the design's
+    example naming one can't be rendered from verified fields), its context
+    `sender's snapshot, digest matches`, and its last line `Complete the
+    task with: atem message complete <task id>` (completing a task across
+    hosts is not built yet). A reply's text and context are dropped a day
+    past its message's expiry; its ids and digest stay.
+  - **`atem message status`** shows, under a message the caller sent (or
+    any, from the owner's terminal), each row to another host: its state,
+    a refusal's code and why (a `ready` row while the link's latest `heads`
+    hasn't announced this host's mailbox says it waits for that), "status
+    pending" before any status, then the host's resolution: each task with
+    its state and detail, its reply and whether it was delivered or kept
+    and why, and a recipient with no task. Text another host sent (its
+    details, its reply) is printed with its control characters escaped.
 
 The receiving host's mailbox on the Station (design II.4.3): a sending host
 puts objects over its own link, and the receiving host syncs its own mailbox

@@ -77,6 +77,8 @@ mod delegated_launches;
 mod delegated_recovery;
 #[path = "delegated/requests.rs"]
 mod delegated_requests;
+#[path = "delegated/results_pass.rs"]
+mod delegated_results_pass;
 #[path = "delegated/send_pass.rs"]
 mod delegated_send_pass;
 
@@ -269,9 +271,18 @@ pub(super) struct State {
     /// monotonic clock (reviews M2, N2: one is settled after a bound of
     /// both). This store's: cleared when another opens.
     admit_failures: HashMap<String, (u32, u64)>,
+    /// The owed results (by task) whose sealing failed: their tries in a
+    /// row so far and when the first failed (review N4). This store's.
+    result_failures: HashMap<String, (u32, u64)>,
     /// The mailbox committed objects since admission last ran: it runs on
     /// the next pass (review L1; else on the scheduling pass's cadence).
     admit_due: bool,
+    /// The mailbox kept an object since the sending host's results were
+    /// last judged (or a status they wait for was recorded): judged on the
+    /// next pass (else once a minute, `results_pass`).
+    results_due: bool,
+    /// When the kept results were last judged.
+    results_drained_at: Option<Instant>,
     /// Tests: at the mailbox's crash point (after a page's commit, before
     /// its dones), the dones the store owed and the positions of the dones
     /// live then.
@@ -378,7 +389,10 @@ impl State {
             mail_pruned_at: None,
             mail_limits: Default::default(),
             admit_failures: HashMap::new(),
+            result_failures: HashMap::new(),
             admit_due: true,
+            results_due: true,
+            results_drained_at: None,
             #[cfg(test)]
             mail_crash_probe: Vec::new(),
             ack_failures: 0,
@@ -615,6 +629,7 @@ impl HostBridge {
                     // Admission's failure counts are a store's (its rows'
                     // numbers; review N2).
                     self.work.admit_failures.clear();
+                    self.work.result_failures.clear();
                     // Read once it opened (with the hook only: off, nothing
                     // reads it, as on main).
                     self.work.kept = (!prepared).then_some(KeptControls::Unreadable);
@@ -999,6 +1014,22 @@ impl HostBridge {
                         && self.collab_origin_live(&grant.origin, sessions)
                 })
             })
+            && self.remote_delivery_allowed(record)
+    }
+
+    /// Another host's reply is delivered only with host senders on, where
+    /// its sender's standing and return grant are checked each pass
+    /// (`remote_deliveries`); with the hook turned off it waits (review
+    /// L4). Any other task: allowed.
+    fn remote_delivery_allowed(&self, record: &WorkRecord) -> bool {
+        if self.senders_on() || record.principal != "local" {
+            return true;
+        }
+        let Some(store) = self.work.store.as_ref() else {
+            return true;
+        };
+        crate::runtime::delegated::results_back::delivery_of(&store.db, &record.task.task_id)
+            .is_ok_and(|delivers| delivers.is_none())
     }
 
     fn work_route_allowed(&self, record: &WorkRecord, a: &Sender) -> bool {
@@ -1321,6 +1352,9 @@ impl HostBridge {
                 self.work.recheck_tasks = true;
                 self.work.recheck_grants = true;
             }
+            // The sending host's results back: what came back judged, the
+            // replies delivered or kept, before this pass dispatches.
+            self.results_pass(cx.sessions);
             let passed = self
                 .collab_pass(cx, self.work.recheck_grants)
                 .and_then(|looked| {
@@ -1469,6 +1503,7 @@ impl HostBridge {
                 // The new store numbers its inbox rows afresh: no failure
                 // count of the old one's carries over (review N2).
                 self.work.admit_failures.clear();
+                self.work.result_failures.clear();
                 true
             }
             Err(_) => false,
@@ -2438,6 +2473,19 @@ impl HostBridge {
                 self.work_fail_lost(&mut r, lost)?;
                 continue;
             }
+            // Another host's reply left queued with host senders off (a
+            // debug runtime started again without the hook): it waits,
+            // holding no session, until the hook is back or its deadline
+            // (review N5), as a delegated task does with the hook off.
+            if !self.remote_delivery_allowed(&r) {
+                let detail = delegated_send_pass::SENDERS_OFF;
+                if r.status.state != WorkState::Blocked || r.status.detail != detail {
+                    r.status.state = WorkState::Blocked;
+                    r.status.detail = detail.into();
+                    self.work.store.as_ref().unwrap().save_work(&r)?;
+                }
+                continue;
+            }
             if self.collab_wait_for_launch(&mut r)? {
                 continue;
             }
@@ -2732,6 +2780,19 @@ impl HostBridge {
             r.status.detail = "explicit result delivered to the originating agent".into();
             return Ok(());
         }
+        // Another host's reply delivered (design II.4.4): the same.
+        if receipt.state == ReceiptState::Completed
+            && let Some(store) = self.work.store.as_ref()
+            && let Ok(Some((task_id, host_id, reply))) =
+                crate::runtime::delegated::results_back::delivery_of(&store.db, &r.task.task_id)
+        {
+            r.status.state = WorkState::Completed;
+            r.status.result = Some(crate::runtime::delegated::results_back::snapshot(
+                &task_id, &host_id, &reply,
+            ));
+            r.status.detail = "explicit result delivered to the originating agent".into();
+            return Ok(());
+        }
         // A rejected receipt says why (`control revoked`, `host trust
         // changed`, `session closed`, …).
         if let (ReceiptState::Rejected, Some(detail)) = (receipt.state, &receipt.detail) {
@@ -2950,6 +3011,7 @@ mod local_tests {
         include!("delegated/mail_pass_tests.rs");
         include!("delegated/send_pass_tests.rs");
         include!("delegated/admit_tests.rs");
+        include!("delegated/results_tests.rs");
     }
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::broker::{InProcess, Launcher};

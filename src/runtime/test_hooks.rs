@@ -459,6 +459,10 @@ mod imp {
         faults_dir().is_some_and(|dir| dir.join("hold_admission").exists())
     }
 
+    pub fn results_held() -> bool {
+        faults_dir().is_some_and(|dir| dir.join("hold_results").exists())
+    }
+
     pub fn crash_held() -> bool {
         faults_dir().is_some_and(|dir| dir.join("hold_crash").exists())
     }
@@ -900,6 +904,16 @@ pub fn host_work_held() -> bool {
 pub fn admission_held() -> bool {
     #[cfg(debug_assertions)]
     return imp::admission_held();
+    #[cfg(not(debug_assertions))]
+    false
+}
+
+/// The sending host's results back wait (`<pty faults>/hold_results`): no
+/// result the mailbox kept is judged while it exists, so a test sees the
+/// mailbox's own rows. Release builds: never.
+pub fn results_held() -> bool {
+    #[cfg(debug_assertions)]
+    return imp::results_held();
     #[cfg(not(debug_assertions))]
     false
 }
