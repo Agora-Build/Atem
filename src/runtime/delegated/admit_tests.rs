@@ -1573,3 +1573,54 @@ fn admission_runs_when_due_not_every_pass() {
         assert!(reads.is_empty(), "{reads:?}");
     });
 }
+
+/// Review L2: an inbox row whose plaintext no longer reads (a stricter
+/// reader than the one that wrote it) is no removal without a decision:
+/// refused `malformed` with its evidence, marked for its sender (the copy
+/// was authenticated when it opened), and reported `invalid_request`.
+#[test]
+fn an_unreadable_inbox_row_is_refused_and_reported() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let _host = sp_host(&mut rig, root, &os);
+        let id = uuid::Uuid::new_v4().to_string();
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute(
+                "INSERT INTO mailbox_inbox(sender_host, object_id, kind, plain, object_hash, at_ms,
+                    expires_at, signed_seq) VALUES('host-b', ?1, 'request', x'7b7d', 'ad-hash', 0,
+                    ?2, 1)",
+                rusqlite::params![id, host_now().wall_ms + HOUR],
+            )
+            .unwrap();
+        ad_admit(&mut rig);
+        assert_eq!(ad_inbox_rows(&rig), 0);
+        let refused: (String, bool, String) = rig
+            .bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .query_row(
+                "SELECT reason, report, object_id FROM mailbox_refused WHERE evidence='ad-hash'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(refused, ("malformed".into(), true, id.clone()));
+        ad_admit(&mut rig);
+        assert_eq!(
+            ad_latest(&rig),
+            ResultPlain::Refusal {
+                object_id: id,
+                refused: "invalid_request".into()
+            }
+        );
+    });
+}

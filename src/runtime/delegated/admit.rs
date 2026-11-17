@@ -78,6 +78,8 @@ pub struct InboxRow {
     pub n: i64,
     pub sender_host: String,
     pub object_id: String,
+    /// The object's `object_hash` (hex): its evidence.
+    pub object_hash: String,
     /// None when its bytes no longer read as a plaintext.
     pub plain: Option<EnvelopePlain>,
     /// Its object's expiry and `signed_at_head.seq`: 0 for a row written
@@ -93,7 +95,7 @@ pub struct InboxRow {
 pub fn inbox(db: &Connection, limit: usize) -> Result<Vec<InboxRow>> {
     let mut q = db.prepare(
         "SELECT n, sender_host, object_id, plain, coalesce(expires_at, 0),
-            coalesce(signed_seq, 0), held FROM mailbox_inbox ORDER BY n LIMIT ?1",
+            coalesce(signed_seq, 0), held, object_hash FROM mailbox_inbox ORDER BY n LIMIT ?1",
     )?;
     let rows = q.query_map([limit as i64], |r| {
         Ok(InboxRow {
@@ -104,6 +106,7 @@ pub fn inbox(db: &Connection, limit: usize) -> Result<Vec<InboxRow>> {
             expires_at: r.get(4)?,
             signed_seq: r.get(5)?,
             held: r.get(6)?,
+            object_hash: r.get(7)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -112,6 +115,27 @@ pub fn inbox(db: &Connection, limit: usize) -> Result<Vec<InboxRow>> {
 /// Inbox row `n` taken: decided. Whether it was still there.
 pub fn take_row(tx: &Transaction, n: i64) -> Result<bool> {
     Ok(tx.execute("DELETE FROM mailbox_inbox WHERE n=?1", [n])? == 1)
+}
+
+/// Inbox row `row`, whose plaintext no longer reads (a stricter reader than
+/// the one that wrote it), refused `malformed` with its evidence, marked
+/// for its sender (the copy was authenticated when it opened; review L2):
+/// never a removal without a decision. Kept as the mailbox keeps a
+/// refusal, a margin past its object's expiry (`now_ms` at least).
+pub fn refuse_unreadable(tx: &Transaction, row: &InboxRow, now_ms: u64) -> Result<()> {
+    use super::mailbox_store::KEEP_MARGIN_MS;
+    tx.execute(
+        "INSERT OR IGNORE INTO mailbox_refused(evidence, reason, sender_host, object_id, report,
+            bytes, keep_until, at_ms) VALUES(?1, 'malformed', ?2, ?3, 1, NULL, ?4, ?5)",
+        params![
+            row.object_hash,
+            row.sender_host,
+            row.object_id,
+            row.expires_at.max(now_ms).saturating_add(KEEP_MARGIN_MS),
+            now_ms
+        ],
+    )?;
+    Ok(())
 }
 
 /// Inbox row `n` held (ruling R47): a stop waiting for room, holding its

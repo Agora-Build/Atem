@@ -428,8 +428,11 @@ impl HostBridge {
                 &mut followups,
             )?,
             // Its bytes no longer read (a stricter reader than the one that
-            // wrote it): nothing to decide.
-            None => true,
+            // wrote it): refused and reported (review L2).
+            None => {
+                admit::refuse_unreadable(&tx, row, signing.now_d)?;
+                true
+            }
         };
         if !decided {
             // A stop waiting for room among its sender's early stops: held,
