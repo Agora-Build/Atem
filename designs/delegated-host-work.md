@@ -2195,7 +2195,8 @@ most 24 h retention, quotas, acknowledgments and deduplication").
 
 **Status objects built behind the debug-only hook** (host-work-v1 §11.5, "On the receiving host": sent at
 acceptance and at every later change of a task's state, a newer one superseding one the Station hasn't stored, none
-to a sender with no current key). Results back and the sending host's check are not built.
+to a sender with no current key or re-verified since its message; a resend the mailbox reads as a duplicate gets the
+status, or the whole refusal, again). Results back and the sending host's check are not built.
 
 The host that ran the work sends **`atem-result`** objects back to the sending host through the same mailbox. They
 have the envelope's shape with type `atem-result`, signing label `atem-result-v1` and seal label
@@ -2331,8 +2332,9 @@ is superseded: a host's `host_id` is its `atem_id` (above).
 ## II.7 What a host sender can do after admission
 
 **Built on the receiving host behind the debug-only hook** (host-work-v1 §11.5, "On the receiving host"): `cancel`
-and `complete` as the table says, each answered with the message's status, and one opened before its request kept
-until its request comes. The sending host doesn't send them yet.
+and `complete` as the table says (a cancel also withdraws an attempt waiting `accepted`), each answered with the
+message's status, one not reached also by its own id (`busy`, or `forbidden` without authority over the task), and one
+opened before its request kept until its request comes. The sending host doesn't send them yet.
 
 A host sender has no channel (II.2.1), so the source's interaction authority (I.3.1) maps onto objects:
 

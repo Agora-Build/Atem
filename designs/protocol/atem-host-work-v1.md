@@ -3652,22 +3652,42 @@ exactly as without this section):
 - host senders' gate also needs the mailbox read to the announced head with
   no refusal, fault or reset waiting, no request, cancel or complete left
   on the Station, or waiting on this host, for want of room (a result left
-  there holds none), and every inbox row admitted (design II.5).
-  `atem status`'s `Control feeds:` line names this part.
+  there holds none), and every inbox row admitted (design II.5; a stop
+  waiting in the inbox for room among its sender's early stops holds only
+  that sender's task starts, below). `atem status`'s `Control feeds:` line
+  names this part.
 - **admission** (`runtime/delegated/admit.rs`, `admit_pass.rs`; design
-  II.4.2 step 7, II.4.4, II.6, II.7): each pass while hosting runs, host
-  senders' gate open or not (it waits for the inbox, so admission never
-  waits for it), every inbox row is decided in its own `BEGIN IMMEDIATE`
+  II.4.2 step 7, II.4.4, II.6, II.7): while hosting runs, on the pass
+  after a mailbox commit decided an object, else on host work's 100 ms
+  cadence (never on every 16 ms pass), host senders' gate open or not (it
+  waits for the inbox, so admission never waits for it), the inbox's rows
+  are decided, at most 128 a pass, each in its own `BEGIN IMMEDIATE`
   transaction of the host-work store, with the row's removal and the
   status owed to its sender enqueued in the put engine (until stored);
-  nothing reaches an agent or is put before it commits. While hosting is
-  paused the rows wait (nothing could start).
+  nothing reaches an agent or is put before it commits (**Atem's reading,
+  for Astation:** "`select` from host senders" and design II.4.2 step 7
+  and II.6 commit the resolution with the object's verdict and its
+  cursor; here the opened object commits with the cursor as a durable
+  inbox row, which stands in for the verdict and holds its sender's task
+  starts, and the resolution commits in admission's later transaction,
+  after the done: it is decided before any task of the sender can start).
+  A row that can't be decided (a store fault, a record that doesn't read)
+  skips none of the others and is tried again at later passes; after 8
+  tries it is settled, as a task record that doesn't read is: refused
+  `busy` by its own id (a request's refusal recorded), removed, with a
+  runtime.log line. A row whose plaintext no longer reads (a stricter
+  reader than the one that wrote it) is refused `malformed`, reported
+  `invalid_request` as check 5's refusals are. While hosting is paused the
+  rows wait (nothing could start).
   - **A request.** Deduplicated against this host's own permanent records,
     never only the claims: a message record (never deleted) of the sender
     with that `message_id` and digest gets its current status again,
     nothing else; another digest, or an id another principal used here (a
     message record, or a local send's), `request_id_reused`; a recorded
-    whole refusal of the same digest gets that refusal again. The
+    whole refusal of the same digest gets that refusal again. A message
+    already expired on `D` when admission takes it (a long pause, an
+    outage) is refused whole `busy` (never judged so under a clock
+    anchor): no task past its deadline. The
     sender's standing is checked again on the committed list against the
     head it signed at (**Atem's reading, for Astation:** a revoke and a
     readmit, or a removal and a re-add, between its opening and its
@@ -3688,12 +3708,15 @@ exactly as without this section):
     channel member's publish meets them, refuse it whole `busy`:
     `per_workflow` messages per workflow (counted once per message admitted),
     the 256 unfinished tasks and the store's records, the sender's
-    unresolved outcomes. Each whole refusal is recorded for good and
-    reported as `{"kind":"status","object_id":<message_id>,"refused":
-    <code>}` (**Atem's reading, for Astation:** `request_id_reused` and
-    `busy` are object refusals, since a recipient's receipt carries only
-    `forbidden` or `stale_target`; `busy` is final for that `message_id`,
-    a resend gets it again: the sender sends anew). Each task is a delegated
+    unresolved outcomes. Each whole refusal is recorded and reported as
+    `{"kind":"status","object_id":<message_id>,"refused":<code>}`
+    (**Atem's reading, for Astation:** `request_id_reused` and `busy` are
+    object refusals, since a recipient's receipt carries only `forbidden`
+    or `stale_target`; `busy` is final for that `message_id`, a resend
+    gets it again: the sender sends anew). A recorded refusal is kept 48
+    hours past its message's expiry (beyond any copy the mailbox can still
+    pass on, a day past it), at most 1,024 per sender (the oldest dropped
+    first), pruned by the mailbox's minute prune. Each task is a delegated
     task of `host:<sender>`, its admission record from the permit, its
     message frame.
   - **`cancel` and `complete`** (design II.7). The sender's own task,
@@ -3717,11 +3740,14 @@ exactly as without this section):
     narrowed since, the sender revoked, or a task admitted before a revoke
     and a readmit, or a removal and a re-add: the owner's alone). One
     whose task isn't here yet (a free between pages can open a later
-    object first) is kept as an early stop, bound to its sender, its object
-    and the task it names, until its expiry, at most 32 per sender (a 33rd
-    stays in the inbox, holding the gate); its request's admission applies
-    it in its own transaction (a cancel cancels the task at once, a
-    complete finds it queued). One naming another sender's task changes
+    object first) is kept as an early stop, bound to its sender at its
+    current generation and epoch (after a revoke and a readmit, or a
+    removal and a re-add, it no longer applies), its object and the task
+    it names, until its expiry (dropped by the mailbox's minute prune,
+    never under a clock anchor), at most 32 per sender (a 33rd stays in
+    the inbox, holding only its own sender's task starts, until a kept one
+    goes); its request's admission applies it in its own transaction (a
+    cancel cancels the task at once, a complete finds it queued). One naming another sender's task changes
     nothing and gets no status.
   - **Status objects** (design II.4.4): `seal_result` to the sender's
     current `host_enc_key`, signed with this host's `host_channel_key` at
@@ -3734,12 +3760,14 @@ exactly as without this section):
     seals the message's current status, every task's state, and enqueues
     it in one transaction with the mark cleared. A newer status settles
     one the Station hasn't stored yet (never put); each is its own object.
-    A sender with no current key, or no longer a current host, gets none:
-    the record keeps the state for the owner. The sender's resend of an
-    admitted request that the mailbox reads as a duplicate (its claim
-    held) marks the message's status owed again (**Atem's reading, for
-    Astation:** the Station may have lost the first; superseding keeps one
-    waiting). A refusal row marked for its
+    A sender with no current key, no longer a current host, or re-verified
+    since the message (another host key than the one it came under, its
+    old outbox gone) gets none: the record keeps the state for the owner.
+    The sender's resend of an admitted request that the mailbox reads as a
+    duplicate (its claim held) marks the message's status owed again, and
+    a resend of a request refused whole has its recorded refusal sent
+    again (**Atem's reading, for Astation:** the Station may have lost the
+    first; superseding keeps one status waiting). A refusal row marked for its
     sender (check 5 or 6, after the copy was shown to be the sender's) is
     reported `{"kind":"status","object_id","refused":"invalid_request"}`
     once, its mark cleared in that transaction.
