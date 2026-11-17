@@ -124,8 +124,9 @@ forms existed. Labels never authorize:
 `labels = ["project:astation"]` addresses agents, `principals =
 ["project:astation"]` consents to the signed project's hosts; `atem runtime
 check` prints them on separate lines and says so for a route that names one.
-Nothing sends as a host sender yet: the mailbox that would carry its work is
-planned.
+Behind the same hook, host senders' work travels through each receiving
+host's mailbox on the Station, sealed end to end (host-work-v1 §11.5; a dev
+host sets it up as section 14 says, "Host senders on a dev host").
 
 **Environment.** A remote request never carries paths, commands, arguments or
 environment values. The agent gets `HOME`, `PATH`, `USER`, `LOGNAME`, `SHELL`,
@@ -609,27 +610,34 @@ release build):
 
 - **Not implemented:** automatic launch when remote work arrives. A coordinator
   can launch, wait for readiness, then enqueue. Local collaboration supports
-  `launch = "on_message"` on an explicitly approved route.
+  `launch = "on_message"` on an explicitly approved route, and so, behind the
+  debug-only hook, does a host sender's message that asks for it
+  (host-work-v1 §11.5, "A `select`'s `launch`").
 - **Not implemented:** durable delivery through the Station: atomic
   write-and-notify with memory or vault, an outbox, replay with cursors across
   replicas, and delivery to an offline host. Today a sender must reach the host
   while it is online.
 - **Not implemented:** work from an offline sender. Dispatch uses the sender's
   live channel, so its tasks wait until it reconnects. There is no origin proof
-  that would let the Station replay an envelope. Cross-instance sending is
-  planned in [delegated-host-work.md](delegated-host-work.md). Behind the
-  debug-only hook, a delegated sender's accepted task runs while the sender
-  is offline (section 7); it still has to reach the host to send it.
+  that would let the Station replay an envelope. Behind the debug-only hook, a
+  delegated sender's accepted task runs while the sender is offline (section
+  7); it still has to reach the host to send it. Cross-instance sending, as
+  host senders whose sealed envelopes wait in the receiving host's mailbox,
+  is built only behind that hook
+  ([delegated-host-work.md](delegated-host-work.md), Part II).
 - **Not implemented:** remote selector routing and context subscriptions.
   Remote senders resolve recipients (host, route, session, process) themselves.
-  Local collaboration expands selectors once and persists that resolution.
+  Local collaboration expands selectors once and persists that resolution, and
+  so, behind the debug-only hook, does a host sender's receiving host.
 - **Not implemented:** cross-instance result routing and workflow limits.
   A remote sender reads an agent's reply with `reply_query` (feature
   `host.reply`) and completes the task with `work_complete`; progress goes back
   through `work_query`/`message_query`. Local collaboration has durable workflow
   limits counted in messages and one correlated reply per task for every
   sender, delivered into a local sender's agent only with origin-route
-  consent.
+  consent. Behind the debug-only hook, a host sender's results come back
+  through the mailbox and are delivered the same way, and its workflow's
+  limits count across hosts (host-work-v1 §11.5).
 - **Not implemented:** progress push. Launch and task status are query-only.
 - **Not implemented:** resolving an `outcome_unknown` task by hand. It holds
   its session's queue until it expires at its deadline ("expired with its
@@ -667,9 +675,10 @@ fences launches not yet started; a halted session journal holds local tasks
 the same way until that restart; `[collab] send = false` only refuses new
 sends. A session is launched only for `atem message send --launch` on a route
 with `launch = "on_message"`, and only for a Claude Code profile.
-**Not implemented:** cross-instance transport, the shared Station directory
-and mailbox, and the stages 2-3 permission agreements
-([delegated-host-work.md](delegated-host-work.md)).
+Cross-instance sending, as host senders through the Station mailbox, is
+built only behind the debug-only hook ([delegated-host-work.md](delegated-host-work.md),
+Part II; section 14, "Host senders on a dev host"). **Not implemented:** the
+shared directory, and anything of it in a release build.
 
 ### OS service and boot startup (not implemented)
 
@@ -720,6 +729,19 @@ real Station and Astation are not exercised: that is the joint check.
 
 ```bash
 cargo test --test delegated_binary --test control_feed_binary -- --test-threads=1
+```
+
+Host senders run the same way, with `host.senders` in the hook:
+`tests/host_mail_binary.rs` covers one real receiving host's mailbox and
+admission against the fake Station's mailbox (the sending host played by the
+test), `tests/host_senders_binary.rs` two real hosts end to end (sends,
+replies delivered as data, cancel, complete, launch on message, lost
+answers, a kill, a revoke, the limits, hook off). The delegated design's
+VII.B, "Covered by Atem's tests (fake Station)", maps them onto its joint
+tests.
+
+```bash
+cargo test --test host_mail_binary --test host_senders_binary -- --test-threads=1
 ```
 
 ## 14. Delegated work on a dev host (debug builds only)
@@ -827,3 +849,89 @@ its environment holds.
          `add_host` durably before it sends `deviceVerified`, so the old
          proved socket can close before the certificate is delivered. That
          ceremony-ordering risk is Astation's, tracked in Astation #80.
+
+### Host senders on a dev host
+
+For the joint check of host senders (the delegated host-work design's
+VII.B, after VII.A): agents on two dev hosts of the same account sending
+each other work through the Station mailbox (the design's Part II;
+host-work-v1 §11.5). Each host is set up as above, plus:
+
+1. **The hook** in each host's `env.sh`:
+   `ATEM_TEST_HOST_FEATURES=host.delegated,host.senders` (add `host.alerts`
+   for the alerts' checks; `host.senders` without `host.delegated` is
+   ignored). The runtime's start line then ends `host.senders on`, and its
+   `welcome` lists `host.senders` while hosting is on. At its start a
+   pinned host that holds no host encryption key for its trust generation
+   makes one (`pairing/host_enc_key`, its id recorded in
+   `pairing/host_enc_generated`). Run `atem runtime check` with the same
+   variable in its environment (source `env.sh` first): without it a debug
+   build reads `runtime.toml` as a release build does, and a route that
+   names a host-sender principal doesn't load.
+2. **`runtime.toml`.** A route takes work from other hosts only when its
+   `principals` consent: `project:<name>` (every host of that signed
+   project) or `host:<host_id>` (that host; a host's `host_id` is its
+   `atem_id`), beside its other principals (section 2). To send, `[collab]
+   send = true` and a route for the sending agents that lists `local`; with
+   `results = true` on that route, replies come back into the session that
+   sent. Labels only address: a `project:` selector reaches the agents of
+   routes or instances labelled `project:<name>`, and an `atem:<atem_id>`
+   selector every agent of that host. For example, on both hosts (each
+   sends and receives), with the profiles of section 2:
+
+   ```toml
+   [collab]
+   send = true
+
+   [[routes]]
+   id = "backend"
+   revision = 1
+   profile_id = "backend"
+   principals = ["local", "project:build"]  # local agents, and the hosts of the signed project "build"
+   results = true                           # replies to what this route's agents sent come back to them
+
+   [[routes]]
+   id = "launcher"
+   revision = 1
+   profile_id = "launched"
+   principals = ["project:build"]
+   launch = "on_message"                    # `--launch` with `atem:<this host>/launcher` starts its agent
+   ```
+3. **The device list** (Astation signs these, behind its signing gate for
+   an enumerated test account; Atem signs none):
+   - each host's `host_enc_key` entry: a native manager reads the key with
+     `host_enc_key_get` over its channel and signs the entry with a fresh
+     confirmation (the ceremony's way, draft PR #176, isn't on main);
+   - a `project_set` listing both hosts with `message`, `notify` and
+     `prompt`, and `launch` for launch on message.
+
+   A sending host plans only hosts its own list gives a current key and a
+   shared project covering the work (`atem message send` says which hosts
+   a `project:` fan-out skipped, and why), and sends only while its list
+   shows it a current host at its trust generation, not revoked.
+4. **The Station.** Both hosts use the same one. It adds `mailbox` to the
+   `heads` of a host whose `welcome` lists `host.senders`, stores what one
+   host puts for another, and serves each host its own mailbox
+   (host-work-v1 §11.5, "The mailbox calls"). Until it announces a host's
+   mailbox, that host puts nothing and reads nothing, and host senders'
+   gate stays closed.
+5. **What to check.**
+   - `atem status`'s `Control feeds:` line adds `host senders' mailbox
+     read to its head`, or `host senders' mailbox not checked (<why>)`,
+     with the mailbox's alerts since the start.
+   - On the sending host, `atem message status <message id>` (from the
+     sending session, or the owner's terminal) shows a row per host:
+     `ready` (`waiting for the Station to announce this host's mailbox`
+     while it hasn't), `sent`, `accepted` or `refused (<code>)`; `status
+     pending` until the first status; then that host's tasks, each with its
+     state and detail, its reply with whether it was delivered (or why
+     not), and the `cancel` and `complete` sent for it.
+   - On the receiving host the task runs as a delegated task of
+     `host:<sending host>`: its prompt names that host, and an unknown
+     outcome raises an owner alert like any delegated task's (`atem task
+     list --unknown`).
+6. **Turning `host.senders` off** (the variable without it, started
+   again through `env.sh`): nothing is put, synced or admitted; a host
+   sender's tasks wait (`revocations not yet checked`) and a reply waiting
+   for delivery waits too (`host senders are off on this host`), until
+   their deadlines. The store keeps its tables.
