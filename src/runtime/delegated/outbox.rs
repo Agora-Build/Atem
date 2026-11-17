@@ -216,8 +216,9 @@ pub fn quota_backoff_ms(count: u32) -> u64 {
 /// `mailbox_put_refused` of row `n` at `now_ms`, on `place`: `quota` puts
 /// it again after the backoff (the code kept until it is stored);
 /// `forbidden` holds it to `place` (rule 3: final on that link generation,
-/// put again on a later one or once the device list moved); `id_reused`
-/// and `expired` refuse it for good, with the code.
+/// put again on a later one or once the device list moved); `expired`
+/// refuses it for good, with the code; `id_reused` puts no copy again
+/// ([`final_for_copies`]: a stored row still expires at its expiry).
 pub fn refused(store: &Store, n: i64, code: PutRefusal, now_ms: u64, place: Place) -> Result<()> {
     if code == PutRefusal::Forbidden {
         store.db.execute(
@@ -240,23 +241,35 @@ pub fn refused(store: &Store, n: i64, code: PutRefusal, now_ms: u64, place: Plac
                 now_ms.saturating_add(quota_backoff_ms(count.unwrap_or(0)))
             ],
         )?;
-    } else {
+    } else if code == PutRefusal::Expired {
         store.db.execute(
             "UPDATE mail_outbox SET state='refused', code=?2
             WHERE n=?1 AND state IN ('queued','stored')",
             params![n, code.code()],
         )?;
+    } else {
+        final_for_copies(store, n, code.code())?;
     }
     Ok(())
 }
 
 /// Row `n`'s bytes no longer read as a mailbox object (a stricter reader
-/// than the one that enqueued it): refused, `malformed`, never put.
+/// than the one that enqueued it): `malformed`, never put again.
 pub fn unreadable(store: &Store, n: i64) -> Result<()> {
+    final_for_copies(store, n, "malformed")
+}
+
+/// No copy of row `n` is put again (`code`): one never stored is
+/// `refused`; one stored keeps `stored` (its first copy was stored) with
+/// the code, its next put at its expiry, so it is never due again and
+/// still expires then (review L-N4).
+fn final_for_copies(store: &Store, n: i64, code: &str) -> Result<()> {
     store.db.execute(
-        "UPDATE mail_outbox SET state='refused', code='malformed'
+        "UPDATE mail_outbox SET code=?2,
+            state=CASE state WHEN 'stored' THEN 'stored' ELSE 'refused' END,
+            next_put_ms=CASE state WHEN 'stored' THEN expires_at ELSE next_put_ms END
         WHERE n=?1 AND state IN ('queued','stored')",
-        [n],
+        params![n, code],
     )?;
     Ok(())
 }

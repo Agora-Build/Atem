@@ -3630,9 +3630,11 @@ exactly as without this section):
   is put again on a later one, or once this host's device list moved, until
   it expires; `id_reused` and `expired` refuse the row with the code. A row
   already stored stays `sent` when the Station refuses a later copy (its
-  code recorded): the first copy may be running on the receiver; a Station
-  `expired` there is the row's expiry. A row whose bytes no longer read is
-  refused `malformed`, never put.
+  code recorded; after `id_reused` no copy is put again, and it still
+  expires at its object's expiry): the first copy may be running on the
+  receiver; a Station `expired` there is the row's expiry. A row whose
+  bytes no longer read is `malformed`, never put again (refused if never
+  stored).
 - Rules 1 and 8: puts go only after a `heads` on the link generation that
   announces this host's mailbox (the Station's association of the link),
   as the mailbox's own calls; at most 8 live per link generation; a put

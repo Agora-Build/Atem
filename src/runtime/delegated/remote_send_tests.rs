@@ -459,3 +459,64 @@ fn the_receivers_refusal_refuses_the_row_and_settles_it() {
     assert!(!refused_by_receiver(&tx, &message.message_id, "b", "forbidden").unwrap());
     assert!(!accepted(&tx, &message.message_id, "b").unwrap());
 }
+
+/// A `sent` row whose later copy is refused `id_reused`, or whose bytes no
+/// longer read, is put no more but still expires at its object's expiry
+/// (review L-N4).
+#[test]
+fn a_sent_row_whose_later_copy_is_refused_still_expires() {
+    let (_dir, store) = store();
+    let log = list();
+    let p = plan(&log.log, ME, &["atem:b".into(), "atem:c".into()], false).unwrap();
+    let part = RemotePart::of(&p, "acct");
+    let message = local(vec![]);
+    commit(&store, &log, ME, &message, &part).unwrap();
+    let (b, _) = engine_bytes(&store, "b", &message.message_id);
+    let (c, _) = engine_bytes(&store, "c", &message.message_id);
+    for n in [b, c] {
+        outbox::stored(&store, n, T0).unwrap();
+    }
+    outbox::refused(
+        &store,
+        b,
+        PutRefusal::IdReused,
+        T0 + outbox::RESEND_MS,
+        outbox::tests::AT,
+    )
+    .unwrap();
+    outbox::unreadable(&store, c).unwrap();
+    let states = || -> Vec<(String, Option<String>)> {
+        rows_of(&store, &message.message_id)
+            .into_iter()
+            .map(|r| (r.1, r.2))
+            .collect()
+    };
+    assert_eq!(
+        states(),
+        [
+            ("sent".into(), Some("id_reused".into())),
+            ("sent".into(), Some("malformed".into())),
+        ]
+    );
+    let sender = atem_client::host_mail::HostRef {
+        host_id: "a".into(),
+        host_trust_gen: 1,
+    };
+    let due = outbox::due(
+        &store,
+        &sender,
+        message.expires_at - 1,
+        outbox::tests::AT,
+        &[],
+        8,
+    );
+    assert!(due.unwrap().is_empty(), "put no more");
+    outbox::expire(&store, message.expires_at).unwrap();
+    assert_eq!(
+        states(),
+        [
+            ("expired".into(), Some("id_reused".into())),
+            ("expired".into(), Some("malformed".into())),
+        ]
+    );
+}
