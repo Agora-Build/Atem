@@ -219,7 +219,8 @@ impl MailboxMismatch {
 /// it (rule 4). A put's own fields are 178 bytes fewer than the largest
 /// page's, so a 512 KiB put can carry more: the reader refuses such a put,
 /// `too_large`, and the Station drops it as a put it can't read (Atem's
-/// reading, for Astation's agreement). No builder makes one: the largest
+/// reading, agreed with Astation 2026-11-16, #120 comment 6930157163). No
+/// builder makes one: the largest
 /// sealed object is about 328 KB.
 pub const MAX_SERVED_OBJECT_BYTES: usize = 524_013;
 

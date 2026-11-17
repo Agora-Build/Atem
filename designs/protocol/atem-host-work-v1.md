@@ -3497,9 +3497,9 @@ independently by `scripts/check-r9-vectors.py`, which models the mailbox
 from these rules. Not built: admission on the receiving host, the results back on the
 sending host, and a Station's side.
 
-**The reference mailbox's readings** (Atem's, **for Astation's
-agreement**; where the rules below leave a choice, a Station that answers
-otherwise doesn't match the vectors):
+**The reference mailbox's readings** (Atem's, **agreed with Astation
+2026-11-16, #120 comment 6930157163**; where the rules below leave a
+choice, a Station that answers otherwise doesn't match the vectors):
 - **An object is at most what a page carries at every position.** Rule 9
   bounds a put and a page alike at 512 KiB, but a page's own fields, with
   every number at its largest (2^53 − 1), take 178 bytes more than a

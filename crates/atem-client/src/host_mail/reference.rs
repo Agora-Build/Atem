@@ -25,8 +25,8 @@
 //! last given.
 //!
 //! **What the model does** (rule numbers are §11.5's; where the rules leave
-//! a choice, its "reference mailbox's readings", Atem's, for Astation's
-//! agreement):
+//! a choice, its "reference mailbox's readings", Atem's, agreed with Astation 2026-11-16,
+//! #120 comment 6930157163):
 //! - **Mailboxes** (rule 2): one per receiving `(account_id, genesis_hash,
 //!   host_id, host_trust_gen)` of this device list, minted by the first
 //!   object stored in it or the first `heads` with `host.senders` of its host
@@ -37,7 +37,7 @@
 //!   whose object, as received, is over what a page can carry at every
 //!   position included (`too_large`, the reader's
 //!   [`MAX_SERVED_OBJECT_BYTES`](super::mailbox::MAX_SERVED_OBJECT_BYTES):
-//!   Atem's reading, for Astation's agreement); `forbidden` unless the caller
+//!   Atem's reading, agreed with Astation 2026-11-16); `forbidden` unless the caller
 //!   is a current host at its link's generation, the object's sender, of the
 //!   link's account and root, and the recipient is a current host at the
 //!   generation the object names; `expired` when `now_ms` is at or past
