@@ -570,6 +570,11 @@ impl HostBridge {
                 refuse("request_id_reused", false)
             };
         }
+        // Expired before admission took it (a long pause, an outage; review
+        // L6): no task past its deadline. Not judged under a clock anchor.
+        if message.expires_at <= signing.now_d && !signing.anchored {
+            return refuse("busy", true);
+        }
         let list = &signing.list;
         // The sender's standing now, against the head it signed at.
         let Some(standing) = may_send(list, sender, row.signed_seq) else {

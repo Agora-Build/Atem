@@ -1674,3 +1674,31 @@ fn no_status_goes_to_a_sender_re_verified_since() {
         assert_eq!(rows(&rig, "mail_outbox"), 1, "none to the new generation");
     });
 }
+
+/// Review L6: a request whose message expired before admission took it (a
+/// long pause, an outage) is refused `busy`, recorded, and makes no task:
+/// none past its deadline counts toward `per_workflow` or takes room.
+#[test]
+fn a_message_already_expired_is_not_admitted() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let _host = sp_host(&mut rig, root, &os);
+        let message = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
+        ad_inbox_request(&rig, &message);
+        sp_d(&rig, message.expires_at);
+        ad_admit(&mut rig);
+        assert_eq!(
+            ad_latest(&rig),
+            ResultPlain::Refusal {
+                object_id: message.message_id.clone(),
+                refused: "busy".into()
+            }
+        );
+        assert!(ad_tasks(&rig, &message).is_empty());
+        assert_eq!(
+            counted(&rig, &format!("receive:{}", message.workflow_id)),
+            0
+        );
+    });
+}
