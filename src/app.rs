@@ -1133,7 +1133,9 @@ mod tests {
                             deadline = Some(tokio::time::Instant::now() + Duration::from_millis(1_500));
                         }
                     }
-                    routes
+                    // The socket goes back with the routes, so the link
+                    // stays open until the test has checked it.
+                    (routes, socket)
                 });
                 let mut app = App::new();
                 app.local_route_proof = hook;
@@ -1160,7 +1162,7 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 assert!(app.astation_connected, "hook {hook}: the local link");
-                let routes = server.await.unwrap();
+                let (routes, _socket) = server.await.unwrap();
                 (routes, challenge)
             });
             let (routes, challenge) = routes;
