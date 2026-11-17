@@ -114,8 +114,9 @@ impl Rig {
     /// host and another host, agent hosting on, the runtime running `hook`.
     /// The fake Station holds the same list and reads the host as one whose
     /// welcome lists `host.senders` when the hook turns it on. Admission
-    /// waits (`<pty faults>/hold_admission`): these tests see the mailbox's
-    /// own rows, and admit by hand ([`Rig::admit_all`]).
+    /// waits (`<pty faults>/hold_admission`), and so does the judging of
+    /// kept results (`hold_results`): these tests see the mailbox's own
+    /// rows, and admit by hand ([`Rig::admit_all`]).
     fn start(via: Via, hook: Hook) -> Rig {
         Rig::build(via, hook, None)
     }
@@ -220,6 +221,7 @@ principals = [{mac:?}, "project:{PROJECT}"{local}]
         std::fs::create_dir_all(&faults).unwrap();
         if admitting.is_none() {
             private(&faults.join("hold_admission"), "");
+            private(&faults.join("hold_results"), "");
         }
         let head = log.log.head();
         let head = json!({"seq": head.seq, "hash": head.hash.to_hex()});

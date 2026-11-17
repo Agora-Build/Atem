@@ -105,10 +105,19 @@ impl HostBridge {
 
     /// Every result the mailbox kept judged and applied (the module docs).
     pub(super) fn results_drain(&mut self) {
-        if !self.senders_on() {
+        // Debug builds: held while a test says (`<pty faults>/hold_results`).
+        if !self.senders_on() || crate::runtime::test_hooks::results_held() {
+            return;
+        }
+        // Nothing can be judged now (the store isn't this identity's, the
+        // list doesn't serve, no `D`): tried again on the next pass (the
+        // receiver, which reads this host's key, only once the store is).
+        if self.mail_store().is_none() {
+            self.work.results_due = true;
             return;
         }
         let Some((list, receiver, now_d)) = self.mail_receiver() else {
+            self.work.results_due = true;
             return;
         };
         let Some((store, _)) = self.mail_store() else {
