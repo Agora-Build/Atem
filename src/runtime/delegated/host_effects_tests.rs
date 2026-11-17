@@ -234,7 +234,7 @@ fn a_revoke_with_interrupt_running_interrupts_started_tasks() {
         assert_eq!(settled(&rig, &queued), outcome(Event::Revoked));
         rig.bridge.work.scheduled = Instant::now();
         passes(&mut rig, 2);
-        escs_reach(&rig, 1).await;
+        escs_delivered(&mut rig, 1).await;
         settle(&mut rig).await;
         passes(&mut rig, 3);
         assert_eq!(escs(&rig), 1, "once per turn");
@@ -588,7 +588,7 @@ fn a_later_interrupt_record_interrupts_only_tasks_admitted_before_the_revoke() {
             "admitted after the readmit"
         );
         passes(&mut rig, 2);
-        escs_reach(&rig, 1).await;
+        escs_delivered(&mut rig, 1).await;
         settle(&mut rig).await;
         turn_interrupted(&mut rig, &running).await;
         rig.until(|r| settled(r, &running).0 == WorkState::AwaitingResult)
@@ -934,7 +934,7 @@ fn device_list_effects_run_while_hosting_is_paused() {
         assert_eq!(settled(&rig, &queued), outcome(Event::Revoked));
         assert_eq!(intents(&rig, &running).len(), 1);
         passes(&mut rig, 2);
-        escs_reach(&rig, 1).await;
+        escs_delivered(&mut rig, 1).await;
         settle(&mut rig).await;
         turn_interrupted(&mut rig, &running).await;
         assert_eq!(escs(&rig), 1);

@@ -253,7 +253,7 @@ fn revoke_with_interrupt_writes_intents() {
         assert_eq!(settled(&rig, &queued), outcome(Event::Revoked));
         assert_eq!(escs(&rig), 0, "nothing acted before the commit's followups");
         passes(&mut rig, 2);
-        escs_reach(&rig, 1).await;
+        escs_delivered(&mut rig, 1).await;
         settle(&mut rig).await;
         passes(&mut rig, 3);
         assert_eq!(escs(&rig), 1, "once per turn");
@@ -295,7 +295,7 @@ fn a_later_interrupt_record_writes_intents_once() {
             "in the record's transaction"
         );
         passes(&mut rig, 2);
-        escs_reach(&rig, 1).await;
+        escs_delivered(&mut rig, 1).await;
         settle(&mut rig).await;
         // Served again, and another record for the same revocation.
         feed(&mut rig, &s.log, &[&first]);
@@ -803,7 +803,7 @@ fn a_turn_a_revoke_interrupted_reads_turn_interrupted_beside_a_deadline_intent()
         );
         commit_intent(&rig, &running, IntentReason::Deadline);
         passes(&mut rig, 2);
-        escs_reach(&rig, 1).await;
+        escs_delivered(&mut rig, 1).await;
         settle(&mut rig).await;
         passes(&mut rig, 2);
         let stored = intents(&rig, &running);
