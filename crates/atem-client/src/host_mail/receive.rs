@@ -513,7 +513,35 @@ pub fn accept_result(
     provider: &dyn KeyProvider,
     now_ms: u64,
 ) -> ResultVerdict {
-    let (mail, key, standing) = match admit(MailKind::Result, obj, list, me, Some(outbox), now_ms) {
+    accept_result_among(
+        obj,
+        list,
+        me,
+        std::slice::from_ref(outbox),
+        provider,
+        now_ms,
+    )
+    .0
+}
+
+/// [`accept_result`] against every outbox row a sending host has to one
+/// host at one generation (`rows`, its envelopes' `recipient`, the first
+/// row's: a row to another host is never answered): checks 1 to 6 once,
+/// then the first row the plaintext answers, its index beside the verdict
+/// (none when no row answers: `does_not_answer_outbox_row`). A host can't
+/// tell which of its rows a result answers before it is opened, and it
+/// opens it only here. With no row, the copy is still verified and opened
+/// as its claimed sender's, and answers none.
+pub fn accept_result_among(
+    obj: &SignedObject,
+    list: &Membership,
+    me: &Recipient,
+    rows: &[ExpectedResult],
+    provider: &dyn KeyProvider,
+    now_ms: u64,
+) -> (ResultVerdict, Option<usize>) {
+    let first = rows.first();
+    let (mail, key, standing) = match admit(MailKind::Result, obj, list, me, first, now_ms) {
         Admission::Verified {
             mail,
             key,
@@ -523,36 +551,41 @@ pub fn accept_result(
             host_id,
             host_trust_gen,
         } => {
-            return ResultVerdict::Pending {
+            let pending = ResultVerdict::Pending {
                 host_id,
                 host_trust_gen,
             };
+            return (pending, None);
         }
         Admission::Refused { reason, evidence } => {
-            return ResultVerdict::Refused { reason, evidence };
+            return (ResultVerdict::Refused { reason, evidence }, None);
         }
         Admission::RefusedAuthenticated {
             object_id,
             reason,
             sender,
         } => {
-            return ResultVerdict::RefusedAuthenticated {
+            let refused = ResultVerdict::RefusedAuthenticated {
                 object_id,
                 reason,
                 sender,
             };
+            return (refused, None);
         }
     };
     let body = mail.body();
-    let refuse = |reason| ResultVerdict::RefusedAuthenticated {
-        object_id: body.id.clone(),
-        reason,
-        sender: body.sender.clone(),
+    let refuse = |reason| {
+        let refused = ResultVerdict::RefusedAuthenticated {
+            object_id: body.id.clone(),
+            reason,
+            sender: body.sender.clone(),
+        };
+        (refused, None)
     };
     let plain = match open_with(&mail, &key, provider, unseal_result) {
         Ok(plain) => plain,
         Err(Failed::Refused(reason)) => return refuse(reason),
-        Err(Failed::Unavailable(error)) => return ResultVerdict::Unavailable { error },
+        Err(Failed::Unavailable(error)) => return (ResultVerdict::Unavailable { error }, None),
     };
     // A reply names its task: its `result_id` is the task's (host-work-v1
     // §11.5, "`result_id`"), checked with the plaintext, before the row.
@@ -561,20 +594,23 @@ pub fn accept_result(
     {
         return refuse(RESULT_ID_MISMATCH);
     }
-    let answers = match &plain {
-        ResultPlain::Status { message_id, .. } => *message_id == outbox.message_id,
+    let answers = |row: &ExpectedResult| match &plain {
+        ResultPlain::Status { message_id, .. } => *message_id == row.message_id,
         ResultPlain::Refusal { object_id, .. } => {
-            *object_id == outbox.message_id || outbox.cancel_complete_ids.contains(object_id)
+            *object_id == row.message_id || row.cancel_complete_ids.contains(object_id)
         }
-        ResultPlain::Result { task_id, .. } => outbox.task_ids.contains(task_id),
+        ResultPlain::Result { task_id, .. } => row.task_ids.contains(task_id),
     };
-    if !answers {
+    let Some(answered) = rows
+        .iter()
+        .position(|row| Some(&row.recipient) == first.map(|f| &f.recipient) && answers(row))
+    else {
         return refuse(DOES_NOT_ANSWER_OUTBOX_ROW);
-    }
+    };
     let sender = host_principal(&body.sender.host_id);
     // II.4.4: a result of a revoked or removed host verified, but isn't
     // delivered; it is kept as data.
-    match standing {
+    let verdict = match standing {
         Standing::Current => ResultVerdict::Accepted { plain, sender },
         Standing::Revoked => ResultVerdict::NotDelivered {
             plain,
@@ -586,7 +622,8 @@ pub fn accept_result(
             sender,
             reason: NOT_DELIVERED_SENDER_REMOVED,
         },
-    }
+    };
+    (verdict, Some(answered))
 }
 
 /// What checks 1 to 5 settle.
@@ -3052,6 +3089,90 @@ mod tests {
                 "{plain:?}"
             );
         }
+    }
+
+    /// A sending host has many rows to one host and can't tell which one a
+    /// result answers before it opens: `accept_result_among` verifies and
+    /// opens it once, then names the first row it answers, with the verdict
+    /// `accept_result` gives against that row.
+    #[test]
+    fn a_result_is_matched_among_a_hosts_rows() {
+        let w = World::new();
+        let f = w.fields("host-b", "host-a");
+        let other = "8b3e4c60-5d9f-4a0c-9e23-4f7b9c1d5e60";
+        let first = ExpectedResult {
+            message_id: other.into(),
+            cancel_complete_ids: vec![],
+            task_ids: vec![],
+            ..expected(&w)
+        };
+        let rows = [first.clone(), expected(&w)];
+        for (plain, row) in [
+            (status(ID), Some(1)),
+            (status(other), Some(0)),
+            (
+                ResultPlain::Result {
+                    task_id: REPLY_ID.into(),
+                    reply: reply_to(REPLY_ID, 0),
+                },
+                Some(1),
+            ),
+            (
+                ResultPlain::Result {
+                    task_id: other.into(),
+                    reply: reply_to(other, 0),
+                },
+                None,
+            ),
+        ] {
+            let object = result(&w, &f, &plain);
+            let (verdict, answered) = accept_result_among(
+                &object,
+                &w.m,
+                &w.recipient("host-a", true),
+                &rows,
+                &w.encs,
+                NOW,
+            );
+            assert_eq!(answered, row, "{plain:?}");
+            let alone = match row {
+                Some(i) => accept(&w, &object, &rows[i]),
+                None => result_refused_authenticated(DOES_NOT_ANSWER_OUTBOX_ROW),
+            };
+            assert_eq!(verdict, alone, "{plain:?}");
+        }
+        // No row at all answers nothing; a row to another host refuses the
+        // sender, as `accept_result` does.
+        let object = result(&w, &f, &status(ID));
+        let none = accept_result_among(
+            &object,
+            &w.m,
+            &w.recipient("host-a", true),
+            &[],
+            &w.encs,
+            NOW,
+        );
+        assert_eq!(
+            none,
+            (
+                result_refused_authenticated(DOES_NOT_ANSWER_OUTBOX_ROW),
+                None
+            )
+        );
+        let mut elsewhere = expected(&w);
+        elsewhere.recipient.host_id = "host-c".into();
+        let (verdict, answered) = accept_result_among(
+            &object,
+            &w.m,
+            &w.recipient("host-a", true),
+            &[elsewhere],
+            &w.encs,
+            NOW,
+        );
+        assert_eq!(
+            (verdict, answered),
+            (result_refused(NOT_THE_RECIPIENT, &object), None)
+        );
     }
 
     #[test]
