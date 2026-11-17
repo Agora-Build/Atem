@@ -6,6 +6,7 @@ use crate::runtime::collab::results::{
 };
 use crate::runtime::collab::{self, Candidate, DirectoryRow, MessageView, SendRequest};
 use crate::runtime::collab_context::{self, ContextSpec, VaultRef};
+use crate::runtime::delegated::remote_send::RemotePart;
 use crate::runtime::host_work::MessageRecord;
 use anyhow::{Result, anyhow, bail};
 use atem_client::session::messages::{
@@ -1445,7 +1446,11 @@ impl HostBridge {
             &request.memory,
             &request.vault,
         )?;
-        if request.launch
+        // Other hosts (host senders, behind the debug-only hook): the plan
+        // checks `--launch` itself; without one, stage 1's rule.
+        let remote = self.remote_plan(atem_id, &request.to, request.launch)?;
+        if remote.is_none()
+            && request.launch
             && !request.to.iter().any(|s| {
                 s.parse::<Selector>().is_ok_and(|s| {
                     matches!(s,
@@ -1457,6 +1462,11 @@ impl HostBridge {
                 "use --launch with atem:<atem_id>/<route_id>; the route must allow launch = on_message"
             );
         }
+        // One budget of 32 across the local part and the other hosts'.
+        let (budget, remote) = match remote {
+            Some((budget, part)) => (budget, Some(part)),
+            None => (MAX_AGENTS, None),
+        };
         let origin = sessions
             .get(from)
             .filter(|s| s.is_live())
@@ -1477,7 +1487,7 @@ impl HostBridge {
                 host: self.work_host(),
                 destination: Destination::Select {
                     selectors: request.to.clone(),
-                    budget: MAX_AGENTS,
+                    budget,
                     launch: false,
                 },
             }],
@@ -1511,10 +1521,18 @@ impl HostBridge {
                     origin: source.clone(),
                     launch: request.launch,
                     context: specs,
+                    remote,
                 },
             )?;
         } else {
-            self.collab_accept(atem_id, &message, &source, request.launch, sessions)?;
+            self.collab_accept(
+                atem_id,
+                &message,
+                &source,
+                request.launch,
+                sessions,
+                remote.as_ref(),
+            )?;
         }
         Ok(message.message_id)
     }
@@ -1525,7 +1543,9 @@ impl HostBridge {
     /// `launch = "on_message"` and no agent start one (spec section 5). A
     /// send whose session ended while its context was published still makes
     /// its tasks, with their return grants ended from the start: their
-    /// replies are kept, never delivered.
+    /// replies are kept, never delivered. `remote`: its part for other
+    /// hosts (host senders), whose envelopes are sealed and enqueued in the
+    /// same transaction.
     pub(super) fn collab_accept(
         &mut self,
         atem_id: &str,
@@ -1533,6 +1553,7 @@ impl HostBridge {
         origin: &Origin,
         launch: bool,
         sessions: &BTreeMap<SessionId, BrokerSession>,
+        remote: Option<&RemotePart>,
     ) -> Result<()> {
         // Replies are result rows (`collab_reply`), never messages.
         if message.kind != MessageKind::Request {
@@ -1640,12 +1661,15 @@ impl HostBridge {
                     &message.workflow_id,
                     message.created_at,
                 )?;
-                collab::count_received(
-                    tx,
-                    &self.work.config.collab,
-                    &message.workflow_id,
-                    message.created_at,
-                )?;
+                // A send to other hosts only receives nothing here.
+                if remote.is_none_or(|part| part.local) {
+                    collab::count_received(
+                        tx,
+                        &self.work.config.collab,
+                        &message.workflow_id,
+                        message.created_at,
+                    )?;
+                }
                 tx.execute(
                     "INSERT INTO origins(message_id,record) VALUES(?1,?2)",
                     rusqlite::params![message.message_id, serde_json::to_string(origin)?],
@@ -1671,8 +1695,20 @@ impl HostBridge {
                     }
                 }
                 self.collab_reserve_launches(tx, &plan)?;
-                collab::persist(tx, message, resolved)
+                if let Some(part) = remote {
+                    self.remote_seal(tx, atem_id, message, part)?;
+                }
+                collab::persist(tx, message, resolved, remote.is_none_or(|p| p.local))
             })?;
+        // Debug builds: the runtime is killed here, the message and its
+        // envelopes committed, none put yet.
+        #[cfg(not(test))]
+        if remote.is_some() {
+            crate::runtime::test_hooks::crash_point(
+                "crash_after_outbox_commit",
+                "after a message's envelopes to other hosts were committed, before any put",
+            );
+        }
         self.collab_start_launches(plan, message.expires_at);
         Ok(())
     }
@@ -1770,6 +1806,7 @@ impl HostBridge {
                         &publication.origin,
                         publication.launch,
                         cx.sessions,
+                        publication.remote.as_ref(),
                     )
                 });
                 if let Err(error) = result {

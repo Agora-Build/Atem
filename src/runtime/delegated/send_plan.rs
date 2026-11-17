@@ -175,7 +175,7 @@ fn project_hosts(list: &Membership, me: &str, labels: &[Label]) -> Vec<String> {
 
 /// This host may sign envelopes: a current host at its own trust
 /// generation, `authorized` (§11.5's sender rule).
-fn signs(list: &Membership, me: Me<'_>) -> Result<(), String> {
+pub fn signs(list: &Membership, me: Me<'_>) -> Result<(), String> {
     if list
         .host(me.host_id)
         .is_none_or(|h| h.host_trust_gen != me.host_trust_gen)
@@ -237,4 +237,4 @@ impl Target {
 
 #[cfg(test)]
 #[path = "send_plan_tests.rs"]
-mod tests;
+pub(crate) mod tests;

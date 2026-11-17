@@ -62,7 +62,7 @@ impl HostBridge {
 
     /// The store the mailbox reads and writes, and the identity it binds
     /// (the module docs): none with the hook's `host.senders` off.
-    fn mail_store(&self) -> Option<(&Store, HostIdentity)> {
+    pub(crate) fn mail_store(&self) -> Option<(&Store, HostIdentity)> {
         if !(self.features.delegated && self.features.senders) {
             return None;
         }
@@ -82,7 +82,10 @@ impl HostBridge {
         if let Some((store, identity)) = self.mail_store()
             && self.work.mail_prepared.as_ref() != Some(&identity.host)
         {
-            match mailbox_store::prepare(store) {
+            // The sending host's outbox tables too (`remote_send`).
+            match mailbox_store::prepare(store)
+                .and_then(|()| crate::runtime::delegated::remote_send::prepare(store))
+            {
                 Ok(()) => self.work.mail_prepared = Some(identity.host),
                 Err(error) => log_limited(&UNPREPARED, || {
                     format!(
@@ -130,8 +133,8 @@ impl HostBridge {
                 }
                 PageCheck::Nothing
             }
-            // This host puts nothing (the sending host's outbox isn't
-            // built): answers to puts it never made change nothing (rule 8).
+            // This host puts nothing yet: answers to puts it never made
+            // change nothing (rule 8).
             Ok(MailboxToHost::Stored(_) | MailboxToHost::PutRefused(_)) => PageCheck::Nothing,
         };
         if let PageCheck::Apply(applying) = check {

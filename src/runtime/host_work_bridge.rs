@@ -75,6 +75,8 @@ mod delegated_launches;
 mod delegated_recovery;
 #[path = "delegated/requests.rs"]
 mod delegated_requests;
+#[path = "delegated/send_pass.rs"]
+mod delegated_send_pass;
 
 /// The local sender exists only on the broker's internal attachment.
 pub(crate) enum Sender {
@@ -2908,6 +2910,7 @@ mod local_tests {
         include!("delegated/reverify_tests.rs");
         include!("delegated/host_effects_tests.rs");
         include!("delegated/mail_pass_tests.rs");
+        include!("delegated/send_pass_tests.rs");
     }
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::broker::{InProcess, Launcher};
@@ -3903,6 +3906,7 @@ principals = ["local"]
                     context: vec![ContextSpec::Vault {
                         reference: VaultRef::parse("v-context:1@1").unwrap(),
                     }],
+                    remote: None,
                 },
             )
             .unwrap();
@@ -3985,6 +3989,7 @@ principals = ["local"]
                     context: vec![ContextSpec::Vault {
                         reference: VaultRef::parse("v-context:1@1").unwrap(),
                     }],
+                    remote: None,
                 },
             )
             .unwrap();
@@ -4020,6 +4025,7 @@ principals = ["local"]
                     context: vec![ContextSpec::Vault {
                         reference: VaultRef::parse("v-context:1@1").unwrap(),
                     }],
+                    remote: None,
                 },
             )
             .unwrap();
@@ -4807,7 +4813,7 @@ principals = ["local"]
                 assert!(message.valid_local(), "{problem}");
                 let error = rig
                     .bridge
-                    .collab_accept("atem-host", &message, &origin, false, &rig.sessions)
+                    .collab_accept("atem-host", &message, &origin, false, &rig.sessions, None)
                     .unwrap_err();
                 assert_eq!(error.to_string(), problem);
                 assert_eq!(rows(&rig, "counters"), 0, "{problem}");
@@ -4816,7 +4822,7 @@ principals = ["local"]
             // The same message without the problem is accepted, and counts once.
             message.context = vec![snapshot("fits")];
             rig.bridge
-                .collab_accept("atem-host", &message, &origin, false, &rig.sessions)
+                .collab_accept("atem-host", &message, &origin, false, &rig.sessions, None)
                 .unwrap();
             assert_eq!(counted(&rig, &format!("send:{}", message.workflow_id)), 1);
             assert_eq!(
@@ -5062,7 +5068,7 @@ launch = "on_message"
     fn accept(rig: &mut LocalRig, message: &Message, launch: bool) {
         let origin = origin_of(rig);
         rig.bridge
-            .collab_accept("atem-host", message, &origin, launch, &rig.sessions)
+            .collab_accept("atem-host", message, &origin, launch, &rig.sessions, None)
             .unwrap();
     }
 
@@ -5238,6 +5244,7 @@ launch = "on_message"
                         context: vec![ContextSpec::Vault {
                             reference: VaultRef::parse("v-context:1@1").unwrap(),
                         }],
+                        remote: None,
                     },
                 )
                 .unwrap();
@@ -6048,7 +6055,7 @@ launch = "on_message"
             let origin = origin_of(&rig);
             let refused = rig
                 .bridge
-                .collab_accept("atem-host", &message, &origin, true, &rig.sessions)
+                .collab_accept("atem-host", &message, &origin, true, &rig.sessions, None)
                 .unwrap_err();
             assert!(
                 refused

@@ -39,6 +39,8 @@ pub mod host_senders;
 pub mod intents;
 pub mod mailbox;
 pub mod mailbox_store;
+pub mod outbox;
+pub mod remote_send;
 pub mod resolve;
 pub mod send_plan;
 pub mod start;

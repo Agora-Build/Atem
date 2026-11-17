@@ -383,7 +383,10 @@ pub(super) fn task_problem(task: &WorkTask, host: &HostTarget) -> Option<&'stati
     if task.valid_local(host) {
         return None;
     }
-    let control = |text: &str| text.chars().any(|c| c.is_control() && c != '\n' && c != '\t');
+    let control = |text: &str| {
+        text.chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t')
+    };
     Some(
         if control(&task.prompt) || task.context.iter().any(|c| control(&c.text)) {
             TASK_CONTROL_CHARACTERS
@@ -439,6 +442,10 @@ pub(super) struct Publication {
     /// The sender's `--launch`, kept until the message is accepted.
     pub launch: bool,
     pub context: Vec<super::collab_context::ContextSpec>,
+    /// Its part for other hosts (host senders, behind the debug-only hook),
+    /// sealed once the context is frozen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<crate::runtime::delegated::remote_send::RemotePart>,
 }
 
 impl Publication {
@@ -494,6 +501,15 @@ pub(super) fn reserve_context(
         "INSERT INTO publications(message_id,record) VALUES(?1,?2)",
         params![message.message_id, serde_json::to_string(publication)?],
     )?;
+    // Its rows for other hosts publish with it.
+    if let Some(part) = &publication.remote {
+        crate::runtime::delegated::remote_send::reserve(
+            &tx,
+            &message.message_id,
+            part,
+            message.created_at,
+        )?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -532,10 +548,14 @@ pub(super) fn publication_state(
     Ok(())
 }
 
+/// The message's local part (`local`: a selector could reach this host's
+/// agents; a send to other hosts only has a nominal one, which matches
+/// nothing) accepted with its resolution.
 pub(super) fn persist(
     tx: &Transaction<'_>,
     message: &Message,
     resolution: &[ResolvedTask],
+    local: bool,
 ) -> Result<()> {
     tx.execute(
         "INSERT INTO outbox(message_id,envelope,state,detail,next_try_ms,created_ms)
@@ -544,7 +564,9 @@ pub(super) fn persist(
         params![
             message.message_id,
             serde_json::to_string(message)?,
-            if resolution.is_empty() {
+            if !local {
+                "no local agent addressed"
+            } else if resolution.is_empty() {
                 "no_match"
             } else {
                 "delivered to local queue"
@@ -1203,7 +1225,10 @@ mod tests {
         for frame in [Some(&message), Some(&result), None] {
             assert!(render(&full, frame).len() <= MAX_PROMPT_BYTES);
         }
-        let over = local_task("Review the API contract", vec![snapshot(&"x".repeat(room + 1))]);
+        let over = local_task(
+            "Review the API contract",
+            vec![snapshot(&"x".repeat(room + 1))],
+        );
         assert_eq!(
             task_problem(&over, &host),
             Some("the prompt with its context is over 32 KiB")
@@ -1219,10 +1244,7 @@ mod tests {
         };
         assert_eq!(task_problem(&local_task("work", vec![]), &host), None);
         assert_eq!(
-            task_problem(
-                &local_task("work", vec![snapshot("fine\n\tlines")]),
-                &host
-            ),
+            task_problem(&local_task("work", vec![snapshot("fine\n\tlines")]), &host),
             None
         );
         assert_eq!(
