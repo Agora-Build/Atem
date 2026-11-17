@@ -180,7 +180,7 @@ pub struct LinkAssociation {
 
 impl LinkAssociation {
     /// Every part present and in its grammar.
-    fn complete(&self) -> bool {
+    pub(crate) fn complete(&self) -> bool {
         account_ok(&self.account_id)
             && id_ok(&self.host_id)
             && (1..=MAX_SAFE_INTEGER).contains(&self.host_trust_gen)

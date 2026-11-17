@@ -2030,8 +2030,9 @@ fn r9_fixtures_run_against_the_real_runtime() {
     // `r9-vectors-host-envelope` (host-work-v1 §11.5) and
     // `r9-vectors-station-calls` (§11.4's six Station calls and three
     // refusals, byte for byte); 102 with the six `r9-delegated-*` host
-    // scenarios (R9.14 items 1-7).
-    assert_eq!(files.len(), 102, "the r9 fixture files");
+    // scenarios (R9.14 items 1-7); 103 with `r9-vectors-mailbox-calls`
+    // (§11.5's mailbox calls and the reference mailbox's scenarios).
+    assert_eq!(files.len(), 103, "the r9 fixture files");
     let only = std::env::var("ATEM_FIXTURE").ok();
     let mut not_expressible = Vec::new();
     let mut runnable = Vec::new();

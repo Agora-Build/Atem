@@ -64,6 +64,7 @@ use crate::signed::SignedObject;
 pub mod body;
 pub mod mailbox;
 pub mod receive;
+pub mod reference;
 pub mod seal;
 #[cfg(test)]
 mod test_support;
@@ -76,6 +77,9 @@ pub use mailbox::object_hash;
 pub use receive::{
     EnvelopeVerdict, ExpectedResult, Recipient, ResultVerdict, accept_result, evidence_hash,
     open_envelope,
+};
+pub use reference::{
+    CurrentHosts, MailboxTransition, Quota, Quotas, ReferenceMailbox, Reset, Usage,
 };
 pub use seal::{seal_envelope, seal_info, seal_result, unseal_envelope, unseal_result};
 #[cfg(feature = "test-vectors")]

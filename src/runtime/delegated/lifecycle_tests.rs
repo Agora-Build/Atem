@@ -1222,7 +1222,10 @@ fn message_tasks_of_delegated_senders_are_delegated() {
         else {
             panic!("a message result");
         };
-        assert!(matches!(receipt.recipients[1].delivery, Delivery::Stored));
+        assert!(matches!(
+            receipt.recipients[1].delivery,
+            Delivery::Stored {}
+        ));
         let admission = stored_record(&rig, &task)
             .delegated
             .expect("a delegated sender's message task");

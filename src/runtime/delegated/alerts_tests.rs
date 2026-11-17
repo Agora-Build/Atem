@@ -498,7 +498,10 @@ fn sixty_four_from_one_sender_refuse_its_new_tasks() {
         else {
             panic!("a message result");
         };
-        assert!(matches!(receipt.recipients[0].delivery, Delivery::Stored));
+        assert!(matches!(
+            receipt.recipients[0].delivery,
+            Delivery::Stored {}
+        ));
         // A retry of the task accepted before: its status.
         assert!(matches!(
             ask_req(&mut rig, &s.phone, &below),

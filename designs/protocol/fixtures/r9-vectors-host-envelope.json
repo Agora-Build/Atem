@@ -2510,6 +2510,53 @@
         "M10_add_host_evil"
       ],
       "expect": {
+        "object_id": "ab027163-acce-4c80-9f86-94293606fbbc",
+        "reason": "result_id_mismatch",
+        "sender": {
+          "host_id": "host-b",
+          "host_trust_gen": 1
+        },
+        "verdict": "refused_authenticated"
+      },
+      "label": "result_id_mismatch_off_the_row",
+      "note": "a result whose reply's result_id isn't its task's, for a task the outbox row's resolution doesn't list: it fails both checks and is refused result_id_mismatch, the check that runs first (with the plaintext, before the row's)",
+      "now": 1793620801000,
+      "object": "result_id_mismatch",
+      "outbox": {
+        "cancel_complete_ids": [
+          "5708ecb4-c190-4bb2-b98d-c3752e859ffd",
+          "d04169ed-60c8-4915-8978-12f97a27b8a9"
+        ],
+        "message_id": "24fcff6b-c10f-47e2-ba6b-b2dd08bf02f7",
+        "recipient": {
+          "host_id": "host-b",
+          "host_trust_gen": 1
+        },
+        "task_ids": [
+          "e8ed07b0-8add-4025-8618-c4d56996f9f0"
+        ]
+      },
+      "receiver": {
+        "generated": [
+          "host-a-enc-1",
+          "host-a-enc-2"
+        ],
+        "host_id": "host-a",
+        "host_trust_gen": 1,
+        "keys": [
+          "host-a-enc-1"
+        ]
+      }
+    },
+    {
+      "call": "accept_result",
+      "chain": [
+        "M7_add_host_b",
+        "M8_enc_a",
+        "M9_enc_b",
+        "M10_add_host_evil"
+      ],
+      "expect": {
         "object_id": "abfc0bda-2277-440a-b4b9-17fb9782d82a",
         "reason": "does_not_answer_outbox_row",
         "sender": {

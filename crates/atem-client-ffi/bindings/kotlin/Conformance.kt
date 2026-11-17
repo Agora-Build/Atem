@@ -1427,7 +1427,7 @@ fun main(args: Array<String>) {
             mailExpect(c, verdict, plain)
             n++
         }
-        check(n >= 44) { "$n checks" }
+        check(n >= 60) { "$n checks" }
         // Through a platform provider (the JDK's crypto, as an app's
         // Keystore would): the request opens, and the re-signed copy's seal
         // doesn't (ProviderException.OpenFailed), so it is refused
@@ -1460,7 +1460,7 @@ fun main(args: Array<String>) {
             mailExpect(c, verdict, plain)
             n++
         }
-        check(n >= 9) { "$n checks" }
+        check(n >= 20) { "$n checks" }
     }
 
     // ------------------------------------------------------------ recovery

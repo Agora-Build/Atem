@@ -393,6 +393,33 @@ fn reverify_keeps_state() {
 }
 
 #[test]
+fn hosts_lists_the_current_hosts_at_their_newest_generation() {
+    // What a Station's reference mailbox takes as its copy of the list
+    // (`host_mail::CurrentHosts::of`).
+    let mut log = Log::new();
+    assert_eq!(log.m.hosts().count(), 0);
+    log.add_host("host-a", 1);
+    log.add_host("host-b", 1);
+    log.add_host("host-a", 2);
+    log.add_host("host-c", 1);
+    log.remove_host("host-b");
+    let hosts: Vec<(&str, u64)> = log
+        .m
+        .hosts()
+        .map(|h| (h.host_id.as_str(), h.host_trust_gen))
+        .collect();
+    assert_eq!(hosts, [("host-a", 2), ("host-c", 1)]);
+    let current = atem_client::host_mail::CurrentHosts::of(&log.m);
+    assert_eq!(
+        current.iter().collect::<Vec<_>>(),
+        [("host-a", 2), ("host-c", 1)]
+    );
+    assert!(current.is_current("host-a", 2));
+    assert!(!current.is_current("host-a", 1));
+    assert_eq!(current.generation("host-b"), None);
+}
+
+#[test]
 fn membership_epoch_changes_only_on_readd() {
     let mut log = Log::new();
     let a1 = log.add_host("host-a", 1);

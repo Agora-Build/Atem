@@ -726,10 +726,10 @@ fn the_fake_mailbox_follows_the_put_rules() {
     // `forbidden`.
     let other_sender = SenderHost::new(&log, OTHER_HOST, 1, &secret("host mail other host"));
     let mut station_put = |object: &atem_client::SignedObject| {
-        let put = atem_client::host_mail::mailbox::MailboxPut {
-            request_id: uuid::Uuid::new_v4().to_string(),
-            object: object.clone(),
-        };
+        let put = atem_client::host_mail::mailbox::MailboxPut::new(
+            uuid::Uuid::new_v4().to_string(),
+            object.clone(),
+        );
         station.put(SENDER, 1, put.to_json().unwrap().to_string().as_bytes())
     };
     let theirs = other_sender.cancel(&to, head);
@@ -818,10 +818,10 @@ fn the_fake_mailbox_charges_the_wire_bytes_and_limits_the_account() {
         per_sender_bytes: compact,
         ..MailboxQuota::default()
     });
-    let put = atem_client::host_mail::mailbox::MailboxPut {
-        request_id: uuid::Uuid::new_v4().to_string(),
-        object: object.clone(),
-    };
+    let put = atem_client::host_mail::mailbox::MailboxPut::new(
+        uuid::Uuid::new_v4().to_string(),
+        object.clone(),
+    );
     let spaced = serde_json::to_string_pretty(&put.to_json().unwrap()).unwrap();
     let answer = station
         .put(SENDER, 1, spaced.as_bytes())

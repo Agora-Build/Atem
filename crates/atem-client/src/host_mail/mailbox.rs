@@ -209,6 +209,21 @@ impl MailboxMismatch {
 
 // ------------------------------------------------------------ mailbox_put
 
+/// The most bytes a put's object may take as received: 512 KiB
+/// ([`MAX_MAILBOX_MESSAGE_BYTES`]) less a page's own fields with every number
+/// at its largest (2^53 − 1), so that a page can carry it at every position
+/// (rules 4 and 9). The bound is deliberately position-independent: a page's
+/// fields at position 1 are 60 bytes shorter and would carry up to 524,073
+/// bytes, but a Station can't know at a put where the object will be served,
+/// and one it stored but couldn't serve would keep every later object behind
+/// it (rule 4). A put's own fields are 178 bytes fewer than the largest
+/// page's, so a 512 KiB put can carry more: the reader refuses such a put,
+/// `too_large`, and the Station drops it as a put it can't read (Atem's
+/// reading, agreed with Astation 2026-11-16, #120 comment 6930157163). No
+/// builder makes one: the largest
+/// sealed object is about 328 KB.
+pub const MAX_SERVED_OBJECT_BYTES: usize = 524_013;
+
 /// `mailbox_put{request_id, object}` (host → Station): store `object`, one
 /// `atem-envelope` or `atem-result` of the calling host, in the mailbox its
 /// `recipient` names (rule 3). The Station reads the body only
@@ -216,14 +231,44 @@ impl MailboxMismatch {
 /// `id`) is refused by this reader, and the Station drops it unanswered. So
 /// is one whose sealed part isn't of the right shape (`enc` and `ct`
 /// base64url, `enc` 32 bytes, `ct` at least a tag): Atem's reading of rule 3,
-/// agreed with Astation (2026-11-16). The sealed part is never opened or judged.
+/// agreed with Astation (2026-11-16). And so is one whose object, as
+/// received, is over [`MAX_SERVED_OBJECT_BYTES`]. The sealed part is never
+/// opened or judged.
+///
+/// The object is kept as a value and as its exact bytes as received
+/// ([`MailboxPut::object_bytes`]): what the Station charges (design II.4.3,
+/// "the encoded wire bytes it received"), as a page keeps each object's
+/// (`MailboxEntry::bytes`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailboxPut {
     pub request_id: String,
-    pub object: SignedObject,
+    object: SignedObject,
+    object_bytes: Vec<u8>,
 }
 
 impl MailboxPut {
+    /// A sender's put of `object`: its bytes are its compact JSON, what
+    /// the builder writes.
+    pub fn new(request_id: impl Into<String>, object: SignedObject) -> Self {
+        MailboxPut {
+            request_id: request_id.into(),
+            object_bytes: object.to_json().to_string().into_bytes(),
+            object,
+        }
+    }
+
+    /// The object carried.
+    pub fn object(&self) -> &SignedObject {
+        &self.object
+    }
+
+    /// The object's exact bytes as the put carried them (the text of its
+    /// value in the message, from its first to its last byte), or its
+    /// compact JSON for a put built here.
+    pub fn object_bytes(&self) -> &[u8] {
+        &self.object_bytes
+    }
+
     /// The object's kind and body: the recipient it routes to, the sender
     /// rule 1 checks against the caller, the `id` of its key, the times.
     /// Never authority: the receiving host judges the object (II.4.2).
@@ -232,6 +277,9 @@ impl MailboxPut {
     }
 
     fn check(&self) -> Result<()> {
+        if self.object_bytes.len() > MAX_SERVED_OBJECT_BYTES {
+            return Err(RelayError::TooLarge);
+        }
         check_request_id(&self.request_id)?;
         self.mail().map(drop)
     }
@@ -245,22 +293,32 @@ impl MailboxPut {
         finish(m)
     }
 
-    /// Reads received bytes, strictly.
+    /// Reads received bytes, strictly. The object keeps its exact bytes as
+    /// received.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        Self::read(parse(bytes)?.value())
+        Self::read(parse(bytes)?.value(), bytes)
     }
 
-    fn read(root: &Value) -> Result<Self> {
+    /// `root` is the strict parse of `bytes`.
+    fn read(root: &Value, bytes: &[u8]) -> Result<Self> {
         let f = Fields::message(
             root,
             op::MAILBOX_PUT,
             &["type", "op", "request_id", "object"],
         )?;
         let request_id = f.text("request_id")?.to_owned();
+        let value = f.get("object")?;
+        // The bound before the object is read (and before its bytes are
+        // copied).
+        let object_bytes = put_object_bytes(bytes)?;
         // A part of the strict parse; read as a mailbox object (check 1).
-        let object = SignedObject::from_value(f.get("object")?)
-            .map_err(|_| RelayError::Malformed("object"))?;
-        let put = MailboxPut { request_id, object };
+        let object =
+            SignedObject::from_value(value).map_err(|_| RelayError::Malformed("object"))?;
+        let put = MailboxPut {
+            request_id,
+            object,
+            object_bytes,
+        };
         put.check()?;
         Ok(put)
     }
@@ -269,6 +327,26 @@ impl MailboxPut {
     fn id(&self) -> Option<String> {
         self.mail().ok().map(|(_, body)| body.id)
     }
+}
+
+/// The exact text of a put's object in `bytes`, at most
+/// [`MAX_SERVED_OBJECT_BYTES`] (`too_large` otherwise, before anything is
+/// copied): a second read of a message the strict parse has already taken,
+/// so it only finds where the object's text starts and ends.
+fn put_object_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+    use serde::Deserialize;
+    use serde_json::value::RawValue;
+    #[derive(Deserialize)]
+    struct Put<'a> {
+        #[serde(borrow)]
+        object: &'a RawValue,
+    }
+    let put: Put = serde_json::from_slice(bytes).map_err(|_| RelayError::NotStrict)?;
+    let text = put.object.get();
+    if text.len() > MAX_SERVED_OBJECT_BYTES {
+        return Err(RelayError::TooLarge);
+    }
+    Ok(text.as_bytes().to_vec())
 }
 
 /// `mailbox_stored{request_id, id}` (Station → host): the put `request_id`
@@ -900,7 +978,7 @@ impl MailboxToStation {
         let root = parse(bytes)?;
         let root = root.value();
         match op_of(root) {
-            Some(op::MAILBOX_PUT) => MailboxPut::read(root).map(Self::Put),
+            Some(op::MAILBOX_PUT) => MailboxPut::read(root, bytes).map(Self::Put),
             Some(op::MAILBOX_SYNC) => MailboxSync::read(root).map(Self::Sync),
             Some(op::MAILBOX_DONE) => MailboxDone::read(root).map(Self::Done),
             _ => Err(RelayError::WrongMessage),
@@ -1011,10 +1089,7 @@ mod tests {
     }
 
     fn put() -> MailboxPut {
-        MailboxPut {
-            request_id: REQUEST.into(),
-            object: object(),
-        }
+        MailboxPut::new(REQUEST, object())
     }
 
     fn sync(after: u64) -> MailboxSync {
@@ -1367,9 +1442,14 @@ mod tests {
             );
         }
         // A put whose object an older or newer serialization wrote reads the
-        // same: the object is a value, not its bytes.
+        // same object; its exact bytes as received are kept beside it.
         let spaced = serde_json::to_string_pretty(&good).unwrap();
-        assert_eq!(MailboxPut::decode(spaced.as_bytes()).unwrap(), put());
+        let read = MailboxPut::decode(spaced.as_bytes()).unwrap();
+        assert_eq!(
+            (&read.request_id, read.object()),
+            (&put().request_id, &object())
+        );
+        assert_ne!(read.object_bytes(), put().object_bytes());
     }
 
     #[test]
@@ -1641,17 +1721,20 @@ mod tests {
     // ----------------------------------------------------------- bounds
 
     /// A put of exactly `size` bytes: the object's ciphertext grown to just
-    /// under it, then JSON whitespace after the message.
+    /// under the size, and the object to at most what a page can serve
+    /// ([`MAX_SERVED_OBJECT_BYTES`]), then JSON whitespace after the message.
     fn put_of_size(size: usize) -> Vec<u8> {
         let wire = put().to_json().unwrap();
         let ct = b64u_decode_len(&wire["object"]["ct"]);
+        let room =
+            size.min(MAX_SERVED_OBJECT_BYTES + bytes(&wire).len() - bytes(&wire["object"]).len());
         // Base64url without padding: 4 characters per 3 bytes.
-        let mut extra = (size - bytes(&wire).len()) / 4 * 3;
+        let mut extra = (room - bytes(&wire).len()) / 4 * 3;
         loop {
             let mut changed = wire.clone();
             changed["object"]["ct"] = json!(b64u(&vec![0u8; ct + extra]));
             let mut text = bytes(&changed);
-            if text.len() <= size {
+            if text.len() <= room {
                 text.resize(size, b' ');
                 return text;
             }
@@ -1685,20 +1768,146 @@ mod tests {
         let big = MailboxPut::decode(&put_of_size(MAX_MAILBOX_MESSAGE_BYTES - 4)).unwrap();
         assert!(big.to_json().is_ok());
         // The put's builder refuses an object that takes it over the bound.
-        let too_big = MailboxPut {
-            request_id: REQUEST.into(),
-            object: SignedObject::from_value(&wire["object"]).unwrap(),
-        };
+        let too_big = MailboxPut::new(REQUEST, SignedObject::from_value(&wire["object"]).unwrap());
         assert_eq!(too_big.to_json(), Err(RelayError::TooLarge));
+        // Nor would a page at the largest positions carry it.
         let over = MailboxSyncResult {
             request_id: REQUEST.into(),
             mailbox_id: MAILBOX.into(),
-            after: 0,
-            head: 1,
-            through: 1,
-            objects: vec![MailboxEntry::new(1, &too_big.object)],
+            after: MAX_SAFE_INTEGER - 1,
+            head: MAX_SAFE_INTEGER,
+            through: MAX_SAFE_INTEGER,
+            objects: vec![MailboxEntry::new(MAX_SAFE_INTEGER, too_big.object())],
         };
         assert_eq!(over.to_json(), Err(RelayError::TooLarge));
+    }
+
+    /// A put's text with `object` written as is.
+    fn put_text(object: &str) -> String {
+        format!(
+            r#"{{"type":"relay","op":"mailbox_put","request_id":"{REQUEST}","object": {object} }}"#
+        )
+    }
+
+    #[test]
+    fn a_put_keeps_its_objects_exact_bytes_as_received() {
+        // What a Station charges (design II.4.3, "the encoded wire bytes it
+        // received"): the object's text in the put, whatever its spacing or
+        // key order; a put built here carries its compact JSON.
+        assert_eq!(
+            put().object_bytes(),
+            object().to_json().to_string().as_bytes()
+        );
+        let wire = object().to_json();
+        let mut reordered = Map::new();
+        for key in ["sig", "ct", "body", "enc"] {
+            reordered.insert(key.to_owned(), wire[key].clone());
+        }
+        let pretty = serde_json::to_string_pretty(&Value::Object(reordered)).unwrap();
+        for read in [
+            MailboxPut::decode(put_text(&pretty).as_bytes()).unwrap(),
+            match MailboxToStation::decode(put_text(&pretty).as_bytes()).unwrap() {
+                MailboxToStation::Put(put) => put,
+                other => panic!("{other:?}"),
+            },
+        ] {
+            assert_eq!(read.object_bytes(), pretty.as_bytes());
+            assert_eq!(read.object(), &object());
+            // Built again, it is compact.
+            let again = MailboxPut::decode(&bytes(&read.to_json().unwrap())).unwrap();
+            assert_eq!(again, put());
+        }
+    }
+
+    /// The fields of a page with every number at its largest, or at
+    /// position 1, around an object of `object_len` bytes.
+    fn page_overhead(largest: bool) -> usize {
+        let (after, head, position) = if largest {
+            (MAX_SAFE_INTEGER - 1, MAX_SAFE_INTEGER, MAX_SAFE_INTEGER)
+        } else {
+            (0, 1, 1)
+        };
+        let page = MailboxSyncResult {
+            request_id: REQUEST.into(),
+            mailbox_id: MAILBOX.into(),
+            after,
+            head,
+            through: head,
+            objects: vec![MailboxEntry::new(position, &object())],
+        };
+        bytes(&page.to_json().unwrap()).len() - put().object_bytes().len()
+    }
+
+    #[test]
+    fn a_put_carries_only_an_object_a_page_can_serve_at_every_position() {
+        // A page's own fields, at their largest, leave this much for its
+        // object; at position 1 they are 60 bytes shorter, and a page there
+        // could carry up to 524,073, but the bound is position-independent.
+        assert_eq!(
+            MAX_SERVED_OBJECT_BYTES + page_overhead(true),
+            MAX_MAILBOX_MESSAGE_BYTES
+        );
+        assert_eq!(MAX_SERVED_OBJECT_BYTES, 524_013);
+        assert_eq!(MAX_MAILBOX_MESSAGE_BYTES - page_overhead(false), 524_073);
+        // An object of exactly the bound, as received, is read; a byte more
+        // is refused, `too_large`, and the Station drops the put.
+        let of_len = |len: usize, spaces: usize| -> String {
+            let wire = object().to_json();
+            let ct = b64u_decode_len(&wire["ct"]);
+            let mut extra = (len - spaces - wire.to_string().len()) / 4 * 3;
+            loop {
+                let mut changed = wire.clone();
+                changed["ct"] = json!(b64u(&vec![0u8; ct + extra]));
+                let text = changed.to_string();
+                if text.len() + spaces <= len {
+                    // Spaces inside the object, after its opening brace,
+                    // to reach the length exactly.
+                    let pad = len - text.len();
+                    return format!("{{{}{}", " ".repeat(pad), &text[1..]);
+                }
+                extra -= 1;
+            }
+        };
+        let at = of_len(MAX_SERVED_OBJECT_BYTES, 0);
+        assert_eq!(at.len(), MAX_SERVED_OBJECT_BYTES);
+        let read = MailboxPut::decode(put_text(&at).as_bytes()).unwrap();
+        assert_eq!(read.object_bytes().len(), MAX_SERVED_OBJECT_BYTES);
+        let over = of_len(MAX_SERVED_OBJECT_BYTES + 1, 0);
+        assert_eq!(
+            MailboxPut::decode(put_text(&over).as_bytes()),
+            Err(RelayError::TooLarge)
+        );
+        assert_eq!(
+            MailboxToStation::decode(put_text(&over).as_bytes()),
+            Err(RelayError::TooLarge)
+        );
+        // The bytes as received count: spaces inside the object take it
+        // over, though its compact JSON is under.
+        let spaced = of_len(MAX_SERVED_OBJECT_BYTES + 1, 8);
+        let compact: Value = serde_json::from_str(&spaced).unwrap();
+        assert!(compact.to_string().len() <= MAX_SERVED_OBJECT_BYTES);
+        assert_eq!(
+            MailboxPut::decode(put_text(&spaced).as_bytes()),
+            Err(RelayError::TooLarge)
+        );
+        // A sender's builder never makes one.
+        let well_over = of_len(MAX_SERVED_OBJECT_BYTES + 8, 0);
+        let big = SignedObject::from_value(&serde_json::from_str(&well_over).unwrap()).unwrap();
+        assert!(big.to_json().to_string().len() > MAX_SERVED_OBJECT_BYTES);
+        assert_eq!(
+            MailboxPut::new(REQUEST, big).to_json(),
+            Err(RelayError::TooLarge)
+        );
+        // Every object a put carries, a page serves at every position.
+        let page = MailboxSyncResult {
+            request_id: REQUEST.into(),
+            mailbox_id: MAILBOX.into(),
+            after: MAX_SAFE_INTEGER - 1,
+            head: MAX_SAFE_INTEGER,
+            through: MAX_SAFE_INTEGER,
+            objects: vec![MailboxEntry::new(MAX_SAFE_INTEGER, read.object())],
+        };
+        assert!(bytes(&page.to_json().unwrap()).len() <= MAX_MAILBOX_MESSAGE_BYTES);
     }
 
     // -------------------------------------------------------- answering

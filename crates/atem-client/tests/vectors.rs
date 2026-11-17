@@ -253,6 +253,8 @@ fn every_vectors_file_has_a_runner() {
             "r9-vectors-host-route.json",
             "r9-vectors-host-work-control.json",
             "r9-vectors-keys.json",
+            // Its runner is tests/mailbox_calls.rs.
+            "r9-vectors-mailbox-calls.json",
             "r9-vectors-membership-log.json",
             "r9-vectors-pairing.json",
             "r9-vectors-push-hint.json",
@@ -10612,7 +10614,7 @@ fn host_envelope_vectors(book: &Book) -> Value {
         message_id: mail_id("request"),
         recipients: vec![RecipientReceipt {
             recipient_id: mail_id("request recipient"),
-            delivery: Delivery::Stored,
+            delivery: Delivery::Stored {},
         }],
     };
     let f = ba(&g, "status");
@@ -11515,6 +11517,22 @@ fn host_envelope_vectors(book: &Book) -> Value {
         Some(outbox(&request_id)),
         e,
     );
+    // Both checks fail: the row's resolution doesn't list the task either.
+    // The `result_id` check comes first (host-work-v1 §11.5, Atem's reading
+    // agreed with Astation 2026-11-16).
+    let mut off_row = outbox(&request_id);
+    off_row["task_ids"] = serde_json::json!([mail_id("another task")]);
+    let e = g.refused_authenticated("result_id_mismatch", "result_id_mismatch");
+    g.check(
+        "result_id_mismatch_off_the_row",
+        "a result whose reply's result_id isn't its task's, for a task the outbox row's resolution doesn't list: it fails both checks and is refused result_id_mismatch, the check that runs first (with the plaintext, before the row's)",
+        "result_id_mismatch",
+        &b,
+        to_a,
+        MAIL_NOW,
+        Some(off_row),
+        e,
+    );
     let e = g.refused_authenticated("status", "does_not_answer_outbox_row");
     g.check(
         "does_not_answer_outbox_row",
@@ -11863,6 +11881,57 @@ fn host_envelope() {
         assert!(reasons.contains(reason), "no check refuses for {reason}");
     }
     run.pass("every reason of host_mail::receive has a check");
+
+    // The place of the `result_id` check (host-work-v1 §11.5, Atem's
+    // reading agreed with Astation): a result failing both it and the
+    // outbox row's check is `result_id_mismatch`. Read from the data: the
+    // reply's `result_id` against its task, the task against the row.
+    let mut both = Vec::new();
+    for c in file["checks"].as_array().unwrap() {
+        if c["call"] != "accept_result" {
+            continue;
+        }
+        let sealed = &objects[s(c, "object")]["sealed"];
+        let Some(plain) = sealed.get("plaintext").and_then(Value::as_str) else {
+            continue;
+        };
+        let plain: Value = serde_json::from_str(plain).unwrap();
+        if plain["kind"] != "result" {
+            continue;
+        }
+        let task = s(&plain, "task_id");
+        let mismatch =
+            s(&plain["reply"], "result_id") != atem_client::session::host_work::result_id(task);
+        let off_row = !c["outbox"]["task_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == task);
+        if mismatch && off_row {
+            assert_eq!(
+                c["expect"]["reason"],
+                "result_id_mismatch",
+                "{}",
+                s(c, "label")
+            );
+            both.push(s(c, "label").to_owned());
+        }
+        if !mismatch && off_row {
+            assert_eq!(
+                c["expect"]["reason"],
+                "does_not_answer_outbox_row",
+                "{}",
+                s(c, "label")
+            );
+        }
+    }
+    assert!(
+        !both.is_empty(),
+        "a result failing both the result_id and the row checks"
+    );
+    run.pass(format!(
+        "a result failing both the result_id and the row checks is result_id_mismatch ({both:?})"
+    ));
     run.finish();
 }
 

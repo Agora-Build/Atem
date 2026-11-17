@@ -4446,6 +4446,10 @@ package's X25519, HKDF and ChaCha20-Poly1305), and of
 `r9-vectors-station-calls` (each message of the Station calls and their
 refusals as strict I-JSON whose compact form in RFC 8785 key order is its
 text, its fields, and what it names in the control vectors and log L), and
+of `r9-vectors-mailbox-calls` (each mailbox call and answer the same way,
+each object's signature, `object_hash` and size, and every scenario run
+against a model of the Station's mailbox written there from host-work-v1
+§11.5, "The mailbox calls": each outcome, answer and state), and
 exits non-zero on a mismatch; it grows a checker per file. It derives no
 verdict, but those of `r9-vectors-host-envelope`, which it recomputes from
 the bytes, the device list and the receiver (host-work-v1 §11.5's checks,

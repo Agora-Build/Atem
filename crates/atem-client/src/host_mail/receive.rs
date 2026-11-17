@@ -2929,7 +2929,7 @@ mod tests {
             message_id: message_id.into(),
             recipients: vec![RecipientReceipt {
                 recipient_id: ID2.into(),
-                delivery: Delivery::Stored,
+                delivery: Delivery::Stored {},
             }],
         }
     }

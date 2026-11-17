@@ -143,6 +143,9 @@ pub const RECOVERY_SIGN: &str = "atem-recovery-sign-v1";
 pub const SAFETY_CODE: &str = "atem-safety-code-v2";
 /// A Station's report ids to the Portal (`control::ledger`).
 pub const STATION_REPORT_ID: &str = "atem-station-report-id-v1";
+/// The `mailbox_id`s the reference mailbox mints from its seed
+/// (`host_mail::reference`).
+pub const REFERENCE_MAILBOX_ID: &str = "atem-reference-mailbox-id-v1";
 
 #[cfg(test)]
 mod tests {
@@ -248,6 +251,7 @@ mod tests {
             RECOVERY_SIGN,
             SAFETY_CODE,
             STATION_REPORT_ID,
+            REFERENCE_MAILBOX_ID,
         ];
         let mut all: Vec<&str> = signing.iter().chain(others.iter()).copied().collect();
         let n = all.len();

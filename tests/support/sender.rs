@@ -206,10 +206,7 @@ impl SenderHost {
     /// `request_id`, the shared builder's message): the Station's answer,
     /// checked to answer the put (none: dropped, or lost).
     pub fn put(&self, station: &mut FakeStation, object: &SignedObject) -> Option<MailboxToHost> {
-        let put = MailboxPut {
-            request_id: uuid(),
-            object: object.clone(),
-        };
+        let put = MailboxPut::new(uuid(), object.clone());
         let bytes = put.to_json().expect("a put the shared builder makes");
         let answer = station.put(
             &self.host_id,

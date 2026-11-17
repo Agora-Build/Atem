@@ -1450,7 +1450,7 @@ impl FakeStation {
         {
             return Some(refused(PutRefusal::Expired));
         }
-        let hash = object_hash(&put.object);
+        let hash = object_hash(put.object());
         // Its bytes as received (design II.4.3: limits on the encoded wire
         // bytes), never a serialization of the fake's own.
         let size = received_object_len(bytes).unwrap_or(bytes.len());
@@ -1482,7 +1482,7 @@ impl FakeStation {
                 hash,
                 expires_at: body.expires_at,
                 bytes: size,
-                object: put.object.clone(),
+                object: put.object().clone(),
             },
         );
         self.stored_answer(&put)
