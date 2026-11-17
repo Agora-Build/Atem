@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A runtime.log line that would come at every pass (a store the mailbox
 /// can't use): the first, then at powers of two.
-fn log_limited(count: &AtomicU64, line: impl FnOnce() -> String) {
+pub(super) fn log_limited(count: &AtomicU64, line: impl FnOnce() -> String) {
     let n = count.fetch_add(1, Ordering::Relaxed) + 1;
     if n.is_power_of_two() {
         eprintln!("{} ({n} so far)", line());
@@ -82,9 +82,11 @@ impl HostBridge {
         if let Some((store, identity)) = self.mail_store()
             && self.work.mail_prepared.as_ref() != Some(&identity.host)
         {
-            // The sending host's outbox tables too (`remote_send`).
+            // The sending host's outbox tables too (`remote_send`), and
+            // admission's (`admit`).
             match mailbox_store::prepare(store)
                 .and_then(|()| crate::runtime::delegated::remote_send::prepare(store))
+                .and_then(|()| crate::runtime::delegated::admit::prepare(store))
             {
                 Ok(()) => self.work.mail_prepared = Some(identity.host),
                 Err(error) => log_limited(&UNPREPARED, || {

@@ -185,7 +185,7 @@ const TABLES: &str = "
     CREATE TABLE IF NOT EXISTS mailbox_inbox (
         n INTEGER PRIMARY KEY, sender_host TEXT NOT NULL, object_id TEXT NOT NULL,
         kind TEXT NOT NULL, plain BLOB NOT NULL, object_hash TEXT NOT NULL,
-        at_ms INTEGER NOT NULL);
+        at_ms INTEGER NOT NULL, expires_at INTEGER, signed_seq INTEGER);
     CREATE TABLE IF NOT EXISTS mailbox_refused (
         n INTEGER PRIMARY KEY, evidence TEXT NOT NULL UNIQUE, reason TEXT NOT NULL,
         sender_host TEXT, object_id TEXT, report INTEGER NOT NULL, bytes BLOB,
@@ -227,8 +227,12 @@ const TABLES: &str = "
 
 /// The columns the mailbox's tables gained after their first shape
 /// (review P5: a store made by an earlier build of this mailbox gets them
-/// when its tables are made): `(table, column, kind)`.
-const NEW_COLUMNS: [(&str, &str, &str); 8] = [
+/// when its tables are made): `(table, column, kind)`. An inbox row's
+/// object's expiry and `signed_at_head.seq` are admission's (an early stop
+/// is kept until its expiry; the sender's standing is checked again at
+/// admission); a row written before them has neither, and admission refuses
+/// it (it can't tell when it was signed).
+const NEW_COLUMNS: [(&str, &str, &str); 10] = [
     ("mailbox_cursor", "skip_at", "INTEGER"),
     ("mailbox_cursor", "skip_freed", "INTEGER NOT NULL DEFAULT 0"),
     ("mailbox_cursor", "freed", "INTEGER NOT NULL DEFAULT 0"),
@@ -237,6 +241,8 @@ const NEW_COLUMNS: [(&str, &str, &str); 8] = [
     ("mailbox_cursor", "read_to", "INTEGER NOT NULL DEFAULT 0"),
     ("mailbox_cursor", "skip_inbox_now", "INTEGER"),
     ("mailbox_pending", "no_room", "INTEGER NOT NULL DEFAULT 0"),
+    ("mailbox_inbox", "expires_at", "INTEGER"),
+    ("mailbox_inbox", "signed_seq", "INTEGER"),
 ];
 
 /// The mailbox's tables in `store`, made if missing (a table of an earlier
@@ -918,15 +924,17 @@ fn record(
                     EnvelopePlain::Complete { .. } => "complete",
                 };
                 tx.execute(
-                    "INSERT INTO mailbox_inbox(sender_host, object_id, kind, plain, object_hash, at_ms)
-                    VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO mailbox_inbox(sender_host, object_id, kind, plain, object_hash, at_ms,
+                        expires_at, signed_seq) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         body.sender.host_id,
                         body.id,
                         kind,
                         plain.to_bytes()?.as_slice(),
                         hash.to_hex(),
-                        now_ms()
+                        now_ms(),
+                        body.expires_at,
+                        body.signed_at_head.seq
                     ],
                 )?;
                 Decision::Opened

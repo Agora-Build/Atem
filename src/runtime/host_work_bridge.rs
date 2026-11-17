@@ -53,6 +53,8 @@ const TURN_INTERRUPTED: &str = "turn interrupted";
 mod collab_bridge;
 #[path = "collab_launch_bridge.rs"]
 mod collab_launch_bridge;
+#[path = "delegated/admit_pass.rs"]
+mod delegated_admit_pass;
 #[path = "delegated/dispatch.rs"]
 mod delegated_dispatch;
 #[path = "delegated/feed_pass.rs"]
@@ -1285,6 +1287,10 @@ impl HostBridge {
             );
         }
         self.work_fence_launches();
+        // Host senders' mail the mailbox committed (with `host.senders`):
+        // every inbox row decided, gate open or not, before anything of
+        // this pass is dispatched.
+        self.admit_mail(cx.sessions);
         if Instant::now() >= self.work.scheduled {
             self.work.scheduled = Instant::now() + Duration::from_millis(100);
             let inputs = self.work_inputs(cx.sessions);
@@ -2914,6 +2920,7 @@ mod local_tests {
         include!("delegated/host_effects_tests.rs");
         include!("delegated/mail_pass_tests.rs");
         include!("delegated/send_pass_tests.rs");
+        include!("delegated/admit_tests.rs");
     }
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::broker::{InProcess, Launcher};

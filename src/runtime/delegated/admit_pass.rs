@@ -1,0 +1,704 @@
+//! (`impl HostBridge`) Admission of host senders' mail on the receiving
+//! host (the delegated host-work design II.4.2 step 7, II.4.4, II.6, II.7;
+//! host-work-v1 §11.5, "On the receiving host"), with the debug-only hook's
+//! `host.senders` on. Each pass while hosting runs, gate open or not (the
+//! gate's mailbox part waits for the inbox, so admission never waits for
+//! it): every inbox row the mailbox committed becomes a decision in its
+//! own `BEGIN IMMEDIATE` transaction of the host-work store, with the row's
+//! removal and the status owed to its sender enqueued in the put engine
+//! (`outbox::enqueue`, until stored). Nothing reaches an agent, and
+//! nothing is put, before that commits. Its store is [`admit`].
+//!
+//! - **A request**: deduplicated against this host's own permanent records
+//!   (a message record, a recorded whole refusal: never only the mailbox's
+//!   claims); the sender's standing checked again on the committed list
+//!   (`signed_at_head` at or after its current generation and epoch); then
+//!   step 7: each recipient for this host's triple, with the sender's
+//!   permit (`host_sender_permits`) in place of a channel scope, `select`
+//!   expanded once with stage 1's `resolve` over the agents of routes that
+//!   consent to it; the limits; the message record, its tasks (each with
+//!   its admission record, `Admission::for_host`). A `cancel` or
+//!   `complete` waits in the inbox for now.
+//! - **Status objects** (II.4.4): the message's current status, sealed to
+//!   the sender's current `host_enc_key` with this host's
+//!   `host_channel_key`, signed at the committed head, at acceptance. A sender with no current key, or no longer a current host,
+//!   gets none: the record keeps the state for the owner.
+use super::*;
+use crate::runtime::delegated::admit::{self, InboxRow};
+use crate::runtime::delegated::host_senders::{
+    HostOp, HostSender, host_sender_permits, host_standing,
+};
+use crate::runtime::delegated::outbox::{self, Policy};
+use crate::runtime::host_work::MessageRecord;
+use crate::session_protocol::r9::HostKey;
+use atem_client::host_mail::{EnvelopePlain, HostRef, MailFields, ResultPlain};
+use atem_client::host_principal::{host_principal, host_principal_key, parse_host_principal};
+use atem_client::membership::{Membership, ProjectOp};
+use atem_client::session::messages::{
+    Delivery, Destination, Message, MessageReceipt, Recipient, RecipientReceipt,
+};
+use atem_client::session::select::Selector;
+use rusqlite::Transaction;
+use std::collections::BTreeSet;
+use std::sync::atomic::AtomicU64;
+
+/// Inbox rows decided per pass, at most (the inbox holds 128).
+const ROWS_PER_PASS: usize = 128;
+
+static UNADMITTED: AtomicU64 = AtomicU64::new(0);
+static UNSEALED: AtomicU64 = AtomicU64::new(0);
+
+/// What signs and seals this host's status objects (design II.4.4): its
+/// committed device list, itself as a current host at its own trust
+/// generation, its `host_channel_key`, its account and the delegated
+/// clock's `D`.
+struct Signing {
+    list: Arc<Membership>,
+    key: Arc<HostKey>,
+    me: HostRef,
+    account: String,
+    now_d: u64,
+}
+
+impl Signing {
+    /// `plain` sealed to host `to` (its current key, at its current trust
+    /// generation), signed at the committed head, alive 24 h: its exact
+    /// bytes and where they go. None when `to` can't receive one now (no
+    /// longer a current host, or no key), or the seal failed (a line).
+    fn seal(&self, to: &str, plain: &ResultPlain) -> Option<(Vec<u8>, HostRef)> {
+        let host = self.list.host(to)?;
+        let key = self.list.host_enc_key(to)?;
+        let target = HostRef {
+            host_id: to.to_owned(),
+            host_trust_gen: host.host_trust_gen,
+        };
+        let fields = MailFields {
+            account_id: self.account.clone(),
+            genesis_hash: self.list.genesis_hash(),
+            sender: self.me.clone(),
+            recipient: target.clone(),
+            enc_kid: atem_client::encoding::hex(&key.current.kid),
+            id: uuid::Uuid::new_v4().to_string(),
+            created_at: self.now_d,
+            expires_at: self.now_d.saturating_add(hw::MAX_LIFETIME_MS),
+            signed_at_head: self.list.head(),
+        };
+        match self.key.seal_result(&fields, plain, &key.current.key) {
+            Ok(object) => Some((object.to_json().to_string().into_bytes(), target)),
+            Err(error) => {
+                super::delegated_mail_pass::log_limited(&UNSEALED, || {
+                    format!("atem runtime: a status to host {to} couldn't be sealed ({error})")
+                });
+                None
+            }
+        }
+    }
+
+    /// The current status of `record` (a host sender's message) to its
+    /// sender, enqueued in `tx` (none when the sender can't receive one).
+    fn status(
+        &self,
+        tx: &Transaction,
+        store: &Store,
+        record: &MessageRecord,
+    ) -> anyhow::Result<()> {
+        let message_id = &record.message.message_id;
+        let plain = ResultPlain::Status {
+            message_id: message_id.clone(),
+            recipients: admit::receipts(store, record)?,
+        };
+        let sealed = parse_host_principal(&record.message.sender)
+            .and_then(|sender| self.seal(sender, &plain));
+        match sealed {
+            Some((bytes, to)) => {
+                let n = outbox::enqueue(tx, &bytes, &to, Policy::UntilStored)?;
+                admit::sent(tx, message_id, n)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// `{"kind":"status","object_id","refused":code}` to `sender`,
+    /// enqueued in `tx` (none when it can't receive one).
+    fn refusal(
+        &self,
+        tx: &Transaction,
+        sender: &str,
+        object_id: &str,
+        code: &str,
+    ) -> anyhow::Result<()> {
+        let plain = ResultPlain::Refusal {
+            object_id: object_id.to_owned(),
+            refused: code.to_owned(),
+        };
+        if let Some((bytes, to)) = self.seal(sender, &plain) {
+            outbox::enqueue(tx, &bytes, &to, Policy::UntilStored)?;
+        }
+        Ok(())
+    }
+}
+
+/// The ops of every project in effect that lists both `sender` and this
+/// host (`me`): a host sender's account permission toward it (design
+/// II.2.3), whatever the route.
+fn shared_ops(list: &Membership, me: &str, sender: &str) -> BTreeSet<ProjectOp> {
+    if sender == me {
+        return BTreeSet::new();
+    }
+    list.host_projects(sender)
+        .into_iter()
+        .filter(|name| list.project_hosts(name).contains(&me))
+        .filter_map(|name| list.project(name))
+        .flat_map(|project| project.ops.iter().copied())
+        .collect()
+}
+
+/// Whether `sender` may send now on `list` an object it signed at
+/// `signed_seq` (design II.3.1, check 3 again at admission): a current
+/// host, authorized at a generation and in a membership epoch at or before
+/// that head. A revoke and a readmit, or a removal and a re-add, since the
+/// object opened refuse it.
+fn may_send(list: &Membership, sender: &str, signed_seq: u64) -> bool {
+    host_standing(list, sender, None)
+        .is_ok_and(|(generation, epoch)| signed_seq >= generation && signed_seq >= epoch)
+}
+
+impl HostBridge {
+    /// The signing of this host's status objects now, when it may sign
+    /// (§11.5's sender rule: its committed list shows it a current host at
+    /// its own trust generation), with its key and `D`.
+    fn signing(&self) -> Option<Signing> {
+        let list = self.send_list()?;
+        let now_d = self.start_view().now_d_ms?;
+        let key = self.host_key.clone()?;
+        let host = self.work_host();
+        if list
+            .host(&host.atem_device_id)
+            .is_none_or(|h| h.host_trust_gen != host.host_trust_gen)
+        {
+            return None;
+        }
+        Some(Signing {
+            list,
+            key,
+            me: HostRef {
+                host_id: host.atem_device_id,
+                host_trust_gen: host.host_trust_gen,
+            },
+            account: host.account_id,
+            now_d,
+        })
+    }
+
+    /// Each pass while hosting runs, with `host.senders` on (and the
+    /// store this identity's, its tables made): the refusals to report,
+    /// then every inbox row decided (the module docs). The gate's mailbox
+    /// part follows the inbox as it now stands. Debug builds: held while a
+    /// test says (`<pty faults>/hold_admission`).
+    pub(super) fn admit_mail(&mut self, sessions: &BTreeMap<SessionId, BrokerSession>) {
+        if !self.senders_on() || crate::runtime::test_hooks::admission_held() {
+            return;
+        }
+        let Some(signing) = self.signing() else {
+            return;
+        };
+        match self.admit_with(&signing, sessions) {
+            // The gate's mailbox part as the inbox now stands, before
+            // anything of this pass is dispatched.
+            Ok(true) => {
+                self.mail_observe();
+                self.publish_mail_gate();
+            }
+            Ok(false) => {}
+            Err(error) => super::delegated_mail_pass::log_limited(&UNADMITTED, || {
+                format!("atem runtime: host senders' mail not admitted ({error:#}); tried again")
+            }),
+        }
+    }
+
+    /// Whether an inbox row was decided.
+    fn admit_with(
+        &self,
+        signing: &Signing,
+        sessions: &BTreeMap<SessionId, BrokerSession>,
+    ) -> anyhow::Result<bool> {
+        let Some(store) = self.outbox_store() else {
+            return Ok(false);
+        };
+        let mut decided = false;
+        for row in admit::inbox(&store.db, ROWS_PER_PASS)? {
+            // A row that can't be decided now stays (holding the gate: fail
+            // closed); the rows after it are decided all the same.
+            match self.admit_row(store, signing, &row, sessions) {
+                Ok(taken) => decided |= taken,
+                Err(error) => super::delegated_mail_pass::log_limited(&UNADMITTED, || {
+                    format!(
+                        "atem runtime: host sender {}'s mailbox object {} not admitted ({error:#}); tried again",
+                        row.sender_host, row.object_id
+                    )
+                }),
+            }
+        }
+        Ok(decided)
+    }
+
+    /// One inbox row decided in its own transaction, removed with its
+    /// decision (a `cancel` or `complete` stays: not admitted yet): whether
+    /// it was taken.
+    fn admit_row(
+        &self,
+        store: &Store,
+        signing: &Signing,
+        row: &InboxRow,
+        sessions: &BTreeMap<SessionId, BrokerSession>,
+    ) -> anyhow::Result<bool> {
+        let tx = store.immediate()?;
+        let decided = match &row.plain {
+            Some(EnvelopePlain::Request { message }) => {
+                self.admit_request(&tx, store, signing, row, message, sessions)?;
+                true
+            }
+            Some(EnvelopePlain::Cancel { .. } | EnvelopePlain::Complete { .. }) => false,
+            // Its bytes no longer read (a stricter reader than the one that
+            // wrote it): nothing to decide.
+            None => true,
+        };
+        if !decided {
+            return Ok(false);
+        }
+        admit::take_row(&tx, row.n)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// A host sender's request (design II.4.2 step 7, "Duplicates"; the
+    /// module docs), decided in `tx`: its message record and tasks, or a
+    /// refusal, and the status to its sender.
+    fn admit_request(
+        &self,
+        tx: &Transaction,
+        store: &Store,
+        signing: &Signing,
+        row: &InboxRow,
+        message: &Message,
+        sessions: &BTreeMap<SessionId, BrokerSession>,
+    ) -> anyhow::Result<()> {
+        let sender = row.sender_host.as_str();
+        let principal = host_principal(sender);
+        let id = &message.message_id;
+        let digest = message.digest();
+        // A refusal of the whole request, recorded for good when `record`
+        // (a resend is answered the same), reported to its sender.
+        let refuse = |code: &str, record: bool| -> anyhow::Result<()> {
+            if record {
+                admit::refuse(tx, sender, id, &digest, code, signing.now_d)?;
+            }
+            signing.refusal(tx, sender, id, code)
+        };
+        // Duplicates: this host's own permanent records. The same content
+        // again is its current status; other content, or an id another
+        // principal used here, `request_id_reused` (host-work v1's rule).
+        if let Some(old) = store.message(id)? {
+            if old.message.sender != principal || old.receipt.digest != digest {
+                return refuse("request_id_reused", false);
+            }
+            return signing.status(tx, store, &old);
+        }
+        let local: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM outbox WHERE message_id=?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        if local {
+            return refuse("request_id_reused", false);
+        }
+        if let Some((recorded, code)) = admit::refusal(tx, sender, id)? {
+            return if recorded == digest {
+                refuse(&code, false)
+            } else {
+                refuse("request_id_reused", false)
+            };
+        }
+        let list = &signing.list;
+        // The sender's standing now, against the head it signed at.
+        if !may_send(list, sender, row.signed_seq) {
+            return refuse("forbidden", true);
+        }
+        // A host sender's Message, without attachments (checked when it
+        // opened; here as the last line).
+        if !message.valid_from_host(sender) {
+            return refuse("invalid_request", true);
+        }
+        let host = self.work_host();
+        let mine: Vec<&Recipient> = message
+            .recipients
+            .iter()
+            .filter(|r| r.host == host)
+            .collect();
+        // None for this host's triple (another host, or this one at an
+        // older trust generation).
+        if mine.is_empty() {
+            return refuse("stale_target", true);
+        }
+        let mut tasks = Vec::new();
+        let recipients: Vec<RecipientReceipt> = mine
+            .into_iter()
+            .map(|r| RecipientReceipt {
+                recipient_id: r.recipient_id.clone(),
+                delivery: self.deliver(list, message, &digest, r, sender, sessions, &mut tasks),
+            })
+            .collect();
+        // A task that could never be dispatched refuses the message (its
+        // text and context are every task's).
+        if tasks
+            .iter()
+            .any(|t| crate::runtime::collab::task_problem(&t.task, &host).is_some())
+        {
+            return refuse("invalid_request", true);
+        }
+        for task in &tasks {
+            if store.work(&task.task.task_id)?.is_some() {
+                return refuse("request_id_reused", true);
+            }
+        }
+        // The limits (II.9), as a channel member's publish meets them.
+        if (!tasks.is_empty() && store.over_capacity(&principal)?) || !room(tx, &tasks)? {
+            return refuse("busy", true);
+        }
+        if let Err(error) = crate::runtime::collab::count_received(
+            tx,
+            &self.work.config.collab,
+            &message.workflow_id,
+            message.created_at,
+        ) {
+            if error.to_string().starts_with("limit:") {
+                return refuse("busy", true);
+            }
+            return Err(error);
+        }
+        let key = list
+            .host(sender)
+            .map(|h| host_principal_key(&h.host_key).to_hex())
+            .unwrap_or_default();
+        let record = MessageRecord {
+            sender_key: json!(key),
+            message: message.clone(),
+            receipt: MessageReceipt {
+                message_id: id.clone(),
+                digest,
+                sender: principal,
+                recipients,
+            },
+        };
+        tx.execute(
+            "INSERT INTO messages(id,record) VALUES(?1,?2)",
+            rusqlite::params![id, serde_json::to_string(&record)?],
+        )?;
+        for task in &tasks {
+            let state = serde_json::to_value(task.status.state)?;
+            tx.execute(
+                "INSERT INTO work(id,record,state) VALUES(?1,?2,?3)",
+                rusqlite::params![
+                    task.task.task_id,
+                    serde_json::to_string(task)?,
+                    state.as_str().unwrap_or_default()
+                ],
+            )?;
+        }
+        signing.status(tx, store, &record)
+    }
+
+    /// One recipient of a host sender's request for this host (step 7),
+    /// with the sender's permit in place of a channel scope: a notice
+    /// `stored`, an agent task `work`, a `select` expanded once
+    /// (`resolved` or `no_match`), else `refused{forbidden}`. Its tasks go
+    /// to `tasks`.
+    #[allow(clippy::too_many_arguments)]
+    fn deliver(
+        &self,
+        list: &Membership,
+        message: &Message,
+        digest: &str,
+        r: &Recipient,
+        sender: &str,
+        sessions: &BTreeMap<SessionId, BrokerSession>,
+        tasks: &mut Vec<WorkRecord>,
+    ) -> Delivery {
+        let forbidden = || Delivery::Refused {
+            code: "forbidden".into(),
+        };
+        let me = self.work_host().atem_device_id;
+        let at = |route_id: &str, revision: u64| {
+            self.work
+                .config
+                .route(route_id)
+                .filter(|route| route.revision == revision)
+        };
+        let permits = |route: &crate::runtime::host_work::Route, op: HostOp| {
+            let sender = HostSender {
+                host_id: sender,
+                admitted: None,
+            };
+            host_sender_permits(list, &me, &sender, route, op).is_ok()
+        };
+        match &r.destination {
+            // A host notice: the account's `message` op (II.2.3).
+            Destination::Host => {
+                if shared_ops(list, &me, sender).contains(&ProjectOp::Message) {
+                    Delivery::Stored
+                } else {
+                    forbidden()
+                }
+            }
+            Destination::Project {
+                route_id,
+                route_revision,
+            } => match at(route_id, *route_revision) {
+                Some(route) if permits(route, HostOp::Notice) => Delivery::Stored,
+                _ => forbidden(),
+            },
+            Destination::Agent {
+                route_id,
+                route_revision,
+                target,
+            } => {
+                let task = message.task(r);
+                let record = task.and_then(|task| {
+                    self.host_task(
+                        list,
+                        message,
+                        digest,
+                        sender,
+                        route_id,
+                        *route_revision,
+                        task,
+                    )
+                });
+                match record {
+                    Some(record) if self.host_target_ok(&record, target, sessions) => {
+                        let delivery = Delivery::Work {
+                            work: (&record.status).into(),
+                        };
+                        tasks.push(record);
+                        delivery
+                    }
+                    _ => forbidden(),
+                }
+            }
+            Destination::Select {
+                selectors, budget, ..
+            } => {
+                // No project it shares with this host grants a task's ops.
+                let ops = shared_ops(list, &me, sender);
+                if !HostOp::Task.needs().iter().all(|op| ops.contains(op)) {
+                    return forbidden();
+                }
+                let Ok(selectors) = selectors
+                    .iter()
+                    .map(|s| s.parse::<Selector>())
+                    .collect::<Result<Vec<_>, _>>()
+                else {
+                    return forbidden();
+                };
+                // The agents of routes that consent to the sender and whose
+                // grant covers a task (II.6, "The receiver decides"): no
+                // sending session to leave out.
+                let candidates: Vec<crate::runtime::collab::Candidate> = self
+                    .work
+                    .config
+                    .routes
+                    .iter()
+                    .filter(|route| permits(route, HostOp::Task))
+                    .flat_map(|route| self.route_candidates(route, sessions))
+                    .collect();
+                let resolved = crate::runtime::collab::resolve(
+                    &me,
+                    &candidates,
+                    &selectors,
+                    *budget,
+                    "",
+                    &message.message_id,
+                    &r.recipient_id,
+                );
+                let host = self.work_host();
+                let mut progress = Vec::new();
+                for t in resolved {
+                    let task = hw::WorkTask {
+                        task_id: t.task_id,
+                        workflow_id: message.workflow_id.clone(),
+                        target: wire::Target {
+                            account_id: host.account_id.clone(),
+                            atem_device_id: host.atem_device_id.clone(),
+                            host_trust_gen: host.host_trust_gen,
+                            session_id: t.session_id,
+                            process_gen: t.process_gen,
+                        },
+                        expires_at: message.expires_at,
+                        prompt: message.text.clone(),
+                        context: message.context.clone(),
+                        attachments: Vec::new(),
+                    };
+                    if let Some(record) = self.host_task(
+                        list,
+                        message,
+                        digest,
+                        sender,
+                        &t.route_id,
+                        t.route_revision,
+                        task,
+                    ) {
+                        progress.push((&record.status).into());
+                        tasks.push(record);
+                    }
+                }
+                if progress.is_empty() {
+                    Delivery::NoMatch {}
+                } else {
+                    Delivery::Resolved { tasks: progress }
+                }
+            }
+        }
+    }
+
+    /// The agents of `route` a selector may match: its profile's live
+    /// sessions, with this host's labels, the route's and their own tags
+    /// (stage 1's candidates, `collab_candidates`).
+    fn route_candidates(
+        &self,
+        route: &crate::runtime::host_work::Route,
+        sessions: &BTreeMap<SessionId, BrokerSession>,
+    ) -> Vec<crate::runtime::collab::Candidate> {
+        let Some(profile) = self.work.config.profile(&route.profile_id) else {
+            return Vec::new();
+        };
+        sessions
+            .values()
+            .filter(|s| {
+                s.is_live()
+                    && s.cwd == profile.cwd
+                    && s.provider == profile.provider
+                    && self.projects.key_of(s.id.as_str()) == Some(profile.project.as_str())
+            })
+            .map(|session| crate::runtime::collab::Candidate {
+                route_id: route.id.clone(),
+                route_revision: route.revision,
+                session_id: session.id.to_string(),
+                process_gen: session.process_gen.clone(),
+                started_ms: session.created_at_ms,
+                labels: self
+                    .work
+                    .config
+                    .instance
+                    .labels
+                    .iter()
+                    .chain(&route.labels)
+                    .chain(session.self_tags())
+                    .filter_map(|s| s.parse().ok())
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// The task `task` of a host sender's message through `route_id` at
+    /// `revision` (design I.4.1): queued, its admission record frozen from
+    /// the sender's permit; none when the route doesn't take it.
+    #[allow(clippy::too_many_arguments)]
+    fn host_task(
+        &self,
+        list: &Membership,
+        message: &Message,
+        digest: &str,
+        sender: &str,
+        route_id: &str,
+        revision: u64,
+        task: hw::WorkTask,
+    ) -> Option<WorkRecord> {
+        let route = self
+            .work
+            .config
+            .route(route_id)
+            .filter(|route| route.revision == revision)?;
+        let profile = self.work.config.profile(&route.profile_id)?;
+        let me = self.work_host().atem_device_id;
+        let permit = host_sender_permits(
+            list,
+            &me,
+            &HostSender {
+                host_id: sender,
+                admitted: None,
+            },
+            route,
+            HostOp::Task,
+        )
+        .ok()?;
+        let admission = Admission::for_host(list, sender, &permit, route_id, revision)?;
+        let principal = host_principal(sender);
+        Some(WorkRecord {
+            control_gen: self.host.control_gen(&principal),
+            principal,
+            attachment_owner: String::new(),
+            route_id: route_id.to_owned(),
+            route_revision: revision,
+            profile_id: profile.id.clone(),
+            profile_revision: profile.revision,
+            project: profile.project.clone(),
+            digest: hw::digest(&serde_json::to_vec(&(digest, &task.task_id)).ok()?),
+            status: WorkStatus {
+                task_id: task.task_id.clone(),
+                receipt_id: uuid::Uuid::new_v4().to_string(),
+                state: WorkState::Queued,
+                detail: "waiting for a ready agent".into(),
+                result: None,
+                resolved: None,
+            },
+            task,
+            turn_id: None,
+            authorization_expires_at: None,
+            message: Some(MessageFrame {
+                message_id: message.message_id.clone(),
+                mark: None,
+            }),
+            delegated: Some(admission),
+            deadline_passed: false,
+        })
+    }
+
+    /// Whether an agent recipient's `target` is a session of `record`'s
+    /// profile on this host (a channel member's check, `work_allowed`'s:
+    /// its process generation, directory, provider and launch project).
+    fn host_target_ok(
+        &self,
+        record: &WorkRecord,
+        target: &wire::Target,
+        sessions: &BTreeMap<SessionId, BrokerSession>,
+    ) -> bool {
+        let Some(profile) = self.work.config.profile(&record.profile_id) else {
+            return false;
+        };
+        self.work_host().contains(target)
+            && SessionId::parse(&target.session_id)
+                .and_then(|id| sessions.get(&id))
+                .is_some_and(|s| {
+                    s.process_gen == target.process_gen
+                        && s.cwd == profile.cwd
+                        && s.provider == profile.provider
+                        && self.projects.key_of(s.id.as_str()) == Some(profile.project.as_str())
+                })
+    }
+}
+
+/// Whether the store has room for a message with `tasks` (host work's
+/// bounds, as `accept_message` checks them): open messages and tasks
+/// within `MAX_RECORDS`, unfinished tasks within `MAX_QUEUED`.
+fn room(tx: &Transaction, tasks: &[WorkRecord]) -> anyhow::Result<bool> {
+    use crate::runtime::host_work::{MAX_QUEUED, MAX_RECORDS, open_records};
+    let queued = tasks.iter().filter(|t| !t.status.state.terminal()).count();
+    let unfinished: usize = tx.query_row(
+        "SELECT count(*) FROM work WHERE state IN ('queued','blocked','submitting','submitted')",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(open_records(tx, "messages")? < MAX_RECORDS
+        && open_records(tx, "work")? + tasks.len() <= MAX_RECORDS
+        && unfinished + queued <= MAX_QUEUED)
+}

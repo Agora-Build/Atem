@@ -61,7 +61,7 @@ impl HostBridge {
     }
 
     /// The committed device list, when it serves.
-    fn send_list(&self) -> Option<std::sync::Arc<atem_client::membership::Membership>> {
+    pub(super) fn send_list(&self) -> Option<std::sync::Arc<atem_client::membership::Membership>> {
         self.start_view()
             .list
             .clone()
@@ -211,7 +211,7 @@ impl HostBridge {
 
     /// The store the outbox writes (its tables made): none with the hook
     /// off, or while it isn't this identity's.
-    fn outbox_store(&self) -> Option<&Store> {
+    pub(super) fn outbox_store(&self) -> Option<&Store> {
         let (store, identity) = self.mail_store()?;
         (self.work.mail_prepared.as_ref() == Some(&identity.host)).then_some(store)
     }
