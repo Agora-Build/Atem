@@ -747,6 +747,24 @@ final class ConformanceTests: XCTestCase {
         // actions, sorted by bytes, each once; every action the
         // membership-log vectors sign is one of them.
         let wireShapes = try load("r9-vectors-delegated-wire")
+        let requirements = try load("r9-vectors-required-verifier")
+        for value in a(requirements["cases"]).map(o) {
+            check("required verifier: " + s(value["label"])) {
+                let body = s(value["body_json"])
+                if value["reject"] as? Bool == true {
+                    var refused = false
+                    do { _ = try membershipRequiredVersion(bodyJson: body) }
+                    catch is AtemError { refused = true }
+                    try eq(refused, true, "invalid body must throw")
+                } else {
+                    let actual = try membershipRequiredVersion(bodyJson: body)
+                    if let expected = value["requirement"] as? [String: Any] {
+                        try eq(actual, VerifierRequirement(action: s(expected["action"]),
+                            minimumVersion: UInt32(u(expected["minimum_version"]))))
+                    } else { try eq(actual, nil as VerifierRequirement?) }
+                }
+            }
+        }
         check("verifier inventory: version and known actions (R9.2)") {
             let ours = verifierInventory()
             let pinned = o(wireShapes["verifier"])
@@ -2237,6 +2255,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 76)
+        XCTAssertEqual(passed, 120)
     }
 }

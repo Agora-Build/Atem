@@ -228,6 +228,9 @@ FILES+=("$MAIL_VECTOR")
 STATION_VECTOR="atem-client-${VERSION}-r9-vectors-station-calls.json"
 cp designs/protocol/fixtures/r9-vectors-station-calls.json "$OUT/$STATION_VECTOR"
 FILES+=("$STATION_VECTOR")
+REQUIRED_VECTOR="atem-client-${VERSION}-r9-vectors-required-verifier.json"
+cp designs/protocol/fixtures/r9-vectors-required-verifier.json "$OUT/$REQUIRED_VECTOR"
+FILES+=("$REQUIRED_VECTOR")
 # The Station's acknowledgment fixtures (test 48), for Station builders.
 for fixture in designs/protocol/fixtures/r9-control-ack-*.json; do
   ACK_FIXTURE="atem-client-${VERSION}-$(basename "$fixture")"

@@ -329,6 +329,13 @@ pub fn verifier_inventory() -> JsResult<JsValue> {
     to_js(&crate::log::verifier_inventory())
 }
 
+/// Strict unsigned membership-body classifier for R9.2's signing gate.
+/// An absent requirement means universal support; invalid input throws.
+#[wasm_bindgen(js_name = membershipRequiredVersion)]
+pub fn membership_required_version(body_json: String) -> JsResult<JsValue> {
+    to_js(&err(crate::log::membership_required_version(body_json))?)
+}
+
 // --------------------------------------------------------- host work
 
 /// A task's one `result_id` (host-work-v1 §11.5): the shared core's

@@ -104,9 +104,15 @@ The Rust core's tests run all of them; the Swift, Kotlin and WASM
 conformance suites run the framing vectors through the exports of
 [Prompt framing](#prompt-framing-delegated-host-work-design-iii2) (VII.C test
 40), the control records', the push hints', the envelopes' and results' and
-the Station calls' vectors and the acknowledgment fixtures, and
+the Station calls' vectors and the acknowledgment fixtures.
+The shared minimum-version cases also ship as
+`atem-client-<version>-r9-vectors-required-verifier.json`, listed in the
+package hashes and unchanged from the source fixture. They exercise the
+production `membership_required_version` export, including malformed bodies.
+The package checker runs all 44 through the shipped Node WASM package.
+
 `scripts/check-atem-client-packages.sh` runs the framing vectors through the
-packaged WASM build. They are fixture data, not a live integration test: the
+packaged WASM build. These are fixture data, not a live integration test: the
 host renders every prompt (`session::framing`); a client never does.
 
 Status: built and released in Atem v0.8.0 (2026-10-31);
@@ -650,7 +656,27 @@ a verifier is confirmed, and it extends the gate to three scope ops:
 - How the signer learns the inventories of verifiers that aren't hosts
   (each app calls `verifier_inventory()`) is Astation's.
 
+The shared classifier is `membership::required_version(unsigned_body_bytes)`;
+bindings expose `membership_required_version(body_json)` (Swift/Kotlin
+`membershipRequiredVersion`, WASM `membershipRequiredVersion`). It returns an
+optional `VerifierRequirement { action, minimum_version }` (WASM fields
+`action`, `minimumVersion`). `None`/nil means a known body whose action/rules
+predate reported inventories. An invalid or unknown body throws; it never
+falls through to universal support. The strict reader checks duplicate keys,
+bounds, canonical arrays, key algorithms and the action's schema through the
+same `check_body`/`Entry` path used by membership verification.
+
+The classifier is not a chain or signature verifier and does not authenticate
+or enumerate participants. A valid shape may still be refused on its chain.
+The five new actions require version 2; a service add/set_roles carrying
+launch, message or notify requires version 1. All other known actions need no
+reported inventory. It changes no wire form, verifier verdict or rollout gate;
+production adoption still needs the reviewed SDK publication and complete
+authenticated evidence from every participant.
+
 Tests:
+- `r9-vectors-required-verifier.json` covers all sixteen known actions,
+  old/new service scopes and strict refusals, through Rust and every binding.
 - All three suites check `verifier_inventory()` against
   `r9-vectors-delegated-wire`'s `verifier`.
 - The end-to-end test (`check-atem-client-bindings.sh e2e`) checks

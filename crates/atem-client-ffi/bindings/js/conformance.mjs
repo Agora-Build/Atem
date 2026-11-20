@@ -469,6 +469,19 @@ check("device-list actions: verifyHostEncSig binds every field of a host's enc_s
 // actions, sorted by bytes, each once; every action the
 // membership-log vectors sign is one of them.
 const wireShapes = load("r9-vectors-delegated-wire");
+for (const value of load("r9-vectors-required-verifier").cases) {
+  check(`required verifier: ${value.label}`, () => {
+    if (value.reject) {
+      let refused = false;
+      try { m.membershipRequiredVersion(value.body_json); } catch { refused = true; }
+      eq(refused, true, "invalid body must throw");
+    } else {
+      const actual = m.membershipRequiredVersion(value.body_json);
+      const expected = value.requirement;
+      same(actual == null ? null : { action: actual.action, minimum_version: actual.minimumVersion }, expected);
+    }
+  });
+}
 check("verifier inventory: version and known actions (R9.2)", () => {
   const ours = m.verifierInventory();
   same(ours, wireShapes.verifier, "this binding's verifier");

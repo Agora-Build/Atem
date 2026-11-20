@@ -1,0 +1,267 @@
+{
+  "name": "r9-vectors-required-verifier",
+  "requires": "r9",
+  "kind": "vectors",
+  "note": "Unsigned body structural checks and R9.2 minimum reported version. No signature, membership authority or participant authentication is established.",
+  "cases": [
+    {
+      "label": "E1",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"genesis\",\"member\":{\"auth_key\":{\"alg\":\"p256\",\"pub\":\"BGj-ylkEWPb6IhML-_3UFdZBrKwvdFDlz-QamAuwz2xIOjXX2myAwtuCxfGu8jmWSTz-tAG9CkVNSCiRhZ-00bE\"},\"device_id\":\"dev-mac\",\"enc_key\":{\"alg\":\"x25519\",\"pub\":\"2v1EMbjZDC-YryNDJmZaakKgKMTtTjjIb0sA4XnLI1k\"},\"kind\":\"native\",\"roles\":[\"control\",\"manage\",\"view\"]},\"prev_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"recovery_key\":{\"alg\":\"ed25519\",\"pub\":\"mHZ8mI_wz3J66ZF4EenE7WO3-0hgjUwyaI23ny7ZQ2A\"},\"seq\":1,\"signed_at\":1792400000000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": null
+    },
+    {
+      "label": "E2",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"add_host\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host\":{\"host_id\":\"host-a\",\"host_key\":{\"alg\":\"ed25519\",\"pub\":\"ma83XDqxm6EF2qRk7IN4a9VFv5TX8wRPAdlUZYziNY4\"},\"host_trust_gen\":1},\"prev_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"seq\":2,\"signed_at\":1792400001000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": null
+    },
+    {
+      "label": "E3",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"p256\",\"pub\":\"BGV5Ov3b43EjUrJGejYvqwfQljq9X4Tx0Rd1aYDInE29tmNy-IIhgIH0hY-cheON0bvA_O0yEeah0yUbXnxO5SQ\"},\"device_id\":\"dev-phone\",\"enc_key\":{\"alg\":\"x25519\",\"pub\":\"oJkn3Pr5ZonLiInBeyLi4eNyIcHkLMRz0EmmHE-ZiXY\"},\"kind\":\"native\",\"roles\":[\"control\",\"manage\",\"view\"]},\"prev_hash\":\"7cc348b5991f0995cb2a7b9300202dc8323733484fc49bfd264800447a2d4e3d\",\"seq\":3,\"signed_at\":1792400002000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": null
+    },
+    {
+      "label": "E6",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"remove\",\"device_id\":\"dev-ipad\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"prev_hash\":\"54c0f64f7fd1a3677a91650d40079ebffd03a6da8d78b91278c421d862337cf9\",\"seq\":6,\"signed_at\":1792400005000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": null
+    },
+    {
+      "label": "C6_mac",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"set_roles\",\"device_id\":\"dev-phone\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"prev_hash\":\"54c0f64f7fd1a3677a91650d40079ebffd03a6da8d78b91278c421d862337cf9\",\"roles\":[\"control\",\"view\"],\"seq\":6,\"signed_at\":1792400005600,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": null
+    },
+    {
+      "label": "R7",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"recovery_add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"p256\",\"pub\":\"BOm7i4Cu1xarfYVGVRmURoigaOOB_yt5yLlW4CnTUf9gaeHjs5A0zoKxYoYTEtio_r83Vy4pqmeshYM35j0cLOs\"},\"device_id\":\"dev-newmac\",\"enc_key\":{\"alg\":\"x25519\",\"pub\":\"5Y2eIkg4yFW5YCV4PRTZ4IZ4HzbTcTEUjuhZv7a_wFY\"},\"kind\":\"native\",\"roles\":[\"control\",\"manage\",\"view\"]},\"prev_hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":7,\"signed_at\":1793177600000,\"signer\":\"recovery\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": null
+    },
+    {
+      "label": "K7_current",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"set_recovery_key\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"kit\":\"current\",\"prev_hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"recovery_key\":{\"alg\":\"ed25519\",\"pub\":\"asca14HfbOftkoQeW8YvdC2gZ3Ga2vEjRFoyFg2WYuk\"},\"seq\":7,\"signed_at\":1793177600000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": null
+    },
+    {
+      "label": "A8",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"recovery_approve\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"prev_hash\":\"5766081f65a59528ab914a1d7f9a49bb3e23c2e86f3694b1e77a0325d0ccf1a9\",\"seq\":8,\"signed_at\":1793181200000,\"signer\":\"dev-mac\",\"target\":\"5766081f65a59528ab914a1d7f9a49bb3e23c2e86f3694b1e77a0325d0ccf1a9\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": null
+    },
+    {
+      "label": "V8",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"recovery_veto\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"prev_hash\":\"5766081f65a59528ab914a1d7f9a49bb3e23c2e86f3694b1e77a0325d0ccf1a9\",\"seq\":8,\"signed_at\":1793181200000,\"signer\":\"dev-phone\",\"target\":\"5766081f65a59528ab914a1d7f9a49bb3e23c2e86f3694b1e77a0325d0ccf1a9\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": null
+    },
+    {
+      "label": "KB7",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"k_backup\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"k_backup\":{\"backup_hash\":\"ae88af5e8b273a1a5904829a37c2a9b48e3ecb56f072deee923ae0e43e8f7d3e\",\"blob_version\":3,\"kids\":[\"b982533d\",\"1f2e3d4c\"],\"recovery_key\":{\"alg\":\"ed25519\",\"pub\":\"mHZ8mI_wz3J66ZF4EenE7WO3-0hgjUwyaI23ny7ZQ2A\"}},\"prev_hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":7,\"signed_at\":1793264100007,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": null
+    },
+    {
+      "label": "P8_set",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"project_set\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"prev_hash\":\"ac770ee1db37fce117f4d0031ae2bbfebff5f030d93a9df26b9f35a5b1a52901\",\"project\":{\"hosts\":[\"host-a\",\"host-b\"],\"name\":\"astation\",\"ops\":[\"launch\",\"message\",\"notify\",\"prompt\"]},\"seq\":8,\"signed_at\":1793620808000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": {
+        "action": "project_set",
+        "minimum_version": 2
+      }
+    },
+    {
+      "label": "P10_remove",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"project_remove\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"name\":\"astation\",\"prev_hash\":\"4f0f1113b0607374ed8e9a479f2dd91ab1cdf329f936754cb45f19d2aed391f4\",\"seq\":10,\"signed_at\":1793620810000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": {
+        "action": "project_remove",
+        "minimum_version": 2
+      }
+    },
+    {
+      "label": "EK7_set",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"host_enc_key\",\"enc_key\":{\"alg\":\"x25519\",\"pub\":\"VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA\"},\"enc_sig\":\"Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAA\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-a\",\"host_trust_gen\":1,\"prev_hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":7,\"signed_at\":1793620807000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": {
+        "action": "host_enc_key",
+        "minimum_version": 2
+      }
+    },
+    {
+      "label": "HS7_revoke",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"host_sender_revoke\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-a\",\"interrupt_running\":false,\"prev_hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":7,\"signed_at\":1793620807000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": {
+        "action": "host_sender_revoke",
+        "minimum_version": 2
+      }
+    },
+    {
+      "label": "HS8_readmit",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"host_sender_readmit\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-a\",\"prev_hash\":\"c67a263830fa86740b515f200cfad113ac5242a4fb924753ae92f2695e9fb1b3\",\"seq\":8,\"signed_at\":1793620808000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": {
+        "action": "host_sender_readmit",
+        "minimum_version": 2
+      }
+    },
+    {
+      "label": "P9_remove_host_b",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"remove_host\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"prev_hash\":\"fe5214b9d143fc1789fb016b42415348bb14369c75b02fe756815bbcda70f2ae\",\"seq\":9,\"signed_at\":1793620809000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": null
+    },
+    {
+      "label": "add-view",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"ed25519\",\"pub\":\"QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE\"},\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"kind\":\"service\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]}},\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": null
+    },
+    {
+      "label": "add-interrupt,prompt,view",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"ed25519\",\"pub\":\"QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE\"},\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"kind\":\"service\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"interrupt\",\"prompt\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]}},\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": null
+    },
+    {
+      "label": "add-launch,view",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"ed25519\",\"pub\":\"QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE\"},\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"kind\":\"service\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"launch\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]}},\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": {
+        "action": "add",
+        "minimum_version": 1
+      }
+    },
+    {
+      "label": "add-message,view",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"ed25519\",\"pub\":\"QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE\"},\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"kind\":\"service\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"message\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]}},\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": {
+        "action": "add",
+        "minimum_version": 1
+      }
+    },
+    {
+      "label": "add-notify,view",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"ed25519\",\"pub\":\"QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE\"},\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"kind\":\"service\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"notify\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]}},\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": {
+        "action": "add",
+        "minimum_version": 1
+      }
+    },
+    {
+      "label": "add-launch,message,notify,view",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"ed25519\",\"pub\":\"QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE\"},\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"kind\":\"service\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"launch\",\"message\",\"notify\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]}},\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": {
+        "action": "add",
+        "minimum_version": 1
+      }
+    },
+    {
+      "label": "set_roles-view",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"set_roles\",\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]},\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": null
+    },
+    {
+      "label": "set_roles-interrupt,prompt,view",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"set_roles\",\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"interrupt\",\"prompt\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]},\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": null
+    },
+    {
+      "label": "set_roles-launch,view",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"set_roles\",\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"launch\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]},\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": {
+        "action": "set_roles",
+        "minimum_version": 1
+      }
+    },
+    {
+      "label": "set_roles-message,view",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"set_roles\",\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"message\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]},\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": {
+        "action": "set_roles",
+        "minimum_version": 1
+      }
+    },
+    {
+      "label": "set_roles-notify,view",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"set_roles\",\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"notify\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]},\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": {
+        "action": "set_roles",
+        "minimum_version": 1
+      }
+    },
+    {
+      "label": "set_roles-launch,message,notify,view",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"set_roles\",\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"launch\",\"message\",\"notify\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]},\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": {
+        "action": "set_roles",
+        "minimum_version": 1
+      }
+    },
+    {
+      "label": "invalid-action",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"future_action\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"ed25519\",\"pub\":\"QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE\"},\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"kind\":\"service\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"interrupt\",\"prompt\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]}},\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "reject": true
+    },
+    {
+      "label": "invalid-v",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"ed25519\",\"pub\":\"QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE\"},\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"kind\":\"service\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"interrupt\",\"prompt\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]}},\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":2}",
+      "reject": true
+    },
+    {
+      "label": "invalid-type",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"ed25519\",\"pub\":\"QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE\"},\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"kind\":\"service\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"interrupt\",\"prompt\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]}},\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-other\",\"v\":1}",
+      "reject": true
+    },
+    {
+      "label": "unknown-field",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"ed25519\",\"pub\":\"QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE\"},\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"kind\":\"service\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"interrupt\",\"prompt\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]}},\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"unexpected\":null,\"v\":1}",
+      "reject": true
+    },
+    {
+      "label": "unsorted-ops",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"ed25519\",\"pub\":\"QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE\"},\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"kind\":\"service\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"view\",\"launch\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]}},\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "reject": true
+    },
+    {
+      "label": "duplicate-ops",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"ed25519\",\"pub\":\"QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE\"},\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"kind\":\"service\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"view\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]}},\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "reject": true
+    },
+    {
+      "label": "unknown-op",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"ed25519\",\"pub\":\"QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE\"},\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"kind\":\"service\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"future\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]}},\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "reject": true
+    },
+    {
+      "label": "wrong-key-alg",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"x25519\",\"pub\":\"QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE\"},\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"kind\":\"service\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"interrupt\",\"prompt\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]}},\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "reject": true
+    },
+    {
+      "label": "expired-body-still-needs-chain-validation",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"ed25519\",\"pub\":\"QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE\"},\"device_id\":\"svc-discord\",\"expires_at\":1792400003999,\"kind\":\"service\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"interrupt\",\"prompt\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]}},\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "requirement": null
+    },
+    {
+      "label": "duplicate-action",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"remove\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"ed25519\",\"pub\":\"QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE\"},\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"kind\":\"service\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"interrupt\",\"prompt\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]}},\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "reject": true
+    },
+    {
+      "label": "escaped-duplicate-action",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"\\u0061ction\":\"add\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"ed25519\",\"pub\":\"QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE\"},\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"kind\":\"service\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"interrupt\",\"prompt\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]}},\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "reject": true
+    },
+    {
+      "label": "duplicate-nested-key",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"ed25519\",\"pub\":\"QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE\"},\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"kind\":\"native\",\"kind\":\"service\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"interrupt\",\"prompt\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]}},\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "reject": true
+    },
+    {
+      "label": "null-body",
+      "body_json": "null",
+      "reject": true
+    },
+    {
+      "label": "fractional-seq",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"ed25519\",\"pub\":\"QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE\"},\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"kind\":\"service\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"interrupt\",\"prompt\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]}},\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"seq\":5.0,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "reject": true
+    },
+    {
+      "label": "unsafe-integer",
+      "body_json": "{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"ed25519\",\"pub\":\"QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE\"},\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"kind\":\"service\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"interrupt\",\"prompt\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]}},\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"seq\":9007199254740992,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "reject": true
+    },
+    {
+      "label": "oversized-body",
+      "body_json": "                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 {\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"ed25519\",\"pub\":\"QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE\"},\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"kind\":\"service\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"interrupt\",\"prompt\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]}},\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "reject": true
+    }
+  ]
+}

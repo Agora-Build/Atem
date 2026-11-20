@@ -573,6 +573,21 @@ fun main(args: Array<String>) {
     // so String order), each once; every action the membership-log vectors
     // sign is one of them.
     val wireShapes = load("r9-vectors-delegated-wire")
+    for (value in load("r9-vectors-required-verifier")["cases"].arr()) {
+        check("required verifier: ${value["label"].s()}") {
+            if (value.obj()["reject"] == true) {
+                var refused = false
+                try { membershipRequiredVersion(value["body_json"].s()) }
+                catch (e: AtemException) { refused = true }
+                eq(refused, true, "invalid body must throw")
+            } else {
+                val actual = membershipRequiredVersion(value["body_json"].s())
+                val expected = value.obj()["requirement"]
+                eq(actual, if (expected == null) null else VerifierRequirement(
+                    expected["action"].s(), expected["minimum_version"].l().toUInt()))
+            }
+        }
+    }
     check("verifier inventory: version and known actions (R9.2)") {
         val ours = verifierInventory()
         eq(ours.version.toLong(), wireShapes["verifier"]["version"].l(), "version")
