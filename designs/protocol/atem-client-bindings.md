@@ -105,6 +105,12 @@ conformance suites run the framing vectors through the exports of
 [Prompt framing](#prompt-framing-delegated-host-work-design-iii2) (VII.C test
 40), the control records', the push hints', the envelopes' and results' and
 the Station calls' vectors and the acknowledgment fixtures, and
+The shared minimum-version cases also ship as
+`atem-client-<version>-r9-vectors-required-verifier.json`, listed in the
+package hashes and unchanged from the source fixture. They exercise the
+production `membership_required_version` export, including malformed bodies.
+The package checker runs all 44 through the shipped Node WASM package.
+
 `scripts/check-atem-client-packages.sh` runs the framing vectors through the
 packaged WASM build. They are fixture data, not a live integration test: the
 host renders every prompt (`session::framing`); a client never does.

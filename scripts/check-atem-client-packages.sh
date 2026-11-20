@@ -40,6 +40,7 @@ SHIPPED_VECTORS=(
   r9-vectors-delegated-wire.json:r9-vectors-delegated-wire.json
   r9-vectors-host-envelope.json:r9-vectors-host-envelope.json
   r9-vectors-station-calls.json:r9-vectors-station-calls.json
+  r9-vectors-required-verifier.json:r9-vectors-required-verifier.json
 )
 for fixture in "$ROOT"/designs/protocol/fixtures/r9-control-ack-*.json; do
   SHIPPED_VECTORS+=("$(basename "$fixture"):$(basename "$fixture")")
@@ -115,6 +116,25 @@ if [ -f "$WASM" ]; then
     }
     console.log(`wasm (nodejs): ${framing.escape.length} framing escape and ${sizes.cases.length} size vectors`);
   ' "$WORK/atem-client-wasm/nodejs/atem_client_ffi.js" "$FRAMING_VECTORS" "$FRAMING_SIZE_VECTORS"
+  "$NODE" -e '
+    const ffi = require(process.argv[1]);
+    const vectors = require(process.argv[2]);
+    if (vectors.cases.length !== 44) throw new Error("required-verifier case count");
+    for (const c of vectors.cases) {
+      let actual, refused = false;
+      try { actual = ffi.membershipRequiredVersion(c.body_json); } catch { refused = true; }
+      if (c.reject === true) {
+        if (!refused) throw new Error(`${c.label}: invalid body accepted`);
+      } else {
+        if (refused) throw new Error(`${c.label}: valid body refused`);
+        const expected = c.requirement;
+        if (expected === null ? actual != null :
+            actual?.action !== expected.action || actual?.minimumVersion !== expected.minimum_version)
+          throw new Error(`${c.label}: wrong requirement`);
+      }
+    }
+    console.log(`wasm (nodejs): ${vectors.cases.length} packaged required-verifier cases`);
+  ' "$WORK/atem-client-wasm/nodejs/atem_client_ffi.js" "$DIR/atem-client-${VERSION}-r9-vectors-required-verifier.json"
   for t in web bundler; do
     test -s "$WORK/atem-client-wasm/$t/atem_client_ffi_bg.wasm"
     test -s "$WORK/atem-client-wasm/$t/atem_client_ffi.d.ts"
