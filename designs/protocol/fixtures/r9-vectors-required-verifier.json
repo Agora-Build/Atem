@@ -1,5 +1,7 @@
 {
-  "kind": "membership-verifier-requirements",
+  "name": "r9-vectors-required-verifier",
+  "requires": "r9",
+  "kind": "vectors",
   "note": "Unsigned body structural checks and R9.2 minimum reported version. No signature, membership authority or participant authentication is established.",
   "cases": [
     {
