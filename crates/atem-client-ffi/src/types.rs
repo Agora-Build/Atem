@@ -296,6 +296,16 @@ impl From<&atem_client::membership::VerifierInventory> for VerifierInventory {
     }
 }
 
+record! {
+    /// The exact action and minimum reported verifier version required before
+    /// signing this membership body. The caller authenticates and enumerates
+    /// every verifier; this result alone never authorizes a signature.
+    pub struct VerifierRequirement {
+        pub action: String,
+        pub minimum_version: u32,
+    }
+}
+
 data_enum! {
     /// Why a signer shouldn't draft a change now
     /// (`MembershipLog::check_change`; advisory, the verifier still accepts

@@ -259,6 +259,7 @@ fn every_vectors_file_has_a_runner() {
             "r9-vectors-pairing.json",
             "r9-vectors-push-hint.json",
             "r9-vectors-recovery.json",
+            "r9-vectors-required-verifier.json", // tests/required_verifier.rs
             "r9-vectors-station-calls.json",
         ],
         "a new vectors file needs a runner below"

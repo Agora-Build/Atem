@@ -38,6 +38,24 @@ pub const MAX_STORED_JSON: usize = 16 << 20;
 /// than its own (`Stored{unsupported_version}`).
 pub const STORED_VERSION: u64 = 1;
 
+/// R9.2 compatibility requirement for a strictly checked unsigned membership
+/// body. `None` is a known body predating reported inventories; malformed or
+/// unknown bodies throw. This neither verifies chain authority nor permits
+/// signing without authenticated, current evidence for every participant.
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub fn membership_required_version(
+    body_json: String,
+) -> Result<Option<crate::types::VerifierRequirement>> {
+    Ok(
+        atem_client::membership::required_version(body_json.as_bytes())?.map(|requirement| {
+            crate::types::VerifierRequirement {
+                action: requirement.action.into(),
+                minimum_version: requirement.minimum_version,
+            }
+        }),
+    )
+}
+
 impl HostClock {
     /// The reading as the core takes it. Both times are milliseconds and at
     /// most 2^53 − 1 (the JSON integer domain the durable snapshot is

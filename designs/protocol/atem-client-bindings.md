@@ -650,7 +650,27 @@ a verifier is confirmed, and it extends the gate to three scope ops:
 - How the signer learns the inventories of verifiers that aren't hosts
   (each app calls `verifier_inventory()`) is Astation's.
 
+The shared classifier is `membership::required_version(unsigned_body_bytes)`;
+bindings expose `membership_required_version(body_json)` (Swift/Kotlin
+`membershipRequiredVersion`, WASM `membershipRequiredVersion`). It returns an
+optional `VerifierRequirement { action, minimum_version }` (WASM fields
+`action`, `minimumVersion`). `None`/nil means a known body whose action/rules
+predate reported inventories. An invalid or unknown body throws; it never
+falls through to universal support. The strict reader checks duplicate keys,
+bounds, canonical arrays, key algorithms and the action's schema through the
+same `check_body`/`Entry` path used by membership verification.
+
+The classifier is not a chain or signature verifier and does not authenticate
+or enumerate participants. A valid shape may still be refused on its chain.
+The five new actions require version 2; a service add/set_roles carrying
+launch, message or notify requires version 1. All other known actions need no
+reported inventory. It changes no wire form, verifier verdict or rollout gate;
+production adoption still needs the reviewed SDK publication and complete
+authenticated evidence from every participant.
+
 Tests:
+- `r9-vectors-required-verifier.json` covers all sixteen known actions,
+  old/new service scopes and strict refusals, through Rust and every binding.
 - All three suites check `verifier_inventory()` against
   `r9-vectors-delegated-wire`'s `verifier`.
 - The end-to-end test (`check-atem-client-bindings.sh e2e`) checks

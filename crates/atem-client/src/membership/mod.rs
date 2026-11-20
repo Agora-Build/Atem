@@ -56,6 +56,7 @@ pub mod host_enc_key;
 pub mod host_senders;
 pub mod projects;
 pub mod publish;
+pub mod required_version;
 pub mod service;
 pub mod stored;
 pub mod wait;
@@ -78,6 +79,7 @@ pub use projects::{
     MAX_PROJECT_HOSTS, MAX_PROJECT_NAME, MIN_PROJECT_HOSTS, Project, ProjectOp, project_name_ok,
     project_remove, project_set,
 };
+pub use required_version::{VerifierRequirement, required_version};
 pub use service::{
     ServiceChangeError, ServiceScope, service_add, service_grant, service_key_fingerprint,
     service_key_fingerprint_of, service_key_fingerprint_of_add, service_narrowing, service_renewal,
