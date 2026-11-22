@@ -152,6 +152,31 @@ mod tests {
         assert_eq!(names, OPS);
     }
 
+    /// The ops that need no version are exactly the seven v0.8.0 shipped
+    /// (its `OPS`): a new op given `None` by mistake fails here, so it can't
+    /// be read as one every verifier knows, even with the vectors
+    /// regenerated.
+    #[test]
+    fn only_v0_8_0s_seven_ops_need_no_version() {
+        let none: Vec<&str> = OP_SINCE
+            .iter()
+            .filter(|(_, since)| since.is_none())
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(
+            none,
+            [
+                "approval",
+                "interrupt",
+                "prompt",
+                "rule_revoke",
+                "stop",
+                "terminal",
+                "view"
+            ]
+        );
+    }
+
     /// No entry asks for more than this verifier reports, and a requirement
     /// is a version (1 or more).
     #[test]
