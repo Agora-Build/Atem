@@ -2351,10 +2351,13 @@ readable by the owner (I.4.5), and the sending host's task view says the result 
 
 **Built behind the debug-only hook** (host-work-v1 §11.5, "On the receiving host"): host senders' gate has this
 mailbox part beside the feed's and the device list's: the mailbox read to the announced head with no refusal, fault or
-reset waiting, no request, cancel or complete left on the Station or waiting on this host for want of room (a result
-holds none; an object pending for a newer sender generation holds none, as below), and every inbox row admitted (a stop
-waiting for room among its sender's early stops holds only that sender's starts). `atem status`'s `Control feeds:` line
-names it. Its readings on back-pressure are agreed with Astation (2026-11-17, #120 comment 6938206284).
+reset waiting, and no request, cancel or complete left on the Station or waiting on this host for want of room (a
+result holds none; an object pending for a newer sender generation holds none, as below). Until then nobody can say
+whose objects wait, so every host sender's starts wait. An opened request, cancel or complete committed as an inbox row
+and not yet admitted (a stop waiting for room among its sender's early stops included) holds only its own sender's
+starts, never another sender's (item 3 below); the host reads those senders from the committed rows, so a restart, or
+a store fault that keeps a row undecided, still holds them. `atem status`'s `Control feeds:` line names it, and the
+senders the inbox holds. Its readings on back-pressure are agreed with Astation (2026-11-17, #120 comment 6938206284).
 
 Before a host starts any unstarted remote task of a host sender, it has, for its own Station:
 
@@ -2367,11 +2370,17 @@ Before a host starts any unstarted remote task of a host sender, it has, for its
    list advances, so waiting for it would let anyone who can put an object in this host's mailbox stall its
    host-sender work until the object's own `expires_at`; and a newer generation of a sender can't stop this host's
    tasks of the old principal. **Changed after Astation's review:** the earlier claim that a newer `add_host` cancels
-   those tasks is removed; a key change cancels nothing (II.2.1, II.8).
+   those tasks is removed; a key change cancels nothing (II.2.1, II.8). **Changed with Astation's agreement of
+   admission's commit order (2026-11-20, #120 comment 7028723996, final readings item 6):** an object opened and
+   committed with the cursor as an inbox row counts as fetched and committed here; it is decided (accepted or refused,
+   applied) in admission's later transaction, and until then it holds its own sender's unstarted tasks only, as
+   Astation's proviso asks: "Persisted inbox obligations block that sender's starts until decided, including restart
+   and storage failure. No task/effect/put before its commit, and other senders are not globally blocked."
 
 The gate closes as in I.5.8: on a disconnect, a reset of the feed or the mailbox, and when no head has arrived for
 60 seconds. While it is closed, unstarted tasks of host senders show `blocked`, detail `revocations not yet checked`,
-and don't hold their session. Local tasks and other senders are unaffected. A restart closes it (I.6.2 step 7).
+and don't hold their session; so do one host sender's while an inbox row of its own waits for admission (item 3).
+Local tasks and other senders are unaffected. A restart closes it (I.6.2 step 7).
 
 **Why.** A sender's `cancel` or a native `revoke` may be waiting for a host that was offline. A queued task of a host
 sender then never starts ahead of a stop that was waiting for its host (the source's section 15.3). The gate trusts
