@@ -4733,8 +4733,9 @@ sets versus sequences (R9.2). Still open:
    start of a build that knows it. The agreed design's rotation within a
    trust generation (II.4.1), its answer to `enc_key_reused`, and its
    compromise remedy (`retire_previous`) need a way to ask the host for a
-   new key: a flag on the op, or a local command. Still open, as a
-   separate proposal Astation asked for (2026-11-20, #120 comment 7028723996;
+   new key: a flag on the op, or a local command. Proposed on 2026-11-22
+   (#120 comment 7086542274: a separate op, `host_enc_key_new`), for
+   Astation's agreement; asked for on 2026-11-20 (#120 comment 7028723996;
    R9.14 item 8).
 
 ### R9.14 Delegated host work (items 1-7 and item 8's `host_enc_key_get` built behind a debug-only hook; not advertised by release builds)
@@ -5174,7 +5175,8 @@ below. Item 8's request stays open.
          `bad_enc_sig`).
        - A relay or a channel can't offer a key the host didn't vouch for
          in this generation.
-     - **Open, a separate proposal still to write:** how a manager asks a
+     - **Open, proposed on 2026-11-22 (#120 comment 7086542274, a separate
+       op `host_enc_key_new`), for Astation's agreement:** how a manager asks a
        host for a *new* key. Astation (2026-11-20, #120 comment 7028723996):
        routine rotation stays a separate, unresolved operation; this op is
        no rotation, and in-place re-verification is no way to one; the
