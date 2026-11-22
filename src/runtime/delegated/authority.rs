@@ -271,8 +271,9 @@ pub fn every_caller(
     }
 }
 
-/// A native member holding `control` at the head, under its own key.
-fn owner(caller_principal: &str, caller_key: &[u8], list: &Membership) -> bool {
+/// A native member holding `control` at the head, under its own key: the
+/// owner's voice (design I.4.5).
+pub fn owner(caller_principal: &str, caller_key: &[u8], list: &Membership) -> bool {
     let Some(device_id) = caller_principal.strip_prefix("member:") else {
         return false;
     };

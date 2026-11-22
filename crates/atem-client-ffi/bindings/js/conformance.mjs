@@ -1,7 +1,7 @@
 // The shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json), the
 // host-work prompt-framing vectors (fixtures/host-work/prompt-framing-v1.json,
-// framing-size-v1.json) and the host-work result_id vectors
-// (fixtures/host-work/requests-v1.json) run through the WASM binding under
+// framing-size-v1.json) and the host-work request, result_id and answers
+// vectors (fixtures/host-work/requests-v1.json) run through the WASM binding under
 // Node. Usage:
 //   node conformance.mjs <wasm-bindgen nodejs pkg dir> <fixtures dir>
 // The same checks run through Kotlin (bindings/kotlin/Conformance.kt) and
@@ -1562,11 +1562,31 @@ const requests = loadWork("requests-v1");
 check("host work: result_id known answers and the reply check (§11.5)", () => {
   eq(requests.result_ids.length, 2);
   for (const c of requests.result_ids) eq(m.hostWorkResultId(c.task_id), c.result_id, c.name);
-  eq(requests.answers.length, 3);
-  for (const c of requests.answers) {
+  const replies = requests.answers.filter((c) => c.result.result.kind === "reply");
+  eq(replies.length, 3);
+  for (const c of replies) {
     const reply = c.result.result.reply;
     eq(reply === null || reply.result_id === m.hostWorkResultId(c.request.data.task_id), c.answers, c.name);
   }
+});
+// Every request case read as the core reads it (what sendJson seals): the
+// owner's work_query, work_interrupt and work_resolve name a host sender's
+// selector task (its UUID v5, host-work-v1 §11.2, §11.5), read as strictly
+// as a UUID v4; the other task ops keep a UUID v4. And every answers case
+// correlated as the connection correlates a result it reads.
+check("host work: request vectors and result correlation (§11.2, §11.5)", () => {
+  for (const c of requests.cases) eq(m.hostWorkRequestValid(c.raw !== undefined ? c.raw : str(c.message)), c.valid, c.name);
+  for (const name of ["work_query_selector_task", "work_interrupt_selector_task", "work_resolve_selector_task"]) {
+    if (!requests.cases.some((c) => c.name === name && c.valid)) throw new Error(`${name} missing`);
+  }
+  eq(m.hostWorkRequestValid("not json"), false);
+  eq(requests.answers.length, 5);
+  for (const c of requests.answers) eq(m.hostWorkResultAnswers(str(c.request), str(c.result)), c.answers, c.name);
+  // Read as strictly as the connection reads a record: a duplicate key
+  // (here a wrong `re` before the right one) is no result.
+  const answering = requests.answers.find((c) => c.answers);
+  const doubled = '{"re":"99999999-9999-4999-8999-999999999999",' + str(answering.result).slice(1);
+  eq(m.hostWorkResultAnswers(str(answering.request), doubled), false, "a duplicate key");
 });
 
 console.log(`wasm conformance: ${passed} passed, ${failures.length} failed`);

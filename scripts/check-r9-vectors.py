@@ -24,7 +24,10 @@ from the shared core's reference mailbox. The other files'
 (`crates/atem-client/tests/vectors.rs`) and the binding suites.
 It also recomputes every Station report id of the acknowledgment fixtures
 (`r9-control-ack-*`, host-work-v1 §11.4): the known answers of the
-reference ledger's `report_id`.
+reference ledger's `report_id`; and, from host-work-v1 §4 and §11.2, the
+verdicts of `host-work/requests-v1`'s requests that name a task (the
+owner's ops naming a host sender's selector task among them), of its `work`
+results and of its `answers` correlation.
 
 Usage: python3 -I scripts/check-r9-vectors.py designs/protocol/fixtures
 
@@ -3772,6 +3775,223 @@ def check_host_route(file, data, report, context):
         case.equal(codes, {(v, c) for v in ROUTE_KINDS for c in ("malformed", "bad_signature")}, "each verifier refuses the other kind and a relabelled proof")
 
 
+# ------------------------------------------- host-work/requests-v1 (task ops)
+
+# The requests naming a task (host-work-v1 §4 "Query, cancel, complete",
+# §11.2): their exact fields beyond v, id, host, op and task_id.
+TASK_OPS = {
+    "work_query": [],
+    "reply_query": [],
+    "work_cancel": [],
+    "work_complete": ["result"],
+    "work_interrupt": [],
+    "work_resolve": ["resolution"],
+}
+# The owner's ops (§11.2): they name a host sender's selector task (its
+# UUID v5, §11.5) as well as a UUID v4; the others a UUID v4 only.
+OWNER_TASK_OPS = {"work_query", "work_interrupt", "work_resolve"}
+WORK_STATES = {
+    "queued", "blocked", "submitting", "submitted", "awaiting_result",
+    "completed", "failed", "cancelled", "expired", "outcome_unknown",
+}
+OPAQUE_ID = r"[A-Za-z0-9._:-]{1,128}"
+MAX_REQUEST_BYTES = 256 * 1024
+# Unicode's White_Space property (PropList.txt).
+WHITE_SPACE = set(map(chr, [*range(0x09, 0x0E), 0x20, 0x85, 0xA0, 0x1680, *range(0x2000, 0x200B), 0x2028, 0x2029, 0x202F, 0x205F, 0x3000]))
+
+
+def task_snapshot_ok(s):
+    """A context snapshot a channel's work_complete or work_resolve{done}
+    carries (§4): memory or vault (a `result` kind is local only), exactly
+    its fields, an opaque id, a version from 1, a text of at most 128 KiB
+    without NUL whose SHA-256 is the digest."""
+    return (
+        isinstance(s, dict)
+        and sorted(s) == ["digest", "id", "kind", "text", "version"]
+        and s["kind"] in ("memory", "vault")
+        and isinstance(s["id"], str) and re.fullmatch(OPAQUE_ID, s["id"]) is not None
+        and safe_int(s["version"], 1)
+        and isinstance(s["text"], str) and len(s["text"].encode()) <= 128 * 1024 and "\0" not in s["text"]
+        and s["digest"] == sha256(s["text"].encode()).hex()
+    )
+
+
+def failed_detail_ok(d):
+    """`failed.detail` (§11.2): 1-1024 bytes, something besides White_Space,
+    no control character and no Cf character."""
+    import unicodedata
+
+    return (
+        isinstance(d, str)
+        and 1 <= len(d.encode()) <= 1024
+        and any(c not in WHITE_SPACE for c in d)
+        and not any(unicodedata.category(c) in ("Cc", "Cf") for c in d)
+    )
+
+
+def host_target_ok(h):
+    return (
+        isinstance(h, dict)
+        and sorted(h) == ["account_id", "atem_device_id", "host_trust_gen"]
+        and all(isinstance(h[k], str) and re.fullmatch(OPAQUE_ID, h[k]) for k in ("account_id", "atem_device_id"))
+        and safe_int(h["host_trust_gen"])
+    )
+
+
+def task_request_ok(text):
+    """A whole request naming a task, as host-work-v1 §1, §4 and §11.2 write
+    it: strict JSON, `{"type":"session","data":{...}}`, the op's exact
+    fields, v 1, a UUID v4 id, the host, the task id (a lowercase UUID v4,
+    or for the owner's ops a UUID v5 too), and the op's own field."""
+    try:
+        message = json.loads(text, object_pairs_hook=_no_duplicates, parse_float=_no_float, parse_constant=_no_constant)
+    except (ValueError, NotStrict):
+        return False
+    if not isinstance(message, dict) or sorted(message) != ["data", "type"] or message["type"] != "session":
+        return False
+    d = message["data"]
+    if not isinstance(d, dict) or d.get("op") not in TASK_OPS:
+        return False
+    op = d["op"]
+    if sorted(d) != sorted(["v", "id", "host", "op", "task_id"] + TASK_OPS[op]):
+        return False
+    if len(json.dumps(d, separators=(",", ":"), ensure_ascii=False).encode()) > MAX_REQUEST_BYTES:
+        return False
+    task = d["task_id"]
+    task_ok = is_uuid(task, 4) or op in OWNER_TASK_OPS and is_uuid(task, 5)
+    if not (d["v"] == 1 and type(d["v"]) is int and is_uuid(d["id"], 4) and host_target_ok(d["host"]) and task_ok):
+        return False
+    if op == "work_complete":
+        return task_snapshot_ok(d["result"])
+    if op == "work_resolve":
+        r = d["resolution"]
+        if not isinstance(r, dict):
+            return False
+        if r.get("kind") == "failed":
+            return sorted(r) == ["detail", "kind"] and failed_detail_ok(r["detail"])
+        if r.get("kind") == "done":
+            return sorted(r) == ["kind", "result"] and task_snapshot_ok(r["result"])
+        return False
+    return True
+
+
+def resolver_ok(resolved):
+    """`resolved{by, at}` (§11.2): `local`, or `member:`/`service:` and an
+    opaque id; the host's wall clock, a safe integer."""
+    return (
+        isinstance(resolved, dict)
+        and sorted(resolved) == ["at", "by"]
+        and isinstance(resolved["by"], str)
+        and (resolved["by"] == "local" or re.fullmatch(r"(member|service):" + OPAQUE_ID, resolved["by"]) is not None)
+        and safe_int(resolved["at"])
+    )
+
+
+def work_status_ok(w):
+    """A `work` status (§4 "Status", §11.2): its task a UUID v4 or a host
+    sender's selector task (its UUID v5: a status answers only the request
+    that named its task), the attempt's UUID v4 `receipt_id`, a state, a
+    detail of at most 1024 bytes, a result exactly when completed (a
+    snapshot), and `resolved` only on a settled status, never null."""
+    if not isinstance(w, dict):
+        return False
+    keys = set(w)
+    if not {"task_id", "receipt_id", "state", "detail"} <= keys <= {"task_id", "receipt_id", "state", "detail", "result", "resolved"}:
+        return False
+    result = w.get("result")
+    return (
+        (is_uuid(w["task_id"], 4) or is_uuid(w["task_id"], 5))
+        and is_uuid(w["receipt_id"], 4)
+        and w["state"] in WORK_STATES
+        and isinstance(w["detail"], str) and len(w["detail"].encode()) <= 1024
+        and (result is None or task_snapshot_ok(result))
+        and (w["state"] == "completed") == (result is not None)
+        and ("resolved" not in w or resolver_ok(w["resolved"]) and w["state"] in ("completed", "failed"))
+    )
+
+
+def work_result_ok(r):
+    """A `host_work_result` of kind `work` (§7), as its data."""
+    return (
+        isinstance(r, dict)
+        and sorted(r) == ["attachment_gen", "channel_id", "host", "id", "op", "re", "result", "v"]
+        and r["v"] == 1 and type(r["v"]) is int and r["op"] == "host_work_result"
+        and all(is_uuid(r[k], 4) for k in ("id", "re", "attachment_gen"))
+        and host_target_ok(r["host"])
+        and isinstance(r["channel_id"], str) and r["channel_id"] != ""
+        and isinstance(r["result"], dict) and sorted(r["result"]) == ["kind", "work"] and r["result"]["kind"] == "work"
+        and work_status_ok(r["result"]["work"])
+    )
+
+
+def task_answer(request, result):
+    """Whether a result (its data) answers a request naming a task: its `re`
+    and host, then a reply naming the task's `result_id` (or none yet), or
+    the task's own status (with `work_complete`'s result, or settled the way
+    `work_resolve` asked)."""
+    d = request["data"]
+    if result["re"] != d["id"] or result["host"] != d["host"]:
+        return False
+    body, op = result["result"], d["op"]
+    if body["kind"] == "reply":
+        return op == "reply_query" and (body["reply"] is None or body["reply"]["result_id"] == result_id_of(d["task_id"]))
+    if body["kind"] != "work" or op == "reply_query" or body["work"]["task_id"] != d["task_id"]:
+        return False
+    w = body["work"]
+    if op == "work_complete":
+        return w.get("result") == d["result"]
+    if op == "work_resolve":
+        r = d["resolution"]
+        settled = w["state"] == "failed" if r["kind"] == "failed" else w["state"] == "completed" and w.get("result") == r["result"]
+        return "resolved" in w and settled
+    return True
+
+
+def check_host_work_task_requests(file, data, report):
+    """host-work/requests-v1's requests that name a task (§4, §11.2): each
+    case's verdict recomputed from the rules as written there (the owner's
+    `work_query`, `work_interrupt` and `work_resolve` take a host sender's
+    selector task, its UUID v5, as well as a UUID v4, Astation's ask on #120
+    comment 7028723996; the other ops a UUID v4 only); its `work` results'
+    (a selector task's status among them); and the `answers` cases'
+    correlation. The file's other cases are the Rust runner's and the
+    binding suites'."""
+
+    def op_of(c):
+        m = c.get("message")
+        return m["data"].get("op") if isinstance(m, dict) and isinstance(m.get("data"), dict) else None
+
+    with report.case(file, "task requests") as case:
+        cases = [c for c in data["cases"] if op_of(c) in TASK_OPS]
+        for op in OWNER_TASK_OPS:
+            case.check(
+                any(op_of(c) == op and c["valid"] and is_uuid(c["message"]["data"]["task_id"], 5) for c in cases),
+                f"{op}: a selector task's id read",
+            )
+            case.check(
+                any(op_of(c) == op and not c["valid"] and isinstance(c["message"]["data"].get("task_id"), str) and c["message"]["data"]["task_id"].lower() != c["message"]["data"]["task_id"] for c in cases),
+                f"{op}: an uppercase id refused",
+            )
+        for op in set(TASK_OPS) - OWNER_TASK_OPS:
+            case.check(
+                any(op_of(c) == op and not c["valid"] and is_uuid(c["message"]["data"]["task_id"], 5) for c in cases),
+                f"{op}: a UUID v5 refused",
+            )
+        for c in cases:
+            text = c["raw"] if "raw" in c else json.dumps(c["message"], ensure_ascii=False)
+            case.equal(task_request_ok(text), c["valid"], f"{c['name']}: {'read' if c['valid'] else 'refused'} by §4 and §11.2's rules")
+    with report.case(file, "work results") as case:
+        works = [c for c in data["results"] if isinstance(c["result"].get("result"), dict) and c["result"]["result"].get("kind") == "work"]
+        case.check(any(c["valid"] and is_uuid(c["result"]["result"]["work"]["task_id"], 5) for c in works), "a selector task's status read")
+        for c in works:
+            case.equal(work_result_ok(c["result"]), c["valid"], f"{c['name']}: {'read' if c['valid'] else 'refused'}")
+    with report.case(file, "answers") as case:
+        for c in data["answers"]:
+            text = json.dumps(c["request"], ensure_ascii=False)
+            case.check(task_request_ok(text), f"{c['name']}: its request reads")
+            case.equal(task_answer(c["request"], c["result"]), c["answers"], f"{c['name']}: answers")
+
+
 # ---------------------------------------------------------------------- main
 
 # In order: a checker may use what an earlier one recorded in `context`.
@@ -3814,6 +4034,8 @@ def main(argv):
                 "name, kind, requires, side",
             )
         check_control_ack(name, data, report, context)
+    requests = "host-work/requests-v1"
+    check_host_work_task_requests(requests, load_strict(fixtures / f"{requests}.json"), report)
     print(f"{report.cases} cases, {report.failures} failed")
     return 1 if report.failures else 0
 

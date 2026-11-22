@@ -1865,13 +1865,39 @@ fun main(args: Array<String>) {
         val known = requests["result_ids"].arr()
         eq(known.size, 2)
         for (c in known) eq(hostWorkResultId(c["task_id"].s()), c["result_id"].s(), c["name"].s())
-        val answers = requests["answers"].arr()
-        eq(answers.size, 3)
-        for (c in answers) {
+        val replies = requests["answers"].arr().filter { it["result"]["result"]["kind"] == "reply" }
+        eq(replies.size, 3)
+        for (c in replies) {
             val reply = c["result"]["result"]["reply"]
             val ok = reply == null || reply["result_id"].s() == hostWorkResultId(c["request"]["data"]["task_id"].s())
             eq(ok, c["answers"] as Boolean, c["name"].s())
         }
+    }
+    // Every request case read as the core reads it (what sendJson seals):
+    // the owner's work_query, work_interrupt and work_resolve name a host
+    // sender's selector task (its UUID v5, host-work-v1 §11.2, §11.5), read
+    // as strictly as a UUID v4; the other task ops keep a UUID v4. And every
+    // answers case correlated as the connection correlates a result it reads.
+    check("host work: request vectors and result correlation (§11.2, §11.5)") {
+        val cases = requests["cases"].arr()
+        for (c in cases) {
+            val text = if (c.obj().containsKey("raw")) c["raw"].s() else Json.write(c["message"])
+            eq(hostWorkRequestValid(text), c["valid"] as Boolean, c["name"].s())
+        }
+        for (name in listOf("work_query_selector_task", "work_interrupt_selector_task", "work_resolve_selector_task")) {
+            eq(cases.any { it["name"] == name && it["valid"] == true }, true, name)
+        }
+        eq(hostWorkRequestValid("not json"), false)
+        val answers = requests["answers"].arr()
+        eq(answers.size, 5)
+        for (c in answers) {
+            eq(hostWorkResultAnswers(Json.write(c["request"]), Json.write(c["result"])), c["answers"] as Boolean, c["name"].s())
+        }
+        // Read as strictly as the connection reads a record: a duplicate key
+        // (here a wrong `re` before the right one) is no result.
+        val answering = answers.first { it["answers"] == true }
+        val doubled = "{\"re\":\"99999999-9999-4999-8999-999999999999\"," + Json.write(answering["result"]).substring(1)
+        eq(hostWorkResultAnswers(Json.write(answering["request"]), doubled), false, "a duplicate key")
     }
 
     println("kotlin conformance: $passed passed, ${failures.size} failed")

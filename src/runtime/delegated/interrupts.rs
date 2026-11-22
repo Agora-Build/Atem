@@ -390,6 +390,8 @@ impl HostBridge {
         if self.work.error {
             return Err("busy".into());
         }
+        // A UUID v5: a host sender's selector task, the owner's alone.
+        self.selector_task_named(a, task_id)?;
         let r = self
             .work
             .store

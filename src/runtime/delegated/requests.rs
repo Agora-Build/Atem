@@ -21,6 +21,60 @@ use crate::session_protocol::wire::ReceiptState;
 pub(super) use crate::runtime::delegated::start::CANCELLED_BEFORE_SUBMISSION;
 
 impl HostBridge {
+    /// A request naming a UUID v5 task (`work_query`, `work_interrupt`,
+    /// `work_resolve`; host-work-v1 §11.2, §11.5; Astation's ask, #120
+    /// comment 7028723996): a host sender's selector task, which the owner
+    /// manages from a channel. Served on only when both hold:
+    ///
+    /// - the caller is the owner (a native member holding `control` at the
+    ///   head of the open list, under its own key), decided before the
+    ///   task is looked for, so nobody else learns whether it exists;
+    /// - the task is on this host and its recorded provenance is a host
+    ///   sender's selector task ([`host_selector_task`]).
+    ///
+    /// Anything else is answered as a task the host doesn't have
+    /// (`forbidden`, no detail), whoever asks: a v5 id grants nothing. A
+    /// UUID v4 passes untouched, its rules today's. Then the op's own path
+    /// (the owner rule of `delegated_caller`, the op's effect) runs as for
+    /// any delegated task.
+    pub(super) fn selector_task_named(
+        &self,
+        a: &Sender,
+        task_id: &str,
+    ) -> Result<(), HostWorkError> {
+        if !atem_client::session::wire::is_uuid_v5(task_id) {
+            return Ok(());
+        }
+        let missing = || HostWorkError::from("forbidden");
+        let is_owner = a
+            .remote()
+            .zip(self.open_list())
+            .is_some_and(|(caller, list)| {
+                crate::runtime::delegated::authority::owner(
+                    &caller.name(),
+                    caller.key.as_bytes(),
+                    list,
+                )
+            });
+        if !is_owner {
+            return Err(missing());
+        }
+        let store = self.work.store.as_ref().ok_or("busy")?;
+        let r = store
+            .work(task_id)
+            .map_err(|_| "busy")?
+            .ok_or_else(missing)?;
+        let message = match &r.message {
+            Some(frame) => store.message(&frame.message_id).map_err(|_| "busy")?,
+            None => None,
+        };
+        if host_selector_task(&r, message.as_ref(), &self.work_host()) {
+            Ok(())
+        } else {
+            Err(missing())
+        }
+    }
+
     /// The store may hold a delegated task: `host.delegated` is on, or the
     /// store held one when it opened (the delegated clock is built for it
     /// then, `ensure_clock`; with the hook off no new one is admitted).
@@ -267,6 +321,8 @@ impl HostBridge {
         if !self.features.delegated {
             return crate::runtime::delegated::request(self.features, req);
         }
+        // A UUID v5: a host sender's selector task, the owner's alone.
+        self.selector_task_named(a, task_id)?;
         let r = self
             .work
             .store
@@ -346,4 +402,49 @@ impl HostBridge {
             Err(_) => Err("busy".into()),
         }
     }
+}
+
+/// Whether `r` is a host sender's selector task as this host recorded it
+/// (host-work-v1 §11.5, "The selector task id" and "On the receiving
+/// host"): delegated as host sender `host:<host_id>` (its principal and its
+/// admission's), from the stored message `message` of that sender (the one
+/// its record names), one of whose `select` recipients for this host
+/// (`host`) resolved to it: its id is `selector_task_id` of the message,
+/// that recipient and the task's session, and the recipient's recorded
+/// receipt lists it.
+pub(super) fn host_selector_task(
+    r: &WorkRecord,
+    message: Option<&crate::runtime::host_work::MessageRecord>,
+    host: &HostTarget,
+) -> bool {
+    use atem_client::session::messages::{Delivery, Destination};
+    use atem_client::session::select::selector_task_id;
+    let (Some(admission), Some(frame), Some(record)) = (&r.delegated, &r.message, message) else {
+        return false;
+    };
+    let crate::runtime::delegated::DelegatedSender::Host { host_id, .. } = &admission.sender else {
+        return false;
+    };
+    let principal = atem_client::host_principal::host_principal(host_id);
+    let task_id = r.task.task_id.as_str();
+    r.principal == principal
+        && admission.principal == principal
+        && r.status.task_id == task_id
+        && record.message.message_id == frame.message_id
+        && record.message.sender == principal
+        && record.receipt.sender == principal
+        && record.message.recipients.iter().any(|recipient| {
+            &recipient.host == host
+                && matches!(recipient.destination, Destination::Select { .. })
+                && selector_task_id(
+                    &frame.message_id,
+                    &recipient.recipient_id,
+                    &r.task.target.session_id,
+                ) == task_id
+                && record.receipt.recipients.iter().any(|receipt| {
+                    receipt.recipient_id == recipient.recipient_id
+                        && matches!(&receipt.delivery,
+                            Delivery::Resolved { tasks } if tasks.iter().any(|t| t.task_id == task_id))
+                })
+        })
 }

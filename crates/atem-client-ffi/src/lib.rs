@@ -36,7 +36,8 @@
 //! - `host_mail` (feature `host`; planned, host role only): envelopes and
 //!   results between hosts, sealed and judged by the receiver's checks;
 //! - [`host_work`]: a task's `result_id` (host-work-v1 §11.5), the
-//!   derivation the connection checks a `reply_query`'s reply against;
+//!   derivation the connection checks a `reply_query`'s reply against, and
+//!   the request reader and result correlation the connection applies;
 //! - [`encoding`]: canonical JSON, `enc`, signing inputs and hashes;
 //! - [`framing`]: the prompt framing's escaping and marker check, the
 //!   Unicode version pinned for them and a task's preflight size check

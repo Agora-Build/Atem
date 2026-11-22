@@ -2274,6 +2274,83 @@ mod delegated_work_ops {
             Some(ConnectError::Request("invalid_request"))
         );
     }
+
+    /// Host-work-v1 §11.2 (Astation's ask, #120 comment 7028723996): the
+    /// owner's `work_query`, `work_interrupt` and `work_resolve` go naming a
+    /// host sender's selector task (its UUID v5, §11.5), and are tracked as
+    /// any; `reply_query` and `work_cancel` naming one, or any op naming an
+    /// id that is no lowercase UUID v4 or v5, are refused before anything is
+    /// sealed. Whose task the id is, the host decides.
+    #[test]
+    fn the_owners_ops_go_naming_a_selector_task() {
+        const SELECTOR: &str = "80160896-4fcd-5e6e-adac-98bac5497321";
+        let world = World::new(&L);
+        let log = world.log(&L);
+        let now = || world.mono();
+        // A host that serves host work, replies and `host.delegated`.
+        world.core.lock().unwrap().welcome_override = Some(|w| {
+            use atem_client::session::host_work::{REPLY_FEATURE, WORK_FEATURE};
+            w.features
+                .extend([DELEGATED_FEATURE, WORK_FEATURE, REPLY_FEATURE].map(String::from))
+        });
+        let mac = Device::native(&world, "dev-phone", log);
+        let mut wire = world.tcp();
+        let mut attached = mac.connect(&mut wire).unwrap();
+        // Sealed only: what the host makes of each is the runtime's tests'.
+        let named = |attached: &Attached, n: u8, op: &str, task: &str| {
+            let mut m = message(
+                attached,
+                &format!("aaaaaaaa-0000-4000-8000-0000000001{n:02x}"),
+                op,
+            );
+            m["data"]["task_id"] = json!(task);
+            if op == "work_complete" {
+                let text = "done";
+                m["data"]["result"] = json!({"kind": "vault", "id": "v-done:1", "version": 1,
+                    "text": text, "digest": atem_client::session::host_work::digest(text.as_bytes())});
+            }
+            m
+        };
+        for (n, op) in [
+            (1, "work_query"),
+            (2, "work_interrupt"),
+            (3, "work_resolve"),
+        ] {
+            let sent = named(&attached, n, op, SELECTOR);
+            attached
+                .send(&sent, now())
+                .unwrap_or_else(|e| panic!("{op}: {e:?}"));
+            assert_eq!(
+                attached.send(&sent, now()).err(),
+                Some(ConnectError::Request("duplicate host work message id")),
+                "{op}: tracked until answered"
+            );
+            let upper = named(&attached, n + 0x10, op, &SELECTOR.to_uppercase());
+            assert_eq!(
+                attached.send(&upper, now()).err(),
+                Some(ConnectError::Request("invalid_request")),
+                "{op}"
+            );
+        }
+        for (n, op) in [
+            (0x21, "reply_query"),
+            (0x22, "work_cancel"),
+            (0x23, "work_complete"),
+        ] {
+            assert_eq!(
+                attached
+                    .send(&named(&attached, n, op, SELECTOR), now())
+                    .err(),
+                Some(ConnectError::Request("invalid_request")),
+                "{op}"
+            );
+            // The same request naming a UUID v4 goes: the id is what is
+            // refused.
+            attached
+                .send(&named(&attached, n + 0x10, op, TASK), now())
+                .unwrap_or_else(|e| panic!("{op} naming a UUID v4: {e:?}"));
+        }
+    }
 }
 
 /// `alert_list` (delegated host-work design I.4.6) on the client: a host-work

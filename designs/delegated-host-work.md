@@ -762,7 +762,10 @@ is served while hosting is paused too.
 
 **Changed for host senders.** A host sender has no channel. Its interactions are signed envelopes (II.7): `cancel`
 and `complete`. Status and replies come back to it as signed, sealed objects; it never queries. It gets no
-`work_interrupt` or `work_resolve` in this version: the owner does both.
+`work_interrupt` or `work_resolve` in this version: the owner does both, from Astation or a phone too (**built
+behind the debug-only hook on Astation's ask, #120 comment 7028723996**: the owner's `work_query`, `work_interrupt`
+and `work_resolve` name a host sender's selector task by its UUID v5; anyone else is answered as for a missing task;
+host-work-v1 §11.2).
 
 ### I.4.6 Unknown outcomes need explicit resolution
 
