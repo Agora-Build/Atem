@@ -2094,7 +2094,8 @@ which entries:
   - Hosts report in `welcome`. How the signer learns the inventories of
     verifiers that aren't hosts (native controllers, Station replicas,
     other SDK consumers, each of which can call `verifier_inventory()`) is
-    Astation's.
+    Astation's; a native member or a service reports with the signed
+    verifier report below, whose carriage is Astation's too.
   - The shared helper (built; **agreed with Astation on 2026-11-22**, #120
     comment 7082465179, item 3: the API Astation asked for on #120,
     comments 7030456149 and 7040054791, built in Atem #190) gives a signer each entry's
@@ -2132,6 +2133,64 @@ which entries:
   - a newer host's, naming an action this release doesn't know;
   - the bounds, at versions above 2, each listing the sixteen actions;
   - one refused case per rule.
+- *A member's signed verifier report* (**agreed for implementation on
+  Astation #101, comment 7082464613**; built in the shared core,
+  `atem_client::member_report`, and in every binding; nothing carries it
+  yet). How a verifier that isn't a host (a native app, an SDK process, a
+  service bot) reports its inventory to a signer. The primitive is
+  Atem's; carriage, challenge storage and single use, the roster of slots
+  and every lifecycle rule are Astation's.
+  - The minter (the signer, or a Station on its behalf) issues and stores
+    a single-use challenge `{signer, slot, origin, connection, nonce,
+    issued_at, expires_at}`: `signer` `member:<device_id>` or
+    `service:<device_id>`; `slot` 1–128 bytes of `[A-Za-z0-9._:-]`;
+    `origin` the Station, exact as `normalize_relay` writes it;
+    `connection` the slot's generation, 1 to 2^53 − 1; `nonce` 32 random
+    bytes, base64url; `0 < expires_at − issued_at ≤ 30000` ms. A challenge
+    is read strictly, in at most 4,096 bytes.
+  - The reporter answers with a signed object in R9.1's form: type
+    `atem-verifier-report`, `v` 1, label `atem-verifier-report-v1`, the
+    body `{account_id, genesis_hash, head{seq, hash}, signer, slot,
+    process, challenge{origin, connection, nonce, issued_at, expires_at},
+    verifier{version, actions}}`. `signer` and `slot` sit at the top and the
+    rest of the challenge is echoed in `challenge`. The body's `jcs` is at
+    most 4,096 bytes and the object 16 KiB; no `kit_sig`, no `null`, no
+    field beyond these at any level, and no duplicate key (escaped ones
+    included). `verifier` is read for its shape only, as a welcome's is.
+  - Signers: a current `native` member with its own `auth_key`, or a
+    current, unexpired `service` with its own key, under the algorithm
+    the list pins. Nothing else: no browser grant, host, `recovery` or
+    delegation; none reports for another member.
+  - The builder takes nothing that matters from its caller. The head,
+    account and genesis are the reporter's own verified log's (a frozen log
+    refuses); `verifier` is the loaded core's `VerifierInventory::ours()`;
+    `process` is 16 CSPRNG bytes drawn once per loaded core (per process
+    image, per WASM instance), readable for logs. It refuses a challenge
+    whose `origin` isn't its configured Station normalized
+    (`origin_mismatch`), whose `signer` isn't itself or whose `slot` isn't
+    its configured slot, whose lease is out of range, or that has expired.
+    The signing purpose `VerifierReport` never prompts: the provider signs
+    only with a key that needs no interaction (R9.6 rule 3's live window
+    included), else it returns `Cancelled` and the slot stays unconfirmed.
+    Nothing creates, rekeys or enrolls a key for it, and the signing input
+    is built only inside the core from the typed body.
+  - The verifier, `verify_verifier_report(log, report, expected challenge,
+    now_ms)`, reads membership and keys at its own current head. The first
+    failure is the code: `malformed`, `frozen`, `wrong_account` (account
+    or genesis), `unknown_signer`, `signer_expired`, `bad_signature`,
+    `stale_log`, `fork`, `signer_mismatch`, `slot_mismatch`,
+    `challenge_mismatch` (any other challenge field), `expired` (`now_ms ≥
+    expires_at`). A cryptographically valid report for another member or
+    slot fails. It returns `{signer, kind (native or service), slot,
+    process, connection, head, at_head, inventory, expires_at}`; a report
+    at an ancestor head verifies with `at_head: false`, and the consumer
+    decides whether that suffices (Astation's signer requires `at_head`).
+  - What it proves: the member key's authority over that report, for that
+    challenge, at that head. Not process uniqueness: two processes in one
+    slot, a missing slot, a replaced process and the single use of a
+    challenge are the consumer's to judge. A live browser grant runs the
+    verifier and has no report, so it stays unconfirmed.
+  - Vectors: `r9-vectors-verifier-report` (R9.12).
 
 Each of the five is signed by a native manager, like every
 entry but `recovery_add` (the recovery key signing one is
@@ -4420,7 +4479,17 @@ action and every scope op, the strict reader's refusals, the 16 KiB input
 and 4,096-byte body bounds, and a refused shape of each of the five actions;
 its runners are `crates/atem-client/tests/required_verifier.rs`, the FFI's
 and the binding conformance suites, and `scripts/check-r9-vectors.py`
-doesn't check it, since it holds no cryptographic value). The membership
+doesn't check it, since it holds no cryptographic value) and
+`r9-vectors-verifier-report` (R9.2 "A member's signed verifier report",
+agreed for implementation on Astation #101: the minter's challenges read
+or refused; native P-256 and Ed25519 reports at the head and at an
+ancestor, a service's, an inventory naming a later action; every malformed
+shape, signed where the body allows; every refusal in its order,
+substitution by another member and another slot included; the builder's
+bodies and refusals; and the immutable request's finishes; its runners
+are `crates/atem-client/tests/verifier_report.rs`, the FFI's, the binding
+conformance suites and `scripts/check-r9-vectors.py`, which derives every
+verdict). The membership
 log also carries the planned actions of R9.2 "Host senders and projects"
 (signed only behind the signing gate): projects (`P7_add_host_b`,
 `P8_set`, the replacing `P9_narrow`, `P10_remove`; a host removed and added again,
