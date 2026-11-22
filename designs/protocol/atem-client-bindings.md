@@ -81,7 +81,10 @@ Every production SDK artifact includes
 `atem-client-<version>-r9-vectors-delegated-wire.json`,
 `atem-client-<version>-r9-vectors-host-envelope.json`,
 `atem-client-<version>-r9-vectors-station-calls.json` (amended for step 4,
-**agreed with Astation (2026-11-13, #120 comment 6848326392)**: a new file in the manifest) and the six
+**agreed with Astation (2026-11-13, #120 comment 6848326392)**: a new file in the manifest),
+`atem-client-<version>-r9-vectors-required-verifier.json` (amended for the
+signing gate's shared helper, **Atem's proposal, for Astation's agreement**:
+a new file in the manifest) and the six
 `atem-client-<version>-r9-control-ack-*.json` (amended for step 4: the
 sixth, `r9-control-ack-reasons`, is O5's, **for Astation's sign-off**) in its SHA-256
 manifest. These are the shared positive/negative request vectors from
@@ -97,9 +100,12 @@ from `fixtures/r9-vectors-delegated-wire.json` (session-v1 R9.14; R9.2 and
 R9.8), the
 envelopes' and results' vectors from `fixtures/r9-vectors-host-envelope.json`
 (host-work-v1 §11.5; planned, host role), the Station calls' byte goldens
-from `fixtures/r9-vectors-station-calls.json` (host-work-v1 §11.4, §9) and
-the Station's acknowledgment fixtures `fixtures/r9-control-ack-*.json` (§9,
-delegated host-work test 48).
+from `fixtures/r9-vectors-station-calls.json` (host-work-v1 §11.4, §9),
+the signing gate's requirement of each unsigned entry body from
+`fixtures/r9-vectors-required-verifier.json` (session-v1 R9.2 "How the
+signing gate uses it"; "The verifier's inventory" below) and the Station's
+acknowledgment fixtures `fixtures/r9-control-ack-*.json` (§9, delegated
+host-work test 48).
 The Rust core's tests run all of them; the Swift, Kotlin and WASM
 conformance suites run the framing vectors through the exports of
 [Prompt framing](#prompt-framing-delegated-host-work-design-iii2) (VII.C test
@@ -108,6 +114,13 @@ the Station calls' vectors and the acknowledgment fixtures, and
 `scripts/check-atem-client-packages.sh` runs the framing vectors through the
 packaged WASM build. They are fixture data, not a live integration test: the
 host renders every prompt (`session::framing`); a client never does.
+
+The required-verifier vectors run through the production
+`membership_required_version` export in the Rust core's and the FFI's tests
+and in all three conformance suites: each case's requirement, or its
+refusal with the case's `reason`. `scripts/check-atem-client-packages.sh`
+also runs every case of the shipped copy (byte-identical to the source
+fixture and listed in the sums) through the packaged Node WASM build.
 
 Status: built and released in Atem v0.8.0 (2026-10-31);
 Astation integrates the bindings, and the joint live tests passed. Crate: `crates/atem-client-ffi`. Protocol: the r9 appendix of
@@ -623,8 +636,9 @@ one. Atem hosts send one in every welcome from the first release that
 carries this change; hosts from v0.8.0 to v0.8.5 send none. It is the
 host's claim about itself and never opens the gate alone.
 
-How a signer's gate uses it (**Atem's proposal, agreed with Astation (2026-11-13, #120 comment 6848326392), its adoption
-closed until the shared `required_version` helper exists**; session-v1 R9.2 "How the signing gate uses it"). It says when
+How a signer's gate uses it (**Atem's proposal, agreed with Astation (2026-11-13, #120 comment 6848326392); the shared
+`required_version` helper its adoption waited on is built (below; its API Atem's proposal, for Astation's agreement), and
+adoption stays Astation's, from a pinned SDK publication**; session-v1 R9.2 "How the signing gate uses it"). It says when
 a verifier is confirmed, and it extends the gate to three scope ops:
 
 - Versions only widen. A version lists every action of the one before it
@@ -650,7 +664,53 @@ a verifier is confirmed, and it extends the gate to three scope ops:
 - How the signer learns the inventories of verifiers that aren't hosts
   (each app calls `verifier_inventory()`) is Astation's.
 
+**The signing gate's requirement of an entry** (built; **Atem's proposal,
+for Astation's agreement**: the API Astation asked for on #120, comments
+7030456149 and 7040054791; session-v1 R9.2 "How the signing gate uses it").
+`membership_required_version(body_json)` (Swift
+`membershipRequiredVersion(bodyJson:)`, Kotlin and JS
+`membershipRequiredVersion`; the core's
+`atem_client::membership::required_version`) takes an entry's unsigned body
+as JSON text (not the `{body, sig}` object) and returns an optional
+`VerifierRequirement{action, minimum_version}` (JS `null` or `{action,
+minimumVersion}`):
+
+- none (`nil`, `null`) for an entry every release from v0.8.0 to v0.8.5
+  accepts: every action but the five, a native member's `add` and
+  `set_roles`, and a service's `add` or `set_roles` whose scope has R9.6's
+  seven ops only;
+- version 2 for `project_set`, `project_remove`, `host_sender_revoke`,
+  `host_sender_readmit` and `host_enc_key`;
+- version 1 for a service `add` or `set_roles` whose scope carries
+  `launch`, `message` or `notify`.
+
+The body is read strictly (strict I-JSON, at most 16 KiB, no duplicate key
+at any depth, integers only), then given the same `SignedObject`/`Entry`
+parse as a received entry (after the strict parse and JCS): the 4,096-byte
+body bound, canonical sets, key algorithms and the action's own fields and
+rules. A body that doesn't parse is never read as needing none: it throws
+`AtemError.Membership{code: "membership_invalid", detail, index: nil}` (JS
+`kind: "membership"`, `code: "membership_invalid"`, `detail`), `detail` the
+verifier's code for that shape (`malformed`, `too_large`, `unknown_field`,
+`array_not_canonical`, `wrong_alg`, `bad_scope`, `bad_project`, …). An
+action this build doesn't know is `malformed`, like any malformed field (a
+refusal reason is part of the verifier's rules, so it keeps its code): to
+tell a newer action from a damaged body, compare the body's `action` with
+`verifier_inventory()`'s `actions`.
+
+The helper checks no signature or chain (a body of the right shape may
+still be refused on its chain), authenticates no verifier and confirms no
+inventory. It changes no wire form, verifier verdict or rollout gate:
+adoption stays Astation's, from a pinned SDK publication, with the gate's
+other conditions (every strict verifier's confirmed inventory, and
+authenticated, current evidence from every participant).
+
 Tests:
+- `r9-vectors-required-verifier` covers all sixteen actions, every scope op
+  in a service's `add` and `set_roles`, the strict reader's refusals, both
+  size bounds and a refused shape of each of the five actions, each refusal
+  with its `reason`: the core's and the FFI's `tests/required_verifier.rs`
+  and all three suites check every case.
 - All three suites check `verifier_inventory()` against
   `r9-vectors-delegated-wire`'s `verifier`.
 - The end-to-end test (`check-atem-client-bindings.sh e2e`) checks

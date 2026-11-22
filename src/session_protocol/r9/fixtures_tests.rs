@@ -3,7 +3,7 @@
 //! pinned to the vectors' log, the real session host over a `FileJournal`,
 //! and clients that are the shared core, routed by handle on one link.
 use super::envelope;
-use super::tests::{Client, Rig};
+use super::tests::{Client, Rig, now_at};
 use super::*;
 use crate::session_protocol::membership::r9log::{TestLog, auth};
 use atem_client::connect::{Event as CEvent, Identity};
@@ -26,7 +26,7 @@ fn unhex32(text: &str) -> [u8; 32] {
 
 /// The vectors' log (the `pinned` labels) with every client key, and
 /// host-a's seed.
-fn vector_log(pinned: &[Value]) -> (TestLog, [u8; 32]) {
+fn vector_log(pinned: &[Value], now: HostNow) -> (TestLog, [u8; 32]) {
     let keys_file = load("r9-vectors-keys");
     let keys = &keys_file["keys"];
     let mut book = SoftwareKeys::new();
@@ -61,7 +61,6 @@ fn vector_log(pinned: &[Value]) -> (TestLog, [u8; 32]) {
             .unwrap()
         })
         .collect();
-    let now = membership::r9log::host_now();
     let account = entries[0].account_id.clone();
     let genesis = entries[0].hash();
     let log = Membership::verify_chain(&account, &genesis, &entries, &now)
@@ -125,10 +124,12 @@ struct Run {
 impl Run {
     fn new(file: &Value) -> Run {
         let setup = &file["setup"];
-        let (log, seed) = vector_log(setup["pinned"].as_array().unwrap());
         let host = &setup["host"];
+        // Signed vector services expire; admission must use the fixture clock.
+        let now = now_at(host["wall_clock_ms"].as_u64().unwrap(), 1_000);
+        let (log, seed) = vector_log(setup["pinned"].as_array().unwrap(), now.host.clone());
         let dir = tempfile::tempdir().unwrap();
-        let mut rig = Rig::build(
+        let mut rig = Rig::build_at(
             dir,
             log,
             host["host_id"].as_str().unwrap(),
@@ -148,6 +149,7 @@ impl Run {
                     })
                     .collect::<Vec<_>>()
             ),
+            now,
         );
         rig.engine = R9Host::new(Limits::default(), None);
         let principals = setup["clients"]

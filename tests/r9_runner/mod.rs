@@ -125,6 +125,9 @@ pub fn not_expressible(scenario: &Value) -> Option<String> {
         (Some("vectors"), _) if name == "r9-vectors-mailbox-calls" => {
             "known-answer mailbox calls (exact bytes between a host and its Station) and the Station's mailbox scenarios, no host process: crates/atem-client/tests/mailbox_calls.rs (the shared builders and readers, and the reference mailbox) and scripts/check-r9-vectors.py".into()
         }
+        (Some("vectors"), _) if name == "r9-vectors-required-verifier" => {
+            "unsigned device-list entry bodies and the signing gate's requirement of each (R9.2), no host process: crates/atem-client/tests/required_verifier.rs (the shared core's required_version) and crates/atem-client-ffi/tests/required_verifier.rs (the production export); scripts/check-r9-vectors.py doesn't check it".into()
+        }
         (Some("vectors"), _) => "known-answer vectors (exact bytes), no host process: crates/atem-client/tests/vectors.rs (and channel_fixtures.rs for the handshake)".into(),
         (_, Some("client")) if name == "r9-handshake-wrong-head" => {
             "the client refusing an accept with the wrong head: no host acts in it (crates/atem-client/tests/channel_fixtures.rs)".into()

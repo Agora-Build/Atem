@@ -765,6 +765,37 @@ final class ConformanceTests: XCTestCase {
                 throw Failure(description: "\(x) isn't listed")
             }
         }
+        // The signing gate's requirement of each unsigned body (session-v1
+        // R9.2 "How the signing gate uses it"; Atem's proposal, for
+        // Astation's agreement): r9-vectors-required-verifier's requirement,
+        // or its refusal as Membership(membership_invalid, the case's reason).
+        let requirementFile = try load("r9-vectors-required-verifier")
+        let requirements = a(requirementFile["cases"]).map(o)
+        check("required verifier: the cases") { try eq(requirements.count, 56) }
+        for value in requirements {
+            check("required verifier: " + s(value["label"])) {
+                let body = s(value["body_json"])
+                if value["reject"] as? Bool == true {
+                    do {
+                        _ = try membershipRequiredVersion(bodyJson: body)
+                        throw Failure(description: "invalid body accepted")
+                    } catch let e as AtemError {
+                        guard case let .Membership(code, detail, index) = e else {
+                            throw Failure(description: "expected Membership, got \(e)")
+                        }
+                        try eq(code, "membership_invalid", "code")
+                        try eq(detail, s(value["reason"]), "reason")
+                        try eq(index == nil, true, "index")
+                    }
+                } else {
+                    let actual = try membershipRequiredVersion(bodyJson: body)
+                    if let expected = value["requirement"] as? [String: Any] {
+                        try eq(actual, VerifierRequirement(action: s(expected["action"]),
+                            minimumVersion: UInt32(u(expected["minimum_version"]))))
+                    } else { try eq(actual, nil as VerifierRequirement?) }
+                }
+            }
+        }
         check("device-list actions: a manager signs each under a purpose that names it (R9.6 rule 4)") {
             #if canImport(CryptoKit)
             let mac = CryptoKitKeys()
@@ -2237,6 +2268,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 76)
+        XCTAssertEqual(passed, 133)
     }
 }

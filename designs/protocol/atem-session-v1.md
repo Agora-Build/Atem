@@ -2062,8 +2062,9 @@ which entries:
   update. The signer's gate keeps its rules: an unknown, offline or
   unconfirmed verifier keeps signing off, and a host whose welcome carries
   no `verifier` is unconfirmed.
-- *How the signing gate uses it* (**Atem's proposal, agreed with Astation (2026-11-13, #120 comment 6848326392), its adoption
-  closed until the shared `required_version` helper exists**). This says when a verifier is confirmed, and it extends the
+- *How the signing gate uses it* (**Atem's proposal, agreed with Astation (2026-11-13, #120 comment 6848326392); the shared
+  `required_version` helper its adoption waited on is built (below; its API Atem's proposal, for Astation's agreement), and
+  adoption stays Astation's, from a pinned SDK publication**). This says when a verifier is confirmed, and it extends the
   gate to three scope ops (below). It removes none of the rules above.
   - Versions only widen. Version N lists every action of version N − 1,
     and it accepts every entry N − 1 accepts, with the same derived state.
@@ -2094,6 +2095,37 @@ which entries:
     verifiers that aren't hosts (native controllers, Station replicas,
     other SDK consumers, each of which can call `verifier_inventory()`) is
     Astation's.
+  - The shared helper (built; **Atem's proposal, for Astation's
+    agreement**: the API Astation asked for on #120, comments 7030456149
+    and 7040054791, proposed in Atem #190) gives a signer each entry's
+    requirement, so no app keeps its own table of actions and ops:
+    `atem_client::membership::required_version(body)`, in the bindings
+    `membership_required_version(body_json)` (JS
+    `membershipRequiredVersion`). It takes the entry's unsigned body as
+    JSON text, reads it strictly and gives it the same `SignedObject` and
+    `Entry` parse as a received entry (after the strict parse and JCS).
+    It returns no requirement for an entry every release from v0.8.0 to
+    v0.8.5 accepts, or `{action, minimum_version}`: the entry's action and
+    the first version that accepts it. Its table is the one above:
+    - version 2 for `project_set`, `project_remove`,
+      `host_sender_revoke`, `host_sender_readmit` and `host_enc_key`;
+    - version 1 for a service `add` or `set_roles` whose scope carries
+      `launch`, `message` or `notify` (a scope needs the highest of its
+      ops' versions);
+    - none for every other entry, among them a native member's `add` or
+      `set_roles` and a service's whose scope carries only R9.6's seven
+      ops.
+
+    A body that doesn't parse as an entry is refused with the verifier's
+    reason (`Invalid`; in the bindings `Membership{membership_invalid,
+    detail}`), never read as needing none. An action the helper's build
+    doesn't know is `malformed`, like any malformed field: a signer tells
+    it from a damaged body by the body's `action` against
+    `verifier_inventory()`. The helper checks no signature or chain,
+    authenticates no verifier and confirms no inventory: every other
+    condition of the gate stays the signer's. A new verifier version
+    changes it with its rules (`VERIFIER_VERSION`'s doc). Vectors:
+    `r9-vectors-required-verifier` (R9.12).
 - Vectors: `r9-vectors-delegated-wire`. Its `verifier` is this release's
   own (version 2). Its `welcome` cases cover:
   - a welcome with a `verifier`, and one without;
@@ -4365,7 +4397,7 @@ with this release's own inventory), `r9-vectors-host-work-control`
 native managers' and a host principal's records, a record signed by a
 manager removed before the host received it, every verification reason
 and parse code, records reusing another record's id, and `ControlState`
-sequences with their per-effect results) and `r9-vectors-host-envelope`
+sequences with their per-effect results), `r9-vectors-host-envelope`
 (host-work-v1 §11.5: envelopes and results between hosts on device lists
 the file carries after log L, each `built` one reproduced by the shared
 core's builders, and checks naming every verdict and reason of the
@@ -4381,10 +4413,17 @@ expiry and every time
 check, mismatched plaintext ids, attachments, a plaintext with `null`, a
 retired previous key, a result from a host the row didn't go to, a dropped
 reply, results of revoked and removed hosts kept as data, and an object at
-each plaintext bound). The membership log also carries the planned
-actions of R9.2 "Host senders and projects" (signed only behind the
-signing gate): projects (`P7_add_host_b`, `P8_set`, the replacing
-`P9_narrow`, `P10_remove`; a host removed and added again,
+each plaintext bound) and `r9-vectors-required-verifier` (R9.2 "How the
+signing gate uses it": unsigned entry bodies only, nothing signed, each with
+the requirement `required_version` gives it or its refusal's `reason`: every
+action and every scope op, the strict reader's refusals, the 16 KiB input
+and 4,096-byte body bounds, and a refused shape of each of the five actions;
+its runners are `crates/atem-client/tests/required_verifier.rs`, the FFI's
+and the binding conformance suites, and `scripts/check-r9-vectors.py`
+doesn't check it, since it holds no cryptographic value). The membership
+log also carries the planned actions of R9.2 "Host senders and projects"
+(signed only behind the signing gate): projects (`P7_add_host_b`,
+`P8_set`, the replacing `P9_narrow`, `P10_remove`; a host removed and added again,
 `P9_remove_host_b`, `P10_readd_host_b`, `P11_set_again`; a project
 emptied by `remove_host` and still removable, `P10_remove_host_a`,
 `P11_remove_emptied`; a re-verified host, `P9_reverify_a`; refused:

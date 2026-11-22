@@ -329,6 +329,15 @@ pub fn verifier_inventory() -> JsResult<JsValue> {
     to_js(&crate::log::verifier_inventory())
 }
 
+/// The signing gate's requirement of one unsigned membership-entry body
+/// (`log::membership_required_version`): `null`, or `{action,
+/// minimumVersion}`. A body that doesn't parse throws `kind: "membership"`,
+/// `code: "membership_invalid"`, `detail` the verifier's code.
+#[wasm_bindgen(js_name = membershipRequiredVersion)]
+pub fn membership_required_version(body_json: String) -> JsResult<JsValue> {
+    to_js(&err(crate::log::membership_required_version(body_json))?)
+}
+
 // --------------------------------------------------------- host work
 
 /// A task's one `result_id` (host-work-v1 §11.5): the shared core's

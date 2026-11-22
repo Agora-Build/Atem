@@ -588,6 +588,31 @@ fun main(args: Array<String>) {
             if (a !in ours.actions) throw AssertionError("$a isn't listed")
         }
     }
+    // The signing gate's requirement of each unsigned body (session-v1 R9.2
+    // "How the signing gate uses it"; Atem's proposal, for Astation's
+    // agreement): r9-vectors-required-verifier's requirement, or its refusal
+    // as Membership(membership_invalid, the case's reason).
+    val requirements = load("r9-vectors-required-verifier")["cases"].arr()
+    check("required verifier: the cases") { eq(requirements.size, 56) }
+    for (value in requirements) {
+        check("required verifier: ${value["label"].s()}") {
+            if (value.obj()["reject"] == true) {
+                try {
+                    membershipRequiredVersion(value["body_json"].s())
+                    throw AssertionError("invalid body accepted")
+                } catch (e: AtemException.Membership) {
+                    eq(e.code, "membership_invalid", "code")
+                    eq(e.detail, value["reason"].s(), "reason")
+                    eq(e.index, null, "index")
+                }
+            } else {
+                val actual = membershipRequiredVersion(value["body_json"].s())
+                val expected = value.obj()["requirement"]
+                eq(actual, if (expected == null) null else VerifierRequirement(
+                    expected["action"].s(), expected["minimum_version"].l().toUInt()))
+            }
+        }
+    }
     check("device-list actions: a manager signs each under a purpose that names it (R9.6 rule 4)") {
         val mac = JdkKeys()
         mac.addP256("dev-mac/auth", unhex(keys["dev-mac"]["auth"]["secret_hex"].s()), unhex(keys["dev-mac"]["auth"]["pub_hex"].s()))

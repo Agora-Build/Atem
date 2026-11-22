@@ -127,6 +127,26 @@ impl Rig {
         host_seed: [u8; 32],
         sessions: Value,
     ) -> Rig {
+        Self::build_at(
+            dir,
+            log,
+            host_id,
+            host_trust_gen,
+            host_seed,
+            sessions,
+            now_at(r9log::host_now().wall_ms, 1_000),
+        )
+    }
+
+    pub fn build_at(
+        dir: tempfile::TempDir,
+        log: TestLog,
+        host_id: &str,
+        host_trust_gen: u64,
+        host_seed: [u8; 32],
+        sessions: Value,
+        now: Now,
+    ) -> Rig {
         let profile = crate::paths::ProfilePaths::in_dir(dir.path());
         let journal = dir.path().join("runtime").join("journal");
         store::private_dir(&journal).unwrap();
@@ -143,7 +163,6 @@ impl Rig {
             "clients": [],
         });
         let file_journal = FileJournal::open(&journal).unwrap();
-        let now = now_at(r9log::host_now().wall_ms, 1_000);
         let mut rt = FakeRuntime::from_json_with(setup, HostConfig::default(), file_journal);
         rt.host.set_refuse_r8(true);
         rt.set_now(now.mono);

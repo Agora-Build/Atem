@@ -484,6 +484,29 @@ check("verifier inventory: version and known actions (R9.2)", () => {
   for (const a of FIVE) if (!ours.actions.includes(a)) throw new Error(`${a} isn't listed`);
 });
 
+// ---------------------------- the signing gate's requirement of each body
+// r9-vectors-required-verifier (session-v1 R9.2 "How the signing gate uses
+// it"; Atem's proposal, for Astation's agreement): each unsigned body's
+// requirement, or its refusal as membership/membership_invalid with the
+// case's reason.
+const requirements = load("r9-vectors-required-verifier").cases;
+check("required verifier: the cases", () => eq(requirements.length, 56));
+for (const value of requirements) {
+  check(`required verifier: ${value.label}`, () => {
+    if (value.reject) {
+      const e = throwsCode(() => m.membershipRequiredVersion(value.body_json), value.reason);
+      eq(e.kind, "membership", "kind");
+      eq(e.code, "membership_invalid", "code");
+      eq(e.detail, value.reason, "reason");
+      eq(e.index === undefined, true, "index");
+    } else {
+      const actual = m.membershipRequiredVersion(value.body_json);
+      const expected = value.requirement;
+      same(actual == null ? null : { action: actual.action, minimum_version: actual.minimumVersion }, expected);
+    }
+  });
+}
+
 // ---------------------------------- delegated host work: control records
 // r9-vectors-host-work-control: every record parses and verifies on each of
 // its chains as `checks` says (or its parse refuses it, `parse_error`); the
