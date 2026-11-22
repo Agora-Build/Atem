@@ -3984,14 +3984,19 @@ exactly as without this section):
     the reply, and the status pass seals it as it seals a status and
     enqueues it until stored, recorded sent in that transaction. **Atem's
     readings, agreed with Astation (2026-11-20, #120 comment 7028723996, "Results"
-    item 5), but for the last clause of this sentence:** one result per
+    item 5; its last clause on 2026-11-22, [#120 comment
+    7082465179][c-7082465179], item 1):** one result per
     task, only once `submitted` (a reply still publishing waits; a refused
     one sends nothing, a corrected one sends one once submitted); none to a
     sender with no current key, no longer a current host or re-verified
     since its message (the owner still reads the reply); signed while this
     host is a current host at its own trust generation, `authorized` or
-    not, as statuses are (**still Atem's reading, for Astation**: signing
-    while this host is revoked as a sender).
+    not, as statuses are. Signing while this host is revoked as a sender
+    gives it no right to start or send new work: the asking host still
+    checks its recorded recipient, the resolution it recorded, the return
+    grant and its delivery policy, and a result whose sender is revoked,
+    removed or no longer granted stays data the owner reads, never an
+    agent's prompt.
     A result goes only once, so one that a store fault keeps from sealing
     stays owed and goes on a later pass, each on its own (one that keeps
     failing holds none of the others), and is settled, its mark cleared
@@ -4105,8 +4110,11 @@ exactly as without this section):
   in one `BEGIN IMMEDIATE` transaction, its effect and its removal from the
   kept results. **Atem's readings: "A status", "A result", "What waits,
   what goes" and "The delivery" agreed with Astation (2026-11-20,
-  #120 comment 7028723996, "Results" items 1 to 4), "Task ids" still for
-  Astation:**
+  #120 comment 7028723996, "Results" items 1 to 4), "Task ids" on
+  2026-11-22 ([#120 comment 7082465179][c-7082465179], item 2: the task
+  ids of the first status naming the resolution are the message's, and a
+  later status only moves their states; it adds, replaces, rebinds or
+  takes none):**
   - **A status.** The first status naming this host's resolution of the
     row's recipient records it (each task with its receipt, state and
     detail, or `no_match`, `stored` or `refused` with no task) and moves the
@@ -4806,18 +4814,28 @@ agreed the rest on 2026-11-20 ([#120 comment 7028723996][c-7028723996]):
 proviso Astation attached where it attached one. Final readings item 9,
 project narrowing, is settled by the owner's decision of 2026-11-22, which
 judges each entry on its own as Astation asked (§11.6, "Project entries
-are judged per entry"). Earlier: the receiving host's mailbox readings
+are judged per entry"). On 2026-11-22 ([#120 comment
+7082465179][c-7082465179]) Astation agreed the two readings this index
+still held, each marked agreed where it is written: signing while this
+host is revoked as a sender ([On the receiving host][mailbox-calls],
+"Results back") and the remote task ids ([On the sending
+host][mailbox-calls], "Task ids"). It also took #195's per-sender gate as
+meeting final reading 6's proviso: an inbox row waiting for admission
+holds only its own sender's starts, and a sender whose mailbox state is
+unknown, uncommitted or unreadable still holds every host sender. A
+`busy` answer to a cancel the host couldn't admit means the cancel took
+no effect: the sending host records that cancel `refused by the host
+(busy)`, never as cancelled. Earlier: the receiving host's mailbox readings
 ([#120 comment 6938206284][c-6938206284]) and this section's wire ([#120
 comment 6903887341][c-6903887341]). All of it runs only behind the
 debug-only hook.
 
-- **Signing while revoked.** Statuses and results are signed while this host is a current host at its own trust generation, `authorized` as a sender or not; "Results" item 5 doesn't name that part, and no comment asked it: [On the receiving host][mailbox-calls], "Results back".
-- **Remote task ids.** A remote task id is one message's (a status naming one that another message holds doesn't take it), and each delivery has its own task id; "Results" item 4 doesn't name it: [On the sending host][mailbox-calls], "Task ids".
 - **Routine encryption-key rotation**, a separate proposal still to write. As Astation said, it must define the manager's request, the owner's confirmation, the refusal of a reused key, the publication order and the old key's retention and retirement; `host_enc_key_get` is no rotation, and in-place re-verification is no way to one (session-v1 R9.13 item 8, R9.14 item 8).
-- **Offered: the owner's `reply_query` for a host sender's selector task**, so the owner reads its reply from Astation or a phone as it already queries, interrupts and resolves it; `reply_query` takes a UUID v4 only today (§11.2, "The owner's ops on a host sender's task").
-- **The shared pieces Astation asked for, for its sign-off:** the host-result framing vectors and renderers (`framing-host-result-v1.json`, [atem-client-bindings.md](atem-client-bindings.md)), and the signing gate's `required_version` helper as merged (session-v1 R9.2, "How the signing gate uses it").
+- **Asked by Astation, being built: the owner's `reply_query` for a host sender's selector task** ([#120 comment 7082465179][c-7082465179]), so the owner reads its reply from Astation or a phone as it already queries, interrupts and resolves it, with #191's authority, provenance and no-disclosure rules and shared and platform vectors; `reply_query` takes a UUID v4 only today (§11.2, "The owner's ops on a host sender's task").
+- **The shared pieces for Astation's own run:** the host-result framing vectors and renderers (`framing-host-result-v1.json`, [atem-client-bindings.md](atem-client-bindings.md)), published in the SDK pin `atem-client-sdk-bd19a6358885` with #190's `required_version` helper, whose shape Astation agreed on 2026-11-22 (session-v1 R9.2, "How the signing gate uses it").
 
 [c-6903887341]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-6903887341
+[c-7082465179]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-7082465179
 [c-6938206284]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-6938206284
 [mailbox-calls]: #the-mailbox-calls-agreed-with-astation-2026-11-16
 
