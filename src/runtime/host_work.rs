@@ -647,6 +647,19 @@ pub struct WorkRecord {
     /// every other task, whose record is as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_id: Option<String>,
+    /// A device-list entry's stop of a host sender's task whose attempt
+    /// was live when the entry reached it (review H1; the owner's decision
+    /// 2026-11-22, per entry): the first stopping entry's event and `seq`,
+    /// written in host-work's device-list effects' transaction
+    /// (`host_senders::list_effects`). The start check refuses the task
+    /// with it, after a host sender's own cancel, whatever the head shows,
+    /// so the attempt's withdrawal, whoever makes it (the effects'
+    /// followup, the dispatch, the start's recovery), settles the task with
+    /// that event, across a crash, a receipt-database fault or a halted
+    /// journal; an attempt found started instead runs, and the mark goes.
+    /// None on every other task, whose record is as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_stop: Option<crate::runtime::delegated::host_senders::ListStop>,
 }
 
 /// What a message's task renders around its text: the message's id and
@@ -2668,6 +2681,7 @@ mod tests {
             delegated: None,
             deadline_passed: false,
             cancel_id: None,
+            list_stop: None,
             principal: "member:phone".into(),
             attachment_owner: String::new(),
             control_gen: 1,

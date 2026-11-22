@@ -103,7 +103,7 @@ impl HostBridge {
             profile: profile.clone(),
             expires_at,
         };
-        let (guard, check) = self.delegated_spawn(&launch, permit);
+        let (guard, check) = self.delegated_spawn(&launch, None, permit);
         Ok(Some((launch, guard, check)))
     }
 
@@ -111,10 +111,15 @@ impl HostBridge {
     /// sender's `launch` (its permit `permit`): the guard fences it after
     /// the spawn, as every launch's, its expiry on the delegated clock; the
     /// check runs [`launch_check`] against the start view first. A host
-    /// sender's launch on message has them too (`admit_pass.rs`).
+    /// sender's launch on message has them too (`admit_pass.rs`), with its
+    /// request id (`host_launch`; ruling R51, a spawn is a start): a device-list
+    /// entry that stopped it fails the check (`StartView::launch_stopped`),
+    /// and a check that lets it go says so under the view's lock
+    /// (`StartView::launch_went`), so no entry after that reaches it.
     pub(super) fn delegated_spawn(
         &self,
         launch: &StartLaunch,
+        host_launch: Option<&str>,
         permit: &Arc<AtomicBool>,
     ) -> (SpawnGuard, PreSpawnCheck) {
         let (profile, expires_at) = (&launch.profile, launch.expires_at);
@@ -145,6 +150,7 @@ impl HostBridge {
             launch.clone(),
             self.features,
         );
+        let host_launch = host_launch.map(str::to_owned);
         let check: PreSpawnCheck = Arc::new(move || {
             // Hosting §5's fences first: a receipt-database fault, hosting
             // switched off or a halted journal (the pass's, `permit`), the
@@ -161,9 +167,17 @@ impl HostBridge {
                 return PreSpawn::Fence;
             }
             let verdict = {
-                let view = view
+                let mut view = view
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Stopped by a device-list entry before its spawn (ruling
+                // R51): its record says `failed` already; nothing spawns.
+                if let Some(detail) = host_launch
+                    .as_deref()
+                    .and_then(|id| view.launch_stopped(id))
+                {
+                    return PreSpawn::Fail(detail);
+                }
                 if view.halted && list_usable(&view) {
                     return PreSpawn::Fence;
                 }
@@ -172,7 +186,11 @@ impl HostBridge {
                 let Some(now_d) = view.now_d_ms else {
                     return PreSpawn::Wait;
                 };
-                launch_check(&view, &start, now_d)
+                let verdict = launch_check(&view, &start, now_d);
+                if let (LaunchVerdict::Go, Some(id)) = (verdict, &host_launch) {
+                    view.launch_went(id);
+                }
+                verdict
             };
             match verdict {
                 LaunchVerdict::Wait(_) => PreSpawn::Wait,
@@ -288,6 +306,8 @@ impl HostBridge {
         result: std::result::Result<(), &anyhow::Error>,
         no_start: bool,
     ) {
+        // Out of the launcher's hands: its spawn check's marks go.
+        self.start_view().forget_launch(request_id);
         match result {
             Ok(()) => self.remote_launched(request_id, LaunchState::Started),
             Err(error) => match error.downcast_ref::<NotSpawned>() {

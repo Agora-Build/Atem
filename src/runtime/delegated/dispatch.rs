@@ -351,9 +351,10 @@ impl HostBridge {
         cx: &mut Cx,
     ) -> anyhow::Result<bool> {
         let receipt = self.host.attempt_receipt(&a.attempt_id, &r.task.task_id);
-        // The start check's withdrawal for a hold isn't counted.
+        // The start check's withdrawal for a hold, or for host-work's own
+        // wait for its device-list effects, isn't counted (review L1).
         let event = self.start_view().refused(&a.attempt_id);
-        let held = event == Some(Event::Held);
+        let held = event.is_some_and(|e| !e.counts_withdrawal());
         let end = match &receipt {
             // Absent: never admitted (I.6.3).
             None => Some(AttemptEnd::NotAdmitted),
@@ -414,6 +415,8 @@ impl HostBridge {
         if let Some(cancel) = next.cancel_id.take() {
             self.cancel_unreached(&tx, &next.principal, &cancel)?;
         }
+        // A device-list entry's stop that found it started: it runs.
+        next.list_stop = None;
         store.save_work(&next)?;
         store.end_attempt(&tx, &r.task.task_id, &a.attempt_id, AttemptEnd::Started)?;
         tx.commit()?;
@@ -572,7 +575,7 @@ impl HostBridge {
                 match crate::runtime::delegated::admit::launch_failure(&store.db, &id)?
                     .or_else(|| self.work.refused.get(&id).cloned())
                 {
-                    Some(why) => format!("approved route launch not started: {why}"),
+                    Some(why) => crate::runtime::delegated::admit::launch_not_started(&why),
                     None => "approved route launch failed; check its cwd and environment".into(),
                 },
             ),

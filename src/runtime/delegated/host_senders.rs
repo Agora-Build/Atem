@@ -26,8 +26,9 @@
 //!   sender cancels its unstarted tasks admitted before it (`sender
 //!   revoked`), a revoke with `interrupt_running` writes an interrupt intent
 //!   for each of them that started; a project entry fails the unstarted
-//!   tasks it no longer covers (`sender's authorization narrowed`); a
-//!   readmit and a newer `add_host` do nothing. They are written in one
+//!   tasks the list as of that entry no longer covers (`sender's
+//!   authorization narrowed`), per entry, so a later restore revives none;
+//!   a readmit and a newer `add_host` do nothing. They are written in one
 //!   transaction with host-work's own applied device-list `seq`
 //!   ([`applied_seq`], in `host-work.sqlite`), so a crash between an entry's
 //!   commit and its effects loses none: the next pass, and the start before
@@ -35,16 +36,19 @@
 use super::effects::{self, Followup};
 use super::start::Event;
 use super::{DelegatedSender, SenderClass};
-use crate::runtime::host_work::{Route, Store};
+use crate::runtime::host_work::{Route, Store, WorkRecord};
 use crate::runtime::test_hooks::HostFeatures;
 use anyhow::{Result, bail};
 use atem_client::encoding::Hash32;
 use atem_client::host_principal::{host_principal, parse_host_principal};
 use atem_client::membership::entry::Action;
-use atem_client::membership::{HostSenderState, Membership, ProjectOp, project_name_ok};
-use atem_client::session::host_work::WorkState;
+use atem_client::membership::{
+    HostRecord, HostSenderState, ListAsOf, Membership, Project, ProjectOp, project_name_ok,
+};
+use atem_client::session::host_work::{LaunchState, WorkState};
 use atem_client::session::wire::is_delegated_sender;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 /// Host-work's applied device-list `seq` (II.3.1, "Crash safety"): one row,
@@ -244,13 +248,74 @@ pub fn host_sender_permits(
     Err(Event::Narrowed)
 }
 
+/// What the host-sender checks read of a device list: the committed list
+/// ([`Membership`]) or the list as of one of its entries ([`ListAsOf`]: a
+/// project entry judged per entry, review L2's narrow view).
+pub trait Grants {
+    fn host(&self, host_id: &str) -> Option<&HostRecord>;
+    fn host_membership_epoch(&self, host_id: &str) -> Option<u64>;
+    fn host_sender_state(&self, host_id: &str) -> Option<HostSenderState>;
+    fn project(&self, name: &str) -> Option<&Project>;
+    fn project_hosts(&self, name: &str) -> Vec<&str>;
+    fn host_projects(&self, host_id: &str) -> Vec<&str>;
+}
+
+macro_rules! grants_of {
+    ($list:ty) => {
+        impl Grants for $list {
+            fn host(&self, host_id: &str) -> Option<&HostRecord> {
+                <$list>::host(self, host_id)
+            }
+            fn host_membership_epoch(&self, host_id: &str) -> Option<u64> {
+                <$list>::host_membership_epoch(self, host_id)
+            }
+            fn host_sender_state(&self, host_id: &str) -> Option<HostSenderState> {
+                <$list>::host_sender_state(self, host_id)
+            }
+            fn project(&self, name: &str) -> Option<&Project> {
+                <$list>::project(self, name)
+            }
+            fn project_hosts(&self, name: &str) -> Vec<&str> {
+                <$list>::project_hosts(self, name)
+            }
+            fn host_projects(&self, host_id: &str) -> Vec<&str> {
+                <$list>::host_projects(self, host_id)
+            }
+        }
+    };
+}
+grants_of!(Membership);
+grants_of!(ListAsOf);
+
+/// The committed list as the start view shares it.
+impl<L: Grants> Grants for std::sync::Arc<L> {
+    fn host(&self, host_id: &str) -> Option<&HostRecord> {
+        L::host(self, host_id)
+    }
+    fn host_membership_epoch(&self, host_id: &str) -> Option<u64> {
+        L::host_membership_epoch(self, host_id)
+    }
+    fn host_sender_state(&self, host_id: &str) -> Option<HostSenderState> {
+        L::host_sender_state(self, host_id)
+    }
+    fn project(&self, name: &str) -> Option<&Project> {
+        L::project(self, name)
+    }
+    fn project_hosts(&self, name: &str) -> Vec<&str> {
+        L::project_hosts(self, name)
+    }
+    fn host_projects(&self, host_id: &str) -> Vec<&str> {
+        L::host_projects(self, host_id)
+    }
+}
+
 /// Whether a task admitted with `admitted` from `host_id` is still covered
 /// for `op` on `list` (conditions 2 and 3, the device list's part): its
 /// standing, and its recorded consent's grant now. What the device list's
 /// own entries do to such a task (`list_effects`): `Removed` or `Revoked`
 /// (cancelled), `Narrowed` (failed); no route is read.
 pub fn host_task_covered(
-    list: &Membership,
+    list: &impl Grants,
     this_host: &str,
     host_id: &str,
     admitted: Admitted<'_>,
@@ -269,7 +334,7 @@ pub fn host_task_covered(
 /// while it may send (step 1 of [`host_sender_permits`]), checked against
 /// `admitted` (a task's recorded generation and epoch) when given.
 pub fn host_standing(
-    list: &Membership,
+    list: &impl Grants,
     host_id: &str,
     admitted: Option<(u64, u64)>,
 ) -> Result<(u64, u64), Event> {
@@ -296,7 +361,7 @@ pub fn host_standing(
 /// on and their ops; none when the entry doesn't name the sender, or names
 /// no project in effect listing both hosts.
 fn grant(
-    list: &Membership,
+    list: &impl Grants,
     this_host: &str,
     sender: &str,
     entry: &str,
@@ -370,11 +435,47 @@ pub fn set_applied_seq(tx: &Transaction, genesis: &Hash32, seq: u64) -> Result<(
     Ok(())
 }
 
+/// A device-list entry's stop of a host sender's task whose attempt was
+/// live when the entry reached it (`WorkRecord::list_stop`, review H1): the
+/// entry's `seq` and the event, written in [`list_effects`]' transaction,
+/// the first stopping entry's only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListStop {
+    pub seq: u64,
+    pub event: Event,
+}
+
+/// A host sender's launch on message this run reserved and hasn't spawned
+/// (its spawn check never let it go, `StartView::launch_gone`): what a
+/// project entry may stop (ruling R51). A launch of a run before a restart
+/// is the start's recovery's (`Store::recover`: of unknown outcome unless
+/// its session is live, never spawned again), never one of these.
+#[derive(Debug, Clone)]
+pub struct QueuedLaunch {
+    pub request_id: String,
+    /// Its admission record (the sender's grant when its request was
+    /// admitted, `device_list_seq` among it).
+    pub admission: super::Admission,
+}
+
+/// What [`list_effects`] asks of the bridge once its transaction
+/// committed.
+#[derive(Debug, Default)]
+pub struct ListEffects {
+    /// A live attempt's withdrawal, the intents carried out.
+    pub followups: Vec<Followup>,
+    /// The queued launches an entry stopped, with why (request id,
+    /// detail): `failed` in the transaction, with their waiting tasks; the
+    /// bridge drops them from its queue, and its spawn check refuses one the
+    /// launcher holds.
+    pub launches: Vec<(String, &'static str)>,
+}
+
 /// The effects on host senders' tasks of `list`'s entries after `after`
 /// (host-work's applied `seq`) up to its head, in `tx`, entry by entry
-/// (design II.2.2, II.3.1, II.8); what must wait for the commit is returned
-/// (a live attempt's withdrawal, the intents carried out). The caller
-/// writes the new applied `seq` in the same transaction.
+/// (design II.2.2, II.3.1, II.8), and on `launches` (this run's queued
+/// launches on message); what must wait for the commit is returned. The
+/// caller writes the new applied `seq` in the same transaction.
 ///
 /// - **`host_sender_revoke`** at `seq` (II.3.1): the sender's tasks
 ///   admitted before it (their generation below `seq`) stop as a revoke
@@ -388,26 +489,52 @@ pub fn set_applied_seq(tx: &Transaction, genesis: &Hash32, seq: u64) -> Result<(
 ///   (their epoch below `seq`) stop the same way (`Removed`: `cancelled`,
 ///   `sender revoked`). This host's own removal is the device list's
 ///   (every principal fenced, a new identity's store).
-/// - **`project_set`, `project_remove`**: once per call, after the other
-///   entries, each host sender's unstarted task is judged on `list` as it
-///   committed ([`host_task_covered`]): one no longer covered stops with
-///   the event (`Narrowed`: `failed`, `sender's authorization narrowed`).
-///   Tasks awaiting their result or of unknown outcome are kept.
+/// - **`project_set`, `project_remove`** at `seq`, per entry (the owner's
+///   decision, 2026-11-22; Astation's integration requirement, #120
+///   comment 7028723996, final readings item 9): each host sender's task
+///   that waits, or whose attempt is live, admitted on a list before `seq`
+///   (`Admission::device_list_seq` below it), is judged on the list as of
+///   `seq` ([`Membership::prefixes`], [`host_task_covered`]): one no
+///   longer covered stops with the event (`Narrowed`: `failed`, `sender's
+///   authorization narrowed`), and stays stopped whatever a later entry
+///   restores: a live attempt's task gets the stop on its record first
+///   ([`ListStop`], review H1), for revokes and removals too. Tasks
+///   awaiting their result or of unknown outcome are kept.
+///   A queued launch on message (ruling R51: a spawn is a start), admitted
+///   before `seq`, that the list as of `seq` no longer covers for a launch
+///   on message (its consent's projects with `launch` and a task's ops,
+///   [`HostOp::LaunchOnMessage`]) fails with the event's detail, its record
+///   `failed` and why kept (`admit::launch_failed`, as the spawn check's
+///   refusal), and every task waiting for it that waits still fails with
+///   it (`approved route launch not started: <why>`); a later restore
+///   revives neither.
 /// - **`host_sender_readmit`, `add_host`**: nothing (cancelled tasks stay
 ///   cancelled; a new key changes no authorization).
 ///
+/// Entries go in `seq` order, so a task two entries reach (a narrowing
+/// and a revoke) takes the first one's outcome: an unstarted task is
+/// settled by it in `tx`, and of the withdrawals asked for one live
+/// attempt only the first is kept.
+///
 /// Idempotent, keyed by the entry's `seq`: a task already in the state
 /// the entry gives is left, an intent already written isn't written again,
-/// so entries applied again (a replay) add nothing.
+/// so entries applied again (a replay) add nothing, and revive nothing.
 pub fn list_effects(
     store: &Store,
     tx: &Transaction,
     list: &Membership,
     this_host: &str,
     after: u64,
-) -> Result<Vec<Followup>> {
+    launches: &[QueuedLaunch],
+) -> Result<ListEffects> {
     let mut out = Vec::new();
-    let mut projects = false;
+    let mut stopped = Vec::new();
+    // The list as of each project entry (`ListAsOf`), read forward once
+    // from the first one; host senders' tasks a project entry may stop,
+    // read at the first one; the queued launches not stopped yet.
+    let mut prefixes = None;
+    let mut reachable: Option<Vec<WorkRecord>> = None;
+    let mut queued: Vec<&QueuedLaunch> = launches.iter().collect();
     for seq in after.saturating_add(1)..=list.head().seq {
         let Some(entry) = list.entry(seq) else {
             continue;
@@ -420,7 +547,7 @@ pub fn list_effects(
                 let principal = host_principal(host_id);
                 let mut tasks =
                     admitted_before(store, &principal, |generation, _| generation < seq)?;
-                effects::stop(store, tx, &mut tasks, Event::Revoked, &mut out)?;
+                stop(store, tx, &mut tasks, Event::Revoked, seq, &mut out)?;
                 if *interrupt_running {
                     effects::interrupt(store, tx, &principal, &tasks, &seq.to_string(), &mut out)?;
                 }
@@ -428,16 +555,107 @@ pub fn list_effects(
             Action::RemoveHost { host_id } if host_id != this_host => {
                 let principal = host_principal(host_id);
                 let mut tasks = admitted_before(store, &principal, |_, epoch| epoch < seq)?;
-                effects::stop(store, tx, &mut tasks, Event::Removed, &mut out)?;
+                stop(store, tx, &mut tasks, Event::Removed, seq, &mut out)?;
             }
-            Action::ProjectSet { .. } | Action::ProjectRemove { .. } => projects = true,
+            Action::ProjectSet { .. } | Action::ProjectRemove { .. } => {
+                let walk = prefixes.get_or_insert_with(|| list.prefixes());
+                let Some(then) = walk.as_of(seq) else {
+                    bail!("the device list has no position {seq}");
+                };
+                let tasks = match &mut reachable {
+                    Some(tasks) => tasks,
+                    None => reachable.insert(host_senders_tasks(store)?),
+                };
+                narrowed(store, tx, tasks, then, seq, this_host, &mut out)?;
+                stopped.extend(launches_narrowed(
+                    store,
+                    tx,
+                    &mut queued,
+                    then,
+                    seq,
+                    this_host,
+                )?);
+            }
             _ => {}
         }
     }
-    if projects {
-        narrowed(store, tx, list, this_host, &mut out)?;
+    first_withdrawals(&mut out);
+    Ok(ListEffects {
+        followups: out,
+        launches: stopped,
+    })
+}
+
+/// The project entry at `seq`'s effect on `queued` launches, `then` the
+/// list as of it (ruling R51): each admitted before `seq` that `then` no
+/// longer covers for a launch on message leaves `queued`; if its record
+/// still says `starting`, it fails with the event's detail, why kept, and
+/// the tasks waiting for it that wait (no live attempt: none has its
+/// session) fail with it. What it stopped (request id, detail).
+fn launches_narrowed(
+    store: &Store,
+    tx: &Transaction,
+    queued: &mut Vec<&QueuedLaunch>,
+    then: &ListAsOf,
+    seq: u64,
+    this_host: &str,
+) -> Result<Vec<(String, &'static str)>> {
+    let mut reached = Vec::new();
+    queued.retain(|launch| {
+        let admission = &launch.admission;
+        let event = admission.host_admitted().and_then(|(host_id, admitted)| {
+            if admission.device_list_seq >= seq {
+                return None;
+            }
+            host_task_covered(then, this_host, host_id, admitted, HostOp::LaunchOnMessage).err()
+        });
+        match event {
+            Some(event) => {
+                reached.push((launch.request_id.clone(), event));
+                false
+            }
+            None => true,
+        }
+    });
+    let mut stopped = Vec::new();
+    for (request_id, event) in reached {
+        let Some(mut record) = store.launch(&request_id)? else {
+            continue;
+        };
+        if record.status.state != LaunchState::Starting {
+            continue;
+        }
+        let (_, detail) = event.outcome();
+        super::admit::launch_failed(tx, &request_id, detail)?;
+        record.status.state = LaunchState::Failed;
+        store.save_launch(&record)?;
+        let why = super::admit::launch_not_started(detail);
+        for task_id in super::admit::waiting_for(tx, &request_id)? {
+            let Some(mut r) = store.work(&task_id)? else {
+                continue;
+            };
+            if !matches!(r.status.state, WorkState::Queued | WorkState::Blocked)
+                || store.live_attempt(&task_id)?.is_some()
+            {
+                continue;
+            }
+            r.status.state = WorkState::Failed;
+            r.status.detail = why.clone();
+            store.save_work(&r)?;
+        }
+        stopped.push((request_id, detail));
     }
-    Ok(out)
+    Ok(stopped)
+}
+
+/// Of the withdrawals `out` asks for one attempt, the first: a task's
+/// first stop, in `seq` order, is its outcome.
+fn first_withdrawals(out: &mut Vec<Followup>) {
+    let mut asked = BTreeSet::new();
+    out.retain(|followup| match followup {
+        Followup::Withdraw { attempt_id, .. } => asked.insert(attempt_id.clone()),
+        _ => true,
+    });
 }
 
 /// `principal`'s (a host sender's) tasks that wait or run, each with its
@@ -457,30 +675,94 @@ fn admitted_before(
     Ok(tasks)
 }
 
-/// A project entry's effect: every host sender's task that waits (or whose
-/// attempt is live) and that `list` no longer covers stops with the event
-/// [`host_task_covered`] gives (a narrowing; a revoke or removal applied
-/// above already settled theirs). One read of the active tasks.
+/// Host senders' tasks that wait or run (`queued`, `blocked`,
+/// `submitting`, `submitted`): what a project entry may stop. One read of
+/// the active tasks a catch-up.
+fn host_senders_tasks(store: &Store) -> Result<Vec<WorkRecord>> {
+    let mut tasks = store.active_tasks()?;
+    tasks.retain(|r| {
+        r.delegated
+            .as_ref()
+            .and_then(|a| a.host_admitted())
+            .is_some()
+    });
+    Ok(tasks)
+}
+
+/// The effect of the project entry at `seq`, `then` the list as of it, on
+/// `tasks` (those no entry of this catch-up reached yet): every one
+/// admitted on a list before `seq` that `then` no longer covers is reached,
+/// and leaves `tasks`. If it still waits, or its attempt is live, as `tx`
+/// has it now (an entry before this one, a revoke or removal, may have
+/// settled it), it stops with the event [`host_task_covered`] gives (a
+/// narrowing); a started one goes on. A task admitted at `seq` or after was
+/// judged on a list that had the entry.
 fn narrowed(
     store: &Store,
     tx: &Transaction,
-    list: &Membership,
+    tasks: &mut Vec<WorkRecord>,
+    then: &ListAsOf,
+    seq: u64,
     this_host: &str,
     out: &mut Vec<Followup>,
 ) -> Result<()> {
-    for r in store.active_tasks()? {
-        let Some((host_id, admitted)) = r.delegated.as_ref().and_then(|a| a.host_admitted()) else {
+    let mut reached = Vec::new();
+    tasks.retain(|r| {
+        let event = r.delegated.as_ref().and_then(|admission| {
+            let (host_id, admitted) = admission.host_admitted()?;
+            if admission.device_list_seq >= seq {
+                return None;
+            }
+            host_task_covered(then, this_host, host_id, admitted, HostOp::Task).err()
+        });
+        match event {
+            Some(event) => {
+                reached.push((r.task.task_id.clone(), event));
+                false
+            }
+            None => true,
+        }
+    });
+    for (task_id, event) in reached {
+        let Some(r) = store.work(&task_id)? else {
             continue;
         };
-        let Err(event) = host_task_covered(list, this_host, host_id, admitted, HostOp::Task) else {
-            continue;
-        };
-        let live = store.live_attempt(&r.task.task_id)?;
+        let live = store.live_attempt(&task_id)?;
         if live.is_none() && !matches!(r.status.state, WorkState::Queued | WorkState::Blocked) {
             continue;
         }
         let mut one = [(r, live)];
-        effects::stop(store, tx, &mut one, event, out)?;
+        stop(store, tx, &mut one, event, seq, out)?;
+    }
+    Ok(())
+}
+
+/// `tasks` stop for the entry at `seq` with `event` (`effects::stop`: an
+/// unstarted task takes the event's state in `tx`; a live attempt's
+/// withdrawal is asked). A task whose attempt is live gets the stop on its
+/// record first, in `tx` (`WorkRecord::list_stop`, review H1), so it
+/// outlives what the withdrawal may not (a crash after the commit, a
+/// receipt-database fault, a halted journal); the first entry's stop is
+/// kept, and its withdrawal settles the task with that one's event.
+fn stop(
+    store: &Store,
+    tx: &Transaction,
+    tasks: &mut [effects::Task],
+    event: Event,
+    seq: u64,
+    out: &mut Vec<Followup>,
+) -> Result<()> {
+    for task in tasks.iter_mut() {
+        let then = match (&task.1, task.0.list_stop) {
+            (None, _) => event,
+            (Some(_), Some(first)) => first.event,
+            (Some(_), None) => {
+                task.0.list_stop = Some(ListStop { seq, event });
+                store.save_work(&task.0)?;
+                event
+            }
+        };
+        effects::stop(store, tx, std::slice::from_mut(task), then, out)?;
     }
     Ok(())
 }

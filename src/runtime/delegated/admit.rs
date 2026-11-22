@@ -154,6 +154,20 @@ pub fn launch_failed(db: &Connection, request_id: &str, detail: &str) -> Result<
     Ok(())
 }
 
+/// The detail of a task whose launch failed before its spawn for `why`
+/// (stage 1's text, review L5): the dispatch's, and a device-list entry's
+/// that stopped the launch (ruling R51).
+pub fn launch_not_started(why: &str) -> String {
+    format!("approved route launch not started: {why}")
+}
+
+/// The tasks that wait for launch `request_id`.
+pub fn waiting_for(db: &Connection, request_id: &str) -> Result<Vec<String>> {
+    let mut q = db.prepare("SELECT task_id FROM mail_launches WHERE request_id=?1")?;
+    let rows = q.query_map([request_id], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 /// Why the launch `request_id` failed at its spawn check, if it did.
 pub fn launch_failure(db: &Connection, request_id: &str) -> Result<Option<String>> {
     Ok(db

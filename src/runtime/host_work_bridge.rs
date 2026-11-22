@@ -515,6 +515,7 @@ impl HostBridge {
             self.work.refused.clear();
         }
         self.work.refused.insert(request_id.to_string(), why);
+        self.start_view().forget_launch(request_id);
         self.remote_launched(request_id, LaunchState::Failed);
     }
 
@@ -1814,6 +1815,7 @@ impl HostBridge {
                     delegated: None,
                     deadline_passed: false,
                     cancel_id: None,
+                    list_stop: None,
                     attachment_owner: attachment_owner(&a),
                     principal,
                     control_gen: self.host.control_gen(&a.name()),
@@ -2187,6 +2189,7 @@ impl HostBridge {
                     delegated: None,
                     deadline_passed: false,
                     cancel_id: None,
+                    list_stop: None,
                     attachment_owner: attachment_owner(a),
                     principal: a.name(),
                     control_gen: self.host.control_gen(&a.name()),
@@ -3654,6 +3657,7 @@ principals = ["local"]
             delegated: None,
             deadline_passed: false,
             cancel_id: None,
+            list_stop: None,
             principal: principal.into(),
             attachment_owner: String::new(),
             control_gen,
@@ -4185,6 +4189,7 @@ principals = ["local"]
                 delegated: None,
                 deadline_passed: false,
                 cancel_id: None,
+                list_stop: None,
                 principal: "member:owner".into(),
                 attachment_owner: String::new(),
                 control_gen: 0,
@@ -5893,6 +5898,7 @@ launch = "on_message"
                 delegated: None,
                 deadline_passed: false,
                 cancel_id: None,
+                list_stop: None,
                 principal: "local".into(),
                 attachment_owner: Sender::Local.owner(),
                 control_gen,
@@ -6659,6 +6665,7 @@ launch = "on_message"
                         delegated: None,
                         deadline_passed: false,
                         cancel_id: None,
+                        list_stop: None,
                         principal: "browser:b".into(),
                         attachment_owner: String::new(),
                         control_gen: 2,

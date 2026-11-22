@@ -409,7 +409,9 @@ fn a_crash_between_an_entry_and_its_effects_is_replayed_at_the_start() {
         let store = rig.bridge.work.store.as_ref().unwrap();
         let list = rig.bridge.membership.as_ref().unwrap().membership();
         let tx = store.immediate().unwrap();
-        let again = host_senders::list_effects(store, &tx, list, "host", before).unwrap();
+        let again = host_senders::list_effects(store, &tx, list, "host", before, &[])
+            .unwrap()
+            .followups;
         tx.commit().unwrap();
         assert!(
             again.iter().all(|f| !matches!(
@@ -446,7 +448,7 @@ fn the_effects_and_the_applied_seq_commit_together() {
             let store = rig.bridge.work.store.as_ref().unwrap();
             let list = rig.bridge.membership.as_ref().unwrap().membership();
             let tx = store.immediate().unwrap();
-            host_senders::list_effects(store, &tx, list, "host", before).unwrap();
+            host_senders::list_effects(store, &tx, list, "host", before, &[]).unwrap();
             host_senders::set_applied_seq(&tx, &genesis, list.head().seq).unwrap();
             drop(tx);
         }
@@ -859,51 +861,399 @@ fn the_applied_seq_is_read_from_memory() {
     });
 }
 
-// ── Atem's reading of project entries; the effects while paused; replay ──
+// ── Project entries judged per entry; the effects while paused; replay ──
 
-/// Atem's reading (host-work-v1 §11.6, design II.2.2): project entries are
-/// judged once per catch-up against the committed head, as Part I judges
-/// every narrowing at `executing`. A narrowing and a re-widening that reach
-/// host-work's pass together fail nothing; a narrowing and a revoke of the
-/// same sender together give the revoke's `cancelled`, `sender revoked`.
+/// `build` narrowed to `message` alone: a task's `notify` and `prompt` gone.
+fn hs_narrowing() -> ListAction {
+    project_set("build", ["host", "host-b"], [ProjectOp::Message], 0).unwrap()
+}
+
+/// `build` with a task's ops again, as before [`hs_narrowing`].
+fn hs_restoring() -> ListAction {
+    project_set("build", ["host", "host-b"], task_ops(), 0).unwrap()
+}
+
+/// `build` with every op: a widening of a task's.
+fn hs_widening() -> ListAction {
+    project_set(
+        "build",
+        ["host", "host-b"],
+        [
+            ProjectOp::Launch,
+            ProjectOp::Message,
+            ProjectOp::Notify,
+            ProjectOp::Prompt,
+        ],
+        0,
+    )
+    .unwrap()
+}
+
+/// The owner's decision (2026-11-22; Astation's integration requirement,
+/// #120 comment 7028723996, final readings item 9; host-work-v1 §11.6):
+/// project entries are judged per entry, each on the device list as of
+/// its `seq`. A narrowing and a restore that reach host-work's pass
+/// together fail B's queued task at the narrowing, `sender's authorization
+/// narrowed`, and it stays failed: neither the restore nor a later
+/// widening revives it, and it never runs.
 #[test]
-fn project_entries_are_judged_once_per_catch_up_against_the_head() {
+fn a_narrowing_then_a_restore_in_one_catch_up_fails_the_task() {
     local_test(async |root| {
         let mut rig = LocalRig::new(root).await;
         let start = host_now().wall_ms;
         let os = ManualOs::at(start);
         let mut s = host_senders_host(&mut rig, root, &os);
-        let queued = host_task(&mut rig, &s, "HS_ONCE_QUEUED", start + HOUR);
+        let queued = host_task(&mut rig, &s, "HS_RESTORED_QUEUED", start + HOUR);
         hold_host_work(&mut rig);
         ticks(&mut rig, 1);
-        let narrow = |s: &mut HostSenders, rig: &mut LocalRig| {
-            sign_and_carry(
-                rig,
-                s,
-                project_set("build", ["host", "host-b"], [ProjectOp::Message], 0).unwrap(),
-            );
-        };
-        narrow(&mut s, &mut rig);
-        sign_and_carry(
-            &mut rig,
-            &mut s,
-            project_set("build", ["host", "host-b"], task_ops(), 0).unwrap(),
-        );
+        sign_and_carry(&mut rig, &mut s, hs_narrowing());
+        sign_and_carry(&mut rig, &mut s, hs_restoring());
+        ticks(&mut rig, 1);
+        assert_eq!(applied(&rig), s.log.log.head().seq);
+        assert_eq!(settled(&rig, &queued), outcome(Event::Narrowed));
+        sign_and_carry(&mut rig, &mut s, hs_widening());
+        ticks(&mut rig, 1);
+        assert_eq!(settled(&rig, &queued), outcome(Event::Narrowed));
+        rig.bridge.work.scheduled = Instant::now();
+        passes(&mut rig, 3);
+        assert_eq!(settled(&rig, &queued), outcome(Event::Narrowed));
+        assert!(!input(&rig).contains("HS_RESTORED_QUEUED"));
+    });
+}
+
+/// As [`a_narrowing_then_a_restore_in_one_catch_up_fails_the_task`], for a
+/// `project_remove` and a `project_set` that sets the project again.
+#[test]
+fn a_removal_then_a_re_set_in_one_catch_up_fails_the_task() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let queued = host_task(&mut rig, &s, "HS_RESET_QUEUED", start + HOUR);
+        hold_host_work(&mut rig);
+        ticks(&mut rig, 1);
+        sign_and_carry(&mut rig, &mut s, project_remove("build", 0).unwrap());
+        sign_and_carry(&mut rig, &mut s, hs_restoring());
+        ticks(&mut rig, 1);
+        assert_eq!(applied(&rig), s.log.log.head().seq);
+        assert_eq!(settled(&rig, &queued), outcome(Event::Narrowed));
+        sign_and_carry(&mut rig, &mut s, hs_widening());
+        ticks(&mut rig, 1);
+        assert_eq!(settled(&rig, &queued), outcome(Event::Narrowed));
+    });
+}
+
+/// Per entry, a widening alone stops nothing, and neither does a narrowing
+/// that still covers the task (`build` widened, then back to a task's ops,
+/// in one catch-up): B's task runs.
+#[test]
+fn a_widening_or_a_narrowing_that_still_covers_stops_nothing() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let queued = host_task(&mut rig, &s, "HS_STILL_COVERED", start + HOUR);
+        hold_host_work(&mut rig);
+        ticks(&mut rig, 1);
+        sign_and_carry(&mut rig, &mut s, hs_widening());
+        ticks(&mut rig, 1);
+        assert_eq!(applied(&rig), s.log.log.head().seq);
+        assert_eq!(settled(&rig, &queued).0, WorkState::Queued, "a widening");
+        sign_and_carry(&mut rig, &mut s, hs_widening());
+        sign_and_carry(&mut rig, &mut s, hs_restoring());
         ticks(&mut rig, 1);
         assert_eq!(applied(&rig), s.log.log.head().seq);
         assert_eq!(
             settled(&rig, &queued).0,
             WorkState::Queued,
-            "undone in time"
+            "a narrowing that still covers it"
         );
-        narrow(&mut s, &mut rig);
-        sign_and_carry(
-            &mut rig,
-            &mut s,
-            host_sender_revoke("host-b", false, 0).unwrap(),
-        );
+        rig.bridge.work.scheduled = Instant::now();
+        rig.until(|r| input(r).contains("HS_STILL_COVERED")).await;
+    });
+}
+
+/// Per entry, a task is judged only on the entries after the device list
+/// it was admitted on (`Admission::device_list_seq`): one admitted after a
+/// narrowing and its restore committed, before host-work's pass wrote
+/// their effects, was judged on a list that had both, and runs.
+#[test]
+fn a_task_admitted_after_the_entries_is_not_judged_on_them() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        hold_host_work(&mut rig);
         ticks(&mut rig, 1);
-        assert_eq!(settled(&rig, &queued), outcome(Event::Revoked));
+        let before = applied(&rig);
+        sign_and_carry(&mut rig, &mut s, hs_narrowing());
+        sign_and_carry(&mut rig, &mut s, hs_restoring());
+        assert_eq!(applied(&rig), before);
+        let after = host_task(&mut rig, &s, "HS_ADMITTED_AFTER", start + HOUR);
+        ticks(&mut rig, 1);
+        assert_eq!(applied(&rig), s.log.log.head().seq);
+        assert_eq!(settled(&rig, &after).0, WorkState::Queued);
+        rig.bridge.work.scheduled = Instant::now();
+        rig.until(|r| input(r).contains("HS_ADMITTED_AFTER")).await;
+    });
+}
+
+/// No start crosses an entry whose effects aren't written (the owner's
+/// decision, 2026-11-22: no start may cross a missing stop): once a
+/// narrowing and its restore committed, the start check (`may_start`,
+/// which the dispatch and the session host's check at `executing` both
+/// ask; the latter in `the_effects_gates_withdrawal_at_executing_is_not_counted`)
+/// holds B's task, `device list update pending`, until host-work's pass
+/// wrote their effects, which fail it; the committed head alone, which
+/// covers it again, never lets it start.
+#[test]
+fn no_start_crosses_an_entry_whose_effects_arent_written() {
+    use crate::runtime::delegated::start::{StartTask, may_start};
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let queued = host_task(&mut rig, &s, "HS_NO_CROSSING", start + HOUR);
+        hold_host_work(&mut rig);
+        ticks(&mut rig, 1);
+        // The view as a scheduling pass leaves it (`runtime.toml`'s routes).
+        rig.bridge.refresh_start_view();
+        let check = |rig: &LocalRig| {
+            let task = StartTask::of(&stored_record(rig, &queued)).unwrap();
+            let view = rig.bridge.start_view();
+            may_start(&view, &task, view.now_d_ms)
+        };
+        assert_eq!(check(&rig), Ok(()));
+        sign_and_carry(&mut rig, &mut s, hs_narrowing());
+        sign_and_carry(&mut rig, &mut s, hs_restoring());
+        assert_eq!(check(&rig), Err(Event::EffectsPending));
+        ticks(&mut rig, 1);
+        assert_eq!(settled(&rig, &queued), outcome(Event::Narrowed));
+        // Written: a task admitted now starts.
+        let next = host_task(&mut rig, &s, "HS_AFTER_CROSSING", start + HOUR);
+        let task = StartTask::of(&stored_record(&rig, &next)).unwrap();
+        let view = rig.bridge.start_view();
+        assert_eq!(may_start(&view, &task, view.now_d_ms), Ok(()));
+    });
+}
+
+/// Per entry, a live attempt is withdrawn as before: B's task whose
+/// attempt waits `accepted` behind a turn, reached by a narrowing that a
+/// restore follows in the same catch-up, is withdrawn after the commit and
+/// fails from that; the running turn goes on.
+#[test]
+fn a_live_attempt_is_withdrawn_at_a_narrowing_a_restore_follows() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let running = host_running(&mut rig, &s, "HS_LIVE_RUNNING", start).await;
+        let accepted = host_task(&mut rig, &s, "HS_LIVE_ACCEPTED", start + HOUR);
+        blocked(&mut rig, &accepted, BEHIND).await;
+        let attempt = attempt_behind_the_turn(&mut rig, &accepted, "HS_LIVE_ACCEPTED");
+        hold_host_work(&mut rig);
+        sign_and_carry(&mut rig, &mut s, hs_narrowing());
+        sign_and_carry(&mut rig, &mut s, hs_restoring());
+        ticks(&mut rig, 1);
+        assert_eq!(applied(&rig), s.log.log.head().seq);
+        ticks(&mut rig, 1);
+        assert_eq!(settled(&rig, &accepted), outcome(Event::Narrowed));
+        let receipt = rig
+            .bridge
+            .host
+            .attempt_receipt(&attempt, &accepted)
+            .unwrap();
+        assert_eq!(
+            (receipt.state, receipt.detail.as_deref()),
+            (
+                wire::ReceiptState::Rejected,
+                Some(details::WITHDRAWN_BY_THE_HOST)
+            )
+        );
+        assert_eq!(settled(&rig, &running).0, WorkState::Submitted);
+        rig.bridge.work.scheduled = Instant::now();
+        complete(&mut rig, &running).await;
+        passes(&mut rig, 3);
+        assert_eq!(settled(&rig, &accepted), outcome(Event::Narrowed));
+        assert!(!input(&rig).contains("HS_LIVE_ACCEPTED"));
+    });
+}
+
+/// A narrowing and a revoke of the same sender in one catch-up, in both
+/// orders (the owner's decision, 2026-11-22): a task's first stop, in
+/// `seq` order, is its outcome. B's queued task and its task whose attempt
+/// waits `accepted` (withdrawn after the commit, settled from that) take
+/// the first entry's; the running turn goes on.
+#[test]
+fn a_narrowing_and_a_revoke_in_one_catch_up_the_first_stop_wins() {
+    let cases: [(&str, bool, Event); 2] = [
+        ("the narrowing first", true, Event::Narrowed),
+        ("the revoke first", false, Event::Revoked),
+    ];
+    for (what, narrowing_first, event) in cases {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let start = host_now().wall_ms;
+            let os = ManualOs::at(start);
+            let mut s = host_senders_host(&mut rig, root, &os);
+            let running = host_running(&mut rig, &s, "HS_BOTH_RUNNING", start).await;
+            let queued = host_task(&mut rig, &s, "HS_BOTH_QUEUED", start + HOUR);
+            let accepted = host_task(&mut rig, &s, "HS_BOTH_ACCEPTED", start + HOUR);
+            for task in [&queued, &accepted] {
+                blocked(&mut rig, task, BEHIND).await;
+            }
+            let attempt = attempt_behind_the_turn(&mut rig, &accepted, "HS_BOTH_ACCEPTED");
+            hold_host_work(&mut rig);
+            let revoke = host_sender_revoke("host-b", false, 0).unwrap();
+            if narrowing_first {
+                sign_and_carry(&mut rig, &mut s, hs_narrowing());
+                sign_and_carry(&mut rig, &mut s, revoke);
+            } else {
+                sign_and_carry(&mut rig, &mut s, revoke);
+                sign_and_carry(&mut rig, &mut s, hs_narrowing());
+            }
+            ticks(&mut rig, 1);
+            assert_eq!(applied(&rig), s.log.log.head().seq, "{what}");
+            assert_eq!(settled(&rig, &queued), outcome(event), "{what}");
+            ticks(&mut rig, 1);
+            assert_eq!(settled(&rig, &accepted), outcome(event), "{what}");
+            let receipt = rig
+                .bridge
+                .host
+                .attempt_receipt(&attempt, &accepted)
+                .unwrap();
+            assert_eq!(
+                (receipt.state, receipt.detail.as_deref()),
+                (
+                    wire::ReceiptState::Rejected,
+                    Some(details::WITHDRAWN_BY_THE_HOST)
+                ),
+                "{what}"
+            );
+            assert_eq!(settled(&rig, &running).0, WorkState::Submitted, "{what}");
+        });
+    }
+}
+
+/// Per entry, at a bounded cost: a catch-up of several project entries
+/// reads the active tasks once (at its first project entry), the device
+/// list as of each entry built on one pass over the log, nothing verified
+/// again; each entry stops what the list as of it no longer covers (here
+/// the first narrowing, so the later ones reach nothing).
+#[test]
+fn a_catch_up_of_project_entries_reads_the_active_tasks_once() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let queued = host_task(&mut rig, &s, "HS_ONE_READ", start + HOUR);
+        hold_host_work(&mut rig);
+        ticks(&mut rig, 1);
+        let before = applied(&rig);
+        for _ in 0..3 {
+            sign_and_carry(&mut rig, &mut s, hs_narrowing());
+            sign_and_carry(&mut rig, &mut s, hs_restoring());
+        }
+        rig.bridge
+            .work
+            .store
+            .as_mut()
+            .unwrap()
+            .db
+            .trace(Some(hs_traced));
+        HS_TRACED.with(|t| t.borrow_mut().clear());
+        {
+            let store = rig.bridge.work.store.as_ref().unwrap();
+            let list = rig.bridge.membership.as_ref().unwrap().membership();
+            let tx = store.immediate().unwrap();
+            host_senders::list_effects(store, &tx, list, "host", before, &[]).unwrap();
+            tx.commit().unwrap();
+        }
+        rig.bridge.work.store.as_mut().unwrap().db.trace(None);
+        let reads = HS_TRACED.with(|t| {
+            t.borrow()
+                .iter()
+                .filter(|sql| {
+                    sql.contains("SELECT id,record FROM work WHERE state IN")
+                        && !sql.contains("json_extract")
+                })
+                .count()
+        });
+        assert_eq!(reads, 1);
+        assert_eq!(settled(&rig, &queued), outcome(Event::Narrowed));
+    });
+}
+
+/// Design II.3.1, "Crash safety", per entry: a narrowing and its restore
+/// committed in the device list, the runtime killed before host-work wrote
+/// their effects. The next start replays them from host-work's applied
+/// `seq`, entry by entry, before the recovery: B's queued task fails at
+/// the narrowing. Applied again from the same `seq`, nothing is written to
+/// it and nothing is asked; a later restore doesn't revive it.
+#[test]
+fn a_narrowing_and_its_restore_replayed_after_a_crash_stop_the_task_once() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let queued = host_task(&mut rig, &s, "HS_REPLAY_RESTORED", start + HOUR);
+        hold_host_work(&mut rig);
+        ticks(&mut rig, 1);
+        let before = applied(&rig);
+        sign_and_carry(&mut rig, &mut s, hs_narrowing());
+        sign_and_carry(&mut rig, &mut s, hs_restoring());
+        assert_eq!(applied(&rig), before);
+        let steps = restart(&mut rig, root, &os, false, true);
+        assert_eq!(applied(&rig), s.log.log.head().seq);
+        assert_eq!(settled(&rig, &queued), outcome(Event::Narrowed));
+        assert!(
+            !reconciled_at_recovery(&steps, &queued),
+            "settled by the replay, before the recovery"
+        );
+        let stored = serde_json::to_value(stored_record(&rig, &queued)).unwrap();
+        rig.bridge
+            .work
+            .store
+            .as_mut()
+            .unwrap()
+            .db
+            .trace(Some(hs_traced));
+        HS_TRACED.with(|t| t.borrow_mut().clear());
+        let again = {
+            let store = rig.bridge.work.store.as_ref().unwrap();
+            let list = rig.bridge.membership.as_ref().unwrap().membership();
+            let tx = store.immediate().unwrap();
+            let again = host_senders::list_effects(store, &tx, list, "host", before, &[])
+                .unwrap()
+                .followups;
+            tx.commit().unwrap();
+            again
+        };
+        rig.bridge.work.store.as_mut().unwrap().db.trace(None);
+        assert!(again.is_empty(), "{again:?}");
+        let writes: Vec<String> = HS_TRACED.with(|t| {
+            t.borrow()
+                .iter()
+                .filter(|sql| sql.contains("UPDATE work") || sql.contains("INSERT INTO work"))
+                .cloned()
+                .collect()
+        });
+        assert!(writes.is_empty(), "{writes:?}");
+        assert_eq!(
+            serde_json::to_value(stored_record(&rig, &queued)).unwrap(),
+            stored
+        );
+        sign_and_carry(&mut rig, &mut s, hs_widening());
+        ticks(&mut rig, 1);
+        assert_eq!(applied(&rig), s.log.log.head().seq);
+        assert_eq!(settled(&rig, &queued), outcome(Event::Narrowed));
     });
 }
 
@@ -1288,5 +1638,192 @@ fn a_feed_delivery_of_a_carried_record_is_acknowledged() {
         let acks = acks_for_host_b(&rig);
         assert_eq!(acks.len(), 2, "{acks:?}");
         assert!(acks.iter().any(|a| a.contains("duplicate")), "{acks:?}");
+    });
+}
+
+// ── Fix round 1: a live attempt's stop is durable (review H1, L1) ──
+
+/// What comes between host-work's device-list effects' commit and their
+/// followup (the withdrawal of a live attempt), in review H1's cases.
+#[derive(Clone, Copy, Debug)]
+enum HsLoss {
+    /// The runtime is killed: the followup was in memory only.
+    Crash,
+    /// The session journal halts: the withdrawal waits for the restart.
+    HaltedJournal,
+    /// A receipt-database fault: the followups are dropped until the
+    /// restart.
+    StoreFault,
+}
+
+/// Review H1 (the reviewer's probe, made a test), in each way the
+/// withdrawal asked after the commit can be lost: a narrowing and its
+/// restore (or a narrowing and a revoke) reach B's task whose attempt waits
+/// `accepted` behind a turn; host-work's pass commits their effects, the
+/// applied `seq` at the head, and then the runtime is killed, its session
+/// journal halts, or its receipt database fails, before the withdrawal.
+/// The stop was written with the effects (`WorkRecord::list_stop`: the
+/// first stopping entry's event and `seq`), so after the restart the
+/// recovery settles the task with it, though the head covers it again (or
+/// shows the later revoke), and its prompt never reaches the agent.
+#[test]
+fn a_live_attempts_stop_survives_what_comes_after_the_commit() {
+    let cases: [(HsLoss, bool, Event); 4] = [
+        (HsLoss::Crash, false, Event::Narrowed),
+        (HsLoss::HaltedJournal, false, Event::Narrowed),
+        (HsLoss::StoreFault, false, Event::Narrowed),
+        (HsLoss::Crash, true, Event::Narrowed),
+    ];
+    for (loss, revoke, event) in cases {
+        local_test(async |root| {
+            let what = format!("{loss:?}, revoke after: {revoke}");
+            let mut rig = LocalRig::new(root).await;
+            let start = host_now().wall_ms;
+            let os = ManualOs::at(start);
+            let mut s = host_senders_host(&mut rig, root, &os);
+            let running = host_running(&mut rig, &s, "HS_H1_RUNNING", start).await;
+            let accepted = host_task(&mut rig, &s, "HS_H1_ACCEPTED", start + HOUR);
+            blocked(&mut rig, &accepted, BEHIND).await;
+            attempt_behind_the_turn(&mut rig, &accepted, "HS_H1_ACCEPTED");
+            hold_host_work(&mut rig);
+            sign_and_carry(&mut rig, &mut s, hs_narrowing());
+            if revoke {
+                sign_and_carry(
+                    &mut rig,
+                    &mut s,
+                    host_sender_revoke("host-b", false, 0).unwrap(),
+                );
+            } else {
+                sign_and_carry(&mut rig, &mut s, hs_restoring());
+            }
+            match loss {
+                HsLoss::Crash => {}
+                HsLoss::HaltedJournal => {
+                    rig.bridge.host.journal_mut().fail_append_of(1, false);
+                    let effects = rig.bridge.host.fence_principal("service:other", 0);
+                    rig.bridge.exec(
+                        effects,
+                        &mut Cx {
+                            client: &rig.app.astation_client,
+                            sessions: &mut rig.sessions,
+                        },
+                    );
+                    assert!(rig.bridge.host.journal_halted(), "{what}");
+                }
+                HsLoss::StoreFault => {}
+            }
+            rig.bridge.host_senders_pass();
+            assert_eq!(applied(&rig), s.log.log.head().seq, "{what}");
+            assert!(
+                rig.bridge.work.followups.iter().any(|f| matches!(
+                    f,
+                    crate::runtime::delegated::effects::Followup::Withdraw {
+                        then: Event::Narrowed,
+                        ..
+                    }
+                )),
+                "{what}: {:?}",
+                rig.bridge.work.followups
+            );
+            match loss {
+                HsLoss::Crash => {}
+                HsLoss::HaltedJournal => ticks(&mut rig, 2),
+                HsLoss::StoreFault => {
+                    rig.bridge.work_fail();
+                    ticks(&mut rig, 2);
+                }
+            }
+            assert_ne!(settled(&rig, &accepted), outcome(event), "{what}: not yet");
+            restart(&mut rig, root, &os, false, true);
+            rig.bridge.start_view().gates.open_own_station(ORIGIN);
+            complete(&mut rig, &running).await;
+            passes(&mut rig, 5);
+            assert_eq!(settled(&rig, &accepted), outcome(event), "{what}");
+            assert!(!input(&rig).contains("HS_H1_ACCEPTED"), "{what}: never ran");
+        });
+    }
+}
+
+/// Review H1, the start check: once a stop is on the record, the start
+/// check refuses the task with it first, whatever the head says, here
+/// with host-work's effects written and the head covering the task again.
+#[test]
+fn the_start_check_refuses_a_task_its_list_stop_names() {
+    use crate::runtime::delegated::start::{StartTask, may_start};
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let running = host_running(&mut rig, &s, "HS_H1_TURN", start).await;
+        let accepted = host_task(&mut rig, &s, "HS_H1_CHECK", start + HOUR);
+        blocked(&mut rig, &accepted, BEHIND).await;
+        let attempt = attempt_behind_the_turn(&mut rig, &accepted, "HS_H1_CHECK");
+        hold_host_work(&mut rig);
+        sign_and_carry(&mut rig, &mut s, hs_narrowing());
+        sign_and_carry(&mut rig, &mut s, hs_restoring());
+        rig.bridge.host_senders_pass();
+        rig.bridge.refresh_start_view();
+        let task = StartTask::of(&stored_record(&rig, &accepted)).unwrap();
+        {
+            let view = rig.bridge.start_view();
+            assert_eq!(
+                may_start(&view, &task, view.now_d_ms),
+                Err(Event::Narrowed),
+                "the record's stop, first"
+            );
+            // The attempt registered before the stop: the view's copy says
+            // so too, so the session host's check at `executing` refuses it.
+            let live = view.live_task(&attempt).unwrap().clone();
+            assert_eq!(live.list_stop, Some(Event::Narrowed));
+            assert_eq!(may_start(&view, &live, view.now_d_ms), Err(Event::Narrowed));
+        }
+        // The withdrawal asked after the commit lost: the dispatch settles
+        // the task from the record's stop all the same.
+        rig.bridge.work.followups.clear();
+        rig.bridge.work.scheduled = Instant::now();
+        complete(&mut rig, &running).await;
+        passes(&mut rig, 3);
+        assert_eq!(settled(&rig, &accepted), outcome(Event::Narrowed));
+        assert_eq!(attempts(&rig, &accepted)[0].0, attempt);
+        assert!(!input(&rig).contains("HS_H1_CHECK"), "never ran");
+    });
+}
+
+/// Review L1: an entry committed earlier in the tick than host-work's pass
+/// (the start view's applied `seq` behind its head) makes the start check
+/// wait (`Event::EffectsPending`, `device list update pending`); an
+/// attempt that reaches `executing` meanwhile is withdrawn, and that
+/// withdrawal isn't counted toward the attempt limit (design I.6.4, as a
+/// hold's): the task waits, then runs once the effects are written.
+#[test]
+fn the_effects_gates_withdrawal_at_executing_is_not_counted() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = host_senders_host(&mut rig, root, &os);
+        let running = host_running(&mut rig, &s, "HS_L1_RUNNING", start).await;
+        let accepted = host_task(&mut rig, &s, "HS_L1_ACCEPTED", start + HOUR);
+        blocked(&mut rig, &accepted, BEHIND).await;
+        let attempt = attempt_behind_the_turn(&mut rig, &accepted, "HS_L1_ACCEPTED");
+        let (genesis, head) = (s.log.log.genesis_hash(), s.log.log.head().seq);
+        rig.bridge.start_view().host_applied = Some((genesis, head - 1));
+        complete(&mut rig, &running).await;
+        rig.until(|r| {
+            attempts(r, &accepted)
+                .first()
+                .is_some_and(|a| a.1.is_some())
+        })
+        .await;
+        assert_eq!(
+            attempts(&rig, &accepted)[0],
+            (attempt, Some("withdrawn".to_string()), false),
+            "withdrawn, not counted"
+        );
+        rig.until(|r| settled(r, &accepted) == outcome(Event::EffectsPending))
+            .await;
+        rig.bridge.start_view().host_applied = Some((genesis, head));
+        rig.until(|r| input(r).contains("HS_L1_ACCEPTED")).await;
     });
 }

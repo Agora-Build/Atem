@@ -438,6 +438,7 @@ mod tests {
             message: None,
             deadline_passed: false,
             cancel_id: None,
+            list_stop: None,
             delegated: delegated.then(|| Admission {
                 principal: "member:dev-phone".into(),
                 principal_key: "ab".repeat(32),

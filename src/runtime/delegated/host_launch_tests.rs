@@ -406,3 +406,250 @@ fn a_launch_is_shared_only_as_stage_1_shares_one() {
         assert_eq!(rig.bridge.work.launches.len(), 1, "one per profile");
     });
 }
+
+// ── Ruling R51: a spawn is a start, so a launch is judged per entry ──
+
+/// What B's task says once its launch was stopped by a narrowing.
+const HL_NOT_STARTED: &str = "approved route launch not started: sender's authorization narrowed";
+
+/// Project `pl` signed and carried with no pass after it (the entries
+/// reach host-work's pass together): `launch` when `launch`.
+fn hl_entry(rig: &mut LocalRig, host: &mut MbHost, launch: bool) {
+    let mut ops = task_ops().to_vec();
+    if launch {
+        ops.push(ProjectOp::Launch);
+    }
+    sign_and_carry(
+        rig,
+        &mut host.s,
+        atem_client::membership::project_set("pl", ["host", "host-b"], ops, 0).unwrap(),
+    );
+}
+
+/// B's request naming the launch route, admitted, its sender's gate open
+/// (the mailbox read: its part open), and host-work's device-list effects
+/// written up to the head: the message and its launch's request id
+/// (queued, not handed out).
+fn hl_queued(rig: &mut LocalRig) -> (Message, String) {
+    let message = hl_message(rig, &["atem:host/rl"], true);
+    hl_admit(rig, &message);
+    rig.bridge.start_view().gates.set_mailbox(true);
+    rig.bridge.host_senders_pass();
+    let id = rig.bridge.work.launches.back().unwrap().request_id.clone();
+    (message, id)
+}
+
+/// Profile `pl` as the rig's `runtime.toml` on disk (what the spawn check
+/// re-reads), the same as the bridge has it.
+fn hl_configure(rig: &LocalRig, root: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let p = rig.bridge.work.config.profile("pl").unwrap();
+    let mut text = format!(
+        "version = 1\nenabled = true\n[[profiles]]\nid = {:?}\nrevision = {}\nlabel = {:?}\n\
+         provider = {:?}\ncwd = {:?}\nproject = {:?}\nargs = {:?}\nprincipals = {:?}\n\
+         env_names = {:?}\n",
+        p.id, p.revision, p.label, p.provider, p.cwd, p.project, p.args, p.principals, p.env_names
+    );
+    if let Some(env) = &p.env_file {
+        text += &format!("env_file = {env:?}\n");
+    }
+    let path = root.join("runtime.toml");
+    std::fs::write(&path, text).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let loaded = Config::load_for(root, rig.bridge.features).unwrap();
+    assert!(
+        loaded.profile("pl") == Some(p),
+        "the file has the bridge's profile"
+    );
+}
+
+/// Ruling R51 (a spawn is a start), per entry: B's task waits for its
+/// launch, queued with no agent running, and `launch` is taken out of
+/// project `pl`, then given back, in entries host-work's pass reads
+/// together. The spawn boundary waits until their effects are written;
+/// then the launch fails at the narrowing (`sender's authorization
+/// narrowed`: its record `failed`, why kept) and its task with it
+/// (`approved route launch not started: …`), in the effects' transaction.
+/// It leaves the queue, never spawns, and neither the restore nor a later
+/// entry revives it or its task.
+#[test]
+fn a_launch_narrowed_then_restored_in_one_catch_up_never_spawns() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = hl_host(&mut rig, root, &os);
+        let (message, id) = hl_queued(&mut rig);
+        assert_eq!(hl_verdict(&mut rig, &id), LaunchVerdict::Go);
+        hl_entry(&mut rig, &mut host, false);
+        hl_entry(&mut rig, &mut host, true);
+        assert_eq!(
+            hl_verdict(&mut rig, &id),
+            LaunchVerdict::Wait(details::DEVICE_LIST_UPDATE_PENDING),
+            "the spawn boundary waits for the entries' effects"
+        );
+        rig.bridge.host_senders_pass();
+        let db = &rig.bridge.work.store.as_ref().unwrap().db;
+        assert_eq!(launch_state(&rig, &id), LaunchState::Failed);
+        assert_eq!(
+            crate::runtime::delegated::admit::launch_failure(db, &id)
+                .unwrap()
+                .as_deref(),
+            Some(details::AUTHORIZATION_NARROWED)
+        );
+        let task = ad_tasks(&rig, &message).remove(0);
+        assert_eq!(
+            (task.status.state, task.status.detail.as_str()),
+            (WorkState::Failed, HL_NOT_STARTED)
+        );
+        assert!(!rig.bridge.work.pending.contains_key(&id));
+        assert!(
+            rig.bridge.take_remote_launches().is_empty(),
+            "never handed out"
+        );
+        hl_project(&mut rig, &mut host, true);
+        rig.bridge.host_senders_pass();
+        passes(&mut rig, 2);
+        assert_eq!(launch_state(&rig, &id), LaunchState::Failed);
+        assert_eq!(ad_tasks(&rig, &message)[0].status.detail, HL_NOT_STARTED);
+        assert!(rig.bridge.take_remote_launches().is_empty());
+        assert!(
+            attempts(&rig, &task.task.task_id).is_empty(),
+            "never attempted"
+        );
+    });
+}
+
+/// Ruling R51 at the spawn boundary: a launch already handed to the
+/// launcher, its check not run yet, when `launch` is narrowed then
+/// restored. The check waits until host-work wrote the entries' effects,
+/// then refuses it (`sender's authorization narrowed`), nothing spawned;
+/// the launcher's report changes nothing. A launch whose check let it go
+/// before the entries committed had started then: they don't reach it.
+#[test]
+fn the_spawn_check_refuses_a_launch_an_entry_stopped() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = hl_host(&mut rig, root, &os);
+        hl_configure(&rig, root);
+        let (message, id) = hl_queued(&mut rig);
+        rig.bridge.refresh_start_view();
+        let handed = rig.bridge.take_remote_launches();
+        assert_eq!(handed.len(), 1, "handed to the launcher");
+        let check = handed[0].check.clone().unwrap();
+        hl_entry(&mut rig, &mut host, false);
+        hl_entry(&mut rig, &mut host, true);
+        assert_eq!(check(), PreSpawn::Wait, "waits for the entries' effects");
+        rig.bridge.host_senders_pass();
+        assert_eq!(check(), PreSpawn::Fail(details::AUTHORIZATION_NARROWED));
+        let refused = anyhow::Error::from(NotSpawned::Fail(details::AUTHORIZATION_NARROWED));
+        rig.bridge.launch_finished(&id, Err(&refused), true);
+        assert_eq!(launch_state(&rig, &id), LaunchState::Failed);
+        assert_eq!(ad_tasks(&rig, &message)[0].status.detail, HL_NOT_STARTED);
+        // Let go before the entries: it started then.
+        let (_, gone) = hl_queued(&mut rig);
+        assert_ne!(gone, id);
+        rig.bridge.refresh_start_view();
+        let handed = rig.bridge.take_remote_launches();
+        let check = handed[0].check.clone().unwrap();
+        assert_eq!(check(), PreSpawn::Go);
+        hl_entry(&mut rig, &mut host, false);
+        hl_entry(&mut rig, &mut host, true);
+        rig.bridge.host_senders_pass();
+        assert_eq!(launch_state(&rig, &gone), LaunchState::Starting);
+        assert!(rig.bridge.work.pending.contains_key(&gone));
+        rig.bridge.launch_finished(&gone, Ok(()), false);
+        assert_eq!(launch_state(&rig, &gone), LaunchState::Started);
+    });
+}
+
+/// Ruling R51 across a crash, after the commit: the entries' effects
+/// committed (the launch `failed`, why kept, its task failed) and the
+/// runtime killed before the bridge let go of the launch. At the start
+/// nothing of it is queued and nothing spawns; the record and the task
+/// stay as committed (the start's recovery takes only launches still
+/// `starting`); applied again from the same `seq`, nothing is written.
+#[test]
+fn a_launchs_stop_committed_before_a_crash_stays() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = hl_host(&mut rig, root, &os);
+        let (message, id) = hl_queued(&mut rig);
+        let before = applied(&rig);
+        hl_entry(&mut rig, &mut host, false);
+        hl_entry(&mut rig, &mut host, true);
+        let queued = vec![host_senders::QueuedLaunch {
+            request_id: id.clone(),
+            admission: rig.bridge.work.pending[&id]
+                .delegated
+                .as_ref()
+                .unwrap()
+                .launch
+                .admission
+                .clone(),
+        }];
+        let apply = |rig: &LocalRig| {
+            let store = rig.bridge.work.store.as_ref().unwrap();
+            let list = rig.bridge.membership.as_ref().unwrap().membership();
+            let tx = store.immediate().unwrap();
+            let effects =
+                host_senders::list_effects(store, &tx, list, "host", before, &queued).unwrap();
+            host_senders::set_applied_seq(&tx, &list.genesis_hash(), list.head().seq).unwrap();
+            tx.commit().unwrap();
+            effects
+        };
+        let effects = apply(&rig);
+        assert_eq!(
+            effects.launches,
+            [(id.clone(), details::AUTHORIZATION_NARROWED)]
+        );
+        restart(&mut rig, root, &os, false, true);
+        passes(&mut rig, 2);
+        assert_eq!(launch_state(&rig, &id), LaunchState::Failed);
+        assert_eq!(ad_tasks(&rig, &message)[0].status.detail, HL_NOT_STARTED);
+        assert!(rig.bridge.work.pending.is_empty());
+        assert!(
+            rig.bridge.take_remote_launches().is_empty(),
+            "never spawned"
+        );
+        let again = apply(&rig);
+        assert!(
+            again.launches.is_empty() && again.followups.is_empty(),
+            "{again:?}"
+        );
+        assert_eq!(ad_tasks(&rig, &message)[0].status.detail, HL_NOT_STARTED);
+    });
+}
+
+/// Ruling R51 across a crash, before the commit: `launch` narrowed then
+/// restored committed in the device list, the runtime killed before
+/// host-work wrote their effects. The launch was in that run's memory
+/// only: at the start, as every launch not started at a restart, its
+/// record `starting` is of unknown outcome, so it is never spawned again,
+/// and its task fails; the start's replay of the entries reaches no launch
+/// of the run before (Atem's reading: it may have spawned before them).
+#[test]
+fn a_launch_narrowed_then_restored_across_a_crash_never_spawns() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = hl_host(&mut rig, root, &os);
+        let (message, id) = hl_queued(&mut rig);
+        hl_entry(&mut rig, &mut host, false);
+        hl_entry(&mut rig, &mut host, true);
+        restart(&mut rig, root, &os, false, true);
+        passes(&mut rig, 2);
+        assert_eq!(launch_state(&rig, &id), LaunchState::OutcomeUnknown);
+        assert!(
+            rig.bridge.take_remote_launches().is_empty(),
+            "never spawned"
+        );
+        rig.until(|r| ad_tasks(r, &message)[0].status.state == WorkState::Failed)
+            .await;
+        assert_eq!(
+            ad_tasks(&rig, &message)[0].status.detail,
+            "launch outcome unknown; the reserved launch will not be repeated"
+        );
+    });
+}
