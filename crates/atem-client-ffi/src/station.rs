@@ -857,8 +857,12 @@ impl AckLedgerHandle {
 /// `uncovered_cover`, `not_above_mark` (signed anew with the service's own
 /// key, issued at or below its principal's mark or with none); then a
 /// covered principal with no cover (`cover_not_first`), then each effect
-/// of each retained `revoke` or `interrupt_running` that isn't in force
-/// after the snapshot alone on a fresh state:
+/// of each retained `revoke` or `interrupt_running` that the snapshot
+/// alone doesn't keep on a fresh state (a revocation, or an interrupt due
+/// because its principal is revoked, in force; an interrupt not yet due,
+/// of a principal nothing revokes, an `interrupt_running` of that
+/// principal in the snapshot, which a new host holds pending as a host
+/// that read the old feed does):
 /// `stop_lost` when that retained stop is valid at the head,
 /// `stop_not_resigned` (`reason` `removed_manager`) when a removed manager
 /// signed it, a genuine stop a current manager signs again (I.5.4).

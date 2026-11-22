@@ -1294,7 +1294,7 @@ data_enum! {
         /// interrupt). `index` is otherwise the snapshot record's position
         /// (from 0), or the snapshot's length for what only the whole
         /// snapshot shows (a covered principal with no cover, a retained
-        /// stop's effect not in force). `record_id` is that snapshot
+        /// stop's effect not kept). `record_id` is that snapshot
         /// record's, or the retained record's.
         Inconsistent {
             index: u64,

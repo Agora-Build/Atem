@@ -46,17 +46,22 @@
 //!    for.
 //! 9. `stop_lost` or `stop_not_resigned`: an effect of a retained `revoke`
 //!    or `interrupt_running` (its principal's revocation, and the
-//!    interrupt with it) that isn't in force after the snapshot alone is
-//!    applied to a fresh state, a host that never read the old feed, in the
+//!    interrupt with it) that the snapshot alone, applied to a fresh state
+//!    (a host that never read the old feed), doesn't keep (below), in the
 //!    retained order: `stop_lost` when that stop is valid at the head (the
 //!    snapshot drops what it could carry), `stop_not_resigned` when it is
 //!    refused `removed_manager` (`reason`): a genuine stop, its signature
 //!    verified under the former manager's key, which a current manager
-//!    signs again (I.5.4). A retained service's
-//!    `interrupt_running` counts when its principal is revoked, by a
-//!    retained revoke or after the snapshot: until then it waits on every
-//!    host. A host principal's interrupt is in force when its device-list
-//!    revoke itself carried `interrupt_running`. Holds and releases aren't
+//!    signs again (I.5.4). A retained service's interrupt is due once its
+//!    principal is revoked, by a retained revoke or after the snapshot,
+//!    and must then be in force. One not yet due (a retained
+//!    `interrupt_running` of a principal nothing revokes) waits, pending,
+//!    on a host that read the old feed, which interrupts at a later
+//!    revoke: the snapshot must then hold an `interrupt_running` of that
+//!    principal (the retained one carried unchanged, or a current
+//!    manager's copy) so a new host holds it pending too. A host
+//!    principal's interrupt is in force when its device-list revoke itself
+//!    carried `interrupt_running`. Holds and releases aren't
 //!    compared: the Portal's current state decides those.
 //!
 //! **Carried as it is** (Atem's reading of host-work-v1 §11.1, "Resets":
@@ -126,7 +131,7 @@ pub enum SnapshotConsistency {
 pub struct SnapshotInconsistency {
     /// The snapshot record's position (from 0); the snapshot's length for
     /// what only the whole snapshot shows (a covered principal with no
-    /// cover, a retained stop's effect not in force); for
+    /// cover, a retained stop's effect not kept); for
     /// `invalid_retained`, the record's position in the retained records.
     pub index: usize,
     /// The snapshot record's `record_id`; for `invalid_retained`,
@@ -140,8 +145,9 @@ pub struct SnapshotInconsistency {
     /// (always `removed_manager`): [`verify_control`]'s pending or refusal
     /// code.
     pub reason: Option<String>,
-    /// `stop_lost` and `stop_not_resigned`: the effect not in force,
-    /// [`EffectKind::Revocation`] or [`EffectKind::Interrupt`].
+    /// `stop_lost` and `stop_not_resigned`: the effect the snapshot
+    /// doesn't keep, [`EffectKind::Revocation`] or
+    /// [`EffectKind::Interrupt`].
     pub effect: Option<EffectKind>,
     /// `stop_lost` or `stop_not_resigned` of a host principal's interrupt:
     /// its `revoke_seq`.
@@ -180,7 +186,9 @@ impl InconsistencyCode {
         }
     }
 
-    /// Every code, in the order the checks run.
+    /// Every code, in the order the checks first run (`cover_not_first`
+    /// runs again after the last snapshot record, and `stop_lost` and
+    /// `stop_not_resigned` interleave in the retained order).
     pub const ALL: [InconsistencyCode; 10] = [
         InconsistencyCode::InvalidRetained,
         InconsistencyCode::InvalidRecord,
@@ -391,9 +399,24 @@ fn stop_lost(input: &SnapshotInput<'_>, end: usize) -> Option<SnapshotInconsiste
                 if revokes && has.revoked.is_none() {
                     return Some(lost(EffectKind::Revocation, None));
                 }
-                // An interrupt waits for its principal's revocation.
+                // An interrupt is due once its principal is revoked: then it
+                // is in force. Until then it waits on a host that read the
+                // old feed, so the snapshot holds an `interrupt_running` of
+                // that principal for a new host to hold pending too (every
+                // snapshot record verified at the head already).
                 let due = revokes || revoked.contains(&principal) || has.revoked.is_some();
-                if interrupts && due && has.interrupted.is_empty() {
+                let pending_too = || {
+                    input.snapshot.iter().any(|r| {
+                        r.principal().name() == principal
+                            && matches!(r.action(), ControlAction::InterruptRunning { .. })
+                    })
+                };
+                let kept = if due {
+                    !has.interrupted.is_empty()
+                } else {
+                    pending_too()
+                };
+                if interrupts && !kept {
                     return Some(lost(EffectKind::Interrupt, None));
                 }
             }

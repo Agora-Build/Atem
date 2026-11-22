@@ -835,6 +835,11 @@ def check_host_work_control(file, data, report, context):
                     case.check(body["principal_key"] != r9_svc, "principal_key names another key (key_mismatch)")
                 else:
                     case.equal(body["principal_key"], r9_svc, "principal_key = r9_svc")
+            if "wrong_account" in reasons:
+                case.check(
+                    (body["account_id"], body["genesis_hash"]) != (data["account_id"], data["genesis_hash"]),
+                    "another account or genesis (wrong_account)",
+                )
             if "parse_error" in vector:
                 case.check(True, f"refused at parse ({vector['parse_error']}; not derived here)")
 
@@ -1027,8 +1032,10 @@ def derive_snapshot(case, snap, by_label, entries):
     (valid, or a removed manager's), in the retained order (the revocation, then
     the interrupt), not in force after the snapshot alone (snapshot_stops;
     a service's interrupt is due once its principal is revoked by a
-    retained revoke or after the snapshot, a host principal's is in force
-    too when its device-list revoke carried interrupt_running): stop_lost
+    retained revoke or after the snapshot; one not yet due needs an
+    interrupt_running of its principal in the snapshot, which a new host
+    holds pending; a host principal's is in force too when its device-list
+    revoke carried interrupt_running): stop_lost
     when that stop is valid at the head, stop_not_resigned (reason
     removed_manager) when a removed manager signed it, record_id that
     stop. The answer must be
@@ -1134,8 +1141,19 @@ def derive_snapshot(case, snap, by_label, entries):
             interrupts = action == "interrupt_running" or (revokes and body["interrupt_running"])
             if revokes and "revoked" not in has:
                 return at(end, code, body, p, reason, "revocation")
+            # Due once its principal is revoked: then in force. Not yet due,
+            # it waits pending on a host that read the old feed, so the
+            # snapshot must hold an interrupt_running of that principal.
             due = revokes or p in revoked or "revoked" in has
-            if interrupts and due and not has["interrupted"]:
+            if due:
+                kept = bool(has["interrupted"])
+            else:
+                kept = any(
+                    by_label[s]["record"]["body"]["principal"] == p
+                    and by_label[s]["record"]["body"]["action"] == "interrupt_running"
+                    for s in snap["snapshot"]
+                )
+            if interrupts and not kept:
                 return at(end, code, body, p, reason, "interrupt")
         return {"consistent": True}
 
