@@ -816,8 +816,11 @@ for a service or a host sender. Production exports for Station builders:
 `relay_control_ack`, `relay_membership_fetch`,
 `relay_membership_fetch_result`), `relay_control_sync_answers` (whether a
 `control_sync_result` answers a `control_sync`), `AckLedgerHandle` (whose
-calls return an `AckTransition`) and `report_answer`: a Station's side of
-its hosts' feed calls and acknowledgments, and its reports to the Portal.
+calls return an `AckTransition`), `report_answer` and
+`check_control_snapshot_consistency` (a replacement feed's snapshot checked
+for consistency, never completeness, with what a restored Station
+retained): a Station's side of its hosts' feed calls and acknowledgments,
+its reports to the Portal and its recovery from a rollback.
 Production exports for Station builders: §9. An app (Astation) uses none of
 them, but for its `:8080` proxy, which matches a feed result to the call it
 forwarded with `relay_control_sync_answers` (correlation, §9 "Station
@@ -1214,7 +1217,7 @@ jar); it can be run on a download the same way.
 `WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
 Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 
-- **Conformance** (138 checks in JS, 140 in Kotlin and in Swift: the same 138
+- **Conformance** (142 checks in JS, 144 in Kotlin and in Swift: the same 142
   in each language, plus two in Kotlin and Swift, whose provider sees the
   signing request and so the purposes of the five device-list actions and
   of control records; five of each language's are the verifier reports':
@@ -1276,9 +1279,10 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   provider asked under `ServiceControl` (no confirmation) for the
   integration's own key and `ControlRecord` (a fresh confirmation of the
   body) for a native manager.
-- **The Station's side** (`tests/station.rs`, Rust; ten conformance
+- **The Station's side** (`tests/station.rs`, Rust; twelve conformance
   checks per language, of the 70 and 72 above): every acknowledgment
-  fixture (`r9-control-ack-*`, one check each) through `AckLedgerHandle` as
+  fixture (`r9-control-ack-*`, one check each, its `expect_counts` against
+  the state's `done`) through `AckLedgerHandle` as
   a Station persists it (each call's next state committed before the
   reports go and adopted after, restarts from the committed state, two
   replicas from one state giving the same next state and reports and the
@@ -1298,7 +1302,10 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   a record the control parser refuses is refused by the builder with that
   parse code), read back to its fields with each page record judged by
   `parse_control_record` as the file says, refused by the other side's
-  reader as `wrong_message`, and every invalid text refused with its code.
+  reader as `wrong_message`, and every invalid text refused with its code;
+  and every case of `r9-vectors-host-work-control`'s `snapshots` through
+  `check_control_snapshot_consistency`, its input refused outside its
+  grammar (`every_snapshot_case_through_the_binding`).
 - **Durable log** (`tests/stored_log.rs`, Rust; two conformance checks per
   language, of the 70 and 72 above): a partly elapsed wait across a same-boot restart and a reboot,
   the wall clock set back after restore, a wait-ended decision at its chain
@@ -1873,3 +1880,60 @@ it tracks (at most 64 covered hosts each), what each host has in force, the
 reports not yet settled and the ids of those settled unsent. Nothing is
 pruned in this version: keep it as long as the principal exists (design
 I.5.2's retention); `from_json` reads at most 64 MiB.
+
+**A replacement feed after a rollback** (host-work-v1 §11.1, "A
+replacement feed after a rollback" and "The snapshot checker"; **agreed
+with Astation (2026-11-22, #114 comment 7082464868, items 2 and 6)**).
+Start the replacement feed's ledger empty, with no carried settlement
+(`AckLedgerHandle::new`, never the restored state), and admit only acks
+naming the candidate feed, on sockets opened after the recovery: the
+ledger checks the origin, never the `feed_id`, so that rule is yours.
+Record the snapshot's records as any others; a current manager's original
+stop is carried as it is (it names the old feed), and each host reports it
+again as it reads the snapshot (`r9-control-ack-replacement-feed`).
+
+### The snapshot checker
+
+`check_control_snapshot_consistency(log, origin, candidate_feed_id,
+retained_json, snapshot_json, marks, covered)` checks a replacement
+feed's snapshot, before you publish it, for **consistency** with the
+records the restored Station retained. **It never says** that the
+retained records are the whole history, that a mark bounds every time the
+old deployment signed or reserved, or that every author's stops reached
+you: what a rollback lost, nothing here can see (#114, items 1, 3 and 4).
+
+| argument | what it is |
+|---|---|
+| `log` | the device list at the head every snapshot record is verified at (never frozen) |
+| `origin`, `candidate_feed_id` | your exact origin (as `AckLedgerHandle::new` takes it) and the replacement feed's `feed_id` (a UUID v4) |
+| `retained_json` | the records the restored Station retained, in their feed's order (each record's JSON) |
+| `snapshot_json` | the snapshot's records, in publication order |
+| `marks` | `ControlSnapshotMark{principal, mark_ms}` per service principal, once each: a record its own key signs is issued strictly after `mark_ms` (`U_p` after a rollback, or the mark you sign above) |
+| `covered` | the principals the snapshot covers (`service:<id>`), once each |
+
+It answers `ControlSnapshotConsistency::Consistent`, or `Inconsistent{index,
+code, principal, record_id, reason, revoke_seq}`, the first check that
+failed, record by record in publication order, then over the whole
+snapshot (`index` the snapshot's length then): `invalid_record` (not valid
+at the head; `reason` the verifier's code, a removed manager's original
+`removed_manager`: have a current manager sign it again),
+`wrong_origin`, `not_candidate_feed` (a record the service's own key signed
+names the candidate feed; a current manager's stop may name any feed of
+your origin), `cover_not_first` (each covered principal's cover first, a
+hold or release after it; a covered principal with no cover),
+`not_above_mark` (the service's own key, issued at or below the mark, or
+no mark), `uncovered_cover`, and `stop_lost` (a revocation, or its
+interrupt, in force from the retained records but not from the snapshot
+alone on a fresh host; `reason` `revocation` or `interrupt`, `record_id`
+the retained revoke that revoked a service, `revoke_seq` a host
+principal's interrupt). Holds and releases aren't compared: the Portal's
+current state decides them. Errors: a record its parse refuses is
+`Invalid{code}`; any other input outside its grammar (an origin not in its
+exact form, a candidate that isn't a UUID v4, a principal that isn't
+`service:<id>`, marked or covered twice, a mark above 2^53 − 1, a frozen
+list) `Invalid{malformed}`. JS: `checkControlSnapshotConsistency(log,
+origin, candidateFeedId, retainedJson, snapshotJson, [{principal,
+markMs}], covered)` gives `{type: "consistent"}` or `{type:
+"inconsistent", index, code, principal, recordId, reason, revokeSeq}`
+(`null` where none). Its cases: `r9-vectors-host-work-control`'s
+`snapshots`.

@@ -1577,6 +1577,62 @@ leaves the coverage on the old feed: its holds, revokes and interrupts
 still apply, so no stop is lost, but its releases are refused until a
 newer cover arrives.
 
+**A replacement feed after a rollback** (**Atem's reading, agreed with
+Astation (2026-11-22, #114 comment 7082464868, items 2 and 6)**). A
+Station that recovers from a rollback publishes a replacement feed: a new
+`feed_id` and a snapshot as above. A stop it carries needs no
+reconstructed safety clock (a revoke counts from any feed, rule 3, and a
+native's `issued_at` is display only):
+
+- A current native manager's original `revoke` or `interrupt_running` is
+  carried as it is, though it names the old `feed_id`: on a host that
+  applied it from the old feed each effect is a `duplicate`, on one that
+  never read it each applies. Only a removed manager's original needs a
+  current manager's fresh signature, a new `record_id` (`removed_manager`,
+  I.5.4). "As they are" above is such a stop.
+- A record the service's own key signs in the snapshot (a cover, hold,
+  release, revoke or `interrupt_running`) is signed anew: it names the
+  candidate feed and is issued after its principal's mark (the Station's
+  high-water mark, `U_p` after a rollback, #114 item 1). A cover issued no
+  later than a host's evicted floor is refused there as a possible replay
+  (rule 1).
+- The replacement ledger starts with no carried settlement: only freshly
+  proved associations, and acks naming the candidate feed on sockets
+  opened after the recovery, settle it. The Station enforces that at
+  admission (the reference ledger checks the origin, never the `feed_id`,
+  §11.4). Nothing is lost: a host reports each stop in force again,
+  `duplicate`, as it reads the snapshot.
+
+**The snapshot checker** (Astation's ask, #114 item 6). The shared core's
+`control::check_snapshot_consistency` (the bindings'
+`check_control_snapshot_consistency`, beside the ledger) checks a snapshot,
+sans-I/O, against the records the restored Station retained, at the
+verifying head (never a frozen list), with each service principal's mark
+and the set of principals the snapshot covers. Record by record in
+publication order, then over the whole snapshot, it answers `Consistent`
+or the first inconsistency `{index, code, principal, record_id?, reason?,
+revoke_seq?}`:
+
+| Code | When |
+|---|---|
+| `invalid_record` | the record isn't valid at the head (`reason`: `verify_control`'s pending or refusal code; a removed manager's original is `removed_manager`) |
+| `wrong_origin` | a service's record names another Station's origin |
+| `not_candidate_feed` | a record the service's own key signed doesn't name the candidate feed (a current manager's stop may name any feed of the origin) |
+| `cover_not_first` | a covered principal's first record isn't its cover, or a hold or release comes before its principal's cover; at the end (`index`: the snapshot's length), a covered principal with no cover |
+| `not_above_mark` | a record the service's own key signed is issued at or below its principal's mark, or the principal has none |
+| `uncovered_cover` | a cover of a principal outside the covered set |
+| `stop_lost` | at the end: a revocation, or its interrupt, in force in a `ControlState` built from the retained records but not after the snapshot alone is applied to a fresh state (`reason`: `revocation` or `interrupt`; `record_id`: the retained revoke that revoked a service; `revoke_seq`: a host principal's interrupt). Holds and releases aren't compared: the Portal's current state decides them |
+
+Both states are built at the head as a host builds its own, the retained
+records at no position, the snapshot at its positions in the candidate
+feed, a record left pending applied once more after the rest. **It checks
+consistency only:** never that the retained records are the whole
+history, that a mark bounds every time the old deployment signed or
+reserved, or that every author's stops reached the Station (#114, items 1,
+3 and 4 stay the Station's and the owner's). A retained record that isn't
+valid at the head (a removed manager's original) is in force in neither
+state: its re-signing is the ledger's re-sign alert's, not the checker's.
+
 **Stations: the trust model** (**Atem's proposal, agreed with Astation
 (2026-11-11, #120 comment 6810116314) and Auth/Portal (2026-11-12, #147 comment 6813332550)**). The principal's own key may sign every action,
 so whoever holds it controls coverage and can always sign a newer cover;
@@ -1720,6 +1776,22 @@ the same body replayed and holds nothing. The file must exercise the rule:
 a release at the hold's time refused, one after it lifting the hold, a
 time from `initial`, and holds from another feed, at no position and under
 a counted id each refusing a release.
+(**New with #114, items 2 and 6, agreed with Astation 2026-11-22.**) The
+records `M7_revoke_interrupt` (a current manager's revoke with
+`interrupt_running`, naming the old feed), `M8_revoke_resigned_a2` (M3's
+stop signed again for the replacement feed), `M9_revoke_other_station`
+and `A2_cover_at_floor`; the sequences `Q28`…`Q31` (a current manager's
+original stop carried unchanged into the replacement feed: each effect a
+`duplicate` on a host that read the old feed, applied on one that
+didn't), `Q32` (a removed manager's original refused there, its copy
+signed again applied) and `Q33` (a snapshot cover at a host's evicted
+floor refused as a possible replay); and `snapshots`, the checker's cases
+(one per code, and consistent ones, item 2's retained stop among them),
+each with its inputs, `expect` and `in_force`: the stops in force after the
+retained records, after the snapshot alone and after both. The checker
+derives each snapshot case's answer and `in_force` from the records'
+verdicts on its chain, with no state machine, and checks every code is
+exercised.
 It derives no other verdict.
 Every SDK package's checksum manifest lists the file.
 
@@ -3129,11 +3201,19 @@ re-signed copy) and `r9-control-ack-portal-refusals` (retries after a
 `403` that holds every report across a restart, a resume under the same
 report client ID that sends them, and a resume under another that drops
 only the report pending then, after which a late host is reported as
-usual). They run in
+usual), and `r9-control-ack-replacement-feed` (**new with #114, items 2
+and 6, agreed with Astation 2026-11-22**: a Station's replacement feed
+carrying a current manager's original stop unchanged, naming the old feed;
+a fresh ledger, with no carried settlement, counting it per host from acks
+naming the new feed, a duplicate from the host that read the old feed and
+applied from the one that didn't; its counts shown, `expect_counts`, and
+its re-sign alert ended once both hosts have each effect in force). They
+run in
 `crates/atem-client/tests/r9_fixtures.rs` against `AckLedger`, in the
 bindings' `tests/station.rs` and in the Swift, Kotlin and WASM conformance
 suites through `AckLedgerHandle`; `scripts/check-r9-vectors.py` recomputes
-every `reportId` in them. Every SDK package's checksum manifest lists them.
+every `reportId` in them and derives each `expect_counts` from the steps.
+Every SDK package's checksum manifest lists them.
 
 (New in step 4; the goldens and the 256 KiB bound on the complete message
 are **agreed with Astation (2026-11-13, #120 comment 6848326392)**.)
