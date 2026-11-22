@@ -28,7 +28,11 @@ The other files'
 (`crates/atem-client/tests/vectors.rs`) and the binding suites.
 It also recomputes every Station report id of the acknowledgment fixtures
 (`r9-control-ack-*`, host-work-v1 §11.4): the known answers of the
-reference ledger's `report_id`; and, from host-work-v1 §4 and §11.2, the
+reference ledger's `report_id`, and derives their `expect_counts` (the
+ledger's counts) from the steps; from host-work-v1 §11.1 ("Resets"), the
+snapshot checker's answers and the stops in force of
+`r9-vectors-host-work-control`'s `snapshots` (each record's verdict taken
+from its `checks`, as the bound and O1 take each step's result); and, from host-work-v1 §4 and §11.2, the
 verdicts of `host-work/requests-v1`'s requests that name a task (the
 owner's ops naming a host sender's selector task among them), of its `work`
 and `reply` results and of its `answers` correlation.
@@ -946,6 +950,160 @@ def check_host_work_control(file, data, report, context):
             ("colliding_id", "a hold under a counted id (evidence) refusing a release"),
         ]:
             case.check(kind in o1_seen, what)
+
+    answers = set()
+    for snap in data.get("snapshots", []):
+        with report.case(file, snap["label"]) as case:
+            answers.add(derive_snapshot(case, snap, by_label, entries))
+    with report.case(file, "snapshot codes") as case:
+        case.check(
+            answers == set(SNAPSHOT_CODES) | {"consistent"},
+            "the snapshot cases give every inconsistency code and a consistent answer",
+            f"got {sorted(answers)}",
+        )
+
+
+# check_snapshot_consistency's codes, in the order its checks run.
+SNAPSHOT_CODES = [
+    "invalid_record", "wrong_origin", "not_candidate_feed", "cover_not_first",
+    "not_above_mark", "uncovered_cover", "stop_lost",
+]
+
+
+def snapshot_stops(labels, verdict, by_label, entry_at):
+    """The stops in force after the records `labels`, applied in order at
+    the list's head with each record left pending applied again after the
+    rest (no state machine): a service is revoked by its first valid
+    `revoke`, and interrupted once revoked when any valid record of it
+    carries an interrupt (a `revoke` with `interrupt_running`, or an
+    `interrupt_running`); a host principal's valid interrupt is in force at
+    its `revoke_seq` (a valid one names a revoke at or below the head)
+    unless that device-list revoke carried `interrupt_running: true`
+    itself, which interrupted with the entry. As each standing writes it:
+    `{revoked?, interrupted}`, only principals with one."""
+    revoked, interrupting, hosts = {}, set(), {}
+    for label in labels:
+        if verdict(label)["verdict"] != "valid":
+            continue
+        body = by_label[label]["record"]["body"]
+        p, action = body["principal"], body["action"]
+        if p.startswith("host:"):
+            entry = entry_at(body["revoke_seq"])
+            if not entry.get("interrupt_running"):
+                hosts.setdefault(p, set()).add(str(body["revoke_seq"]))
+            continue
+        if action == "revoke":
+            revoked.setdefault(p, body["record_id"])
+        if (action == "revoke" and body["interrupt_running"]) or action == "interrupt_running":
+            interrupting.add(p)
+    out = {}
+    for p, by in revoked.items():
+        out[p] = {"interrupted": [by] if p in interrupting else [], "revoked": by}
+    for p, seqs in hosts.items():
+        out[p] = {"interrupted": sorted(seqs)}
+    return out
+
+
+def derive_snapshot(case, snap, by_label, entries):
+    """A snapshot case (Astation #114, items 2 and 6), derived from the file
+    alone: each record's verdict is its `checks` on the case's chain (the
+    Rust runner and the suites pin those); then, record by record in
+    publication order, invalid_record (not valid; reason: the verdict's),
+    wrong_origin (a service's record naming another origin),
+    not_candidate_feed (a record the service's own key signed, signer =
+    principal, naming another feed than the candidate: a current manager's
+    stop may name any feed of the origin), cover_not_first (a covered
+    principal's first record isn't its cover, or a hold or release before
+    its principal's cover), not_above_mark (the service's own key, issued at
+    or below its principal's mark or with no mark), uncovered_cover; then a
+    covered principal with no cover (index: the snapshot's length); then
+    stop_lost: the first principal (sorted) whose revocation, or interrupt
+    (a host principal's lowest revoke_seq), is in force after the retained
+    records and not after the snapshot alone (snapshot_stops). The answer
+    must be `expect`, and `in_force` the stops derived after the retained
+    records, the snapshot alone and both in order; a host that read the old
+    feed keeps every stop. Returns the answer's code, or `consistent`."""
+    chain = snap["chain"]
+    replay_bodies = [entries[label] for label in LOG_L + list(chain)]
+    entry_at = lambda seq: replay_bodies[seq - 1]  # noqa: E731
+
+    def verdict(label):
+        found = [c for c in by_label[label].get("checks", []) if c["chain"] == chain]
+        if len(found) != 1:
+            case.fail(f"{label} has no verdict on L + {chain}")
+            return {"verdict": "unknown"}
+        return found[0]
+
+    covered, marks = set(snap["covered"]), snap["marks"]
+    case.equal(sorted(covered), snap["covered"], "covered: sorted, each once")
+
+    def answer():
+        def at(index, code, body=None, principal=None, reason=None, revoke_seq=None):
+            out = {"consistent": False, "index": index, "code": code}
+            if body is not None:
+                out["record_id"] = body["record_id"]
+            if principal is not None:
+                out["principal"] = principal
+            if reason is not None:
+                out["reason"] = reason
+            if revoke_seq is not None:
+                out["revoke_seq"] = revoke_seq
+            return out
+
+        seen, covers = set(), set()
+        for i, label in enumerate(snap["snapshot"]):
+            body = by_label[label]["record"]["body"]
+            p, action = body["principal"], body["action"]
+            v = verdict(label)
+            if v["verdict"] != "valid":
+                return at(i, "invalid_record", body, p, v.get("reason"))
+            own = body["signer"] == p
+            if "origin" in body:
+                if body["origin"] != snap["origin"]:
+                    return at(i, "wrong_origin", body, p)
+                if own and body["feed_id"] != snap["candidate_feed_id"]:
+                    return at(i, "not_candidate_feed", body, p)
+            first = p not in seen
+            seen.add(p)
+            if (first and action != "cover" and p in covered) or (action in ("hold", "release") and p not in covers):
+                return at(i, "cover_not_first", body, p)
+            if own and (p not in marks or body["issued_at"] <= marks[p]):
+                return at(i, "not_above_mark", body, p)
+            if action == "cover":
+                if p not in covered:
+                    return at(i, "uncovered_cover", body, p)
+                covers.add(p)
+        end = len(snap["snapshot"])
+        for p in sorted(covered - covers):
+            return at(end, "cover_not_first", principal=p)
+        retained = snapshot_stops(snap["retained"], verdict, by_label, entry_at)
+        fresh = snapshot_stops(snap["snapshot"], verdict, by_label, entry_at)
+        for p in sorted(retained):
+            had, has = retained[p], fresh.get(p, {"interrupted": []})
+            # A service's lost stop is named by the retained revoke that
+            # revoked it.
+            named = {"record_id": had["revoked"]} if "revoked" in had else None
+            if "revoked" in had and "revoked" not in has:
+                return at(end, "stop_lost", named, p, "revocation")
+            if p.startswith("host:"):
+                lost = sorted(int(seq) for seq in set(had["interrupted"]) - set(has["interrupted"]))
+                if lost:
+                    return at(end, "stop_lost", None, p, "interrupt", lost[0])
+            elif had["interrupted"] and not has["interrupted"]:
+                return at(end, "stop_lost", named, p, "interrupt")
+        return {"consistent": True}
+
+    got = answer()
+    case.equal(got, snap["expect"], "the answer, derived from the verdicts, the feeds, the marks and the stops")
+    in_force = {
+        "retained": snapshot_stops(snap["retained"], verdict, by_label, entry_at),
+        "snapshot": snapshot_stops(snap["snapshot"], verdict, by_label, entry_at),
+        "snapshot_over_retained": snapshot_stops(snap["retained"] + snap["snapshot"], verdict, by_label, entry_at),
+    }
+    case.equal(in_force, snap["in_force"], "in_force: the stops after the retained records, the snapshot alone and both")
+    kept = all(in_force["snapshot_over_retained"].get(p) == s for p, s in in_force["retained"].items())
+    case.check(kept, "a host that read the old feed keeps every stop it had")
+    return got.get("code", "consistent")
 
 
 # Applied::why's codes (host-work-v1 §11.1), by what they explain.

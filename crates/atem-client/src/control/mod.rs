@@ -20,10 +20,13 @@
 //! per-effect results, and its own device-list fetch. [`ledger`] is the
 //! Station's reference side of those acknowledgments: what each covered host
 //! has in force, the durable, retryable reports it owes the Portal, and the
-//! re-sign alerts (I.5.4, I.5.8).
+//! re-sign alerts (I.5.4, I.5.8). [`snapshot`] checks a Station's
+//! replacement feed after a rollback for consistency with the records it
+//! retained, never for completeness (host-work-v1 §11.1, "Resets").
 pub mod ledger;
 pub mod record;
 pub mod relay;
+pub mod snapshot;
 pub mod state;
 pub mod verify;
 
@@ -40,6 +43,10 @@ pub use relay::{
     Accept, AckResult, CallRefused, ControlAck, ControlSync, ControlSyncResult, EntryRef,
     FeedEntry, FeedHead, Heads, HeadsWithMailbox, MailboxHead, MembershipFetch,
     MembershipFetchResult, RefusalCode, RefusedCall, RelayError, SyncMismatch, ToHost, ToStation,
+};
+pub use snapshot::{
+    InconsistencyCode, SnapshotConsistency, SnapshotInconsistency, SnapshotInput,
+    check_snapshot_consistency,
 };
 pub use state::{
     ApplicationResult, Applied, ControlState, Coverage, EffectKind, EffectResult, EffectWhy,

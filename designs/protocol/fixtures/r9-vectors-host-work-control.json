@@ -3,7 +3,7 @@
   "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
   "kind": "vectors",
   "name": "r9-vectors-host-work-control",
-  "note": "Control records (delegated host-work I.5.3 to I.5.5, II.3.1; host-work-v1 §11.1; planned: host.senders, not advertised). Wire {\"body\":{…},\"sig\"}; signing input enc([\"atem-host-work-control-v1\", jcs(body)]) (R9.1). The device list is r9-vectors-membership-log's log L followed by `chain` (labels of its others); signers' keys are r9-vectors-keys' (`signed_with`). A service record's principal_key is the r9_svc of the principal's auth_key (SHA-256 of its raw bytes, decision 8), written beside it. `checks`: verify_control's verdict on each chain (valid with the verified signer and, for the principal's own key, the seq that enrolled it; pending or refused with its reason); `parse_error`: the record's parse refuses it (in a feed, refused per record and kept as evidence; over a channel the whole control_records message is invalid_request). `sequences`: ControlState::apply on one host, step by step (the record, the list of the transaction, its feed position or none over a channel, host-work's applied device-list seq) with the record's result, each effect's result, the host's actions and whether the record is kept as evidence; each step applies to the state the step before it left; `state` is ControlState::to_json after the last step (v2: one part per principal, `principals`; each part names its device list, account_id and genesis_hash, and its `records` are the [record_id, digest, issued_at] triples that counted, oldest first; `order` holds one feed per Station origin). A step's position is {origin, feed_id, feed_seq}: a record counts as read at its own feed's position only when origin and feed_id are its body's. Record ids are UUID v4 numbered by record (the X* records and V6_conflicting_id reuse another record's id on purpose). Atem's proposals, for Astation's and Auth/Portal's agreement: covers are ordered by (issued_at, record_id); a hold applies from any feed, a release only from the covering feed after its cover and after that feed's last hold or release; record ids are per principal, and another body under an id the same principal's record counted with is evidence (a stop still applies, a cover or release is refused). Each step's `standing` is ControlState::standing of its record's principal after it (held, interrupted, and revoked and coverage {origin, feed_id} when there are). Its `expect.why` is Applied::why's code (host-work-v1 §11.1: the verifier's pending or refusal reason, or list_frozen, not_revoked, revoke_not_applied, order, after_revoke, collision, not_newer, possible_replay, not_after_hold), present exactly when the record is pending or refused or kept as evidence. A sequence with `initial` starts from that state (ControlState::to_json) instead of a new one: its records of svc-discord that aren't the file's are the record `fill`'s body under those record ids (each signed by svc-discord's key and counted, at no position), so svc-discord's records start full. A principal keeps at most 256 counted record ids (MAX_RECORD_IDS): the next evicts the oldest, never the revocation's record nor the coverage's cover, and raises the part's `evicted_floor` to the newest issued_at evicted; a cover or release of a principal not revoked, under an id not counted and issued no later than the floor, is refused as a possible replay and kept as evidence; a hold, revoke or interrupt never is (decision 19, rulings T4a and T4d, agreed with Astation on 2026-11-13, #120 comment 6848326392). A service's part keeps `hold_issued_at`, the newest issued_at of every hold verified while it wasn't revoked (one that held or found it held, read out of order, from another feed, at no position or under a counted id), never lowered or cleared; a release taken in feed order while held lifts the hold only when issued strictly after it, else it is refused with why not_after_hold (no evidence) and takes no position in the feed's order (O1, requested in Astation's review of PR 2, #120 comment 6848326392; for Astation's sign-off). Each effect pending or refused in `expect` carries the step's why (O5, for Astation's sign-off).",
+  "note": "Control records (delegated host-work I.5.3 to I.5.5, II.3.1; host-work-v1 §11.1; planned: host.senders, not advertised). Wire {\"body\":{…},\"sig\"}; signing input enc([\"atem-host-work-control-v1\", jcs(body)]) (R9.1). The device list is r9-vectors-membership-log's log L followed by `chain` (labels of its others); signers' keys are r9-vectors-keys' (`signed_with`). A service record's principal_key is the r9_svc of the principal's auth_key (SHA-256 of its raw bytes, decision 8), written beside it. `checks`: verify_control's verdict on each chain (valid with the verified signer and, for the principal's own key, the seq that enrolled it; pending or refused with its reason); `parse_error`: the record's parse refuses it (in a feed, refused per record and kept as evidence; over a channel the whole control_records message is invalid_request). `sequences`: ControlState::apply on one host, step by step (the record, the list of the transaction, its feed position or none over a channel, host-work's applied device-list seq) with the record's result, each effect's result, the host's actions and whether the record is kept as evidence; each step applies to the state the step before it left; `state` is ControlState::to_json after the last step (v2: one part per principal, `principals`; each part names its device list, account_id and genesis_hash, and its `records` are the [record_id, digest, issued_at] triples that counted, oldest first; `order` holds one feed per Station origin). A step's position is {origin, feed_id, feed_seq}: a record counts as read at its own feed's position only when origin and feed_id are its body's. Record ids are UUID v4 numbered by record (the X* records and V6_conflicting_id reuse another record's id on purpose). Atem's proposals, for Astation's and Auth/Portal's agreement: covers are ordered by (issued_at, record_id); a hold applies from any feed, a release only from the covering feed after its cover and after that feed's last hold or release; record ids are per principal, and another body under an id the same principal's record counted with is evidence (a stop still applies, a cover or release is refused). Each step's `standing` is ControlState::standing of its record's principal after it (held, interrupted, and revoked and coverage {origin, feed_id} when there are). Its `expect.why` is Applied::why's code (host-work-v1 §11.1: the verifier's pending or refusal reason, or list_frozen, not_revoked, revoke_not_applied, order, after_revoke, collision, not_newer, possible_replay, not_after_hold), present exactly when the record is pending or refused or kept as evidence. A sequence with `initial` starts from that state (ControlState::to_json) instead of a new one: its records of svc-discord that aren't the file's are the record `fill`'s body under those record ids (each signed by svc-discord's key and counted, at no position), so svc-discord's records start full. A principal keeps at most 256 counted record ids (MAX_RECORD_IDS): the next evicts the oldest, never the revocation's record nor the coverage's cover, and raises the part's `evicted_floor` to the newest issued_at evicted; a cover or release of a principal not revoked, under an id not counted and issued no later than the floor, is refused as a possible replay and kept as evidence; a hold, revoke or interrupt never is (decision 19, rulings T4a and T4d, agreed with Astation on 2026-11-13, #120 comment 6848326392). A service's part keeps `hold_issued_at`, the newest issued_at of every hold verified while it wasn't revoked (one that held or found it held, read out of order, from another feed, at no position or under a counted id), never lowered or cleared; a release taken in feed order while held lifts the hold only when issued strictly after it, else it is refused with why not_after_hold (no evidence) and takes no position in the feed's order (O1, requested in Astation's review of PR 2, #120 comment 6848326392; for Astation's sign-off). Each effect pending or refused in `expect` carries the step's why (O5, for Astation's sign-off). `snapshots` (Astation #114, items 2 and 6, agreed 2026-11-22): check_snapshot_consistency on station-dev's replacement feed (`candidate_feed_id`, stations.A2) against what the restored Station retained, on L + `chain`: `retained` (record labels, in its feed's order), `snapshot` (in publication order), `origin`, `marks` (each service principal's mark, ms: a record its own key signs is issued after it) and `covered`; `expect` is {consistent: true} or the first inconsistency {consistent: false, index, code, principal, record_id?, reason?, revoke_seq?} (invalid_record with verify_control's code as reason, wrong_origin, not_candidate_feed, cover_not_first, not_above_mark, uncovered_cover, stop_lost with the effect lost as reason; index is the snapshot's length for what only the whole snapshot shows). A current manager's stop may name any feed of the origin (carried unchanged, item 2); a record the service's own key signs names the candidate feed. Consistency with what is retained only, never the completeness of a history or a clock. `in_force`: the stops each host state has in force (each principal's `revoked` and `interrupted`, only those with one) after the retained records (at no position), after the snapshot alone on a fresh state (a host that never read the old feed) and after the snapshot over the retained state (a host that did), at the list's head, a pending record applied once more after the rest.",
   "records": [
     {
       "checks": [
@@ -20019,6 +20019,682 @@
       "seq": 5
     }
   },
+  "snapshots": [
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [],
+      "covered": [
+        "service:svc-discord"
+      ],
+      "expect": {
+        "consistent": true
+      },
+      "in_force": {
+        "retained": {
+          "service:svc-discord": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000014"
+          }
+        },
+        "snapshot": {
+          "service:svc-discord": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000014"
+          }
+        },
+        "snapshot_over_retained": {
+          "service:svc-discord": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000014"
+          }
+        }
+      },
+      "label": "N1_retained_native_revoke",
+      "marks": {
+        "service:svc-discord": 1793620913000
+      },
+      "note": "a current manager's original revoke carried unchanged: it names the old feed A, which a native-signed stop may (#114 item 2)",
+      "origin": "https://station-dev.agora.build",
+      "retained": [
+        "S1_cover",
+        "M1_revoke"
+      ],
+      "snapshot": [
+        "A2_cover",
+        "M1_revoke"
+      ]
+    },
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [],
+      "covered": [
+        "service:svc-discord"
+      ],
+      "expect": {
+        "consistent": true
+      },
+      "in_force": {
+        "retained": {
+          "service:svc-discord": {
+            "interrupted": [
+              "00000000-0000-4000-8000-000000000064"
+            ],
+            "revoked": "00000000-0000-4000-8000-000000000064"
+          }
+        },
+        "snapshot": {
+          "service:svc-discord": {
+            "interrupted": [
+              "00000000-0000-4000-8000-000000000064"
+            ],
+            "revoked": "00000000-0000-4000-8000-000000000064"
+          }
+        },
+        "snapshot_over_retained": {
+          "service:svc-discord": {
+            "interrupted": [
+              "00000000-0000-4000-8000-000000000064"
+            ],
+            "revoked": "00000000-0000-4000-8000-000000000064"
+          }
+        }
+      },
+      "label": "N2_retained_native_revoke_interrupt",
+      "marks": {
+        "service:svc-discord": 1793620913000
+      },
+      "note": "the same with interrupt_running: the revocation and its interrupt kept",
+      "origin": "https://station-dev.agora.build",
+      "retained": [
+        "S1_cover",
+        "M7_revoke_interrupt"
+      ],
+      "snapshot": [
+        "A2_cover",
+        "M7_revoke_interrupt"
+      ]
+    },
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [],
+      "covered": [
+        "service:svc-discord"
+      ],
+      "expect": {
+        "consistent": true
+      },
+      "in_force": {
+        "retained": {},
+        "snapshot": {
+          "service:svc-discord": {
+            "interrupted": [
+              "00000000-0000-4000-8000-000000000065"
+            ],
+            "revoked": "00000000-0000-4000-8000-000000000065"
+          }
+        },
+        "snapshot_over_retained": {
+          "service:svc-discord": {
+            "interrupted": [
+              "00000000-0000-4000-8000-000000000065"
+            ],
+            "revoked": "00000000-0000-4000-8000-000000000065"
+          }
+        }
+      },
+      "label": "N3_removed_manager_signed_again",
+      "marks": {
+        "service:svc-discord": 1793620913000
+      },
+      "note": "a removed manager's original isn't in force at the head, so nothing retained is lost; its copy signed again by a current manager for A2 is in force (its re-signing is the re-sign alert's, never this check's)",
+      "origin": "https://station-dev.agora.build",
+      "retained": [
+        "S1_cover",
+        "M3_revoke_by_removed_manager"
+      ],
+      "snapshot": [
+        "A2_cover",
+        "M8_revoke_resigned_a2"
+      ]
+    },
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [],
+      "covered": [
+        "service:svc-discord"
+      ],
+      "expect": {
+        "consistent": true
+      },
+      "in_force": {
+        "retained": {},
+        "snapshot": {},
+        "snapshot_over_retained": {}
+      },
+      "label": "N4_holds_not_compared",
+      "marks": {
+        "service:svc-discord": 1793620913000
+      },
+      "note": "a hold retained but not in the snapshot: holds and releases aren't compared, the Portal's current state decides them",
+      "origin": "https://station-dev.agora.build",
+      "retained": [
+        "S1_cover",
+        "S2_hold"
+      ],
+      "snapshot": [
+        "A2_cover"
+      ]
+    },
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [
+        "HS7_revoke"
+      ],
+      "covered": [],
+      "expect": {
+        "consistent": true
+      },
+      "in_force": {
+        "retained": {
+          "host:host-a": {
+            "interrupted": [
+              "7"
+            ]
+          }
+        },
+        "snapshot": {
+          "host:host-a": {
+            "interrupted": [
+              "7"
+            ]
+          }
+        },
+        "snapshot_over_retained": {
+          "host:host-a": {
+            "interrupted": [
+              "7"
+            ]
+          }
+        }
+      },
+      "label": "N5_host_interrupt_carried",
+      "marks": {},
+      "note": "a host principal's interrupt (bound to no feed) carried unchanged; no service is covered, so no cover and no mark",
+      "origin": "https://station-dev.agora.build",
+      "retained": [
+        "H1_interrupt_7"
+      ],
+      "snapshot": [
+        "H1_interrupt_7"
+      ]
+    },
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [],
+      "covered": [
+        "service:svc-discord"
+      ],
+      "expect": {
+        "consistent": true
+      },
+      "in_force": {
+        "retained": {
+          "service:svc-discord": {
+            "interrupted": [
+              "00000000-0000-4000-8000-000000000014"
+            ],
+            "revoked": "00000000-0000-4000-8000-000000000014"
+          }
+        },
+        "snapshot": {
+          "service:svc-discord": {
+            "interrupted": [
+              "00000000-0000-4000-8000-000000000014"
+            ],
+            "revoked": "00000000-0000-4000-8000-000000000014"
+          }
+        },
+        "snapshot_over_retained": {
+          "service:svc-discord": {
+            "interrupted": [
+              "00000000-0000-4000-8000-000000000014"
+            ],
+            "revoked": "00000000-0000-4000-8000-000000000014"
+          }
+        }
+      },
+      "label": "N6_interrupt_before_its_revoke",
+      "marks": {
+        "service:svc-discord": 1793620913000
+      },
+      "note": "the snapshot's interrupt_running read before its revoke waits, and applies once the revoke has, as a host applies its pending records again after a revocation: nothing retained is lost",
+      "origin": "https://station-dev.agora.build",
+      "retained": [
+        "S1_cover",
+        "M1_revoke",
+        "M2_interrupt"
+      ],
+      "snapshot": [
+        "A2_cover",
+        "M2_interrupt",
+        "M1_revoke"
+      ]
+    },
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [],
+      "covered": [
+        "service:svc-discord"
+      ],
+      "expect": {
+        "code": "invalid_record",
+        "consistent": false,
+        "index": 1,
+        "principal": "service:svc-discord",
+        "reason": "removed_manager",
+        "record_id": "00000000-0000-4000-8000-000000000016"
+      },
+      "in_force": {
+        "retained": {},
+        "snapshot": {},
+        "snapshot_over_retained": {}
+      },
+      "label": "I1_invalid_record",
+      "marks": {
+        "service:svc-discord": 1793620913000
+      },
+      "note": "a removed manager's original carried as it is isn't valid at the head",
+      "origin": "https://station-dev.agora.build",
+      "retained": [
+        "S1_cover",
+        "M3_revoke_by_removed_manager"
+      ],
+      "snapshot": [
+        "A2_cover",
+        "M3_revoke_by_removed_manager"
+      ]
+    },
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [],
+      "covered": [
+        "service:svc-discord"
+      ],
+      "expect": {
+        "code": "wrong_origin",
+        "consistent": false,
+        "index": 1,
+        "principal": "service:svc-discord",
+        "record_id": "00000000-0000-4000-8000-000000000066"
+      },
+      "in_force": {
+        "retained": {},
+        "snapshot": {
+          "service:svc-discord": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000066"
+          }
+        },
+        "snapshot_over_retained": {
+          "service:svc-discord": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000066"
+          }
+        }
+      },
+      "label": "I2_wrong_origin",
+      "marks": {
+        "service:svc-discord": 1793620913000
+      },
+      "note": "a current manager's revoke naming another Station's feed: no record of station-dev's snapshot",
+      "origin": "https://station-dev.agora.build",
+      "retained": [
+        "S1_cover"
+      ],
+      "snapshot": [
+        "A2_cover",
+        "M9_revoke_other_station"
+      ]
+    },
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [],
+      "covered": [
+        "service:svc-discord"
+      ],
+      "expect": {
+        "code": "not_candidate_feed",
+        "consistent": false,
+        "index": 1,
+        "principal": "service:svc-discord",
+        "record_id": "00000000-0000-4000-8000-000000000004"
+      },
+      "in_force": {
+        "retained": {
+          "service:svc-discord": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000004"
+          }
+        },
+        "snapshot": {
+          "service:svc-discord": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000004"
+          }
+        },
+        "snapshot_over_retained": {
+          "service:svc-discord": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000004"
+          }
+        }
+      },
+      "label": "I3_not_candidate_feed",
+      "marks": {
+        "service:svc-discord": 1793620913000
+      },
+      "note": "the Station's own revoke carried unchanged from the old feed: a record the service's key signs in a snapshot is signed anew, for the candidate feed",
+      "origin": "https://station-dev.agora.build",
+      "retained": [
+        "S1_cover",
+        "S4_revoke"
+      ],
+      "snapshot": [
+        "A2_cover",
+        "S4_revoke"
+      ]
+    },
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [],
+      "covered": [
+        "service:svc-discord"
+      ],
+      "expect": {
+        "code": "cover_not_first",
+        "consistent": false,
+        "index": 0,
+        "principal": "service:svc-discord",
+        "record_id": "00000000-0000-4000-8000-00000000000f"
+      },
+      "in_force": {
+        "retained": {},
+        "snapshot": {},
+        "snapshot_over_retained": {}
+      },
+      "label": "I4_cover_not_first",
+      "marks": {
+        "service:svc-discord": 1793620913000
+      },
+      "note": "the hold before the cover",
+      "origin": "https://station-dev.agora.build",
+      "retained": [
+        "S1_cover",
+        "S2_hold"
+      ],
+      "snapshot": [
+        "A2_hold",
+        "A2_cover"
+      ]
+    },
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [],
+      "covered": [
+        "service:svc-discord"
+      ],
+      "expect": {
+        "code": "cover_not_first",
+        "consistent": false,
+        "index": 0,
+        "principal": "service:svc-discord"
+      },
+      "in_force": {
+        "retained": {},
+        "snapshot": {},
+        "snapshot_over_retained": {}
+      },
+      "label": "I5_covered_without_a_cover",
+      "marks": {
+        "service:svc-discord": 1793620913000
+      },
+      "note": "a principal the snapshot covers, with no cover in it (found once the whole snapshot is read: index is its length)",
+      "origin": "https://station-dev.agora.build",
+      "retained": [
+        "S1_cover"
+      ],
+      "snapshot": []
+    },
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [],
+      "covered": [
+        "service:svc-discord"
+      ],
+      "expect": {
+        "code": "not_above_mark",
+        "consistent": false,
+        "index": 0,
+        "principal": "service:svc-discord",
+        "record_id": "00000000-0000-4000-8000-00000000000e"
+      },
+      "in_force": {
+        "retained": {},
+        "snapshot": {},
+        "snapshot_over_retained": {}
+      },
+      "label": "I6_not_above_mark",
+      "marks": {
+        "service:svc-discord": 1793620914000
+      },
+      "note": "the snapshot's cover issued at the principal's mark, not after it",
+      "origin": "https://station-dev.agora.build",
+      "retained": [
+        "S1_cover"
+      ],
+      "snapshot": [
+        "A2_cover"
+      ]
+    },
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [],
+      "covered": [
+        "service:svc-discord"
+      ],
+      "expect": {
+        "code": "not_above_mark",
+        "consistent": false,
+        "index": 0,
+        "principal": "service:svc-discord",
+        "record_id": "00000000-0000-4000-8000-00000000000e"
+      },
+      "in_force": {
+        "retained": {},
+        "snapshot": {},
+        "snapshot_over_retained": {}
+      },
+      "label": "I7_no_mark",
+      "marks": {},
+      "note": "a record the service's key signs for a principal with no mark given: no time is known to be after the old deployment's",
+      "origin": "https://station-dev.agora.build",
+      "retained": [
+        "S1_cover"
+      ],
+      "snapshot": [
+        "A2_cover"
+      ]
+    },
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [],
+      "covered": [],
+      "expect": {
+        "code": "uncovered_cover",
+        "consistent": false,
+        "index": 0,
+        "principal": "service:svc-discord",
+        "record_id": "00000000-0000-4000-8000-00000000000e"
+      },
+      "in_force": {
+        "retained": {},
+        "snapshot": {},
+        "snapshot_over_retained": {}
+      },
+      "label": "I8_uncovered_cover",
+      "marks": {
+        "service:svc-discord": 1793620913000
+      },
+      "note": "a cover for a principal outside the covered set",
+      "origin": "https://station-dev.agora.build",
+      "retained": [
+        "S1_cover"
+      ],
+      "snapshot": [
+        "A2_cover"
+      ]
+    },
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [],
+      "covered": [
+        "service:svc-discord"
+      ],
+      "expect": {
+        "code": "stop_lost",
+        "consistent": false,
+        "index": 1,
+        "principal": "service:svc-discord",
+        "reason": "revocation",
+        "record_id": "00000000-0000-4000-8000-000000000064"
+      },
+      "in_force": {
+        "retained": {
+          "service:svc-discord": {
+            "interrupted": [
+              "00000000-0000-4000-8000-000000000064"
+            ],
+            "revoked": "00000000-0000-4000-8000-000000000064"
+          }
+        },
+        "snapshot": {},
+        "snapshot_over_retained": {
+          "service:svc-discord": {
+            "interrupted": [
+              "00000000-0000-4000-8000-000000000064"
+            ],
+            "revoked": "00000000-0000-4000-8000-000000000064"
+          }
+        }
+      },
+      "label": "I9_revocation_lost",
+      "marks": {
+        "service:svc-discord": 1793620913000
+      },
+      "note": "a revocation in force from the retained records, in force nowhere after the snapshot alone (a host that never read the old feed); record_id names the retained revoke",
+      "origin": "https://station-dev.agora.build",
+      "retained": [
+        "S1_cover",
+        "M7_revoke_interrupt"
+      ],
+      "snapshot": [
+        "A2_cover"
+      ]
+    },
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [],
+      "covered": [
+        "service:svc-discord"
+      ],
+      "expect": {
+        "code": "stop_lost",
+        "consistent": false,
+        "index": 2,
+        "principal": "service:svc-discord",
+        "reason": "interrupt",
+        "record_id": "00000000-0000-4000-8000-000000000064"
+      },
+      "in_force": {
+        "retained": {
+          "service:svc-discord": {
+            "interrupted": [
+              "00000000-0000-4000-8000-000000000064"
+            ],
+            "revoked": "00000000-0000-4000-8000-000000000064"
+          }
+        },
+        "snapshot": {
+          "service:svc-discord": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000014"
+          }
+        },
+        "snapshot_over_retained": {
+          "service:svc-discord": {
+            "interrupted": [
+              "00000000-0000-4000-8000-000000000064"
+            ],
+            "revoked": "00000000-0000-4000-8000-000000000064"
+          }
+        }
+      },
+      "label": "I10_interrupt_lost",
+      "marks": {
+        "service:svc-discord": 1793620913000
+      },
+      "note": "the revocation kept by another revoke, its interrupt lost",
+      "origin": "https://station-dev.agora.build",
+      "retained": [
+        "S1_cover",
+        "M7_revoke_interrupt"
+      ],
+      "snapshot": [
+        "A2_cover",
+        "M1_revoke"
+      ]
+    },
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [
+        "HS7_revoke"
+      ],
+      "covered": [],
+      "expect": {
+        "code": "stop_lost",
+        "consistent": false,
+        "index": 0,
+        "principal": "host:host-a",
+        "reason": "interrupt",
+        "revoke_seq": 7
+      },
+      "in_force": {
+        "retained": {
+          "host:host-a": {
+            "interrupted": [
+              "7"
+            ]
+          }
+        },
+        "snapshot": {},
+        "snapshot_over_retained": {
+          "host:host-a": {
+            "interrupted": [
+              "7"
+            ]
+          }
+        }
+      },
+      "label": "I11_host_interrupt_lost",
+      "marks": {},
+      "note": "a host principal's interrupt in force from the retained records, lost: its revoke_seq named",
+      "origin": "https://station-dev.agora.build",
+      "retained": [
+        "H1_interrupt_7"
+      ],
+      "snapshot": []
+    }
+  ],
   "stations": {
     "A": {
       "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
