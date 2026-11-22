@@ -346,6 +346,9 @@ capacity limit or on a storage failure). The reply follows the durable
 | `expired` | not submitted by `expires_at`, or still `awaiting_result` at it (detail `expired awaiting a result`) or `outcome_unknown` (detail `expired with its outcome unknown`) |
 | `outcome_unknown` | the submission is uncertain, or its receipt is gone (detail `receipt no longer available`); never resubmitted; `expired` at `expires_at` |
 
+`task_id` is the task's UUID v4, or a host sender's selector task's UUID v5,
+which only the owner's ops name (§11.2, "The owner's ops on a host sender's
+task"); which task a status is, the request it answers decides.
 `receipt_id` (UUID v4, fixed at enqueue) is the session-v1 `request_id` of the
 prompt; behind `host.delegated` it is the current attempt's own id (§11.2).
 `detail` is display text of at most 1024 bytes; clients don't parse
@@ -1717,16 +1720,16 @@ Two directed-work requests of `host.delegated` (design I.4.5, I.4.6), in
 they serialize back to the same JSON.
 
 ```json
-{"v":1,"id":"…","host":{…},"op":"work_interrupt","task_id":"<UUID v4>"}
-{"v":1,"id":"…","host":{…},"op":"work_resolve","task_id":"<UUID v4>",
+{"v":1,"id":"…","host":{…},"op":"work_interrupt","task_id":"<UUID v4 or v5>"}
+{"v":1,"id":"…","host":{…},"op":"work_resolve","task_id":"<UUID v4 or v5>",
  "resolution":{"kind":"failed","detail":"agent exited"}}
-{"v":1,"id":"…","host":{…},"op":"work_resolve","task_id":"<UUID v4>",
+{"v":1,"id":"…","host":{…},"op":"work_resolve","task_id":"<UUID v4 or v5>",
  "resolution":{"kind":"done","result":{"kind":"vault","id":"…","version":1,"text":"…","digest":"…"}}}
 ```
 
 | Field | Rule |
 |---|---|
-| `task_id` | a UUID v4 |
+| `task_id` | a UUID v4, or a host sender's selector task's UUID v5 (§11.5; below, "The owner's ops on a host sender's task"); lowercase with hyphens, its version and RFC 9562 variant bits checked, as `work_query`'s. `reply_query`, `work_cancel` and `work_complete` keep a UUID v4 |
 | `resolution.kind` | `failed` or `done`, exactly its fields |
 | `failed.detail` | 1–1024 bytes, not blank (something besides White_Space), no control character and no Cf character (bidi controls, zero-width characters; the framing module's General_Category Cf, `framing::is_format`): the detail the task then shows. **Atem's choice, agreed with Astation (2026-11-11, #120 comment 6810116314)**: the design says only `failed{detail}`, so a multi-line, blank or Cf-carrying reason is `invalid_request` |
 | `done.result` | a context snapshot, with `work_complete`'s checks and no more (a `result` kind is local only; **Atem's choice, agreed with Astation (2026-11-13, #120 comment 6848463998)**) |
@@ -1738,6 +1741,54 @@ sender (the principal and key that enqueued it) with current authority, or
 the owner (a native member holding `control` at the head); for
 `work_interrupt` the sender also holds `interrupt`. A task the caller may
 not name is `forbidden`, as for `work_query`.
+
+**The owner's ops on a host sender's task (built behind the debug-only
+hook; Astation asked for it, [#120 comment 7028723996][c-7028723996],
+"Admission" item 1).** A host sender has no channel (design I.4.5), so
+the owner manages its tasks, from Astation or a phone: `work_query`,
+`work_interrupt` and `work_resolve` also name a host sender's selector
+task, the UUID v5 its `select` resolved to on this host (§11.5, "The
+selector task id"), and a `work` status carries that id.
+- **The reader.** The three requests' `task_id` is a lowercase UUID v4 or
+  v5 with hyphens, the version and variant bits checked
+  (`host_work::is_owner_task_id`); an uppercase id, another version or
+  variant is `invalid_request`. `reply_query`, `work_cancel` and
+  `work_complete` keep a UUID v4, and so does every other op naming a
+  task. A `work` status naming a UUID v5 answers only the request that
+  named it.
+- **The host serves a UUID v5 only when both hold.** The caller is the
+  owner (a native member holding `control` at the head of the host's open
+  device list, under its own key), checked before the task is looked for;
+  and the task is on this host with the recorded provenance of a host
+  sender's selector task: delegated as `host:<host_id>` (its principal and
+  its admission's), from that sender's message as stored, one of whose
+  `select` recipients for this host resolved to it (its id is
+  `selector_task_id` of the message, that recipient and the task's
+  session, and the recipient's recorded receipt lists it).
+- **Every other case is a missing task.** A caller that isn't the owner (a
+  native member without `control`, a service, a browser grant) and a UUID
+  v5 that names no such task (none at all, the runtime's `local` task, a
+  channel sender's, or a task whose id its message doesn't derive) get
+  exactly what a task the host doesn't have gets: `forbidden`, no detail,
+  nothing read or changed. A UUID v5 grants nothing. A service is `busy`
+  while the host's control state doesn't read, whatever task it names
+  (§11.6), the missing task's answer too.
+- **What each does** is what it does for any delegated task the owner may
+  act on: `work_query` its status; `work_resolve` an unresolved
+  `outcome_unknown` resolved (`resolved.by` the owner's `member:<id>`), its
+  alert ended and the status the sending host gets showing it; and
+  `work_interrupt` the running turn interrupted once, as below.
+- **A UUID v4 behaves as before**, for every caller and every op.
+- Vectors: `fixtures/host-work/requests-v1.json` (the three requests naming
+  a selector task, their uppercase, another version and variant refused,
+  `reply_query`, `work_cancel` and `work_complete` naming one refused; a
+  selector task's status, resolved by the owner, and its refused forms; a
+  status answering the request that named its task and not another's),
+  checked by the independent checker and run by the Swift, Kotlin and JS
+  suites through the bindings' `host_work_request_valid` and
+  `host_work_result_answers`.
+
+[c-7028723996]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-7028723996
 
 **Results** are `work` results (§4 "Status").
 
@@ -1770,7 +1821,8 @@ not name is `forbidden`, as for `work_query`.
   - A browser grant is never one: its tasks keep v1, and only a
     delegated task is resolved.
   - A host sender (`host:<id>`) is none either, since it gets no
-    `work_resolve` in this version (design I.4.5).
+    `work_resolve` in this version (design I.4.5): the owner resolves its
+    tasks (above), as its own `member:<id>`.
   `resolved` is omitted before the task is resolved, never `null` (a
   reader refuses `null`), and appears on `failed` and `completed` statuses
   only. Its shape is **Atem's choice, agreed with Astation (2026-11-11, #120
@@ -1876,9 +1928,10 @@ an old reader: the first is still a UUID v4, the second a status `detail` of
 at most 1024 bytes.
 
 Vectors: `fixtures/host-work/requests-v1.json` (the requests, valid and
-invalid, a blank and a Cf-carrying `failed.detail` among the refused, and
-`work` results with `resolved`: each kind of resolver, a bare, unknown or
-browser one, and `null`).
+invalid, a blank and a Cf-carrying `failed.detail` among the refused, a
+host sender's selector task named by the owner's ops, and `work` results
+with `resolved`: each kind of resolver, a bare, unknown or browser one,
+and `null`).
 
 ### 11.3 `alert_list` (`host.alerts`)
 
@@ -3869,9 +3922,14 @@ exactly as without this section):
     `select` existed): a receipt's provenance and an owner's alert take a
     UUID v4, or the UUID v5 of a selector's resolution when the sender is
     `host:<host_id>` (`wire::is_delegated_task_id`; the provenance vector
-    `receipt_provenance_host_selector_task`). The channel ops on a task
-    (`work_query`, `work_resolve`, `work_interrupt`) still take a UUID v4
-    only: the owner resolves such a task with `atem task resolve`.
+    `receipt_provenance_host_selector_task`). **Agreed with Astation
+    ([#120 comment 7028723996][c-7028723996], "Admission" item 1)**, which
+    asked for the owner's ops on such a task, **built**: the owner's
+    `work_query`, `work_interrupt` and `work_resolve` over a channel name
+    it, served only to the owner and only for a task whose recorded
+    provenance is a host sender's selector task; every other caller and
+    id is answered as a missing task (§11.2, "The owner's ops on a host
+    sender's task"). `atem task resolve` on the host still resolves it too.
   - **Results back** (design II.4.4; `runtime/delegated/results_back.rs`,
     the status pass in `admit_pass.rs`). A host sender's task's reply
     becomes `{"kind":"result","task_id","reply"}`, the reply exactly as
@@ -4445,10 +4503,13 @@ other, and a resolution never changes.)
   `cancel` and `complete` envelopes; results name it too, as the
   plaintexts above already allow ("A task id is the recipient's UUID v4,
   or the UUID v5 of a selector's fixed resolution").
-- **Where they appear.** Only in a host's `atem-result` status objects,
-  and on the sending host in `atem message status`. A channel never
-  carries `select` (below), so no `message_publish` receipt or
-  `message_query` answer has them. The client core's receipt check takes
+- **Where they appear.** In a host's `atem-result` status objects, and
+  on the sending host in `atem message status`. On a channel, only as a
+  task id: a receipt's provenance and an owner's alert (above, "A host
+  sender's selector task id"), and the owner's `work_query`,
+  `work_interrupt` and `work_resolve` with their `work` results (§11.2).
+  A channel never carries `select` (below), so no `message_publish`
+  receipt or `message_query` answer has them. The client core's receipt check takes
   both forms only in a status object (`status_recipients_valid`; a
   channel's message receipt, `recipients_valid`, refuses them); a `work`
   receipt keeps its `task_id` equal to its `recipient_id`.
@@ -4676,10 +4737,17 @@ agreed on 2026-11-17 ([#120 comment 6938206284][c-6938206284]), and the
 wire of this section with its 512 KiB mailbox calls, agreed on 2026-11-16
 ([#120 comment 6903887341][c-6903887341]).
 
+Item 1 of [#120 comment 6945317466][c-6945317466] is settled: Astation
+agreed that a host sender's selector task id (UUID v5) is a delegated task
+id ([On the receiving host][mailbox-calls], "A host sender's selector task
+id"; [§11.3](#113-alert_list-hostalerts)'s `task_id`; session-v1 R9.14 item
+2), and answered its open point (should the owner's `work_query`,
+`work_resolve` and `work_interrupt` take that UUID v5?) by asking for it
+([#120 comment 7028723996][c-7028723996], "Admission" item 1). Built:
+§11.2, "The owner's ops on a host sender's task".
+
 Asked in [#120 comment 6945317466][c-6945317466] (admission on the
 receiving host):
-- A host sender's selector task id (UUID v5) is a delegated task id, a change of agreed text: [On the receiving host][mailbox-calls], "A host sender's selector task id"; [§11.3](#113-alert_list-hostalerts)'s `task_id`; session-v1 R9.14 item 2 (item 1).
-- **Open point:** `work_query`, `work_resolve` and `work_interrupt` still take a UUID v4 only, so the owner reaches a host sender's selector task only with `atem task resolve` on that host. Should they take its UUID v5 too (design I.4.5)? The same bullet (item 1).
 - Whole refusals `request_id_reused` and `busy` as object refusals, and `busy` final for its message id: [On the receiving host][mailbox-calls], "A request" (items 2 and 3).
 - An unreached `cancel` or `complete` answered by its own id: [On the receiving host][mailbox-calls], "`cancel` and `complete`" (item 4).
 - A cancel reaches a task whose attempt waits `accepted`, its record marked durably first: the same bullet (item 5).
