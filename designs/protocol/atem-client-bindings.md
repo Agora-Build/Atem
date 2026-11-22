@@ -1937,8 +1937,11 @@ release after it), `uncovered_cover`, `not_above_mark` (signed anew with
 the service's own key, issued at or below the mark, or no mark). Then,
 with `index` the snapshot's length: `cover_not_first` for a covered
 principal with no cover, and each effect of each retained `revoke` or
-`interrupt_running` that isn't in force after the snapshot alone on a
-fresh host: `stop_lost` when that retained stop is valid at the head,
+`interrupt_running` that the snapshot alone doesn't keep on a fresh host
+(a revocation, or an interrupt due because its principal is revoked, in
+force; an interrupt not yet due, of a principal nothing revokes, an
+`interrupt_running` of that principal in the snapshot, which a new host
+holds pending as a host that read the old feed does): `stop_lost` when that retained stop is valid at the head,
 `stop_not_resigned` (`reason` `removed_manager`) when a removed manager
 signed it, a stop a current manager signs again; `record_id` the retained stop, `effect` `revocation` or
 `interrupt`, `revoke_seq` a host principal's interrupt. Holds and

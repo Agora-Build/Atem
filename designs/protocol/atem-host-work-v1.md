@@ -1618,9 +1618,9 @@ reconstructed safety clock (a revoke counts from any feed, rule 3, and
 `check_control_snapshot_consistency`, beside the ledger) checks a snapshot,
 sans-I/O, against the records the restored Station retained, at the
 verifying head (never a frozen list), with each service principal's mark
-and the set of principals the snapshot covers. Record by record in
-publication order, then over the whole snapshot, it answers `Consistent`
-or the first inconsistency `{index, code, principal, record_id?, reason?,
+and the set of principals the snapshot covers. First over the retained
+records, then record by record in publication order, then over the whole
+snapshot, it answers `Consistent` or the first inconsistency `{index, code, principal, record_id?, reason?,
 effect?, revoke_seq?}`, the codes in the order they are checked:
 
 | Code | When |
@@ -1633,16 +1633,21 @@ effect?, revoke_seq?}`, the codes in the order they are checked:
 | `cover_not_first` | a covered principal's first record isn't its cover, or a hold or release comes before its principal's cover; after the last record (`index`: the snapshot's length), a covered principal with no cover |
 | `uncovered_cover` | a cover of a principal outside the covered set |
 | `not_above_mark` | a record signed anew with the service's own key is issued at or below its principal's mark, or the principal has none (a retained stop carried unchanged needs no mark) |
-| `stop_lost` | after the last record: an effect of a retained `revoke` or `interrupt_running` that is valid at the head (its principal's revocation, and the interrupt with it) isn't in force after the snapshot alone is applied to a fresh state (`effect`: `revocation` or `interrupt`; `record_id`: that retained stop; `revoke_seq`: a host principal's interrupt) |
+| `stop_lost` | after the last record: an effect of a retained `revoke` or `interrupt_running` that is valid at the head (its principal's revocation, and the interrupt with it) isn't kept by the snapshot alone applied to a fresh state, as the paragraph below says (`effect`: `revocation` or `interrupt`; `record_id`: that retained stop; `revoke_seq`: a host principal's interrupt) |
 | `stop_not_resigned` | the same for a retained stop refused `removed_manager` (`reason`), a genuine stop whose signature verifies under its signer's key from the list's history: a current manager signs it again (I.5.4) |
 
-Every retained stop counts, in the retained order: a stop dropped from
-the snapshot is never `Consistent`, and a retained record that doesn't
-verify is reported before anything is compared. A retained
-service's `interrupt_running` counts once its principal is revoked, by a
-retained revoke or after the snapshot (until then it waits on every
-host); a host principal's interrupt is in force too when its device-list
-revoke carried `interrupt_running`. Holds and releases aren't compared:
+Every retained stop counts, in the retained order, and a retained record
+that doesn't verify is reported before anything is compared. An effect is
+kept when, after the snapshot alone is applied to a fresh state: a
+revocation is in force; a service's interrupt that is due (its principal
+revoked, by a retained revoke or after the snapshot) is in force; a
+service's interrupt not yet due (a retained `interrupt_running` of a
+principal nothing revokes, which a host that read the old feed holds
+pending and applies at a later revoke) has an `interrupt_running` of
+that principal in the snapshot, the retained one carried unchanged or a
+current manager's copy, which a new host holds pending too; a host
+principal's interrupt is in force, or its device-list revoke itself
+carried `interrupt_running`. Holds and releases aren't compared:
 the Portal's current state decides them. A snapshot `revoke` or
 `interrupt_running` whose signed object (body and signature) is a
 retained record's is that stop carried unchanged (as "Resets" above
@@ -1805,8 +1810,13 @@ revoke with `interrupt_running`, naming the old feed),
 `M8_revoke_resigned_a2` (M3's stop signed again for the replacement
 feed), `M9_revoke_other_station`, `A2_cover_at_floor`,
 `S12_revoke_signed_anew_for_the_old_feed`, `A2_revoke_at_mark` (the
-Station's own revoke signed anew, naming the old feed, and at the mark)
-and `S13_revoke_under_s4_id` (another body under S4's `record_id`); the
+Station's own revoke signed anew, naming the old feed, and at the mark),
+`S13_revoke_under_s4_id` (another body under S4's `record_id`),
+`V7_revoke_bad_signature` and `V8_revoke_wrong_account` (retained
+records that don't verify: `invalid_retained`),
+`M10_interrupt_by_removed_manager` and `M11_interrupt_resigned_a2` (a
+removed manager's `interrupt_running`, and its copy signed again for the
+replacement feed); the
 sequences `Q28`…`Q31` (a current manager's original stop carried
 unchanged into the replacement feed: each effect a `duplicate` on a host
 that read the old feed, applied on one that didn't), `Q32` (a removed
