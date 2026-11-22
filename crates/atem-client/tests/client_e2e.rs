@@ -2304,6 +2304,11 @@ mod delegated_work_ops {
                 op,
             );
             m["data"]["task_id"] = json!(task);
+            if op == "work_complete" {
+                let text = "done";
+                m["data"]["result"] = json!({"kind": "vault", "id": "v-done:1", "version": 1,
+                    "text": text, "digest": atem_client::session::host_work::digest(text.as_bytes())});
+            }
             m
         };
         for (n, op) in [
@@ -2327,7 +2332,11 @@ mod delegated_work_ops {
                 "{op}"
             );
         }
-        for (n, op) in [(0x21, "reply_query"), (0x22, "work_cancel")] {
+        for (n, op) in [
+            (0x21, "reply_query"),
+            (0x22, "work_cancel"),
+            (0x23, "work_complete"),
+        ] {
             assert_eq!(
                 attached
                     .send(&named(&attached, n, op, SELECTOR), now())
@@ -2335,6 +2344,11 @@ mod delegated_work_ops {
                 Some(ConnectError::Request("invalid_request")),
                 "{op}"
             );
+            // The same request naming a UUID v4 goes: the id is what is
+            // refused.
+            attached
+                .send(&named(&attached, n + 0x10, op, TASK), now())
+                .unwrap_or_else(|e| panic!("{op} naming a UUID v4: {e:?}"));
         }
     }
 }

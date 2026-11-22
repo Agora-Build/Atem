@@ -1582,6 +1582,11 @@ check("host work: request vectors and result correlation (§11.2, §11.5)", () =
   eq(m.hostWorkRequestValid("not json"), false);
   eq(requests.answers.length, 5);
   for (const c of requests.answers) eq(m.hostWorkResultAnswers(str(c.request), str(c.result)), c.answers, c.name);
+  // Read as strictly as the connection reads a record: a duplicate key
+  // (here a wrong `re` before the right one) is no result.
+  const answering = requests.answers.find((c) => c.answers);
+  const doubled = '{"re":"99999999-9999-4999-8999-999999999999",' + str(answering.result).slice(1);
+  eq(m.hostWorkResultAnswers(str(answering.request), doubled), false, "a duplicate key");
 });
 
 console.log(`wasm conformance: ${passed} passed, ${failures.length} failed`);

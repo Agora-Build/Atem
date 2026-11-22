@@ -2285,6 +2285,11 @@ final class ConformanceTests: XCTestCase {
             for c in answers {
                 try eq(hostWorkResultAnswers(requestJson: js(o(c["request"])), resultJson: js(o(c["result"]))), c["answers"] as! Bool, s(c["name"]))
             }
+            // Read as strictly as the connection reads a record: a duplicate
+            // key (here a wrong `re` before the right one) is no result.
+            let answering = answers.first { $0["answers"] as! Bool }!
+            let doubled = #"{"re":"99999999-9999-4999-8999-999999999999","# + String(js(o(answering["result"])).dropFirst())
+            try eq(hostWorkResultAnswers(requestJson: js(o(answering["request"])), resultJson: doubled), false, "a duplicate key")
         }
 
         print("swift conformance: \(passed) passed, \(failures.count) failed")

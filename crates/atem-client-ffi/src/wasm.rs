@@ -356,8 +356,10 @@ pub fn host_work_request_valid(message_json: String) -> bool {
     crate::host_work::host_work_request_valid(message_json)
 }
 
-/// Whether a `host_work_result`'s `data` reads and answers a whole
-/// host-work request: the connection's own correlation.
+/// Whether a `host_work_result`'s `data` reads strictly (no duplicate key)
+/// and answers a whole host-work request: the connection's reader and
+/// request correlation, not its channel binding (`attachment_gen`,
+/// `channel_id`).
 #[wasm_bindgen(js_name = hostWorkResultAnswers)]
 pub fn host_work_result_answers(request_json: String, result_json: String) -> bool {
     crate::host_work::host_work_result_answers(request_json, result_json)

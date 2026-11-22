@@ -129,3 +129,63 @@ fn every_answers_case_correlates_as_the_vectors_say() {
         bad.to_string()
     ));
 }
+
+/// `host_work_result_answers` reads a result as strictly as the connection
+/// reads its record (review L1): a duplicate key, whether or not one copy
+/// is escaped, anywhere in the result, is no result, so it answers nothing,
+/// even when the last copy is the one that would answer.
+#[test]
+fn a_result_with_a_duplicate_key_answers_nothing() {
+    use atem_client_ffi::host_work::host_work_result_answers;
+    let file = vectors();
+    let case = file["answers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "work_status_answers_its_selector_task")
+        .unwrap();
+    let request = case["request"].to_string();
+    let text = case["result"].to_string();
+    assert!(host_work_result_answers(request.clone(), text.clone()));
+    let re = case["result"]["re"].as_str().unwrap();
+    let task = case["result"]["result"]["work"]["task_id"]
+        .as_str()
+        .unwrap();
+    let other = "99999999-9999-4999-8999-999999999999";
+    for (what, damaged) in [
+        (
+            "re twice",
+            text.replacen(
+                &format!(r#""re":"{re}""#),
+                &format!(r#""re":"{other}","re":"{re}""#),
+                1,
+            ),
+        ),
+        (
+            "re twice, one escaped",
+            text.replacen(
+                &format!(r#""re":"{re}""#),
+                &format!(r#""\u0072e":"{other}","re":"{re}""#),
+                1,
+            ),
+        ),
+        (
+            "the work's task_id twice",
+            text.replacen(
+                &format!(r#""task_id":"{task}""#),
+                &format!(r#""task_id":"{other}","task_id":"{task}""#),
+                1,
+            ),
+        ),
+    ] {
+        assert_ne!(damaged, text, "{what}");
+        assert!(
+            serde_json::from_str::<Value>(&damaged).is_ok(),
+            "{what}: a lenient reader takes it"
+        );
+        assert!(
+            !host_work_result_answers(request.clone(), damaged),
+            "{what}"
+        );
+    }
+}

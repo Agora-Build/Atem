@@ -1893,6 +1893,11 @@ fun main(args: Array<String>) {
         for (c in answers) {
             eq(hostWorkResultAnswers(Json.write(c["request"]), Json.write(c["result"])), c["answers"] as Boolean, c["name"].s())
         }
+        // Read as strictly as the connection reads a record: a duplicate key
+        // (here a wrong `re` before the right one) is no result.
+        val answering = answers.first { it["answers"] == true }
+        val doubled = "{\"re\":\"99999999-9999-4999-8999-999999999999\"," + Json.write(answering["result"]).substring(1)
+        eq(hostWorkResultAnswers(Json.write(answering["request"]), doubled), false, "a duplicate key")
     }
 
     println("kotlin conformance: $passed passed, ${failures.size} failed")
