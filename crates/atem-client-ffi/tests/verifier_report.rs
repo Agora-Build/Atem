@@ -255,6 +255,24 @@ fn reports_through_the_production_binding() {
             }
         }
     }
+    // Among them: a native whose roles changed, a recovery still waiting,
+    // and a high-S P-256 signature.
+    let cases: Vec<&Value> = file["valid"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(file["invalid"].as_array().unwrap())
+        .collect();
+    let by_label = |label: &str| *cases.iter().find(|c| c["label"] == label).unwrap();
+    assert_eq!(
+        by_label("native_after_set_roles")["expect"]["at_head"],
+        false
+    );
+    assert_eq!(
+        by_label("pending_recovery_subject")["code"],
+        "unknown_signer"
+    );
+    assert_eq!(by_label("high_s_signature")["code"], "bad_signature");
     // An expected challenge that doesn't read is the caller's input.
     let case = &file["valid"][0];
     assert!(matches!(

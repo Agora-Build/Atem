@@ -25,8 +25,8 @@ use atem_client::member_report::{
     verify_verifier_report,
 };
 use atem_client::membership::{
-    Action, HostNow, HostRecord, Member, MemberKind, Membership, Role, VerifierInventory,
-    sign_entry,
+    Action, HostNow, HostRecord, Member, MemberKind, Membership, Role, RolesChange,
+    VerifierInventory, sign_entry,
 };
 use atem_client::provider::sign;
 use atem_client::{KeyId, KeyProvider, PublicKey, SignedObject, SoftwareKeys};
@@ -72,8 +72,14 @@ fn nonce(first: u8) -> [u8; 32] {
 struct Gen {
     v: Vectors,
     keys: SoftwareKeys,
-    /// The chain after L: (label, note, entry object).
-    entries: Vec<(&'static str, &'static str, SignedObject)>,
+    /// The entries after L: (label, note, the labels it extends, entry
+    /// object).
+    entries: Vec<(
+        &'static str,
+        &'static str,
+        &'static [&'static str],
+        SignedObject,
+    )>,
 }
 
 impl Gen {
@@ -100,6 +106,7 @@ impl Gen {
         made.push(
             "VR7_add_desk",
             "add dev-desk, a native member with an Ed25519 auth_key, on E6, by dev-mac",
+            NO_CHAIN,
             1_792_400_006_000,
             desk,
         );
@@ -113,9 +120,30 @@ impl Gen {
         made.push(
             "VR8_add_host_b",
             "add_host host-b on VR7_add_desk, by dev-mac: a head after VR7_add_desk",
+            VR7,
             1_792_400_007_000,
             host_b,
         );
+        let view_only = Action::SetRoles {
+            device_id: "dev-phone".into(),
+            change: RolesChange::Native([Role::View].into_iter().collect()),
+        };
+        made.push(
+            "VR7_set_roles_phone",
+            "set_roles dev-phone to [view] on E6, by dev-mac: still a current native member",
+            NO_CHAIN,
+            1_792_400_006_000,
+            view_only,
+        );
+        // r9-vectors-membership-log's R7, byte for byte: the recovery key
+        // adds dev-newmac, pending for 24 h on any list that carries it.
+        let r7 = made.v.object("R7");
+        made.entries.push((
+            "VR7_recovery_add_newmac",
+            "r9-vectors-membership-log's R7 (recovery_add of dev-newmac by the recovery key) on E6: dev-newmac is the subject of a recovery still waiting, no current member",
+            NO_CHAIN,
+            r7,
+        ));
         made
     }
 
@@ -123,12 +151,19 @@ impl Gen {
         self.keys.public_key(&KeyId::new(id)).unwrap()
     }
 
-    fn push(&mut self, label: &'static str, note: &'static str, at: u64, action: Action) {
-        let labels: Vec<&str> = self.entries.iter().map(|(l, _, _)| *l).collect();
-        let log = self.log(&labels, None, NOW);
+    /// An entry by dev-mac on L and the entries `on`.
+    fn push(
+        &mut self,
+        label: &'static str,
+        note: &'static str,
+        on: &'static [&'static str],
+        at: u64,
+        action: Action,
+    ) {
+        let log = self.log(on, None, NOW);
         let body = log.draft("dev-mac", at, &action);
         let entry = sign_entry(&self.keys, &KeyId::new("dev-mac/auth"), body).unwrap();
-        self.entries.push((label, note, entry.object().clone()));
+        self.entries.push((label, note, on, entry.object().clone()));
     }
 
     /// L, then `chain`, then the carriage `freeze`, verified at `now_ms`.
@@ -142,9 +177,9 @@ impl Gen {
             .map(|label| {
                 self.entries
                     .iter()
-                    .find(|(l, _, _)| l == label)
+                    .find(|(l, _, _, _)| l == label)
                     .unwrap_or_else(|| panic!("no entry {label}"))
-                    .2
+                    .3
                     .clone()
             })
             .collect()
@@ -153,10 +188,11 @@ impl Gen {
     fn entries_json(&self) -> Vec<Value> {
         self.entries
             .iter()
-            .map(|(label, note, object)| {
+            .map(|(label, note, on, object)| {
                 json!({
                     "label": label,
                     "note": note,
+                    "on": on,
                     "entry": object.to_json(),
                     "entry_hash": object.entry_hash().unwrap().to_hex(),
                 })
@@ -260,6 +296,35 @@ fn edit(body: &Value, f: impl FnOnce(&mut Value)) -> Value {
     body
 }
 
+/// dev-phone's report at `log`'s head for `challenge`.
+fn phone_text_of(made: &Gen, log: &Membership, challenge: &Value) -> String {
+    signed(
+        &made.keys,
+        "dev-phone/auth",
+        &body_of(log, challenge, ours()),
+    )
+}
+
+/// `s` replaced by `n − s`: the other P-256 signature of the same input,
+/// whose S is high.
+fn high_s(sig: &[u8]) -> Vec<u8> {
+    const N: [u8; 32] = [
+        0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63,
+        0x25, 0x51,
+    ];
+    let mut out = sig[..32].to_vec();
+    let mut tail = [0u8; 32];
+    let mut borrow = 0i16;
+    for i in (0..32).rev() {
+        let d = N[i] as i16 - sig[32 + i] as i16 - borrow;
+        borrow = i16::from(d < 0);
+        tail[i] = d.rem_euclid(256) as u8;
+    }
+    out.extend_from_slice(&tail);
+    out
+}
+
 /// What a case expects of the core.
 #[derive(Debug, Clone)]
 enum Want {
@@ -285,6 +350,8 @@ struct Report {
 const NO_CHAIN: &[&str] = &[];
 const VR7: &[&str] = &["VR7_add_desk"];
 const VR8: &[&str] = &["VR7_add_desk", "VR8_add_host_b"];
+const SET_ROLES: &[&str] = &["VR7_set_roles_phone"];
+const RECOVERY: &[&str] = &["VR7_recovery_add_newmac"];
 
 impl Gen {
     fn report(
@@ -402,6 +469,29 @@ impl Gen {
             case.signed_with = Some(key);
         }
         out[6].now_ms = ISSUED;
+        // A native member whose roles changed (dev-phone to [view]) is still
+        // a current native member: its report from before verifies at an
+        // ancestor, a new one at the head.
+        let roles = self.log(SET_ROLES, None, NOW);
+        for (label, note, text, at_head) in [
+            (
+                "native_after_set_roles",
+                "dev-phone's report at L, verified at L + VR7_set_roles_phone: its roles changed, it is still a current native member",
+                phone_text_of(self, &l, &phone),
+                false,
+            ),
+            (
+                "native_after_set_roles_at_head",
+                "dev-phone's report at L + VR7_set_roles_phone's head, as a member with view only",
+                phone_text_of(self, &roles, &phone),
+                true,
+            ),
+        ] {
+            let mut case =
+                self.report(label, note, SET_ROLES, phone.clone(), text, native(at_head));
+            case.signed_with = Some("dev-phone/auth");
+            out.push(case);
+        }
         out
     }
 
@@ -840,6 +930,32 @@ impl Gen {
             signed(keys, "dev-phone/auth", &body_of(&l7, &phone, ours())),
             "stale_log",
         ));
+        // The subject of a recovery_add still waiting is no current member.
+        let recovering = self.log(RECOVERY, None, NOW);
+        let newmac = challenge("member:dev-newmac", SLOT, 3, nonce(0));
+        out.push(self.report(
+            "pending_recovery_subject",
+            "member:dev-newmac at L + VR7_recovery_add_newmac's head, with its own key: the subject of a recovery_add still waiting",
+            RECOVERY,
+            newmac.clone(),
+            signed(keys, "dev-newmac/auth", &body_of(&recovering, &newmac, ours())),
+            Want::Code("unknown_signer"),
+        ));
+        // The valid report with its P-256 s replaced by n − s: the
+        // verifier takes only low S (R9.1).
+        let mut high: Value = serde_json::from_str(&good_text).unwrap();
+        let sig = atem_client::encoding::b64u_decode(high["sig"].as_str().unwrap()).unwrap();
+        high["sig"] = json!(b64u(&high_s(&sig)));
+        out.push(r(
+            "high_s_signature",
+            "the valid P-256 report (native_p256_at_head) with s replaced by n - s: a high S",
+            format!(
+                r#"{{"body":{},"sig":{}}}"#,
+                jcs(&good).unwrap(),
+                high["sig"]
+            ),
+            "bad_signature",
+        ));
         out.push(r(
             "fork",
             "head seq 6 at C6_ipad's hash (a sibling of E6)",
@@ -1212,6 +1328,27 @@ fn build_cases() -> Vec<BuildCase> {
     );
     expired_svc.now_ms = SVC_EXPIRES;
     out.push(expired_svc);
+    let mut roles = case(
+        "native_after_set_roles",
+        "dev-phone after its roles changed to [view] (L + VR7_set_roles_phone): still a current native member",
+        PHONE,
+        SLOT,
+        STATION,
+        None,
+    );
+    roles.chain = SET_ROLES;
+    out.push(roles);
+    let mut recovering = case(
+        "pending_recovery_subject",
+        "dev-newmac, the subject of a recovery_add still waiting (L + VR7_recovery_add_newmac), answers a challenge for itself",
+        "member:dev-newmac",
+        SLOT,
+        STATION,
+        Some("unknown_signer"),
+    );
+    recovering.chain = RECOVERY;
+    recovering.challenge = challenge("member:dev-newmac", SLOT, 3, nonce(0));
+    out.push(recovering);
     let mut expired = case(
         "challenge_expired",
         "the challenge at its expires_at on the reporter's clock",
@@ -1684,6 +1821,58 @@ fn verifier_report_vectors_run_through_the_shared_core() {
             .map(|c| c.to_string())
             .collect(),
         "every verifier code has a vector"
+    );
+    // The signers whose standing changed, and a high-S signature.
+    let by_label = |label: &str| {
+        file["valid"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(file["invalid"].as_array().unwrap())
+            .find(|c| c["label"] == label)
+            .unwrap_or_else(|| panic!("no case {label}"))
+            .clone()
+    };
+    assert_eq!(
+        by_label("native_after_set_roles")["expect"]["at_head"],
+        false
+    );
+    assert_eq!(
+        by_label("native_after_set_roles_at_head")["expect"]["at_head"],
+        true
+    );
+    assert_eq!(
+        by_label("pending_recovery_subject")["code"],
+        "unknown_signer"
+    );
+    let high = by_label("high_s_signature");
+    assert_eq!(high["code"], "bad_signature");
+    let sig = atem_client::encoding::b64u_decode(
+        serde_json::from_str::<Value>(high["report"].as_str().unwrap()).unwrap()["sig"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let low = high_s(&sig);
+    assert!(low[32..] < sig[32..], "its S is the high one of the pair");
+    let low_text = format!(
+        r#"{{"body":{},"sig":"{}"}}"#,
+        high["report"].as_str().unwrap()[8..]
+            .split(r#","sig":"#)
+            .next()
+            .unwrap(),
+        b64u(&low)
+    );
+    let log = case_log(&v, &file, &high);
+    assert!(
+        verify_verifier_report(
+            &log,
+            low_text.as_bytes(),
+            &read_challenge(&high["challenge"]),
+            NOW
+        )
+        .is_ok(),
+        "its low-S twin verifies"
     );
     let mut build_codes = BTreeSet::new();
     for case in file["builder"]

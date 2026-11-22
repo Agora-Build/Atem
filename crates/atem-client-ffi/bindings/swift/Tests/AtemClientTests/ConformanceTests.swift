@@ -892,6 +892,13 @@ final class ConformanceTests: XCTestCase {
                     try reportError(s(c["code"])) { _ = try verify() }
                 }
             }
+            // Among them: a native whose roles changed, a recovery still
+            // waiting, and a high-S P-256 signature.
+            var byCase: [String: [String: Any]] = [:]
+            for c in a(vrep["valid"]).map(o) + a(vrep["invalid"]).map(o) { byCase[s(c["label"])] = c }
+            try eq(o(byCase["native_after_set_roles"]!["expect"])["at_head"] as? Bool, false, "native_after_set_roles")
+            try eq(s(byCase["pending_recovery_subject"]!["code"]), "unknown_signer", "pending_recovery_subject")
+            try eq(s(byCase["high_s_signature"]!["code"]), "bad_signature", "high_s_signature")
         }
         check("verifier report: the builder") {
             for c in a(vrep["builder"]).map(o) + a(vrep["request"]).map(o) {

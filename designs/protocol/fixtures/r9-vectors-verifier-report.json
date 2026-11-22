@@ -426,6 +426,87 @@
       "station": "https://station-dev.agora.build"
     },
     {
+      "body_but_process": {
+        "account_id": "acct-test-1",
+        "challenge": {
+          "connection": 3,
+          "expires_at": 1793264030000,
+          "issued_at": 1793264000000,
+          "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+          "origin": "https://station-dev.agora.build"
+        },
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "head": {
+          "hash": "6eaa0b350a226f8b2bbbb7b407a0ad5d05db263f120a9a3d82b6458348596540",
+          "seq": 7
+        },
+        "signer": "member:dev-phone",
+        "slot": "astation-ios",
+        "type": "atem-verifier-report",
+        "v": 1,
+        "verifier": {
+          "actions": [
+            "add",
+            "add_host",
+            "genesis",
+            "host_enc_key",
+            "host_sender_readmit",
+            "host_sender_revoke",
+            "k_backup",
+            "project_remove",
+            "project_set",
+            "recovery_add",
+            "recovery_approve",
+            "recovery_veto",
+            "remove",
+            "remove_host",
+            "set_recovery_key",
+            "set_roles"
+          ],
+          "version": 2
+        }
+      },
+      "chain": [
+        "VR7_set_roles_phone"
+      ],
+      "challenge": {
+        "connection": 3,
+        "expires_at": 1793264030000,
+        "issued_at": 1793264000000,
+        "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        "origin": "https://station-dev.agora.build",
+        "signer": "member:dev-phone",
+        "slot": "astation-ios"
+      },
+      "label": "native_after_set_roles",
+      "note": "dev-phone after its roles changed to [view] (L + VR7_set_roles_phone): still a current native member",
+      "now_ms": 1793264001000,
+      "signer": "member:dev-phone",
+      "slot": "astation-ios",
+      "station": "https://station-dev.agora.build"
+    },
+    {
+      "chain": [
+        "VR7_recovery_add_newmac"
+      ],
+      "challenge": {
+        "connection": 3,
+        "expires_at": 1793264030000,
+        "issued_at": 1793264000000,
+        "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        "origin": "https://station-dev.agora.build",
+        "signer": "member:dev-newmac",
+        "slot": "astation-ios"
+      },
+      "code": "unknown_signer",
+      "label": "pending_recovery_subject",
+      "note": "dev-newmac, the subject of a recovery_add still waiting (L + VR7_recovery_add_newmac), answers a challenge for itself",
+      "now_ms": 1793264001000,
+      "signer": "member:dev-newmac",
+      "slot": "astation-ios",
+      "station": "https://station-dev.agora.build"
+    },
+    {
       "chain": [],
       "challenge": {
         "connection": 3,
@@ -719,7 +800,8 @@
       },
       "entry_hash": "55c8d13365bdd6b79b758f910a0bacb0c6e3e99c4a483c4fa5ded9f0962f5ecb",
       "label": "VR7_add_desk",
-      "note": "add dev-desk, a native member with an Ed25519 auth_key, on E6, by dev-mac"
+      "note": "add dev-desk, a native member with an Ed25519 auth_key, on E6, by dev-mac",
+      "on": []
     },
     {
       "entry": {
@@ -746,7 +828,71 @@
       },
       "entry_hash": "be0f62a1402c759bb62f174a3d186bfaa250302abf1b327ec5cc2672ae1709df",
       "label": "VR8_add_host_b",
-      "note": "add_host host-b on VR7_add_desk, by dev-mac: a head after VR7_add_desk"
+      "note": "add_host host-b on VR7_add_desk, by dev-mac: a head after VR7_add_desk",
+      "on": [
+        "VR7_add_desk"
+      ]
+    },
+    {
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "set_roles",
+          "device_id": "dev-phone",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "prev_hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+          "roles": [
+            "view"
+          ],
+          "seq": 7,
+          "signed_at": 1792400006000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "or5PBAJybS-lcY7zQf51PCu1mBQWz5NsTY325UjRYz0eIUUZttDrqrHtzcg7HmZ6mTyuaRy-wB8o5h35LeIiVw"
+      },
+      "entry_hash": "6eaa0b350a226f8b2bbbb7b407a0ad5d05db263f120a9a3d82b6458348596540",
+      "label": "VR7_set_roles_phone",
+      "note": "set_roles dev-phone to [view] on E6, by dev-mac: still a current native member",
+      "on": []
+    },
+    {
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "recovery_add",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "member": {
+            "auth_key": {
+              "alg": "p256",
+              "pub": "BOm7i4Cu1xarfYVGVRmURoigaOOB_yt5yLlW4CnTUf9gaeHjs5A0zoKxYoYTEtio_r83Vy4pqmeshYM35j0cLOs"
+            },
+            "device_id": "dev-newmac",
+            "enc_key": {
+              "alg": "x25519",
+              "pub": "5Y2eIkg4yFW5YCV4PRTZ4IZ4HzbTcTEUjuhZv7a_wFY"
+            },
+            "kind": "native",
+            "roles": [
+              "control",
+              "manage",
+              "view"
+            ]
+          },
+          "prev_hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+          "seq": 7,
+          "signed_at": 1793177600000,
+          "signer": "recovery",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "9eavkSN7QKcCOtUQcDX_mOwsK6CeDdYpASz_DW1FQ2wKUjAcY0y6qvhj4cRhV755Gc1fnUkgLjes5yFnYZQOAg"
+      },
+      "entry_hash": "5766081f65a59528ab914a1d7f9a49bb3e23c2e86f3694b1e77a0325d0ccf1a9",
+      "label": "VR7_recovery_add_newmac",
+      "note": "r9-vectors-membership-log's R7 (recovery_add of dev-newmac by the recovery key) on E6: dev-newmac is the subject of a recovery still waiting, no current member",
+      "on": []
     }
   ],
   "invalid": [
@@ -2164,6 +2310,42 @@
       "report": "{\"body\":{\"account_id\":\"acct-test-1\",\"challenge\":{\"connection\":3,\"expires_at\":1793264030000,\"issued_at\":1793264000000,\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"origin\":\"https://station-dev.agora.build\"},\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"head\":{\"hash\":\"55c8d13365bdd6b79b758f910a0bacb0c6e3e99c4a483c4fa5ded9f0962f5ecb\",\"seq\":7},\"process\":\"dmVjdG9ycy1wcm9jZXNzIQ\",\"signer\":\"member:dev-phone\",\"slot\":\"astation-ios\",\"type\":\"atem-verifier-report\",\"v\":1,\"verifier\":{\"actions\":[\"add\",\"add_host\",\"genesis\",\"host_enc_key\",\"host_sender_readmit\",\"host_sender_revoke\",\"k_backup\",\"project_remove\",\"project_set\",\"recovery_add\",\"recovery_approve\",\"recovery_veto\",\"remove\",\"remove_host\",\"set_recovery_key\",\"set_roles\"],\"version\":2}},\"sig\":\"-3cDlLYJkJpN-RFQE6NSdSAYK-4Hx1Qxdf4MK7cejioofU8JcuuSAdY0_BoUCCr1Dupks2linBtcTNdGNtMu7A\"}"
     },
     {
+      "chain": [
+        "VR7_recovery_add_newmac"
+      ],
+      "challenge": {
+        "connection": 3,
+        "expires_at": 1793264030000,
+        "issued_at": 1793264000000,
+        "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        "origin": "https://station-dev.agora.build",
+        "signer": "member:dev-newmac",
+        "slot": "astation-ios"
+      },
+      "code": "unknown_signer",
+      "label": "pending_recovery_subject",
+      "note": "member:dev-newmac at L + VR7_recovery_add_newmac's head, with its own key: the subject of a recovery_add still waiting",
+      "now_ms": 1793264001000,
+      "report": "{\"body\":{\"account_id\":\"acct-test-1\",\"challenge\":{\"connection\":3,\"expires_at\":1793264030000,\"issued_at\":1793264000000,\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"origin\":\"https://station-dev.agora.build\"},\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"head\":{\"hash\":\"5766081f65a59528ab914a1d7f9a49bb3e23c2e86f3694b1e77a0325d0ccf1a9\",\"seq\":7},\"process\":\"dmVjdG9ycy1wcm9jZXNzIQ\",\"signer\":\"member:dev-newmac\",\"slot\":\"astation-ios\",\"type\":\"atem-verifier-report\",\"v\":1,\"verifier\":{\"actions\":[\"add\",\"add_host\",\"genesis\",\"host_enc_key\",\"host_sender_readmit\",\"host_sender_revoke\",\"k_backup\",\"project_remove\",\"project_set\",\"recovery_add\",\"recovery_approve\",\"recovery_veto\",\"remove\",\"remove_host\",\"set_recovery_key\",\"set_roles\"],\"version\":2}},\"sig\":\"XlY700HR42B6VL3yEX7hbUQCEn95kMTPECN9XPv5lwlBPeZicPSBa3CNJwELS9_djMJd7UOGf1Hbs8rR8HnXsw\"}"
+    },
+    {
+      "chain": [],
+      "challenge": {
+        "connection": 3,
+        "expires_at": 1793264030000,
+        "issued_at": 1793264000000,
+        "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        "origin": "https://station-dev.agora.build",
+        "signer": "member:dev-phone",
+        "slot": "astation-ios"
+      },
+      "code": "bad_signature",
+      "label": "high_s_signature",
+      "note": "the valid P-256 report (native_p256_at_head) with s replaced by n - s: a high S",
+      "now_ms": 1793264001000,
+      "report": "{\"body\":{\"account_id\":\"acct-test-1\",\"challenge\":{\"connection\":3,\"expires_at\":1793264030000,\"issued_at\":1793264000000,\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"origin\":\"https://station-dev.agora.build\"},\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"process\":\"dmVjdG9ycy1wcm9jZXNzIQ\",\"signer\":\"member:dev-phone\",\"slot\":\"astation-ios\",\"type\":\"atem-verifier-report\",\"v\":1,\"verifier\":{\"actions\":[\"add\",\"add_host\",\"genesis\",\"host_enc_key\",\"host_sender_readmit\",\"host_sender_revoke\",\"k_backup\",\"project_remove\",\"project_set\",\"recovery_add\",\"recovery_approve\",\"recovery_veto\",\"remove\",\"remove_host\",\"set_recovery_key\",\"set_roles\"],\"version\":2}},\"sig\":\"7mvM2f5PH1ifQ_UJpcITO0js7T9pXWAgsIOapaYJ8KK4MQ8VPMUCm9NaUbM-WVVfsyf-TiAfEcwgcn784FDaew\"}"
+    },
+    {
       "chain": [],
       "challenge": {
         "connection": 3,
@@ -2993,6 +3175,116 @@
       "report": "{\"body\":{\"account_id\":\"acct-test-1\",\"challenge\":{\"connection\":3,\"expires_at\":1793264000001,\"issued_at\":1793264000000,\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"origin\":\"https://station-dev.agora.build\"},\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"process\":\"dmVjdG9ycy1wcm9jZXNzIQ\",\"signer\":\"member:dev-phone\",\"slot\":\"astation-ios\",\"type\":\"atem-verifier-report\",\"v\":1,\"verifier\":{\"actions\":[\"add\",\"add_host\",\"genesis\",\"host_enc_key\",\"host_sender_readmit\",\"host_sender_revoke\",\"k_backup\",\"project_remove\",\"project_set\",\"recovery_add\",\"recovery_approve\",\"recovery_veto\",\"remove\",\"remove_host\",\"set_recovery_key\",\"set_roles\"],\"version\":2}},\"sig\":\"Rmae0XHZu7dbQIYbHuBRWtSyLr-W-cWzboE6HEUDJK9s-CXavRM8KuJGsNj4JLbcVkOmXTCyE3n-NO-IScGR8w\"}",
       "signed_with": "dev-phone/auth",
       "signing_input_hex": "000000176174656d2d76657269666965722d7265706f72742d7631000003017b226163636f756e745f6964223a22616363742d746573742d31222c226368616c6c656e6765223a7b22636f6e6e656374696f6e223a332c22657870697265735f6174223a313739333236343030303030312c226973737565645f6174223a313739333236343030303030302c226e6f6e6365223a2241414543417751464267634943516f4c4441304f4478415245684d554652595847426b6147787764486838222c226f726967696e223a2268747470733a2f2f73746174696f6e2d6465762e61676f72612e6275696c64227d2c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c2268656164223a7b2268617368223a2262656231383436396235383363316161393831623039646138656434363135333865613631373136393364333435663633313035633561623564306165613739222c22736571223a367d2c2270726f63657373223a22646d566a6447397963793177636d396a5a584e7a4951222c227369676e6572223a226d656d6265723a6465762d70686f6e65222c22736c6f74223a226173746174696f6e2d696f73222c2274797065223a226174656d2d76657269666965722d7265706f7274222c2276223a312c227665726966696572223a7b22616374696f6e73223a5b22616464222c226164645f686f7374222c2267656e65736973222c22686f73745f656e635f6b6579222c22686f73745f73656e6465725f726561646d6974222c22686f73745f73656e6465725f7265766f6b65222c226b5f6261636b7570222c2270726f6a6563745f72656d6f7665222c2270726f6a6563745f736574222c227265636f766572795f616464222c227265636f766572795f617070726f7665222c227265636f766572795f7665746f222c2272656d6f7665222c2272656d6f76655f686f7374222c227365745f7265636f766572795f6b6579222c227365745f726f6c6573225d2c2276657273696f6e223a327d7d"
+    },
+    {
+      "chain": [
+        "VR7_set_roles_phone"
+      ],
+      "challenge": {
+        "connection": 3,
+        "expires_at": 1793264030000,
+        "issued_at": 1793264000000,
+        "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        "origin": "https://station-dev.agora.build",
+        "signer": "member:dev-phone",
+        "slot": "astation-ios"
+      },
+      "expect": {
+        "at_head": false,
+        "connection": 3,
+        "expires_at": 1793264030000,
+        "head": {
+          "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+          "seq": 6
+        },
+        "inventory": {
+          "actions": [
+            "add",
+            "add_host",
+            "genesis",
+            "host_enc_key",
+            "host_sender_readmit",
+            "host_sender_revoke",
+            "k_backup",
+            "project_remove",
+            "project_set",
+            "recovery_add",
+            "recovery_approve",
+            "recovery_veto",
+            "remove",
+            "remove_host",
+            "set_recovery_key",
+            "set_roles"
+          ],
+          "version": 2
+        },
+        "kind": "native",
+        "process": "dmVjdG9ycy1wcm9jZXNzIQ",
+        "signer": "member:dev-phone",
+        "slot": "astation-ios"
+      },
+      "jcs": "{\"account_id\":\"acct-test-1\",\"challenge\":{\"connection\":3,\"expires_at\":1793264030000,\"issued_at\":1793264000000,\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"origin\":\"https://station-dev.agora.build\"},\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"process\":\"dmVjdG9ycy1wcm9jZXNzIQ\",\"signer\":\"member:dev-phone\",\"slot\":\"astation-ios\",\"type\":\"atem-verifier-report\",\"v\":1,\"verifier\":{\"actions\":[\"add\",\"add_host\",\"genesis\",\"host_enc_key\",\"host_sender_readmit\",\"host_sender_revoke\",\"k_backup\",\"project_remove\",\"project_set\",\"recovery_add\",\"recovery_approve\",\"recovery_veto\",\"remove\",\"remove_host\",\"set_recovery_key\",\"set_roles\"],\"version\":2}}",
+      "label": "native_after_set_roles",
+      "note": "dev-phone's report at L, verified at L + VR7_set_roles_phone: its roles changed, it is still a current native member",
+      "now_ms": 1793264001000,
+      "report": "{\"body\":{\"account_id\":\"acct-test-1\",\"challenge\":{\"connection\":3,\"expires_at\":1793264030000,\"issued_at\":1793264000000,\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"origin\":\"https://station-dev.agora.build\"},\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"process\":\"dmVjdG9ycy1wcm9jZXNzIQ\",\"signer\":\"member:dev-phone\",\"slot\":\"astation-ios\",\"type\":\"atem-verifier-report\",\"v\":1,\"verifier\":{\"actions\":[\"add\",\"add_host\",\"genesis\",\"host_enc_key\",\"host_sender_readmit\",\"host_sender_revoke\",\"k_backup\",\"project_remove\",\"project_set\",\"recovery_add\",\"recovery_approve\",\"recovery_veto\",\"remove\",\"remove_host\",\"set_recovery_key\",\"set_roles\"],\"version\":2}},\"sig\":\"7mvM2f5PH1ifQ_UJpcITO0js7T9pXWAgsIOapaYJ8KJHzvDpwzr9ZSylrkzBpqqgCb78X4b4jLjTR0vGHBJK1g\"}",
+      "signed_with": "dev-phone/auth",
+      "signing_input_hex": "000000176174656d2d76657269666965722d7265706f72742d7631000003017b226163636f756e745f6964223a22616363742d746573742d31222c226368616c6c656e6765223a7b22636f6e6e656374696f6e223a332c22657870697265735f6174223a313739333236343033303030302c226973737565645f6174223a313739333236343030303030302c226e6f6e6365223a2241414543417751464267634943516f4c4441304f4478415245684d554652595847426b6147787764486838222c226f726967696e223a2268747470733a2f2f73746174696f6e2d6465762e61676f72612e6275696c64227d2c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c2268656164223a7b2268617368223a2262656231383436396235383363316161393831623039646138656434363135333865613631373136393364333435663633313035633561623564306165613739222c22736571223a367d2c2270726f63657373223a22646d566a6447397963793177636d396a5a584e7a4951222c227369676e6572223a226d656d6265723a6465762d70686f6e65222c22736c6f74223a226173746174696f6e2d696f73222c2274797065223a226174656d2d76657269666965722d7265706f7274222c2276223a312c227665726966696572223a7b22616374696f6e73223a5b22616464222c226164645f686f7374222c2267656e65736973222c22686f73745f656e635f6b6579222c22686f73745f73656e6465725f726561646d6974222c22686f73745f73656e6465725f7265766f6b65222c226b5f6261636b7570222c2270726f6a6563745f72656d6f7665222c2270726f6a6563745f736574222c227265636f766572795f616464222c227265636f766572795f617070726f7665222c227265636f766572795f7665746f222c2272656d6f7665222c2272656d6f76655f686f7374222c227365745f7265636f766572795f6b6579222c227365745f726f6c6573225d2c2276657273696f6e223a327d7d"
+    },
+    {
+      "chain": [
+        "VR7_set_roles_phone"
+      ],
+      "challenge": {
+        "connection": 3,
+        "expires_at": 1793264030000,
+        "issued_at": 1793264000000,
+        "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        "origin": "https://station-dev.agora.build",
+        "signer": "member:dev-phone",
+        "slot": "astation-ios"
+      },
+      "expect": {
+        "at_head": true,
+        "connection": 3,
+        "expires_at": 1793264030000,
+        "head": {
+          "hash": "6eaa0b350a226f8b2bbbb7b407a0ad5d05db263f120a9a3d82b6458348596540",
+          "seq": 7
+        },
+        "inventory": {
+          "actions": [
+            "add",
+            "add_host",
+            "genesis",
+            "host_enc_key",
+            "host_sender_readmit",
+            "host_sender_revoke",
+            "k_backup",
+            "project_remove",
+            "project_set",
+            "recovery_add",
+            "recovery_approve",
+            "recovery_veto",
+            "remove",
+            "remove_host",
+            "set_recovery_key",
+            "set_roles"
+          ],
+          "version": 2
+        },
+        "kind": "native",
+        "process": "dmVjdG9ycy1wcm9jZXNzIQ",
+        "signer": "member:dev-phone",
+        "slot": "astation-ios"
+      },
+      "jcs": "{\"account_id\":\"acct-test-1\",\"challenge\":{\"connection\":3,\"expires_at\":1793264030000,\"issued_at\":1793264000000,\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"origin\":\"https://station-dev.agora.build\"},\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"head\":{\"hash\":\"6eaa0b350a226f8b2bbbb7b407a0ad5d05db263f120a9a3d82b6458348596540\",\"seq\":7},\"process\":\"dmVjdG9ycy1wcm9jZXNzIQ\",\"signer\":\"member:dev-phone\",\"slot\":\"astation-ios\",\"type\":\"atem-verifier-report\",\"v\":1,\"verifier\":{\"actions\":[\"add\",\"add_host\",\"genesis\",\"host_enc_key\",\"host_sender_readmit\",\"host_sender_revoke\",\"k_backup\",\"project_remove\",\"project_set\",\"recovery_add\",\"recovery_approve\",\"recovery_veto\",\"remove\",\"remove_host\",\"set_recovery_key\",\"set_roles\"],\"version\":2}}",
+      "label": "native_after_set_roles_at_head",
+      "note": "dev-phone's report at L + VR7_set_roles_phone's head, as a member with view only",
+      "now_ms": 1793264001000,
+      "report": "{\"body\":{\"account_id\":\"acct-test-1\",\"challenge\":{\"connection\":3,\"expires_at\":1793264030000,\"issued_at\":1793264000000,\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"origin\":\"https://station-dev.agora.build\"},\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"head\":{\"hash\":\"6eaa0b350a226f8b2bbbb7b407a0ad5d05db263f120a9a3d82b6458348596540\",\"seq\":7},\"process\":\"dmVjdG9ycy1wcm9jZXNzIQ\",\"signer\":\"member:dev-phone\",\"slot\":\"astation-ios\",\"type\":\"atem-verifier-report\",\"v\":1,\"verifier\":{\"actions\":[\"add\",\"add_host\",\"genesis\",\"host_enc_key\",\"host_sender_readmit\",\"host_sender_revoke\",\"k_backup\",\"project_remove\",\"project_set\",\"recovery_add\",\"recovery_approve\",\"recovery_veto\",\"remove\",\"remove_host\",\"set_recovery_key\",\"set_roles\"],\"version\":2}},\"sig\":\"OzFWWKJhmVD7j2n7r4EbE9T9ChFl6_pDnzPh5OdhcoUuup4sFIkHYBo3u9WHnyOCynofgpPE4GJla8GGe22u1A\"}",
+      "signed_with": "dev-phone/auth",
+      "signing_input_hex": "000000176174656d2d76657269666965722d7265706f72742d7631000003017b226163636f756e745f6964223a22616363742d746573742d31222c226368616c6c656e6765223a7b22636f6e6e656374696f6e223a332c22657870697265735f6174223a313739333236343033303030302c226973737565645f6174223a313739333236343030303030302c226e6f6e6365223a2241414543417751464267634943516f4c4441304f4478415245684d554652595847426b6147787764486838222c226f726967696e223a2268747470733a2f2f73746174696f6e2d6465762e61676f72612e6275696c64227d2c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c2268656164223a7b2268617368223a2236656161306233353061323236663862326262626237623430376130616435643035646232363366313230613961336438326236343538333438353936353430222c22736571223a377d2c2270726f63657373223a22646d566a6447397963793177636d396a5a584e7a4951222c227369676e6572223a226d656d6265723a6465762d70686f6e65222c22736c6f74223a226173746174696f6e2d696f73222c2274797065223a226174656d2d76657269666965722d7265706f7274222c2276223a312c227665726966696572223a7b22616374696f6e73223a5b22616464222c226164645f686f7374222c2267656e65736973222c22686f73745f656e635f6b6579222c22686f73745f73656e6465725f726561646d6974222c22686f73745f73656e6465725f7265766f6b65222c226b5f6261636b7570222c2270726f6a6563745f72656d6f7665222c2270726f6a6563745f736574222c227265636f766572795f616464222c227265636f766572795f617070726f7665222c227265636f766572795f7665746f222c2272656d6f7665222c2272656d6f76655f686f7374222c227365745f7265636f766572795f6b6579222c227365745f726f6c6573225d2c2276657273696f6e223a327d7d"
     }
   ]
 }

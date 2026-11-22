@@ -16,7 +16,8 @@ use atem_client::member_report::{
     sign_verifier_report, verifier_report_body, verify_verifier_report,
 };
 use atem_client::membership::{
-    Action, Member, MemberKind, Membership, Role, VerifierInventory, sign_entry,
+    Action, Member, MemberKind, MemberStatus, Membership, Role, RolesChange, VerifierInventory,
+    sign_entry,
 };
 use atem_client::provider::sign;
 use atem_client::{Alg, KeyId, KeyProvider, SignedObject, SoftwareKeys};
@@ -527,6 +528,83 @@ fn an_ancestor_head_verifies_with_at_head_false() {
     assert_eq!(
         verify_verifier_report(&log, ahead.as_bytes(), &challenge, NOW),
         Err(ReportRefusal::StaleLog)
+    );
+}
+
+/// A native member whose roles changed is still a current native member:
+/// its report from before the change verifies at an ancestor, and a new one
+/// at the head.
+#[test]
+fn a_native_whose_roles_changed_still_reports() {
+    let (v, book, clock) = (Vectors::load(), Book::load(), clock());
+    let keys = &book.provider;
+    let log = log_l(&v, &clock);
+    let challenge = challenge(PHONE, SLOT, 3);
+    let before = report(keys, "dev-phone/auth", &log, PHONE, &challenge);
+    let view_only = Action::SetRoles {
+        device_id: "dev-phone".into(),
+        change: RolesChange::Native([Role::View].into_iter().collect()),
+    };
+    let later = after(keys, &log, view_only, &clock);
+    assert!(!later.member("dev-phone").unwrap().member.is_manager());
+    let old = verify_verifier_report(&later, before.as_bytes(), &challenge, NOW).unwrap();
+    assert_eq!((old.kind, old.at_head), (SignerKind::Native, false));
+    let now = report(keys, "dev-phone/auth", &later, PHONE, &challenge);
+    let new = verify_verifier_report(&later, now.as_bytes(), &challenge, NOW).unwrap();
+    assert_eq!((new.kind, new.at_head), (SignerKind::Native, true));
+}
+
+/// The subject of a `recovery_add` still waiting is no current member: it
+/// neither builds a report nor has one verified (`unknown_signer`).
+#[test]
+fn the_pending_subject_of_a_recovery_add_does_not_report() {
+    let (v, book, clock) = (Vectors::load(), Book::load(), clock());
+    let keys = &book.provider;
+    let log = log_l(&v, &clock);
+    // R7: the recovery key adds dev-newmac, pending for 24 h here.
+    let pending = log.evaluate(&[strict(v.wire("R7"))], &clock.now).next;
+    assert!(matches!(
+        pending.member("dev-newmac").unwrap().status,
+        MemberStatus::Pending { .. }
+    ));
+    let newmac = "member:dev-newmac";
+    let challenge = challenge(newmac, SLOT, 3);
+    assert_eq!(
+        verifier_report_body(&pending, &challenge, newmac, SLOT, STATION, NOW).map(|_| ()),
+        Err(ReportRefusal::UnknownSigner)
+    );
+    let phone = report(
+        keys,
+        "dev-phone/auth",
+        &log,
+        PHONE,
+        &self::challenge(PHONE, SLOT, 3),
+    );
+    let text = resigned(keys, "dev-newmac/auth", &phone, |b| {
+        b["signer"] = json!(newmac);
+        b["head"] = pending.head().to_json();
+    });
+    assert_eq!(
+        verify_verifier_report(&pending, text.as_bytes(), &challenge, NOW),
+        Err(ReportRefusal::UnknownSigner)
+    );
+}
+
+/// The verifier takes only a low-S P-256 signature (R9.1): the valid
+/// report with `s` replaced by `n − s` is `bad_signature`.
+#[test]
+fn a_high_s_report_is_refused() {
+    let (v, book, clock) = (Vectors::load(), Book::load(), clock());
+    let log = log_l(&v, &clock);
+    let challenge = challenge(PHONE, SLOT, 3);
+    let text = report(&book.provider, "dev-phone/auth", &log, PHONE, &challenge);
+    assert!(verify_verifier_report(&log, text.as_bytes(), &challenge, NOW).is_ok());
+    let mut object: Value = serde_json::from_str(&text).unwrap();
+    let sig = atem_client::encoding::b64u_decode(object["sig"].as_str().unwrap()).unwrap();
+    object["sig"] = json!(b64u(&high_s(&sig)));
+    assert_eq!(
+        verify_verifier_report(&log, object.to_string().as_bytes(), &challenge, NOW),
+        Err(ReportRefusal::BadSignature)
     );
 }
 

@@ -3927,7 +3927,12 @@ class VrList:
                 member = body["member"]
                 self.members[member["device_id"]] = dict(member, standing="active")
             elif action == "recovery_add":
+                # Pending: the vectors' lists are read within its 24 h wait,
+                # and no chain here approves or vetoes it.
                 self.members[body["member"]["device_id"]] = dict(body["member"], standing="pending")
+            elif action == "set_roles" and "roles" in body:
+                # Roles change, the standing and the key don't.
+                self.members[body["device_id"]]["roles"] = body["roles"]
             elif action == "remove":
                 self.members[body["device_id"]]["standing"] = "removed"
         self.account_id = bodies[0]["account_id"]
@@ -4055,21 +4060,36 @@ def check_verifier_report(file, data, report, context):
     log_l = [v["entry"]["body"] for v in mlog["log"]]
     others = {v["label"]: v["entry"]["body"] for v in mlog["log"] + mlog["others"]}
     entries = {e["label"]: e for e in data["entries"]}
+    def base_of(labels):
+        return log_l + [entries[label]["entry"]["body"] for label in labels]
+
     with report.case(file, "entries") as case:
-        bodies = list(log_l)
-        mac = keys.public("dev-mac", "auth")
         for e in data["entries"]:
             body = e["entry"]["body"]
-            case.equal(body["prev_hash"], sha256(enc(["atem-membership-hash-v1", jcs(bodies[-1])])).hex(), f"{e['label']} chains")
-            case.equal(body["seq"], len(bodies) + 1, f"{e['label']} seq")
+            base = base_of(e["on"])
+            case.equal(body["prev_hash"], sha256(enc(["atem-membership-hash-v1", jcs(base[-1])])).hex(), f"{e['label']} chains on L + {e['on']}")
+            case.equal(body["seq"], len(base) + 1, f"{e['label']} seq")
             case.equal(sha256(enc(["atem-membership-hash-v1", jcs(body)])).hex(), e["entry_hash"], f"{e['label']} entry_hash")
-            case.check(body["signer"] == "dev-mac" and verify("p256", mac, b64u_decode(e["entry"]["sig"]), enc(["atem-membership-entry-v1", jcs(body)])), f"{e['label']} signed by dev-mac")
-            bodies.append(body)
+            # Its signer's key on the list it extends: a current member's
+            # auth_key, or the recovery key of L's genesis.
+            if body["signer"] == "recovery":
+                key = base[0]["recovery_key"]
+            else:
+                member = VrList(base, False).members.get(body["signer"], {})
+                key = member.get("auth_key") if member.get("standing") == "active" else None
+            case.check(
+                key is not None and verify(key["alg"], b64u_decode(key["pub"]), b64u_decode(e["entry"]["sig"]), enc(["atem-membership-entry-v1", jcs(body)])),
+                f"{e['label']} signed by {body['signer']}",
+            )
         desk = entries["VR7_add_desk"]["entry"]["body"]["member"]
         case.equal((desk["auth_key"]["alg"], b64u_decode(desk["auth_key"]["pub"])), ("ed25519", keys.public("dev-desk", "auth")), "dev-desk's Ed25519 key")
+        case.equal(jcs(entries["VR7_recovery_add_newmac"]["entry"]), jcs(next(v["entry"] for v in mlog["others"] if v["label"] == "R7")), "VR7_recovery_add_newmac is R7, byte for byte")
 
     def lst(c):
-        bodies = log_l + [entries[label]["entry"]["body"] for label in c["chain"]]
+        for i, label in enumerate(c["chain"]):
+            if entries[label]["on"] != c["chain"][:i]:
+                raise ValueError(f"{label} doesn't extend {c['chain'][:i]}")
+        bodies = base_of(c["chain"])
         frozen = False
         if "freeze" in c:
             # A carriage at a position the list holds, by a current
@@ -4109,8 +4129,20 @@ def check_verifier_report(file, data, report, context):
             except Refused as e:
                 case.equal(e.code, c.get("code"), "refused")
                 codes.add(e.code)
+                if c["label"] == "high_s_signature":
+                    # A genuine malleation: S above n / 2, and its low-S twin
+                    # is the signer's valid signature.
+                    report_ = json.loads(c["report"])
+                    sig = b64u_decode(report_["sig"])
+                    s_ = int.from_bytes(sig[32:], "big")
+                    case.check(s_ > P256_N // 2, "S is high")
+                    twin = sig[:32] + (P256_N - s_).to_bytes(32, "big")
+                    case.check(verify("p256", keys.public("dev-phone", "auth"), twin, enc([VR_LABEL, jcs(report_["body"])])), "its low-S twin verifies")
     with report.case(file, "coverage") as case:
         case.equal(sorted(codes), sorted(["malformed", "frozen", "wrong_account", "unknown_signer", "signer_expired", "bad_signature", "stale_log", "fork", "signer_mismatch", "slot_mismatch", "challenge_mismatch", "expired"]), "every verifier code")
+        labels = {c["label"] for c in data["valid"] + data["invalid"]}
+        for label in ("native_after_set_roles", "native_after_set_roles_at_head", "pending_recovery_subject", "high_s_signature"):
+            case.check(label in labels, f"{label} present")
     for c in data["builder"] + data["request"]:
         with report.case(file, f"builder {c['label']}") as case:
             try:

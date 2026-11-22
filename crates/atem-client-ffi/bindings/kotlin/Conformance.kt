@@ -694,6 +694,12 @@ fun main(args: Array<String>) {
             if (expect != null) eq(vrepOut(verify()), expect, c["label"].s())
             else reportError(c["code"].s()) { verify() }
         }
+        // Among them: a native whose roles changed, a recovery still
+        // waiting, and a high-S P-256 signature.
+        val byCase = (vrep["valid"].arr() + vrep["invalid"].arr()).associateBy { it["label"].s() }
+        eq(byCase.getValue("native_after_set_roles")["expect"]["at_head"], false, "native_after_set_roles")
+        eq(byCase.getValue("pending_recovery_subject")["code"], "unknown_signer", "pending_recovery_subject")
+        eq(byCase.getValue("high_s_signature")["code"], "bad_signature", "high_s_signature")
     }
     check("verifier report: the builder") {
         for (c in vrep["builder"].arr() + vrep["request"].arr()) {

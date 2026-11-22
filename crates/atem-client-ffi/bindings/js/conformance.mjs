@@ -587,6 +587,12 @@ check("verifier report: reports", () => {
     if (c.expect !== undefined) same(vrepOut(verify()), c.expect, c.label);
     else reportError(verify, c.code);
   }
+  // Among them: a native whose roles changed, a recovery still waiting, and
+  // a high-S P-256 signature.
+  const byCase = Object.fromEntries([...vrep.valid, ...vrep.invalid].map((c) => [c.label, c]));
+  eq(byCase.native_after_set_roles.expect.at_head, false, "native_after_set_roles");
+  eq(byCase.pending_recovery_subject.code, "unknown_signer", "pending_recovery_subject");
+  eq(byCase.high_s_signature.code, "bad_signature", "high_s_signature");
 });
 check("verifier report: the builder", () => {
   for (const c of [...vrep.builder, ...vrep.request]) {
