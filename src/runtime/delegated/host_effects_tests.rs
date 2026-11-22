@@ -409,7 +409,9 @@ fn a_crash_between_an_entry_and_its_effects_is_replayed_at_the_start() {
         let store = rig.bridge.work.store.as_ref().unwrap();
         let list = rig.bridge.membership.as_ref().unwrap().membership();
         let tx = store.immediate().unwrap();
-        let again = host_senders::list_effects(store, &tx, list, "host", before).unwrap();
+        let again = host_senders::list_effects(store, &tx, list, "host", before, &[])
+            .unwrap()
+            .followups;
         tx.commit().unwrap();
         assert!(
             again.iter().all(|f| !matches!(
@@ -446,7 +448,7 @@ fn the_effects_and_the_applied_seq_commit_together() {
             let store = rig.bridge.work.store.as_ref().unwrap();
             let list = rig.bridge.membership.as_ref().unwrap().membership();
             let tx = store.immediate().unwrap();
-            host_senders::list_effects(store, &tx, list, "host", before).unwrap();
+            host_senders::list_effects(store, &tx, list, "host", before, &[]).unwrap();
             host_senders::set_applied_seq(&tx, &genesis, list.head().seq).unwrap();
             drop(tx);
         }
@@ -1169,7 +1171,7 @@ fn a_catch_up_of_project_entries_reads_the_active_tasks_once() {
             let store = rig.bridge.work.store.as_ref().unwrap();
             let list = rig.bridge.membership.as_ref().unwrap().membership();
             let tx = store.immediate().unwrap();
-            host_senders::list_effects(store, &tx, list, "host", before).unwrap();
+            host_senders::list_effects(store, &tx, list, "host", before, &[]).unwrap();
             tx.commit().unwrap();
         }
         rig.bridge.work.store.as_mut().unwrap().db.trace(None);
@@ -1227,7 +1229,9 @@ fn a_narrowing_and_its_restore_replayed_after_a_crash_stop_the_task_once() {
             let store = rig.bridge.work.store.as_ref().unwrap();
             let list = rig.bridge.membership.as_ref().unwrap().membership();
             let tx = store.immediate().unwrap();
-            let again = host_senders::list_effects(store, &tx, list, "host", before).unwrap();
+            let again = host_senders::list_effects(store, &tx, list, "host", before, &[])
+                .unwrap()
+                .followups;
             tx.commit().unwrap();
             again
         };

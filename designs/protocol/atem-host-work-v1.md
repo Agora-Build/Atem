@@ -4979,7 +4979,18 @@ rules into each host sender's task, and the start check asks them again.
   list that already had the entry was judged on it at admission. The start
   check holds a host sender's task until these effects are written up to
   the committed head ("Crash safety"), since the head alone may cover a
-  task an earlier entry stopped.
+  task an earlier entry stopped. A spawn is a start (ruling R51): a
+  `select`'s launch on message this run queued and hasn't spawned,
+  admitted before the entry, that the list as of `seq` no longer covers
+  for a launch on message (`launch` and a task's ops) fails in the same
+  transaction with the event's detail (`sender's authorization narrowed`,
+  as the spawn check's refusal), and the tasks waiting for it fail with it
+  (`approved route launch not started: …`); it leaves the queue, a spawn
+  check the launcher already holds refuses it, and a later restore
+  revives neither. The spawn check also waits for these effects up to the
+  committed head. A launch whose spawn check let it go before the entry
+  started then and goes on; one of a run before a restart is the start's
+  (of unknown outcome unless its session is live, never spawned again).
 - **A later interrupt** (design II.3.1, §11.1 rule 4). A native manager's
   `interrupt_running` about `host:<host_id>`, from a feed or a native's
   channel, writes intents only for the host's tasks admitted before the

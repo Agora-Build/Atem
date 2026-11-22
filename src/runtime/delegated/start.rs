@@ -47,7 +47,7 @@ use atem_client::membership::entry::MemberKind;
 use atem_client::membership::{MemberState, MemberStatus, Membership};
 use atem_client::principal::{Authority, Need, Op};
 use atem_client::session::host_work::WorkState;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// An unstarted task past its deadline: host-work v1's text (§4), the one
@@ -230,6 +230,14 @@ pub struct StartView {
     live: HashMap<String, StartTask>,
     /// The event a start refused each attempt for.
     refused: HashMap<String, Event>,
+    /// Host senders' launches on message a device-list entry stopped while
+    /// the launcher had them (ruling R51), by request id: their spawn check
+    /// refuses them with the detail ([`Self::stop_launch`]).
+    launches_stopped: HashMap<String, &'static str>,
+    /// Host senders' launches whose spawn check let them go, by request id
+    /// (ruling R51): they started then, so no later entry stops them
+    /// ([`Self::launch_went`]).
+    launches_gone: HashSet<String>,
 }
 
 impl StartView {
@@ -249,6 +257,8 @@ impl StartView {
             now_d_ms: None,
             live: HashMap::new(),
             refused: HashMap::new(),
+            launches_stopped: HashMap::new(),
+            launches_gone: HashSet::new(),
         }
     }
 
@@ -302,6 +312,39 @@ impl StartView {
         if let Some(task) = self.live.get_mut(attempt_id) {
             task.cancelled = true;
         }
+    }
+
+    /// Host senders' launch `request_id`, which the launcher holds, was
+    /// stopped by a device-list entry before its spawn (ruling R51), in the
+    /// transaction that just committed: its spawn check refuses it with
+    /// `detail` from now on. Marked before host-work's applied `seq` that
+    /// covers the entry reaches the view, so the check, which waits until
+    /// then ([`launch_check`]), never lets it go.
+    pub fn stop_launch(&mut self, request_id: &str, detail: &'static str) {
+        self.launches_stopped.insert(request_id.to_string(), detail);
+    }
+
+    /// Why a device-list entry stopped launch `request_id`, if one did.
+    pub fn launch_stopped(&self, request_id: &str) -> Option<&'static str> {
+        self.launches_stopped.get(request_id).copied()
+    }
+
+    /// Launch `request_id`'s spawn check let it go (under the view's lock,
+    /// so no entry's effects can be written between the check and this).
+    pub fn launch_went(&mut self, request_id: &str) {
+        self.launches_gone.insert(request_id.to_string());
+    }
+
+    /// Whether launch `request_id`'s spawn check let it go: a device-list
+    /// entry after that doesn't reach it (it started before the entry).
+    pub fn launch_gone(&self, request_id: &str) -> bool {
+        self.launches_gone.contains(request_id)
+    }
+
+    /// Launch `request_id` left the launcher: forgotten.
+    pub fn forget_launch(&mut self, request_id: &str) {
+        self.launches_stopped.remove(request_id);
+        self.launches_gone.remove(request_id);
     }
 
     /// `attempt_id` ended: forgotten, and the event a start refused it
@@ -723,9 +766,12 @@ fn launch_event(view: &StartView, launch: &StartLaunch, now_d_ms: u64) -> Result
 /// II.6; host-work-v1 §11.5, "`select` from host senders"): what
 /// [`host_may_start`] checks of its tasks, with the project's `launch` op
 /// too (`HostOp::LaunchOnMessage`), on the route that consented at
-/// admission, still launching on message for the profile approved then. A
-/// record that names a host sender without its grant fails closed
-/// (`Narrowed`).
+/// admission, still launching on message for the profile approved then,
+/// and last, as a task's ([`host_may_start`]), host-work's effects of the
+/// device list's entries written up to its head (ruling R51: a spawn is a
+/// start; an entry that stopped the launch is then in the start view,
+/// `StartView::launch_stopped`). A record that names a host sender without
+/// its grant fails closed (`Narrowed`).
 fn host_launch_event(view: &StartView, launch: &StartLaunch, now_d_ms: u64) -> Result<(), Event> {
     let adm = &launch.admission;
     let list = usable(view)?;
@@ -770,7 +816,13 @@ fn host_launch_event(view: &StartView, launch: &StartLaunch, now_d_ms: u64) -> R
         }
         return Err(Event::GateClosed);
     }
-    waits(view, list, &SenderStanding::default(), adm, false, true)
+    waits(view, list, &SenderStanding::default(), adm, false, true)?;
+    // A spawn is a start (ruling R51): as a task, it waits for host-work's
+    // effects of the device list's entries up to its head.
+    if !view.host_effects_at(&list.membership) {
+        return Err(Event::Deferred);
+    }
+    Ok(())
 }
 
 /// Host-work's start check in the session host (session-v1 R9.14 item 3):

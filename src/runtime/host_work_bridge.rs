@@ -515,6 +515,7 @@ impl HostBridge {
             self.work.refused.clear();
         }
         self.work.refused.insert(request_id.to_string(), why);
+        self.start_view().forget_launch(request_id);
         self.remote_launched(request_id, LaunchState::Failed);
     }
 

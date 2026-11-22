@@ -431,7 +431,7 @@ impl HostBridge {
             return;
         };
         let permit = Arc::new(AtomicBool::new(true));
-        let (guard, check) = self.delegated_spawn(&start, &permit);
+        let (guard, check) = self.delegated_spawn(&start, Some(&record.status.request_id), &permit);
         let status = record.status;
         let handout = RemoteLaunch {
             request_id: status.request_id.clone(),

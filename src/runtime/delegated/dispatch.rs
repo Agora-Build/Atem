@@ -572,7 +572,7 @@ impl HostBridge {
                 match crate::runtime::delegated::admit::launch_failure(&store.db, &id)?
                     .or_else(|| self.work.refused.get(&id).cloned())
                 {
-                    Some(why) => format!("approved route launch not started: {why}"),
+                    Some(why) => crate::runtime::delegated::admit::launch_not_started(&why),
                     None => "approved route launch failed; check its cwd and environment".into(),
                 },
             ),

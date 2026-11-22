@@ -43,7 +43,7 @@ use atem_client::encoding::Hash32;
 use atem_client::host_principal::{host_principal, parse_host_principal};
 use atem_client::membership::entry::Action;
 use atem_client::membership::{HostSenderState, Membership, ProjectOp, project_name_ok};
-use atem_client::session::host_work::WorkState;
+use atem_client::session::host_work::{LaunchState, WorkState};
 use atem_client::session::wire::is_delegated_sender;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::collections::BTreeSet;
@@ -371,11 +371,37 @@ pub fn set_applied_seq(tx: &Transaction, genesis: &Hash32, seq: u64) -> Result<(
     Ok(())
 }
 
+/// A host sender's launch on message this run reserved and hasn't spawned
+/// (its spawn check never let it go, `StartView::launch_gone`): what a
+/// project entry may stop (ruling R51). A launch of a run before a restart
+/// is the start's recovery's (`Store::recover`: of unknown outcome unless
+/// its session is live, never spawned again), never one of these.
+#[derive(Debug, Clone)]
+pub struct QueuedLaunch {
+    pub request_id: String,
+    /// Its admission record (the sender's grant when its request was
+    /// admitted, `device_list_seq` among it).
+    pub admission: super::Admission,
+}
+
+/// What [`list_effects`] asks of the bridge once its transaction
+/// committed.
+#[derive(Debug, Default)]
+pub struct ListEffects {
+    /// A live attempt's withdrawal, the intents carried out.
+    pub followups: Vec<Followup>,
+    /// The queued launches an entry stopped, with why (request id,
+    /// detail): `failed` in the transaction, with their waiting tasks; the
+    /// bridge drops them from its queue, and its spawn check refuses one the
+    /// launcher holds.
+    pub launches: Vec<(String, &'static str)>,
+}
+
 /// The effects on host senders' tasks of `list`'s entries after `after`
 /// (host-work's applied `seq`) up to its head, in `tx`, entry by entry
-/// (design II.2.2, II.3.1, II.8); what must wait for the commit is returned
-/// (a live attempt's withdrawal, the intents carried out). The caller
-/// writes the new applied `seq` in the same transaction.
+/// (design II.2.2, II.3.1, II.8), and on `launches` (this run's queued
+/// launches on message); what must wait for the commit is returned. The
+/// caller writes the new applied `seq` in the same transaction.
 ///
 /// - **`host_sender_revoke`** at `seq` (II.3.1): the sender's tasks
 ///   admitted before it (their generation below `seq`) stop as a revoke
@@ -398,6 +424,14 @@ pub fn set_applied_seq(tx: &Transaction, genesis: &Hash32, seq: u64) -> Result<(
 ///   longer covered stops with the event (`Narrowed`: `failed`, `sender's
 ///   authorization narrowed`), and stays stopped whatever a later entry
 ///   restores. Tasks awaiting their result or of unknown outcome are kept.
+///   A queued launch on message (ruling R51: a spawn is a start), admitted
+///   before `seq`, that the list as of `seq` no longer covers for a launch
+///   on message (its consent's projects with `launch` and a task's ops,
+///   [`HostOp::LaunchOnMessage`]) fails with the event's detail, its record
+///   `failed` and why kept (`admit::launch_failed`, as the spawn check's
+///   refusal), and every task waiting for it that waits still fails with
+///   it (`approved route launch not started: <why>`); a later restore
+///   revives neither.
 /// - **`host_sender_readmit`, `add_host`**: nothing (cancelled tasks stay
 ///   cancelled; a new key changes no authorization).
 ///
@@ -415,12 +449,16 @@ pub fn list_effects(
     list: &Membership,
     this_host: &str,
     after: u64,
-) -> Result<Vec<Followup>> {
+    launches: &[QueuedLaunch],
+) -> Result<ListEffects> {
     let mut out = Vec::new();
+    let mut stopped = Vec::new();
     // The list as of each project entry, read forward once; host senders'
-    // tasks a project entry may stop, read at the first one.
+    // tasks a project entry may stop, read at the first one; the queued
+    // launches not stopped yet.
     let mut prefixes = list.prefixes();
     let mut reachable: Option<Vec<WorkRecord>> = None;
+    let mut queued: Vec<&QueuedLaunch> = launches.iter().collect();
     for seq in after.saturating_add(1)..=list.head().seq {
         let Some(entry) = list.entry(seq) else {
             continue;
@@ -452,12 +490,85 @@ pub fn list_effects(
                     None => reachable.insert(host_senders_tasks(store)?),
                 };
                 narrowed(store, tx, tasks, then, seq, this_host, &mut out)?;
+                stopped.extend(launches_narrowed(
+                    store,
+                    tx,
+                    &mut queued,
+                    then,
+                    seq,
+                    this_host,
+                )?);
             }
             _ => {}
         }
     }
     first_withdrawals(&mut out);
-    Ok(out)
+    Ok(ListEffects {
+        followups: out,
+        launches: stopped,
+    })
+}
+
+/// The project entry at `seq`'s effect on `queued` launches, `then` the
+/// list as of it (ruling R51): each admitted before `seq` that `then` no
+/// longer covers for a launch on message leaves `queued`; if its record
+/// still says `starting`, it fails with the event's detail, why kept, and
+/// the tasks waiting for it that wait (no live attempt: none has its
+/// session) fail with it. What it stopped (request id, detail).
+fn launches_narrowed(
+    store: &Store,
+    tx: &Transaction,
+    queued: &mut Vec<&QueuedLaunch>,
+    then: &Membership,
+    seq: u64,
+    this_host: &str,
+) -> Result<Vec<(String, &'static str)>> {
+    let mut reached = Vec::new();
+    queued.retain(|launch| {
+        let admission = &launch.admission;
+        let event = admission.host_admitted().and_then(|(host_id, admitted)| {
+            if admission.device_list_seq >= seq {
+                return None;
+            }
+            host_task_covered(then, this_host, host_id, admitted, HostOp::LaunchOnMessage).err()
+        });
+        match event {
+            Some(event) => {
+                reached.push((launch.request_id.clone(), event));
+                false
+            }
+            None => true,
+        }
+    });
+    let mut stopped = Vec::new();
+    for (request_id, event) in reached {
+        let Some(mut record) = store.launch(&request_id)? else {
+            continue;
+        };
+        if record.status.state != LaunchState::Starting {
+            continue;
+        }
+        let (_, detail) = event.outcome();
+        super::admit::launch_failed(tx, &request_id, detail)?;
+        record.status.state = LaunchState::Failed;
+        store.save_launch(&record)?;
+        let why = super::admit::launch_not_started(detail);
+        for task_id in super::admit::waiting_for(tx, &request_id)? {
+            let Some(mut r) = store.work(&task_id)? else {
+                continue;
+            };
+            if !matches!(r.status.state, WorkState::Queued | WorkState::Blocked)
+                || store.live_attempt(&task_id)?.is_some()
+            {
+                continue;
+            }
+            r.status.state = WorkState::Failed;
+            r.status.detail = why.clone();
+            store.save_work(&r)?;
+        }
+        stopped.push((request_id, detail));
+    }
+    Ok(stopped)
 }
 
 /// Of the withdrawals `out` asks for one attempt, the first: a task's

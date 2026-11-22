@@ -16,15 +16,17 @@
 //! host sender's task doesn't start (`StartView::host_effects_at`), since a
 //! project entry is judged on the list as of that entry, and the head alone
 //! may cover a task an entry before it stopped (the owner's decision,
-//! 2026-11-22).
+//! 2026-11-22). A spawn is a start (ruling R51): this run's queued launches
+//! on message are judged per entry too, one an entry stopped leaving the
+//! queue (the launcher's spawn check refuses one it holds,
+//! `StartView::stop_launch`).
 //!
 //! Nothing runs with the hook off (no table is made: hook off = main),
 //! while the device list doesn't serve (frozen, held, faulted, gone: the
 //! start check fails or holds every delegated task then), with a
 //! receipt-database fault, or on a store bound to another identity.
 use super::*;
-use crate::runtime::delegated::effects::Followup;
-use crate::runtime::delegated::host_senders;
+use crate::runtime::delegated::host_senders::{self, ListEffects, QueuedLaunch};
 
 impl HostBridge {
     /// See the module doc. A store error is a receipt-database fault.
@@ -52,30 +54,55 @@ impl HostBridge {
             return;
         }
         let genesis = list.membership.genesis_hash();
-        let done = (|| -> anyhow::Result<(u64, Vec<Followup>)> {
+        // This run's launches on message not spawned (ruling R51), read
+        // after the head moved: no spawn check has let one go since, as
+        // it waits for these effects.
+        let launches = self.queued_host_launches();
+        let done = (|| -> anyhow::Result<(u64, ListEffects)> {
             let after = host_senders::applied_seq(&store.db, &genesis)?;
             if after >= head.seq {
-                return Ok((after, Vec::new()));
+                return Ok((after, ListEffects::default()));
             }
             let tx = store.immediate()?;
-            let followups = host_senders::list_effects(
+            let effects = host_senders::list_effects(
                 store,
                 &tx,
                 &list.membership,
                 &identity.atem_device_id,
                 after,
+                &launches,
             )?;
             host_senders::set_applied_seq(&tx, &genesis, head.seq)?;
             tx.commit()?;
-            Ok((head.seq, followups))
+            Ok((head.seq, effects))
         })();
         match done {
-            Ok((applied, followups)) => {
-                self.work.followups.extend(followups);
+            Ok((applied, effects)) => {
+                self.work.followups.extend(effects.followups);
                 self.work.host_applied = Some(key);
-                // Host senders' tasks start once it reaches the head the
-                // start view shows (`StartView::host_effects_at`).
-                self.start_view().host_applied = Some((genesis, applied));
+                // The launches an entry stopped leave the queue; one the
+                // launcher holds is refused by its spawn check, marked
+                // before the applied `seq` lets that check go on.
+                let mut held = Vec::new();
+                for (request_id, detail) in effects.launches {
+                    self.work.pending.remove(&request_id);
+                    let queued = self.work.launches.len();
+                    self.work.launches.retain(|l| l.request_id != request_id);
+                    if self.work.launches.len() == queued {
+                        held.push((request_id.clone(), detail));
+                    }
+                    eprintln!(
+                        "atem runtime: launch {request_id} failed before its spawn: {detail} (device list)"
+                    );
+                }
+                let mut view = self.start_view();
+                for (request_id, detail) in held {
+                    view.stop_launch(&request_id, detail);
+                }
+                // Host senders' tasks and launches start once it reaches
+                // the head the start view shows (`StartView::host_effects_at`).
+                view.host_applied = Some((genesis, applied));
+                drop(view);
                 // Kept in memory from its commit (or its read): the sync and
                 // the re-verification read it from here.
                 self.work.applied_seq = Some((identity, genesis, applied));
@@ -87,5 +114,26 @@ impl HostBridge {
                 self.work_fail();
             }
         }
+    }
+
+    /// Host senders' launches on message this run reserved that no spawn
+    /// check let go (ruling R51), by request id.
+    fn queued_host_launches(&self) -> Vec<QueuedLaunch> {
+        let view = self.start_view();
+        let mut out: Vec<QueuedLaunch> = self
+            .work
+            .pending
+            .iter()
+            .filter_map(|(request_id, p)| {
+                let d = p.delegated.as_ref()?;
+                d.launch.admission.host_admitted()?;
+                (!view.launch_gone(request_id)).then(|| QueuedLaunch {
+                    request_id: request_id.clone(),
+                    admission: d.launch.admission.clone(),
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a.request_id.cmp(&b.request_id));
+        out
     }
 }
