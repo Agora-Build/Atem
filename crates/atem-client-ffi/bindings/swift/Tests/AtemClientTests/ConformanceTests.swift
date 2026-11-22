@@ -2390,7 +2390,7 @@ final class ConformanceTests: XCTestCase {
                 try eq(s(data["op"]), "reply_query", name)
                 try eq(s(data["task_id"]), selector, name)
                 let reply = o(o(c["result"])["result"])["reply"]
-                if let state {
+                if let state = state {
                     try eq(s(o(reply)["state"]), state, name)
                     try eq(s(o(reply)["result_id"]), hostWorkResultId(taskId: selector), name)
                 } else {
