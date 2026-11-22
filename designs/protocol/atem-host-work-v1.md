@@ -4961,7 +4961,9 @@ rules into each host sender's task, and the start check asks them again.
   written. An attempt already `accepted` that reaches `executing`
   meanwhile is withdrawn there, and that withdrawal isn't counted toward
   the attempt limit (design I.6.4: as a hold's, host-work's own lag; the
-  task waits, then gets a new attempt). A live attempt's stop is on its
+  task waits, then gets a new attempt); one a crash cuts off between that
+  withdrawal and its settle is counted at the recovery, as any withdrawal
+  the recovery settles. A live attempt's stop is on its
   task's record (below), so what follows the commit (a crash, a
   receipt-database fault, a halted journal) never loses it.
 - **Project entries are judged per entry. Owner decision 2026-11-22;

@@ -2901,4 +2901,3 @@ fn a_narrowing_and_its_restore_read_together_fail_the_queued_task() {
     support::delegated::in_turn(&rig, &task_of(&later, &sid), "HM_RESTORED");
     support::delegated::never_ran(&rig, &task, "HM_NARROWED");
 }
-
