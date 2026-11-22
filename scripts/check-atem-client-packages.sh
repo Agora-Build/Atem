@@ -4,9 +4,10 @@
 # Checks what scripts/package-atem-client-bindings.sh put in <dir>, the way
 # Astation should after downloading it (designs/protocol/atem-client-bindings.md
 # §7): the SHA-256 sums, the source pin, the shared vectors listed in the sums
-# and unchanged (host-work requests, prompt framing, framing size; r9 control,
-# push-hint, delegated-wire, host-envelope, Station-call and required-verifier
-# vectors; the acknowledgment fixtures), no test-only or host-role export in
+# and unchanged (host-work requests, prompt framing, framing size, the
+# host-result header's framing; r9 control, push-hint, delegated-wire,
+# host-envelope, Station-call and required-verifier vectors; the
+# acknowledgment fixtures), no test-only or host-role export in
 # the shipped bindings (the framing's vectors-only rendering and host mail
 # included), and each package used once: the Node build of the WASM package
 # runs the packaged framing vectors (escaping, Unicode version, the preflight
@@ -36,6 +37,7 @@ SHIPPED_VECTORS=(
   host-work/requests-v1.json:host-work-requests-v1.json
   host-work/prompt-framing-v1.json:host-work-prompt-framing-v1.json
   host-work/framing-size-v1.json:host-work-framing-size-v1.json
+  host-work/framing-host-result-v1.json:host-work-framing-host-result-v1.json
   r9-vectors-host-work-control.json:r9-vectors-host-work-control.json
   r9-vectors-push-hint.json:r9-vectors-push-hint.json
   r9-vectors-delegated-wire.json:r9-vectors-delegated-wire.json

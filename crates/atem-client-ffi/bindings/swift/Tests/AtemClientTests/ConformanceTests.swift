@@ -2099,13 +2099,15 @@ final class ConformanceTests: XCTestCase {
         // The prompt framing (delegated host-work design III.2) over
         // designs/protocol/fixtures/host-work/: the escaping and the marker
         // check, the Unicode version they are pinned to, the preflight size
-        // check and (a test-vectors build only) the rendering, byte for byte.
+        // check and (a test-vectors build only) the rendering, byte for byte,
+        // the host-result header's included (framing-host-result-v1.json).
         // Strings are compared as UTF-8: Swift's == is canonical equivalence.
         func loadWork(_ name: String) throws -> [String: Any] {
             o(try decodeVectors(Data(contentsOf: dir.appendingPathComponent("host-work").appendingPathComponent("\(name).json"))))
         }
         let framing = try loadWork("prompt-framing-v1")
         let framingSize = try loadWork("framing-size-v1")
+        let framingHost = try loadWork("framing-host-result-v1")
         let framingPrompts = a(framing["prompts"]).map(o)
         func snapshot(_ kind: String, _ id: String, _ version: UInt64, _ text: String) -> [String: Any] {
             ["kind": kind, "id": id, "version": NSNumber(value: version), "digest": sha256Hex(text), "text": text]
@@ -2175,6 +2177,61 @@ final class ConformanceTests: XCTestCase {
             var headless = input
             headless["header"] = nil
             try throwsCode("malformed") { _ = try framingRenderForVectors(inputJson: js(headless), tagBits: 1) }
+        }
+        check("framing: the host-result header's prompts byte for byte, its refusals and its size (vectors only)") {
+            // Another host's reply names that host and no session; the
+            // file's tag, rule line and Unicode version are
+            // prompt-framing-v1.json's.
+            for key in ["tag", "rule", "unicode_version"] {
+                try eq(Array(s(framingHost[key]).utf8), Array(s(framing[key]).utf8), key)
+            }
+            let tag = s(framingHost["tag"])
+            let bits = tagBitsOf(tag)
+            let prompts = a(framingHost["prompts"]).map(o)
+            try eq(prompts.count, 4)
+            // A rendered prompt's first and last lines (a line ends at "\n"
+            // only), as UTF-8.
+            func outerLines(_ rendered: String) -> (head: [UInt8], tail: [UInt8]) {
+                let bytes = Array(rendered.utf8)
+                let headEnd = bytes.firstIndex(of: 0x0A) ?? bytes.count
+                let tailStart = bytes.lastIndex(of: 0x0A).map { $0 + 1 } ?? 0
+                return (Array(bytes[..<headEnd]), Array(bytes[tailStart...]))
+            }
+            for p in prompts {
+                let name = s(p["name"])
+                let input = o(p["input"])
+                let h = o(input["header"])
+                try eq(s(h["kind"]), "host_result", name)
+                try eq(h["session"] == nil, true, "\(name): no session")
+                let rendered = try framingRenderForVectors(inputJson: js(input), tagBits: bits)
+                try eq(Array(rendered.utf8), Array(s(p["rendered"]).utf8), name)
+                try eq(UInt64(rendered.utf8.count), u(p["bytes"]), "\(name): bytes")
+                // The agreed first line, from the input's own verified fields.
+                let first = s(framingHost["first_line"])
+                    .replacingOccurrences(of: "<task_id>", with: s(h["task_id"]))
+                    .replacingOccurrences(of: "host:<host_id>", with: s(h["sender"]))
+                try eq(outerLines(rendered).head, Array("[atem \(tag)] \(first)".utf8), "\(name): first line")
+            }
+            // What is never rendered: a host result naming a session, a
+            // sender that isn't a host principal, and anything but another
+            // host's reply as the runtime delivers it (a context read back,
+            // another closing, a mark, a screenshot).
+            let refused = a(framingHost["refused"]).map(o)
+            try eq(refused.count, 14)
+            for r in refused {
+                try throwsCode(s(r["code"])) { _ = try framingRenderForVectors(inputJson: js(r["input"]!), tagBits: bits) }
+            }
+            // The longest first and last lines are within the worst case the
+            // size checks count, which is prompt-framing-v1.json's: the
+            // bound doesn't move.
+            let size = o(framingHost["size"])
+            try eq(u(size["worst_case_lines"]), u(o(framing["size"])["worst_case_lines"]), "the worst case")
+            let longest = prompts.map { p -> UInt64 in
+                let lines = outerLines(s(p["rendered"]))
+                return UInt64(lines.head.count + 1 + lines.tail.count + 1)
+            }.max()!
+            try eq(longest, u(size["longest_host_result_lines"]), "the longest lines")
+            try eq(u(size["longest_host_result_lines"]) < u(size["worst_case_lines"]), true, "within the worst case")
         }
         check("framing: the size section (typical, worst, worst with a mark, at the bound)") {
             let size = o(framing["size"])
@@ -2295,6 +2352,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 134)
+        XCTAssertEqual(passed, 135)
     }
 }

@@ -1732,10 +1732,12 @@ fun main(args: Array<String>) {
     // The prompt framing (delegated host-work design III.2) over
     // designs/protocol/fixtures/host-work/: the escaping and the marker
     // check, the Unicode version they are pinned to, the preflight size check
-    // and (a test-vectors build only) the rendering, byte for byte.
+    // and (a test-vectors build only) the rendering, byte for byte, the
+    // host-result header's included (framing-host-result-v1.json).
     fun loadWork(name: String) = Json.parse(File(File(dir, "host-work"), "$name.json").readText())
     val framing = loadWork("prompt-framing-v1")
     val framingSize = loadWork("framing-size-v1")
+    val framingHost = loadWork("framing-host-result-v1")
     fun snapshot(kind: String, id: String, version: Long, text: String): Map<String, Any?> =
         linkedMapOf("kind" to kind, "id" to id, "version" to version, "digest" to sha256Hex(text), "text" to text)
     // framingCheckedLen of a text, an optional mark (a host-work MarkTask
@@ -1799,6 +1801,47 @@ fun main(args: Array<String>) {
         val headless = LinkedHashMap(input)
         headless.remove("header")
         throwsCode("malformed") { framingRenderForVectors(Json.write(headless), 1uL) }
+    }
+    check("framing: the host-result header's prompts byte for byte, its refusals and its size (vectors only)") {
+        // Another host's reply names that host and no session; the file's
+        // tag, rule line and Unicode version are prompt-framing-v1.json's.
+        for (key in listOf("tag", "rule", "unicode_version")) eq(framingHost[key], framing[key], key)
+        val tag = framingHost["tag"].s()
+        val bits = tagBitsOf(tag)
+        val prompts = framingHost["prompts"].arr()
+        eq(prompts.size, 4)
+        fun outer(rendered: String): Long {
+            val lines = rendered.split('\n')
+            return (utf8(lines.first()).size + 1 + utf8(lines.last()).size + 1).toLong()
+        }
+        for (p in prompts) {
+            val name = p["name"].s()
+            val h = p["input"]["header"]
+            eq(h["kind"], "host_result", name)
+            eq(h.obj().containsKey("session"), false, "$name: no session")
+            val rendered = framingRenderForVectors(Json.write(p["input"]), bits)
+            eq(rendered, p["rendered"].s(), name)
+            eq(utf8(rendered).size.toLong(), p["bytes"].l(), "$name: bytes")
+            // The agreed first line, from the input's own verified fields.
+            val first = framingHost["first_line"].s()
+                .replace("<task_id>", h["task_id"].s())
+                .replace("host:<host_id>", h["sender"].s())
+            eq(rendered.split('\n').first(), "[atem $tag] $first", "$name: first line")
+        }
+        // What is never rendered: a host result naming a session, a sender
+        // that isn't a host principal, and anything but another host's reply
+        // as the runtime delivers it (a context read back, another closing,
+        // a mark, a screenshot).
+        val refused = framingHost["refused"].arr()
+        eq(refused.size, 14)
+        for (r in refused) throwsCode(r["code"].s()) { framingRenderForVectors(Json.write(r["input"]), bits) }
+        // The longest first and last lines are within the worst case the
+        // size checks count, which is prompt-framing-v1.json's: the bound
+        // doesn't move.
+        val size = framingHost["size"]
+        eq(size["worst_case_lines"].l(), framing["size"]["worst_case_lines"].l(), "the worst case")
+        eq(prompts.maxOf { outer(it["rendered"].s()) }, size["longest_host_result_lines"].l(), "the longest lines")
+        eq(size["longest_host_result_lines"].l() < size["worst_case_lines"].l(), true, "within the worst case")
     }
     check("framing: the size section (typical, worst, worst with a mark, at the bound)") {
         val size = framing["size"]

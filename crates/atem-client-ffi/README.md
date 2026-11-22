@@ -55,3 +55,8 @@ bindings; the end-to-end
 test drives a Kotlin phone and a Node/WASM browser against a test host over
 loopback TCP. Toolchains are passed in by environment (`KOTLINC`, `JNA_JAR`,
 `WASM_BINDGEN`, …; see the script).
+
+The suites also render the host-result header's vectors
+(`framing-host-result-v1.json`: another host's reply, naming that host and
+no session) byte for byte through the vectors-only
+`framing_render_for_vectors`, and check what it never renders.

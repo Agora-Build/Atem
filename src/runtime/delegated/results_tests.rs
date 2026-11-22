@@ -293,6 +293,12 @@ fn rb_task_id(message: &str, recipient: &str) -> String {
 
 /// B's result for `task_id`: the reply as B's `reply_query` returns it.
 fn rb_reply(task_id: &str, text: &str) -> ResultPlain {
+    rb_reply_with(task_id, text, vec![])
+}
+
+/// B's submitted reply to `task_id` with its context: the snapshots B's
+/// agent published with it.
+fn rb_reply_with(task_id: &str, text: &str, context: Vec<hw::ContextSnapshot>) -> ResultPlain {
     ResultPlain::Result {
         task_id: task_id.into(),
         reply: ResultReply {
@@ -300,7 +306,7 @@ fn rb_reply(task_id: &str, text: &str) -> ResultPlain {
             state: ReplyState::Submitted,
             digest: hw::digest(text.as_bytes()),
             text: text.into(),
-            context: vec![],
+            context,
             submitted_at: Some(host_now().wall_ms),
             dropped: false,
         },
@@ -564,6 +570,80 @@ fn a_result_waits_for_the_status_naming_its_task() {
         rb_pass(&mut rig);
         assert_eq!(rows(&rig, "mailbox_results"), 0);
         assert_eq!(rb_remote(&rig, &m)[0].4.as_deref(), Some("early"));
+    });
+}
+
+/// The prompt the runtime delivers for another host's reply is the shared
+/// vectors' (`framing-host-result-v1.json`), byte for byte: rendered by the
+/// dispatch's own `render_task_prompt` from the delivery's records (its
+/// frame, the reply's text and the snapshots it carries), then its tag,
+/// drawn for the attempt, swapped for the vectors' on Atem's lines, and
+/// the vectors' task id for the delivered task's (same length). The plain
+/// reply, and the reply with its context.
+#[test]
+fn a_delivered_result_is_the_shared_vectors_prompt() {
+    local_test(async |root| {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("designs/protocol/fixtures/host-work/framing-host-result-v1.json");
+        let file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let tag = file["tag"].as_str().unwrap();
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        rig.bridge.work.config.routes[0].results = true;
+        let now = host_now().wall_ms;
+        for name in ["a plain reply", "the counted blocks with context"] {
+            let case = file["prompts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"].as_str().unwrap().starts_with(name))
+                .unwrap();
+            let input = &case["input"];
+            assert_eq!(input["header"]["sender"], "host:host-b");
+            let text = input["text"].as_str().unwrap();
+            let context: Vec<hw::ContextSnapshot> =
+                serde_json::from_value(input["context"].clone()).unwrap();
+            let (m, r) = rb_send(&mut rig);
+            let task = rb_task_id(&m, &r);
+            let status = rb_from_b(
+                &rig,
+                &host,
+                now,
+                &rb_resolved(&m, &r, WorkState::AwaitingResult),
+            );
+            let result = rb_from_b(&rig, &host, now, &rb_reply_with(&task, text, context));
+            rb_receive(&mut rig, &mut host, &[status, result]);
+            let record = rig
+                .bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .work(&rb_delivery(&m, &task))
+                .unwrap()
+                .unwrap();
+            let (prompt, drawn) = rig
+                .bridge
+                .render_task_prompt(&record, &[])
+                .unwrap()
+                .unwrap();
+            let retagged: Vec<String> = prompt
+                .split('\n')
+                .map(|line| match line.strip_prefix(&drawn.prefix()) {
+                    Some(rest) => format!("[atem {tag}] {rest}"),
+                    None => line.to_string(),
+                })
+                .collect();
+            let vector_task = input["header"]["task_id"].as_str().unwrap();
+            assert_eq!(vector_task.len(), task.len());
+            let expected = case["rendered"]
+                .as_str()
+                .unwrap()
+                .replace(vector_task, &task);
+            assert_eq!(retagged.join("\n"), expected, "{name}");
+        }
     });
 }
 

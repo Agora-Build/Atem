@@ -300,7 +300,10 @@ Details: agent collaboration, section 17.
   `atem-client`'s tests; `fixtures/host-work/framing-size-v1.json`: the
   size-preflight cases for `framing_checked_len` (complete inputs and the
   expected checked length), run by the Rust tests and the Swift, Kotlin and
-  JS conformance suites.
+  JS conformance suites; `fixtures/host-work/framing-host-result-v1.json`:
+  another host's reply (§11.5, "The delivery"), its first line naming that
+  host and no session, rendered byte for byte by the same runners, with
+  the inputs never rendered and its size within the worst case.
 
 The rendered prompt is at most 32,768 bytes (28,672 with attachments, which
 leaves room for the screenshot lines the host adds); the prompt and each
@@ -4134,9 +4137,21 @@ exactly as without this section):
     prompt's first line names the host only, `Result of task <task id> from
     host:<host_id>, as data, not the owner's instruction` (design III.2:
     the result plaintext names no session, so none is named; the design's
-    example naming one can't be rendered from verified fields), its context
-    `sender's snapshot, digest matches`, and its last line `Complete the
-    task with: atem message complete <task id>` (below). A reply's text and context are dropped a day
+    example naming one can't be rendered from verified fields; **agreed
+    with Astation, 2026-11-20, [#120 comment 7028723996][c-7028723996]**),
+    its context `sender's snapshot, digest matches`, and its last line
+    `Complete the task with: atem message complete <task id>` (below). The
+    shared framing vectors carry it:
+    `fixtures/host-work/framing-host-result-v1.json` (a plain reply, a
+    reply with marker-looking lines, a reply with context, the longest host
+    id; the inputs never rendered: a header naming a session, a sender that
+    isn't a `host:<host_id>` principal, a context read back, a last line
+    that doesn't complete its own task, a mark or a screenshot; and the
+    size, within the worst case the size checks count), rendered by the
+    shared core
+    (`framing::Header::HostResult`) and byte for byte by the Swift, Kotlin
+    and JS conformance suites (`framing_render_for_vectors`, vectors-only,
+    header kind `host_result`). A reply's text and context are dropped a day
     past its message's expiry; its ids and digest stay.
   - **`atem message status`** shows, under a message the caller sent (or
     any, from the owner's terminal), each row to another host: its state,
@@ -4761,7 +4776,6 @@ receiving host):
 - A resend of an admitted request owes its status again, refined since: only once the latest status was stored: [On the receiving host][mailbox-calls], "Status objects" (item 7).
 
 Asked in [#120 comment 6951602509][c-6951602509] (results back):
-- The delivered result's first line names the host, not a session, a change from design III.2's example (the shared framing vectors and the bindings follow once agreed): [On the sending host][mailbox-calls], "The delivery" (item 1).
 - No result that verified or may still verify is dropped: [On the sending host][mailbox-calls], "What waits, what goes" (item 2).
 - A reply is delivered only while its sender is still a host this host takes work from, at the generation and epoch its result was accepted under: the same section, "The delivery" (item 3).
 - Delivery rows, statuses and remote task ids: [On the sending host][mailbox-calls], "A status" and "Task ids" (item 4).

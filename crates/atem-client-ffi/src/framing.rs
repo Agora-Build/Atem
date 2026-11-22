@@ -17,7 +17,9 @@
 //!
 //! With the `test-vectors` feature only (never in a shipped package),
 //! [`framing_render_for_vectors`] renders a prompt with a chosen tag so the
-//! conformance suites can check the shared vectors byte for byte.
+//! conformance suites can check the shared vectors byte for byte
+//! (`prompt-framing-v1.json`, and the host-result header's
+//! `framing-host-result-v1.json`).
 use atem_client::session::framing;
 use atem_client::session::host_work::ContextSnapshot;
 use atem_client::session::mark::MarkTask;
@@ -150,6 +152,15 @@ mod vectors {
     /// significant first, as 12 Crockford base32 characters): the exact
     /// bytes the host would render, for the conformance suites. Never in a
     /// shipped package: a client never renders a prompt itself (III.2).
+    ///
+    /// The header's `kind` is `task`, `result` (a principal and its
+    /// session) or `host_result` (another host's reply: `task_id` and
+    /// `sender`, a `host:<host_id>` principal, and no `session`:
+    /// `framing-host-result-v1.json`). What it refuses is `Invalid`
+    /// `malformed`: a host result naming a session, and anything the core
+    /// refuses; for a host result, a sender that isn't a host principal, a
+    /// context read back, a last line that doesn't complete its own task, a
+    /// mark or a screenshot (`HostResultProblem`).
     #[cfg_attr(feature = "uniffi", uniffi::export)]
     pub fn framing_render_for_vectors(input_json: String, tag_bits: u64) -> Result<String> {
         let input = strict(&input_json)?;
@@ -168,7 +179,16 @@ mod vectors {
                 sender: string(h, "sender")?,
                 session: string(h, "session")?,
             },
-            _ => return Err(bad("header kind is task or result")),
+            // Another host's reply: the host only. Its result names no
+            // session, so an input that gives one is no input.
+            "host_result" if h.get("session").is_some() => {
+                return Err(bad("a host result names no session"));
+            }
+            "host_result" => Header::HostResult {
+                task_id: string(h, "task_id")?,
+                sender: string(h, "sender")?,
+            },
+            _ => return Err(bad("header kind is task, result or host_result")),
         };
         let mark = input
             .get("mark")
