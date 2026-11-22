@@ -236,6 +236,10 @@ FILES+=("$STATION_VECTOR")
 REQUIRED_VECTOR="atem-client-${VERSION}-r9-vectors-required-verifier.json"
 cp designs/protocol/fixtures/r9-vectors-required-verifier.json "$OUT/$REQUIRED_VECTOR"
 FILES+=("$REQUIRED_VECTOR")
+# A member's signed verifier report (session-v1 R9.2, Astation #101).
+REPORT_VECTOR="atem-client-${VERSION}-r9-vectors-verifier-report.json"
+cp designs/protocol/fixtures/r9-vectors-verifier-report.json "$OUT/$REPORT_VECTOR"
+FILES+=("$REPORT_VECTOR")
 # The Station's acknowledgment fixtures (test 48), for Station builders.
 for fixture in designs/protocol/fixtures/r9-control-ack-*.json; do
   ACK_FIXTURE="atem-client-${VERSION}-$(basename "$fixture")"

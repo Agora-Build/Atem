@@ -261,6 +261,7 @@ fn every_vectors_file_has_a_runner() {
             "r9-vectors-recovery.json",
             "r9-vectors-required-verifier.json", // tests/required_verifier.rs
             "r9-vectors-station-calls.json",
+            "r9-vectors-verifier-report.json", // tests/verifier_report.rs
         ],
         "a new vectors file needs a runner below"
     );
@@ -349,6 +350,9 @@ fn keys() {
         ("dev-newmac/enc", "dev-newmac enc"),
         ("dev-phone/auth", "dev-phone auth"),
         ("dev-phone/enc", "dev-phone enc"),
+        // The verifier-report vectors' Ed25519 native.
+        ("dev-desk/auth", "dev-desk auth"),
+        ("dev-desk/enc", "dev-desk enc"),
         ("host-a/host_key", "host-a host_channel_key"),
         ("host-evil/host_key", "host-evil host_key"),
         ("svc-discord/auth", "svc-discord auth"),

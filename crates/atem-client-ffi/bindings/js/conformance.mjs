@@ -8,7 +8,7 @@
 // Swift (bindings/swift/Tests/…/ConformanceTests.swift).
 import { createRequire } from "node:module";
 import { readFileSync, readdirSync } from "node:fs";
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, createPrivateKey, sign as nodeSign } from "node:crypto";
 import { join, resolve } from "node:path";
 
 const [pkgDir, fixturesDir] = process.argv.slice(2).map((p) => resolve(p));
@@ -506,6 +506,141 @@ for (const value of requirements) {
     }
   });
 }
+
+// ------------------------------------------- a member's verifier report
+// r9-vectors-verifier-report (session-v1 R9.2 "How a verifier reports
+// itself"; agreed for implementation on Astation #101): each challenge read
+// or refused; each report verified, or refused with kind report and its
+// code; each builder case as a VerifierReportRequest (its body but the
+// process, which is this instance's); the immutable request's finishes,
+// signed here with Node's crypto (another body, another member: refused);
+// and a bot's synchronous signature with its own key.
+const vrep = load("r9-vectors-verifier-report");
+const P256_N = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n;
+// A P-256 r||s with S low, as a report carries it.
+const lowS = (sig) => {
+  const s = BigInt(`0x${hex(sig.slice(32))}`);
+  if (s <= P256_N / 2n) return sig;
+  return new Uint8Array([...sig.slice(0, 32), ...unhex((P256_N - s).toString(16).padStart(64, "0"))]);
+};
+// A signature by a test key (`<name>/<part>`) over `input`.
+const signWith = (name, input) => {
+  const [keyName, part] = name.split("/");
+  const k = keys[keyName][part];
+  if (k.alg === "ed25519") {
+    const pkcs8 = Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), Buffer.from(k.secret_hex, "hex")]);
+    return new Uint8Array(nodeSign(null, input, createPrivateKey({ key: pkcs8, format: "der", type: "pkcs8" })));
+  }
+  const pub = Buffer.from(k.pub_hex, "hex");
+  const jwk = {
+    kty: "EC",
+    crv: "P-256",
+    d: Buffer.from(k.secret_hex, "hex").toString("base64url"),
+    x: pub.subarray(1, 33).toString("base64url"),
+    y: pub.subarray(33).toString("base64url"),
+  };
+  const key = createPrivateKey({ key: jwk, format: "jwk" });
+  return lowS(new Uint8Array(nodeSign("sha256", input, { key, dsaEncoding: "ieee-p1363" })));
+};
+// L, the case's chain (the file's entries), then its freeze carriage.
+const vrepLog = (c) => {
+  const now = { wallMs: c.now_ms, monoMs: 1000, bootId: "boot-1" };
+  const chain = c.chain.map((label) => str(vrep.entries.find((e) => e.label === label).entry));
+  const log = m.MembershipLog.verify(ACCOUNT, GENESIS, [...L, ...chain], now);
+  if (c.freeze !== undefined) log.extend([entry(c.freeze)], now);
+  return log;
+};
+const vrepOut = (v) => ({
+  signer: v.signer,
+  kind: v.kind,
+  slot: v.slot,
+  process: v.process,
+  connection: v.connection,
+  head: head(v.head),
+  at_head: v.atHead,
+  inventory: { version: v.inventory.version, actions: v.inventory.actions },
+  expires_at: v.expiresAt,
+});
+const reportError = (f, code) => {
+  const e = throwsCode(f, code);
+  eq(e.kind, "report", "kind");
+  eq(e.code, code, "code");
+};
+check("verifier report: challenges", () => {
+  for (const c of vrep.challenges) {
+    if (c.fields === undefined) {
+      reportError(() => m.parseVerifierReportChallenge(c.text), c.code);
+      continue;
+    }
+    const r = m.parseVerifierReportChallenge(c.text);
+    same({ signer: r.signer, slot: r.slot, origin: r.origin, connection: r.connection, nonce: r.nonce, issued_at: r.issuedAt, expires_at: r.expiresAt }, c.fields, c.label);
+  }
+  const fresh = (origin) => m.parseVerifierReportChallenge(m.verifierReportChallenge("member:dev-phone", "astation-ios", origin, 3, 1793264000000, 1793264030000));
+  const [one, two] = [fresh("https://Station-Dev.agora.build/"), fresh("https://station-dev.agora.build")];
+  eq(one.origin, "https://station-dev.agora.build", "the Station normalized");
+  if (one.nonce === two.nonce) throw new Error("a fresh nonce each time");
+  reportError(() => m.verifierReportChallenge("member:dev-phone", "astation-ios", "https://station-dev.agora.build", 3, 1793264000000, 1793264030001), "malformed");
+});
+check("verifier report: reports", () => {
+  for (const c of [...vrep.valid, ...vrep.invalid]) {
+    const verify = () => m.verifyVerifierReport(vrepLog(c), c.report, str(c.challenge), c.now_ms);
+    if (c.expect !== undefined) same(vrepOut(verify()), c.expect, c.label);
+    else reportError(verify, c.code);
+  }
+  // Among them: a native whose roles changed, a recovery still waiting, and
+  // a high-S P-256 signature.
+  const byCase = Object.fromEntries([...vrep.valid, ...vrep.invalid].map((c) => [c.label, c]));
+  eq(byCase.native_after_set_roles.expect.at_head, false, "native_after_set_roles");
+  eq(byCase.pending_recovery_subject.code, "unknown_signer", "pending_recovery_subject");
+  eq(byCase.high_s_signature.code, "bad_signature", "high_s_signature");
+});
+check("verifier report: the builder", () => {
+  for (const c of [...vrep.builder, ...vrep.request]) {
+    const build = () => new m.VerifierReportRequest(vrepLog(c), str(c.challenge), c.signer, c.slot, c.station, "key", c.now_ms);
+    if (c.body_but_process === undefined) {
+      reportError(build, c.code);
+      continue;
+    }
+    const body = JSON.parse(build().bodyJson());
+    eq(body.process, m.verifierReportProcess(), `${c.label}: this instance's process`);
+    delete body.process;
+    same(body, c.body_but_process, c.label);
+  }
+});
+check("verifier report: the immutable request", () => {
+  for (const c of vrep.request) {
+    const log = vrepLog(c);
+    const request = (challenge, slot) => new m.VerifierReportRequest(log, str(challenge), c.signer, slot, c.station, c.key, c.now_ms);
+    const held = request(c.challenge, c.slot);
+    const body = held.bodyJson();
+    const sr = held.signRequest();
+    eq(sr.purpose, c.sign_request.purpose, "purpose");
+    eq(sr.freshConfirmation, false, "no confirmation");
+    eq(sr.label, c.sign_request.label, "label");
+    eq(sr.keyId, c.key, "key");
+    eq(sr.bodyJson, body, "the held body shown");
+    eq(hex(sr.input), hex(m.encodeFields([utf8(sr.label), utf8(body)])), "input");
+    for (const f of c.finishes) {
+      const input = f.over === "held" ? sr.input : request({ ...c.challenge, slot: f.over.slot }, f.over.slot).signRequest().input;
+      const sig = signWith(f.signed_with, input);
+      if (f.code === undefined) eq(held.finish(sig), `{"body":${body},"sig":"${Buffer.from(sig).toString("base64url")}"}`, `${c.label} ${f.label}`);
+      else reportError(() => held.finish(sig), f.code);
+    }
+    eq(held.bodyJson(), body, "the held body never changes");
+  }
+});
+check("verifier report: a bot signs with its own key", () => {
+  const c = vrep.request.find((r) => r.signer.startsWith("service:"));
+  const store = new m.SoftwareKeyStore();
+  store.insertEd25519(c.key, unhex(keys["svc-discord"].auth.secret_hex));
+  store.insertP256("dev-phone/auth", unhex(keys["dev-phone"].auth.secret_hex));
+  const log = vrepLog(c);
+  const sign = (key) => m.signVerifierReport(store, log, str(c.challenge), c.signer, c.slot, c.station, key, c.now_ms);
+  const v = m.verifyVerifierReport(log, sign(c.key), str(c.challenge), c.now_ms);
+  eq(v.kind, "service", "kind");
+  eq(v.process, m.verifierReportProcess(), "process");
+  reportError(() => sign("dev-phone/auth"), "bad_signature");
+});
 
 // ---------------------------------- delegated host work: control records
 // r9-vectors-host-work-control: every record parses and verifies on each of

@@ -42,6 +42,11 @@ pub enum SignLabel {
     /// `atem-result` bodies (II.4.4): the status or result the host that ran
     /// the work sends back, signed by its `host_key`.
     Result,
+    /// `atem-verifier-report` bodies (`member_report`; session-v1 R9.2 "How
+    /// a verifier reports itself", agreed for implementation on Astation
+    /// #101): a native member's or a service's signed report of the
+    /// verifier its loaded core runs, for a minter's challenge.
+    VerifierReport,
 }
 
 impl SignLabel {
@@ -60,6 +65,7 @@ impl SignLabel {
             SignLabel::HostWorkControl => "atem-host-work-control-v1",
             SignLabel::Envelope => "atem-envelope-v1",
             SignLabel::Result => "atem-result-v1",
+            SignLabel::VerifierReport => "atem-verifier-report-v1",
         }
     }
 
@@ -76,6 +82,7 @@ impl SignLabel {
             "atem-host-work-control" => Some(SignLabel::HostWorkControl),
             "atem-envelope" => Some(SignLabel::Envelope),
             "atem-result" => Some(SignLabel::Result),
+            "atem-verifier-report" => Some(SignLabel::VerifierReport),
             _ => None,
         }
     }
@@ -153,7 +160,7 @@ mod tests {
 
     /// Every label, in one list. The match fails to compile until a new
     /// label is listed here too, so the distinctness test covers it.
-    const LABELS: [SignLabel; 13] = [
+    const LABELS: [SignLabel; 14] = [
         SignLabel::MembershipEntry,
         SignLabel::RecoveryCosign,
         SignLabel::BrowserGrant,
@@ -167,6 +174,7 @@ mod tests {
         SignLabel::Envelope,
         SignLabel::Result,
         SignLabel::HostRouteProxy,
+        SignLabel::VerifierReport,
     ];
 
     const fn listed(label: SignLabel) -> usize {
@@ -184,6 +192,7 @@ mod tests {
             SignLabel::Envelope => 10,
             SignLabel::Result => 11,
             SignLabel::HostRouteProxy => 12,
+            SignLabel::VerifierReport => 13,
         }
     }
 
@@ -224,6 +233,21 @@ mod tests {
         assert_eq!(SignLabel::Result.as_str(), "atem-result-v1");
         assert_eq!(ENVELOPE_SEAL, "atem-envelope-seal-v1");
         assert_eq!(RESULT_SEAL, "atem-result-seal-v1");
+    }
+
+    /// A member's signed verifier report (Astation #101): its own body
+    /// type and label, distinct from every route, channel, control and
+    /// membership label (`every_domain_string_is_distinct`).
+    #[test]
+    fn the_verifier_report_has_its_own_label() {
+        assert_eq!(
+            SignLabel::of_body_type("atem-verifier-report"),
+            Some(SignLabel::VerifierReport)
+        );
+        assert_eq!(
+            SignLabel::VerifierReport.as_str(),
+            "atem-verifier-report-v1"
+        );
     }
 
     #[test]

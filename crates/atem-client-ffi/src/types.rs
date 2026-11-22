@@ -84,17 +84,33 @@ unit_enum! {
         /// Host-only signatures (`sig_h`, push hints, seens, a host's
         /// `enc_sig`): never asked of a phone or a desktop client.
         HostSigning,
+        /// A member's signed verifier report (`atem-verifier-report`,
+        /// session-v1 R9.2 "How a verifier reports itself"; agreed for
+        /// implementation on Astation #101): read-only reporting of the
+        /// verifier this app's core runs, for a minter's challenge. **Never
+        /// prompts**: sign only when the key can sign with no interaction
+        /// (R9.6 rule 3's live window included), else return
+        /// `ProviderError::Cancelled` and the slot stays unconfirmed. Before
+        /// signing without a prompt, check that `label` is
+        /// `atem-verifier-report-v1` (and `input` is `enc([label,
+        /// body_json])`); never sign another label without its own prompt.
+        /// The core never creates, rekeys or enrolls a key for it, and
+        /// builds the body itself (`body_json` shows it).
+        VerifierReport,
     }
 }
 
 impl SigningPurpose {
     /// Whether R9.6 rule 4 asks for a fresh confirmation (everything but the
-    /// channel signature, host signing and a service key's own control
-    /// records).
+    /// channel signature, host signing, a service key's own control records
+    /// and a verifier report, which never prompts).
     pub fn needs_fresh_confirmation(self) -> bool {
         !matches!(
             self,
-            SigningPurpose::Channel | SigningPurpose::HostSigning | SigningPurpose::ServiceControl
+            SigningPurpose::Channel
+                | SigningPurpose::HostSigning
+                | SigningPurpose::ServiceControl
+                | SigningPurpose::VerifierReport
         )
     }
 }
@@ -112,6 +128,9 @@ unit_enum! {
         /// `atem-host-work-control-v1`: control records (delegated host
         /// work I.5.3).
         HostWorkControl,
+        /// `atem-verifier-report-v1`: a member's verifier report
+        /// (`verify_verifier_report`).
+        VerifierReport,
     }
 }
 
@@ -293,6 +312,54 @@ impl From<&atem_client::membership::VerifierInventory> for VerifierInventory {
             version: v.version(),
             actions: v.actions().to_vec(),
         }
+    }
+}
+
+unit_enum! {
+    /// Which kind of member signed a verifier report.
+    pub enum ReportSignerKind {
+        /// `member:<device_id>`: a native member, with its `auth_key`.
+        Native,
+        /// `service:<device_id>`: a service, with its own key.
+        Service,
+    }
+}
+
+record! {
+    /// A verifier report's challenge as the minter issues and stores it
+    /// (`verifier_report_challenge`, `parse_verifier_report_challenge`):
+    /// `signer` (`member:<id>` or `service:<id>`), `slot`, `origin` (the
+    /// Station, exact as `normalize_relay` writes it), `connection` (the
+    /// slot's generation, 1 to 2^53 − 1), `nonce` (32 bytes, base64url),
+    /// and the lease `0 < expires_at − issued_at ≤ 30000` ms.
+    pub struct VerifierReportChallenge {
+        pub signer: String,
+        pub slot: String,
+        pub origin: String,
+        pub connection: u64,
+        pub nonce: String,
+        pub issued_at: u64,
+        pub expires_at: u64,
+    }
+}
+
+record! {
+    /// A verified report (`verify_verifier_report`): who signed it and as
+    /// which kind, in which slot and process (base64url, 16 bytes), for
+    /// which `connection`, at which head of the reporter's list (`at_head`
+    /// when it is the verifier's own head, false at an ancestor: the
+    /// consumer decides whether that suffices), its verifier `inventory`
+    /// (read for its shape only) and the challenge's `expires_at`.
+    pub struct VerifiedReport {
+        pub signer: String,
+        pub kind: ReportSignerKind,
+        pub slot: String,
+        pub process: String,
+        pub connection: u64,
+        pub head: LogHead,
+        pub at_head: bool,
+        pub inventory: VerifierInventory,
+        pub expires_at: u64,
     }
 }
 

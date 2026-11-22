@@ -59,6 +59,12 @@
 //! - [`host_route`]: the host route proof a host signs for the relay's
 //!   challenge, and the relay's verifier against its log.
 //!
+//! A verifier that isn't a host (R9.2 "How a verifier reports itself"):
+//!
+//! - [`member_report`]: a native member's or a service's signed report of
+//!   the device-list verifier its loaded core runs, for a minter's
+//!   single-use challenge, and the minter's verifier against its log.
+//!
 //! Delegated host work (`designs/delegated-host-work.md`):
 //!
 //! - [`control`]: control records (`atem-host-work-control`, I.5.3), the
@@ -90,6 +96,7 @@ pub mod host_route;
 pub mod hpke;
 pub mod keys;
 pub mod kit;
+pub mod member_report;
 pub mod membership;
 pub mod principal;
 pub mod project;
@@ -98,9 +105,9 @@ pub mod push;
 pub mod restore;
 pub mod session;
 pub mod signed;
-pub mod station_route;
 #[cfg(feature = "software-keys")]
 pub mod software;
+pub mod station_route;
 
 pub use domain::{SignLabel, SigningInput};
 pub use encoding::Hash32;

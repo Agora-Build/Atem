@@ -162,6 +162,7 @@ impl From<SignLabelKind> for SignLabel {
             SignLabelKind::ChannelHost => SignLabel::ChannelHost,
             SignLabelKind::ChannelClient => SignLabel::ChannelClient,
             SignLabelKind::HostWorkControl => SignLabel::HostWorkControl,
+            SignLabelKind::VerifierReport => SignLabel::VerifierReport,
         }
     }
 }
@@ -190,6 +191,8 @@ pub fn describe(input: &SigningInput) -> (SigningPurpose, Option<String>) {
         | SignLabel::Envelope
         | SignLabel::Result => (SigningPurpose::HostSigning, body()),
         SignLabel::BrowserGrant => (SigningPurpose::BrowserGrant, body()),
+        // A member's verifier report: no confirmation, the body shown.
+        SignLabel::VerifierReport => (SigningPurpose::VerifierReport, body()),
         // A control record (delegated host-work I.5.3), by its signer.
         SignLabel::HostWorkControl => {
             let body = body();
@@ -467,6 +470,8 @@ impl AppKeyProvider for SoftwareKeyStore {
             // planned): the conformance suites seal through this store.
             SignLabel::Envelope,
             SignLabel::Result,
+            // A service's verifier report (a bot's own key).
+            SignLabel::VerifierReport,
         ]
         .into_iter()
         .find(|l| l.as_str().as_bytes() == label)
@@ -604,6 +609,30 @@ mod tests {
         }
     }
 
+    /// A member's verifier report (Astation #101): its own purpose, never a
+    /// fresh confirmation (the provider signs only a key that needs no
+    /// interaction, else `Cancelled`), with the body shown.
+    #[test]
+    fn a_verifier_report_names_its_purpose_and_asks_no_confirmation() {
+        let body = br#"{"slot":"astation-ios","type":"atem-verifier-report","v":1}"#;
+        let request = sign_request(
+            &KeyId::new("k"),
+            &SigningInput::new(SignLabel::VerifierReport, body),
+        );
+        assert_eq!(request.purpose, SigningPurpose::VerifierReport);
+        assert!(!request.fresh_confirmation);
+        assert!(!SigningPurpose::VerifierReport.needs_fresh_confirmation());
+        assert_eq!(request.label, "atem-verifier-report-v1");
+        assert_eq!(
+            request.body_json.as_deref().map(str::as_bytes),
+            Some(&body[..])
+        );
+        assert_eq!(
+            SignLabel::from(SignLabelKind::VerifierReport),
+            SignLabel::VerifierReport
+        );
+    }
+
     /// A control record's purpose follows its signer (I.5.4): a native
     /// manager's needs a fresh confirmation of the body; a Station signing
     /// with the integration's own service key needs none.
@@ -673,9 +702,11 @@ mod tests {
         unlabelled.input = atem_client::encoding::enc(&[b"not-a-label", b"{}"]);
         assert!(AppKeyProvider::sign(&*store, unlabelled).is_err());
         // Every label the core signs with: a control record, a host route
-        // of either kind, and a host's enc_sig over several fields.
+        // of either kind, a service's verifier report, and a host's enc_sig
+        // over several fields.
         for input in [
             SigningInput::new(SignLabel::HostWorkControl, b"{}"),
+            SigningInput::new(SignLabel::VerifierReport, b"{}"),
             SigningInput::new(SignLabel::HostRoute, b"{}"),
             SigningInput::new(SignLabel::HostRouteProxy, b"{}"),
             SigningInput::fields(SignLabel::HostEncKey, &[b"acct", &[7u8; 32], b"host-a"]),

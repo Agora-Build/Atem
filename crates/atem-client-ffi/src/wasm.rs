@@ -46,6 +46,7 @@ fn js_error(e: AtemError) -> JsValue {
         AtemError::Push { .. } => "push",
         AtemError::Stored { .. } => "stored",
         AtemError::State { .. } => "state",
+        AtemError::Report { .. } => "report",
     };
     set("kind", kind.into());
     set("code", e.code().into());
@@ -79,6 +80,7 @@ fn js_error(e: AtemError) -> JsValue {
         | AtemError::Publish { detail, .. }
         | AtemError::Push { detail, .. }
         | AtemError::Stored { detail, .. }
+        | AtemError::Report { detail, .. }
         | AtemError::State { detail } => set("detail", detail.as_str().into()),
     }
     error.into()
@@ -156,6 +158,7 @@ fn label(name: &str) -> JsResult<SignLabelKind> {
         "channel_host" => SignLabelKind::ChannelHost,
         "channel_client" => SignLabelKind::ChannelClient,
         "host_work_control" => SignLabelKind::HostWorkControl,
+        "verifier_report" => SignLabelKind::VerifierReport,
         _ => return Err(bad("unknown label")),
     })
 }
@@ -336,6 +339,145 @@ pub fn verifier_inventory() -> JsResult<JsValue> {
 #[wasm_bindgen(js_name = membershipRequiredVersion)]
 pub fn membership_required_version(body_json: String) -> JsResult<JsValue> {
     to_js(&err(crate::log::membership_required_version(body_json))?)
+}
+
+// ------------------------------------------------- verifier reports
+
+/// A minter's fresh challenge for a member's verifier report
+/// (`member_report::verifier_report_challenge`): canonical JSON, a 32-byte
+/// nonce from `crypto.getRandomValues`. Throws `kind: "report"`, `code:
+/// "malformed"` for a field outside its grammar.
+#[wasm_bindgen(js_name = verifierReportChallenge)]
+pub fn verifier_report_challenge(
+    signer: String,
+    slot: String,
+    origin: String,
+    connection: f64,
+    issued_at: f64,
+    expires_at: f64,
+) -> JsResult<String> {
+    err(crate::member_report::verifier_report_challenge(
+        signer,
+        slot,
+        origin,
+        ms(connection)?,
+        ms(issued_at)?,
+        ms(expires_at)?,
+    ))
+}
+
+/// A challenge's fields: `{signer, slot, origin, connection, nonce,
+/// issuedAt, expiresAt}` (`kind: "report"`, `code: "malformed"` otherwise).
+#[wasm_bindgen(js_name = parseVerifierReportChallenge)]
+pub fn parse_verifier_report_challenge(challenge_json: String) -> JsResult<JsValue> {
+    ok(crate::member_report::parse_verifier_report_challenge(
+        challenge_json,
+    ))
+}
+
+/// This WASM instance's process generation (base64url, 16 bytes), drawn
+/// once per instance: the `process` of every report it builds.
+#[wasm_bindgen(js_name = verifierReportProcess)]
+pub fn verifier_report_process() -> String {
+    crate::member_report::verifier_report_process()
+}
+
+/// Verifies a report against `log` at its head and the stored challenge
+/// (`member_report::verify_verifier_report`): `{signer, kind, slot,
+/// process, connection, head, atHead, inventory, expiresAt}`, or throws
+/// `kind: "report"` with the first failure's `code`.
+#[wasm_bindgen(js_name = verifyVerifierReport)]
+pub fn verify_verifier_report(
+    log: &MembershipLog,
+    report_json: String,
+    expected_challenge_json: String,
+    now_ms: f64,
+) -> JsResult<JsValue> {
+    ok(crate::member_report::verify_verifier_report(
+        log.0.clone(),
+        report_json,
+        expected_challenge_json,
+        ms(now_ms)?,
+    ))
+}
+
+/// A report waiting for its signature (`member_report::VerifierReportRequest`):
+/// an immutable handle on the body the core built. A browser or a bot whose
+/// key answers later signs `signRequest().input` and hands the signature to
+/// `finish`, which takes only a signature over the held body by its signer.
+#[wasm_bindgen]
+pub struct VerifierReportRequest(crate::member_report::VerifierReportRequest);
+
+#[wasm_bindgen]
+impl VerifierReportRequest {
+    #[wasm_bindgen(constructor)]
+    pub fn new(
+        log: &MembershipLog,
+        challenge_json: String,
+        signer: String,
+        slot: String,
+        origin: String,
+        key_id: String,
+        now_ms: f64,
+    ) -> JsResult<VerifierReportRequest> {
+        Ok(VerifierReportRequest(err(
+            crate::member_report::VerifierReportRequest::build(
+                &log.0,
+                &challenge_json,
+                &signer,
+                &slot,
+                &origin,
+                key_id,
+                ms(now_ms)?,
+            ),
+        )?))
+    }
+
+    /// `{keyId, purpose: "verifier_report", freshConfirmation: false, label,
+    /// input, bodyJson}`.
+    #[wasm_bindgen(js_name = signRequest)]
+    pub fn sign_request(&self) -> JsResult<JsValue> {
+        to_js(&self.0.sign_request())
+    }
+
+    /// The held body (canonical JSON).
+    #[wasm_bindgen(js_name = bodyJson)]
+    pub fn body_json(&self) -> String {
+        self.0.body_json()
+    }
+
+    /// The report with `signature` (throws `kind: "report"`, `code:
+    /// "bad_signature"` for one that isn't the signer's over the held body).
+    pub fn finish(&self, signature: Vec<u8>) -> JsResult<String> {
+        err(self.0.finish(signature))
+    }
+}
+
+/// A report signed at once with a key of a software store (a bot's own
+/// service key): `member_report::sign_verifier_report`.
+#[cfg(feature = "software-keys")]
+#[wasm_bindgen(js_name = signVerifierReport)]
+#[allow(clippy::too_many_arguments)]
+pub fn sign_verifier_report(
+    store: &SoftwareKeyStore,
+    log: &MembershipLog,
+    challenge_json: String,
+    signer: String,
+    slot: String,
+    origin: String,
+    key_id: String,
+    now_ms: f64,
+) -> JsResult<String> {
+    err(crate::member_report::sign_verifier_report_with(
+        &*store.0,
+        &log.0,
+        &challenge_json,
+        &signer,
+        &slot,
+        &origin,
+        key_id,
+        ms(now_ms)?,
+    ))
 }
 
 // --------------------------------------------------------- host work

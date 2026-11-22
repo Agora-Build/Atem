@@ -104,6 +104,26 @@ private func canon(_ v: Any) -> String {
     String(data: try! JSONSerialization.data(withJSONObject: v, options: [.fragmentsAllowed, .sortedKeys]), encoding: .utf8)!
 }
 
+// P-256's order n and n / 2, big-endian.
+private let p256N: [UInt8] = [0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51]
+private let p256HalfN: [UInt8] = [0x7f, 0xff, 0xff, 0xff, 0x80, 0x00, 0x00, 0x00, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xde, 0x73, 0x7d, 0x56, 0xd3, 0x8b, 0xcf, 0x42, 0x79, 0xdc, 0xe5, 0x61, 0x7e, 0x31, 0x92, 0xa8]
+
+// A P-256 r‖s with S low (n − s when s > n / 2), as a report carries it.
+private func lowS(_ sig: Data) -> Data {
+    let r = [UInt8](sig.prefix(32))
+    let s = [UInt8](sig.suffix(32))
+    if !p256HalfN.lexicographicallyPrecedes(s) { return sig }
+    var out = [UInt8](repeating: 0, count: 32)
+    var borrow = 0
+    for i in stride(from: 31, through: 0, by: -1) {
+        var d = Int(p256N[i]) - Int(s[i]) - borrow
+        borrow = d < 0 ? 1 : 0
+        if d < 0 { d += 256 }
+        out[i] = UInt8(d)
+    }
+    return Data(r + out)
+}
+
 private struct Failure: Error, CustomStringConvertible {
     let description: String
 }
@@ -194,6 +214,7 @@ func codeOf(_ e: AtemError) -> (String, String?) {
     case let .Publish(code, detail): return (code, detail)
     case let .Push(code, detail): return (code, detail)
     case let .Stored(code, detail): return (code, detail)
+    case let .Report(code, detail): return (code, detail)
     case let .State(detail): return ("state", detail)
     }
 }
@@ -795,6 +816,163 @@ final class ConformanceTests: XCTestCase {
                     } else { try eq(actual, nil as VerifierRequirement?) }
                 }
             }
+        }
+        // A member's verifier report (session-v1 R9.2 "How a verifier
+        // reports itself"; agreed for implementation on Astation #101): each
+        // challenge read or refused; each report verified, or refused as
+        // Report(code); each builder case as a VerifierReportRequest (its
+        // body but the process, which is this core's); the immutable
+        // request's finishes, signed here with CryptoKit (another body,
+        // another member: refused); and the synchronous signer through the
+        // app's provider.
+        let vrep = try load("r9-vectors-verifier-report")
+        func vrepLog(_ c: [String: Any]) throws -> MembershipLog {
+            let at = HostClock(wallMs: u(c["now_ms"]), monoMs: 1000, bootId: "boot-1")
+            let entries = a(vrep["entries"]).map(o)
+            let chain = a(c["chain"]).map { label in js(entries.first { s($0["label"]) == s(label) }!["entry"]!) }
+            let log = try MembershipLog.verify(accountId: account, genesisHash: genesis, entries: l + chain, now: at)
+            if let freeze = c["freeze"] { _ = try log.extend(entries: [entry(s(freeze))], now: at) }
+            return log
+        }
+        func reportError(_ code: String, _ f: () throws -> Void) throws {
+            do {
+                try f()
+            } catch let e as AtemError {
+                guard case let .Report(got, _) = e else { throw Failure(description: "expected Report(\(code)), got \(e)") }
+                try eq(got, code, "code")
+                return
+            }
+            throw Failure(description: "expected Report(\(code)), nothing thrown")
+        }
+        func vrepOut(_ v: VerifiedReport) -> [String: Any] {
+            [
+                "signer": v.signer, "kind": v.kind == .native ? "native" : "service", "slot": v.slot,
+                "process": v.process, "connection": v.connection,
+                "head": ["seq": v.head.seq, "hash": v.head.hash] as [String: Any],
+                "at_head": v.atHead,
+                "inventory": ["version": v.inventory.version, "actions": v.inventory.actions] as [String: Any],
+                "expires_at": v.expiresAt,
+            ]
+        }
+        func vrepRequest(_ log: MembershipLog, _ c: [String: Any], _ challenge: [String: Any], _ slot: String, _ key: String) throws -> VerifierReportRequest {
+            try VerifierReportRequest(log: log, challengeJson: js(challenge), signer: s(c["signer"]), slot: slot,
+                origin: s(c["station"]), keyId: key, nowMs: u(c["now_ms"]))
+        }
+        check("verifier report: challenges") {
+            for c in a(vrep["challenges"]).map(o) {
+                guard let fields = c["fields"] as? [String: Any] else {
+                    try reportError(s(c["code"])) { _ = try parseVerifierReportChallenge(challengeJson: s(c["text"])) }
+                    continue
+                }
+                let r = try parseVerifierReportChallenge(challengeJson: s(c["text"]))
+                let got: [String: Any] = ["signer": r.signer, "slot": r.slot, "origin": r.origin, "connection": r.connection,
+                    "nonce": r.nonce, "issued_at": r.issuedAt, "expires_at": r.expiresAt]
+                try eq(canon(got), canon(fields), s(c["label"]))
+            }
+            func fresh(_ origin: String) throws -> VerifierReportChallenge {
+                try parseVerifierReportChallenge(challengeJson: try verifierReportChallenge(signer: "member:dev-phone",
+                    slot: "astation-ios", origin: origin, connection: 3, issuedAt: 1_793_264_000_000, expiresAt: 1_793_264_030_000))
+            }
+            let one = try fresh("https://Station-Dev.agora.build/")
+            let two = try fresh("https://station-dev.agora.build")
+            try eq(one.origin, "https://station-dev.agora.build", "the Station normalized")
+            try eq(one.nonce == two.nonce, false, "a fresh nonce each time")
+            try reportError("malformed") {
+                _ = try verifierReportChallenge(signer: "member:dev-phone", slot: "astation-ios", origin: "https://station-dev.agora.build",
+                    connection: 3, issuedAt: 1_793_264_000_000, expiresAt: 1_793_264_030_001)
+            }
+        }
+        check("verifier report: reports") {
+            for c in a(vrep["valid"]).map(o) + a(vrep["invalid"]).map(o) {
+                let verify = { try verifyVerifierReport(log: try vrepLog(c), reportJson: s(c["report"]),
+                    expectedChallengeJson: js(o(c["challenge"])), nowMs: u(c["now_ms"])) }
+                if let expect = c["expect"] as? [String: Any] {
+                    try eq(canon(vrepOut(try verify())), canon(expect), s(c["label"]))
+                } else {
+                    try reportError(s(c["code"])) { _ = try verify() }
+                }
+            }
+            // Among them: a native whose roles changed, a recovery still
+            // waiting, and a high-S P-256 signature.
+            var byCase: [String: [String: Any]] = [:]
+            for c in a(vrep["valid"]).map(o) + a(vrep["invalid"]).map(o) { byCase[s(c["label"])] = c }
+            try eq(o(byCase["native_after_set_roles"]!["expect"])["at_head"] as? Bool, false, "native_after_set_roles")
+            try eq(s(byCase["pending_recovery_subject"]!["code"]), "unknown_signer", "pending_recovery_subject")
+            try eq(s(byCase["high_s_signature"]!["code"]), "bad_signature", "high_s_signature")
+        }
+        check("verifier report: the builder") {
+            for c in a(vrep["builder"]).map(o) + a(vrep["request"]).map(o) {
+                let build = { try vrepRequest(try vrepLog(c), c, o(c["challenge"]), s(c["slot"]), "key") }
+                guard let want = c["body_but_process"] as? [String: Any] else {
+                    try reportError(s(c["code"])) { _ = try build() }
+                    continue
+                }
+                let text = try build().bodyJson()
+                var body = o(try JSONSerialization.jsonObject(with: Data(text.utf8)))
+                try eq(body.removeValue(forKey: "process") as? String, verifierReportProcess(), "\(s(c["label"])): this core's process")
+                try eq(canon(body), canon(want), s(c["label"]))
+            }
+        }
+        check("verifier report: the immutable request") {
+            #if canImport(CryptoKit)
+            let reporters = CryptoKitKeys()
+            for name in ["dev-phone", "dev-mac", "dev-desk", "svc-discord"] {
+                let k = key(name, "auth")
+                if s(k["alg"]) == "p256" { try reporters.addP256("\(name)/auth", secret: unhex(s(k["secret_hex"]))) }
+                else { try reporters.addEd25519("\(name)/auth", seed: unhex(s(k["secret_hex"]))) }
+            }
+            for c in a(vrep["request"]).map(o) {
+                let log = try vrepLog(c)
+                let keyId = s(c["key"])
+                let held = try vrepRequest(log, c, o(c["challenge"]), s(c["slot"]), keyId)
+                let body = held.bodyJson()
+                let sr = held.signRequest()
+                try eq(sr.purpose, .verifierReport, "purpose")
+                try eq(sr.freshConfirmation, false, "no confirmation")
+                try eq(sr.label, s(o(c["sign_request"])["label"]), "label")
+                try eq(sr.keyId, keyId, "key")
+                try eq(sr.bodyJson, body, "the held body shown")
+                try eq(hex(sr.input), hex(encodeFields(fields: [utf8(sr.label), utf8(body)])), "input")
+                for f in a(c["finishes"]).map(o) {
+                    var input = sr.input
+                    if let over = f["over"] as? [String: Any] {
+                        var other = o(c["challenge"])
+                        other["slot"] = s(over["slot"])
+                        input = try vrepRequest(log, c, other, s(over["slot"]), keyId).signRequest().input
+                    }
+                    let signer = s(f["signed_with"])
+                    let raw = try reporters.sign(request: SignRequest(keyId: signer, purpose: .verifierReport,
+                        freshConfirmation: false, label: sr.label, input: input, bodyJson: nil))
+                    let sig = try reporters.publicKey(keyId: signer).alg == .p256 ? lowS(raw) : raw
+                    if let code = f["code"] {
+                        try reportError(s(code)) { _ = try held.finish(signature: sig) }
+                    } else {
+                        try eq(try held.finish(signature: sig), "{\"body\":\(body),\"sig\":\"\(b64uString(sig))\"}", "\(s(c["label"])) \(s(f["label"]))")
+                    }
+                }
+                try eq(held.bodyJson(), body, "the held body never changes")
+            }
+            #endif
+        }
+        check("verifier report: the synchronous signer, through the app's provider") {
+            #if canImport(CryptoKit)
+            let c = o(a(vrep["request"])[0])
+            let log = try vrepLog(c)
+            let phone = CryptoKitKeys()
+            try phone.addP256("dev-phone/auth", secret: unhex(s(key("dev-phone", "auth")["secret_hex"])))
+            try phone.addP256("dev-mac/auth", secret: unhex(s(key("dev-mac", "auth")["secret_hex"])))
+            func sign(_ keyId: String) throws -> String {
+                try signVerifierReport(provider: phone, log: log, challengeJson: js(o(c["challenge"])), signer: s(c["signer"]),
+                    slot: s(c["slot"]), origin: s(c["station"]), keyId: keyId, nowMs: u(c["now_ms"]))
+            }
+            let v = try verifyVerifierReport(log: log, reportJson: try sign("dev-phone/auth"),
+                expectedChallengeJson: js(o(c["challenge"])), nowMs: u(c["now_ms"]))
+            try eq(v.process, verifierReportProcess(), "process")
+            try eq(phone.requests.count, 1, "one request")
+            try eq(phone.requests[0].purpose, .verifierReport, "purpose")
+            try eq(phone.requests[0].freshConfirmation, false, "no confirmation")
+            try reportError("bad_signature") { _ = try sign("dev-mac/auth") }
+            #endif
         }
         check("device-list actions: a manager signs each under a purpose that names it (R9.6 rule 4)") {
             #if canImport(CryptoKit)
@@ -2453,6 +2631,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 137)
+        XCTAssertEqual(passed, 142)
     }
 }

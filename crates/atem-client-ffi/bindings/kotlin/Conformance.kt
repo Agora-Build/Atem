@@ -9,6 +9,7 @@
 package atem.bindings.test
 
 import java.io.File
+import java.math.BigInteger
 import java.security.MessageDigest
 import java.util.Base64
 import uniffi.atem_client_ffi.*
@@ -38,6 +39,7 @@ fun AtemException.codeOf(): String = when (this) {
     is AtemException.Publish -> code
     is AtemException.Push -> code
     is AtemException.Stored -> code
+    is AtemException.Report -> code
     is AtemException.BadWelcome -> "bad_welcome"
     is AtemException.Request -> "request"
     is AtemException.State -> "state"
@@ -52,6 +54,7 @@ fun AtemException.detailOf(): String? = when (this) {
     is AtemException.Publish -> detail
     is AtemException.Push -> detail
     is AtemException.Stored -> detail
+    is AtemException.Report -> detail
     is AtemException.BadWelcome -> check
     is AtemException.Request -> detail
     is AtemException.State -> detail
@@ -611,6 +614,150 @@ fun main(args: Array<String>) {
                 eq(actual, if (expected == null) null else VerifierRequirement(
                     expected["action"].s(), expected["minimum_version"].l().toUInt()))
             }
+        }
+    }
+    // A member's verifier report (session-v1 R9.2 "How a verifier reports
+    // itself"; agreed for implementation on Astation #101): each challenge
+    // read or refused; each report verified, or refused as Report(code);
+    // each builder case as a VerifierReportRequest (its body but the
+    // process, which is this core's); the immutable request's finishes,
+    // signed here with the JDK (another body, another member: refused); and
+    // the synchronous signer through the app's provider.
+    val vrep = load("r9-vectors-verifier-report")
+    val p256N = BigInteger("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551", 16)
+    // A P-256 r||s with S low, as a report carries it.
+    fun lowS(sig: ByteArray): ByteArray {
+        val s = BigInteger(1, sig.copyOfRange(32, 64))
+        if (s <= p256N.shiftRight(1)) return sig
+        val t = p256N.subtract(s).toByteArray().let { it.copyOfRange(maxOf(0, it.size - 32), it.size) }
+        return sig.copyOfRange(0, 32) + ByteArray(32 - t.size) + t
+    }
+    val reporters = JdkKeys()
+    for (name in listOf("dev-phone", "dev-mac", "dev-desk", "svc-discord")) {
+        val k = keys[name]["auth"]
+        if (k["alg"].s() == "p256") reporters.addP256("$name/auth", unhex(k["secret_hex"].s()), unhex(k["pub_hex"].s()))
+        else reporters.addEd25519("$name/auth", unhex(k["secret_hex"].s()), unhex(k["pub_hex"].s()))
+    }
+    fun vrepLog(c: Any?): MembershipLog {
+        val at = HostClock(c["now_ms"].l().toULong(), 1000uL, "boot-1")
+        val chain = c["chain"].arr().map { label -> Json.write(vrep["entries"].arr().first { it["label"] == label }["entry"]) }
+        val log = MembershipLog.verify(account, genesis, l + chain, at)
+        c.obj()["freeze"]?.let { log.extend(listOf(entry(it.s())), at) }
+        return log
+    }
+    fun reportError(code: String, f: () -> Unit) {
+        try {
+            f()
+        } catch (e: AtemException.Report) {
+            eq(e.code, code, "code")
+            return
+        }
+        throw AssertionError("expected Report($code), nothing thrown")
+    }
+    fun vrepOut(v: VerifiedReport): Map<String, Any?> = mapOf(
+        "signer" to v.signer,
+        "kind" to v.kind.name.lowercase(),
+        "slot" to v.slot,
+        "process" to v.process,
+        "connection" to v.connection.toLong(),
+        "head" to mapOf("seq" to v.head.seq.toLong(), "hash" to v.head.hash),
+        "at_head" to v.atHead,
+        "inventory" to mapOf("version" to v.inventory.version.toLong(), "actions" to v.inventory.actions),
+        "expires_at" to v.expiresAt.toLong(),
+    )
+    fun vrepRequest(log: MembershipLog, c: Any?, challenge: Any?, slot: String, key: String) =
+        VerifierReportRequest(log, Json.write(challenge), c["signer"].s(), slot, c["station"].s(), key, c["now_ms"].l().toULong())
+    check("verifier report: challenges") {
+        for (c in vrep["challenges"].arr()) {
+            val fields = c.obj()["fields"]
+            if (fields == null) {
+                reportError(c["code"].s()) { parseVerifierReportChallenge(c["text"].s()) }
+                continue
+            }
+            val r = parseVerifierReportChallenge(c["text"].s())
+            eq(mapOf("signer" to r.signer, "slot" to r.slot, "origin" to r.origin, "connection" to r.connection.toLong(),
+                "nonce" to r.nonce, "issued_at" to r.issuedAt.toLong(), "expires_at" to r.expiresAt.toLong()), fields, c["label"].s())
+        }
+        fun fresh(origin: String) = parseVerifierReportChallenge(
+            verifierReportChallenge("member:dev-phone", "astation-ios", origin, 3uL, 1793264000000uL, 1793264030000uL))
+        val one = fresh("https://Station-Dev.agora.build/")
+        eq(one.origin, "https://station-dev.agora.build", "the Station normalized")
+        if (one.nonce == fresh("https://station-dev.agora.build").nonce) throw AssertionError("a fresh nonce each time")
+        reportError("malformed") {
+            verifierReportChallenge("member:dev-phone", "astation-ios", "https://station-dev.agora.build", 3uL, 1793264000000uL, 1793264030001uL)
+        }
+    }
+    check("verifier report: reports") {
+        for (c in vrep["valid"].arr() + vrep["invalid"].arr()) {
+            val verify = { verifyVerifierReport(vrepLog(c), c["report"].s(), Json.write(c["challenge"]), c["now_ms"].l().toULong()) }
+            val expect = c.obj()["expect"]
+            if (expect != null) eq(vrepOut(verify()), expect, c["label"].s())
+            else reportError(c["code"].s()) { verify() }
+        }
+        // Among them: a native whose roles changed, a recovery still
+        // waiting, and a high-S P-256 signature.
+        val byCase = (vrep["valid"].arr() + vrep["invalid"].arr()).associateBy { it["label"].s() }
+        eq(byCase.getValue("native_after_set_roles")["expect"]["at_head"], false, "native_after_set_roles")
+        eq(byCase.getValue("pending_recovery_subject")["code"], "unknown_signer", "pending_recovery_subject")
+        eq(byCase.getValue("high_s_signature")["code"], "bad_signature", "high_s_signature")
+    }
+    check("verifier report: the builder") {
+        for (c in vrep["builder"].arr() + vrep["request"].arr()) {
+            val build = { vrepRequest(vrepLog(c), c, c["challenge"], c["slot"].s(), "key") }
+            val want = c.obj()["body_but_process"]
+            if (want == null) {
+                reportError(c["code"].s()) { build() }
+                continue
+            }
+            val body = LinkedHashMap(Json.parse(build().bodyJson()).obj())
+            eq(body.remove("process"), verifierReportProcess(), "${c["label"].s()}: this core's process")
+            eq(body, want, c["label"].s())
+        }
+    }
+    check("verifier report: the immutable request") {
+        for (c in vrep["request"].arr()) {
+            val log = vrepLog(c)
+            val key = c["key"].s()
+            val held = vrepRequest(log, c, c["challenge"], c["slot"].s(), key)
+            val body = held.bodyJson()
+            val sr = held.signRequest()
+            eq(sr.purpose, SigningPurpose.VERIFIER_REPORT, "purpose")
+            eq(sr.freshConfirmation, false, "no confirmation")
+            eq(sr.label, c["sign_request"]["label"].s(), "label")
+            eq(sr.keyId, key, "key")
+            eq(sr.bodyJson, body, "the held body shown")
+            eq(hex(sr.input), hex(encodeFields(listOf(utf8(sr.label), utf8(body)))), "input")
+            for (f in c["finishes"].arr()) {
+                val input = if (f["over"] == "held") sr.input else {
+                    val slot = f["over"]["slot"].s()
+                    val other = LinkedHashMap(c["challenge"].obj()).also { it["slot"] = slot }
+                    vrepRequest(log, c, other, slot, key).signRequest().input
+                }
+                val signer = f["signed_with"].s()
+                val raw = reporters.sign(SignRequest(signer, SigningPurpose.VERIFIER_REPORT, false, sr.label, input, null))
+                val sig = if (reporters.publicKey(signer).alg == KeyAlg.P256) lowS(raw) else raw
+                val code = f.obj()["code"]
+                if (code == null) {
+                    val b64 = Base64.getUrlEncoder().withoutPadding().encodeToString(sig)
+                    eq(held.finish(sig), "{\"body\":$body,\"sig\":\"$b64\"}", "${c["label"].s()} ${f["label"].s()}")
+                } else reportError(code.s()) { held.finish(sig) }
+            }
+            eq(held.bodyJson(), body, "the held body never changes")
+        }
+    }
+    check("verifier report: the synchronous signer, through the app's provider") {
+        val c = vrep["request"][0]
+        val log = vrepLog(c)
+        val keysUsed = JdkKeys()
+        val k = keys["dev-phone"]["auth"]
+        keysUsed.addP256("dev-phone/auth", unhex(k["secret_hex"].s()), unhex(k["pub_hex"].s()))
+        val report = signVerifierReport(keysUsed, log, Json.write(c["challenge"]), c["signer"].s(), c["slot"].s(), c["station"].s(), "dev-phone/auth", c["now_ms"].l().toULong())
+        val v = verifyVerifierReport(log, report, Json.write(c["challenge"]), c["now_ms"].l().toULong())
+        eq(v.process, verifierReportProcess(), "process")
+        eq(keysUsed.requests.single().purpose, SigningPurpose.VERIFIER_REPORT, "purpose")
+        eq(keysUsed.requests.single().freshConfirmation, false, "no confirmation")
+        reportError("bad_signature") {
+            signVerifierReport(reporters, log, Json.write(c["challenge"]), c["signer"].s(), c["slot"].s(), c["station"].s(), "dev-mac/auth", c["now_ms"].l().toULong())
         }
     }
     check("device-list actions: a manager signs each under a purpose that names it (R9.6 rule 4)") {

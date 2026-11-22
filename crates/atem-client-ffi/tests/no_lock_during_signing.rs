@@ -103,6 +103,7 @@ impl AppKeyProvider for Prompting {
             atem_client::SignLabel::MembershipEntry,
             atem_client::SignLabel::BrowserGrant,
             atem_client::SignLabel::ChannelClient,
+            atem_client::SignLabel::VerifierReport,
         ]
         .into_iter()
         .find(|l| l.as_str().as_bytes() == fields[0])
@@ -271,6 +272,43 @@ fn the_welcome_info_carries_the_hosts_verifier() {
             detail: "verifier".into()
         }
     );
+}
+
+/// A member's verifier report (Astation #101): the body is built under
+/// the log's lock, which is released before the provider signs.
+#[test]
+fn a_verifier_report_holds_no_lock() {
+    let log = log_l();
+    let provider = Prompting::new();
+    let l = log.clone();
+    provider.set_probe(Box::new(move || {
+        let _ = l.head();
+        let _ = l.members();
+    }));
+    let challenge = atem_client_ffi::member_report::verifier_report_challenge(
+        "member:dev-phone".into(),
+        "astation-ios".into(),
+        "https://station-dev.agora.build".into(),
+        1,
+        WALL - 1_000,
+        WALL + 20_000,
+    )
+    .unwrap();
+    let report = atem_client_ffi::member_report::sign_verifier_report(
+        provider.clone(),
+        log.clone(),
+        challenge.clone(),
+        "member:dev-phone".into(),
+        "astation-ios".into(),
+        "https://station-dev.agora.build".into(),
+        "dev-phone/auth".into(),
+        WALL,
+    )
+    .unwrap();
+    atem_client_ffi::member_report::verify_verifier_report(log, report, challenge, WALL).unwrap();
+    let prompts = provider.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1);
+    assert!(!prompts[0].fresh_confirmation);
 }
 
 #[test]

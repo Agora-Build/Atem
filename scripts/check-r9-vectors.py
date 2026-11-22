@@ -19,7 +19,11 @@ to 6 and II.4.4's, written here from host-work-v1 §11.5), and
 `r9-vectors-mailbox-calls`, whose refusal codes and scenario outcomes,
 answers and states it derives with readers and a model of the Station's
 mailbox written here from host-work-v1 §11.5 ("The mailbox calls"), not
-from the shared core's reference mailbox. The other files'
+from the shared core's reference mailbox, and
+`r9-vectors-verifier-report`, whose every challenge reading, report code
+(in the agreed order) or verified fields, builder outcome and request
+finish it derives from that file's rules (session-v1 R9.2, Astation #101).
+The other files'
 `expect` and each `reason` are checked by the Rust runner
 (`crates/atem-client/tests/vectors.rs`) and the binding suites.
 It also recomputes every Station report id of the acknowledgment fixtures
@@ -318,6 +322,9 @@ KEY_LABELS = {
     "K-gen-3/": "K-gen-3",
     "K-evil/": "K-evil",
     "not-recovery/": "not the recovery key",
+    # The verifier-report vectors' Ed25519 native (R9.2).
+    "dev-desk/auth": "dev-desk auth",
+    "dev-desk/enc": "dev-desk enc",
     "recovery/R": "recovery kit R",
     "recovery-2/R": "recovery-kit-2",
     # The delegated host-work actions (II.2.2, II.3.1, II.4.1).
@@ -3775,6 +3782,392 @@ def check_host_route(file, data, report, context):
         case.equal(codes, {(v, c) for v in ROUTE_KINDS for c in ("malformed", "bad_signature")}, "each verifier refuses the other kind and a relabelled proof")
 
 
+# ------------------------------------------------ r9-vectors-verifier-report
+
+# A member's signed verifier report (session-v1 R9.2 "How a verifier reports
+# itself"; agreed for implementation on Astation #101): its body's fields,
+# the body's challenge echo, and the challenge a minter stores.
+VR_BODY_FIELDS = ["account_id", "challenge", "genesis_hash", "head", "process", "signer", "slot", "type", "v", "verifier"]
+VR_ECHO_FIELDS = ["connection", "expires_at", "issued_at", "nonce", "origin"]
+VR_CHALLENGE_FIELDS = ["connection", "expires_at", "issued_at", "nonce", "origin", "signer", "slot"]
+VR_LABEL = "atem-verifier-report-v1"
+VR_MAX_LEASE_MS = 30_000
+VR_MAX_CHALLENGE_BYTES = 4096
+VR_MAX_OBJECT_BYTES = 16 * 1024
+# The report's signer: an r9 principal name with an opaque id; only a
+# member and a service can sign (the others are unknown_signer).
+VR_SIGNER = r"(member|service|host|browser):([A-Za-z0-9._:-]{1,128})"
+
+
+def b64u_encode(raw):
+    import base64
+
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def vr_int(v, low=0):
+    return type(v) is int and low <= v <= SAFE_MAX
+
+
+def vr_b64u(v, n):
+    try:
+        return isinstance(v, str) and len(b64u_decode(v)) == n
+    except ValueError:
+        return False
+
+
+def vr_echo(o):
+    """The fields a challenge and a body's echo share, by R9.2's report
+    rules; raises Refused("malformed")."""
+    if not isinstance(o["origin"], str) or not relay_origin_ok(o["origin"]):
+        raise Refused("malformed")
+    if not vr_int(o["connection"], 1) or not vr_b64u(o["nonce"], 32):
+        raise Refused("malformed")
+    issued, expires = o["issued_at"], o["expires_at"]
+    if not vr_int(issued) or not vr_int(expires) or not 0 < expires - issued <= VR_MAX_LEASE_MS:
+        raise Refused("malformed")
+
+
+def vr_strict(text, bound):
+    if len(text.encode("utf-8")) > bound:
+        raise Refused("malformed")
+    try:
+        return relay_parse(text)
+    except ValueError:  # NotStrict, and json's own errors
+        raise Refused("malformed")
+
+
+def read_vr_challenge(text):
+    """ReportChallenge::parse as written from the file's note: exactly the
+    seven fields, the signer a member or a service."""
+    value = vr_strict(text, VR_MAX_CHALLENGE_BYTES)
+    if not isinstance(value, dict) or sorted(value) != VR_CHALLENGE_FIELDS:
+        raise Refused("malformed")
+    signer = value["signer"]
+    m = re.fullmatch(VR_SIGNER, signer) if isinstance(signer, str) else None
+    if m is None or m.group(1) not in ("member", "service"):
+        raise Refused("malformed")
+    if not isinstance(value["slot"], str) or re.fullmatch(OPAQUE_ID, value["slot"]) is None:
+        raise Refused("malformed")
+    vr_echo(value)
+    return value
+
+
+def vr_arrays_ok(value, path=()):
+    """No null anywhere; an array only at verifier.actions (a set: strictly
+    ascending by bytes)."""
+    if value is None:
+        return False
+    if isinstance(value, dict):
+        return all(vr_arrays_ok(v, path + (k,)) for k, v in value.items())
+    if isinstance(value, list):
+        if path != ("verifier", "actions") or not all(isinstance(v, str) for v in value):
+            return False
+        raw = [v.encode() for v in value]
+        return all(a < b for a, b in zip(raw, raw[1:]))
+    return True
+
+
+def read_vr_report(text):
+    """The report as the shared core reads it: strict I-JSON within 16 KiB,
+    exactly body and sig, the body's jcs within 4,096 bytes, exactly its
+    fields at every level and each field's grammar. Returns (body, sig)."""
+    value = vr_strict(text, VR_MAX_OBJECT_BYTES)
+    if not isinstance(value, dict) or sorted(value) != ["body", "sig"]:
+        raise Refused("malformed")
+    body = value["body"]
+    try:
+        sig = b64u_decode(value["sig"])
+    except ValueError:
+        raise Refused("malformed")
+    if not isinstance(body, dict) or not vr_arrays_ok(body):
+        raise Refused("malformed")
+    if body.get("type") != "atem-verifier-report" or type(body.get("v")) is not int or body["v"] != 1:
+        raise Refused("malformed")
+    if len(jcs(body).encode("utf-8")) > MAX_BODY_BYTES or sorted(body) != VR_BODY_FIELDS:
+        raise Refused("malformed")
+    account = body["account_id"]
+    if not isinstance(account, str) or not 1 <= len(account.encode()) <= 128:
+        raise Refused("malformed")
+    for text_field in ("genesis_hash",):
+        if not isinstance(body[text_field], str) or re.fullmatch(HEX64, body[text_field]) is None:
+            raise Refused("malformed")
+    head = body["head"]
+    if (
+        not isinstance(head, dict) or sorted(head) != ["hash", "seq"] or not vr_int(head["seq"], 1)
+        or not isinstance(head["hash"], str) or re.fullmatch(HEX64, head["hash"]) is None
+    ):
+        raise Refused("malformed")
+    if not isinstance(body["signer"], str) or re.fullmatch(VR_SIGNER, body["signer"]) is None:
+        raise Refused("malformed")
+    if not isinstance(body["slot"], str) or re.fullmatch(OPAQUE_ID, body["slot"]) is None:
+        raise Refused("malformed")
+    if not vr_b64u(body["process"], 16):
+        raise Refused("malformed")
+    echo = body["challenge"]
+    if not isinstance(echo, dict) or sorted(echo) != VR_ECHO_FIELDS:
+        raise Refused("malformed")
+    vr_echo(echo)
+    if not verifier_ok(body["verifier"]):
+        raise Refused("malformed")
+    return body, sig
+
+
+class VrList:
+    """A device list as the report's checks read it, replayed from L and a
+    case's chain: who is a member of which kind and with which key, the
+    chain's entry hashes, and a freeze."""
+
+    def __init__(self, bodies, frozen):
+        self.members, self.hashes, self.frozen = {}, [], frozen
+        for body in bodies:
+            self.hashes.append(sha256(enc(["atem-membership-hash-v1", jcs(body)])).hex())
+            action = body["action"]
+            if action in ("genesis", "add"):
+                member = body["member"]
+                self.members[member["device_id"]] = dict(member, standing="active")
+            elif action == "recovery_add":
+                # Pending: the vectors' lists are read within its 24 h wait,
+                # and no chain here approves or vetoes it.
+                self.members[body["member"]["device_id"]] = dict(body["member"], standing="pending")
+            elif action == "set_roles" and "roles" in body:
+                # Roles change, the standing and the key don't.
+                self.members[body["device_id"]]["roles"] = body["roles"]
+            elif action == "remove":
+                self.members[body["device_id"]]["standing"] = "removed"
+        self.account_id = bodies[0]["account_id"]
+        self.genesis_hash = self.hashes[0]
+
+    def head(self):
+        return {"seq": len(self.hashes), "hash": self.hashes[-1]}
+
+    def signer(self, signer, now):
+        """(kind, alg, public key) of a current signer, or Refused."""
+        m = re.fullmatch(VR_SIGNER, signer)
+        kind = {"member": "native", "service": "service"}.get(m.group(1))
+        member = self.members.get(m.group(2))
+        if kind is None or member is None or member["standing"] != "active" or member["kind"] != kind:
+            raise Refused("unknown_signer")
+        if kind == "service" and now >= member["expires_at"]:
+            raise Refused("signer_expired")
+        return kind, member["auth_key"]["alg"], b64u_decode(member["auth_key"]["pub"])
+
+
+def vr_verify(text, lst, expected, now):
+    """verify_verifier_report, from the file's note: the first failure in
+    the agreed order, or the verified report."""
+    body, sig = read_vr_report(text)
+    if lst.frozen:
+        raise Refused("frozen")
+    if body["account_id"] != lst.account_id or body["genesis_hash"] != lst.genesis_hash:
+        raise Refused("wrong_account")
+    kind, alg, public = lst.signer(body["signer"], now)
+    if not verify(alg, public, sig, enc([VR_LABEL, jcs(body)])):
+        raise Refused("bad_signature")
+    head = body["head"]
+    if head["seq"] > len(lst.hashes):
+        raise Refused("stale_log")
+    if lst.hashes[head["seq"] - 1] != head["hash"]:
+        raise Refused("fork")
+    if body["signer"] != expected["signer"]:
+        raise Refused("signer_mismatch")
+    if body["slot"] != expected["slot"]:
+        raise Refused("slot_mismatch")
+    if any(body["challenge"][k] != expected[k] for k in VR_ECHO_FIELDS):
+        raise Refused("challenge_mismatch")
+    if now >= expected["expires_at"]:
+        raise Refused("expired")
+    return {
+        "signer": body["signer"], "kind": kind, "slot": body["slot"], "process": body["process"],
+        "connection": body["challenge"]["connection"], "head": head, "at_head": head == lst.head(),
+        "inventory": body["verifier"], "expires_at": body["challenge"]["expires_at"],
+    }
+
+
+def vr_normalize(origin):
+    """station_route::normalize_relay for a configured Station: the scheme
+    and host lowercased, a default port and a lone trailing "/" dropped;
+    None for anything it refuses."""
+    if not isinstance(origin, str) or not origin.isascii() or len(origin) > 1024 or "@" in origin:
+        return None
+    m = re.fullmatch(r"([A-Za-z][A-Za-z0-9+.-]*)://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])(?::([0-9]{1,5}))?/?", origin)
+    if m is None:
+        return None
+    scheme, host, port = m.group(1).lower(), m.group(2).lower(), m.group(3)
+    if port is not None and int(port) == {"https": 443, "http": 80}.get(scheme):
+        port = None
+    out = f"{scheme}://{host}" + (f":{int(port)}" if port is not None else "")
+    return out if relay_origin_ok(out) else None
+
+
+def vr_build(case, lst, inventory):
+    """verifier_report_body, from the file's note: the body but its process,
+    or Refused."""
+    signer, slot, now, challenge = case["signer"], case["slot"], case["now_ms"], case["challenge"]
+    m = re.fullmatch(VR_SIGNER, signer)
+    if m is None or m.group(1) not in ("member", "service") or re.fullmatch(OPAQUE_ID, slot) is None:
+        raise Refused("malformed")
+    station = vr_normalize(case["station"])
+    if station is None:
+        raise Refused("malformed")
+    if lst.frozen:
+        raise Refused("frozen")
+    if challenge["origin"] != station:
+        raise Refused("origin_mismatch")
+    if challenge["signer"] != signer:
+        raise Refused("signer_mismatch")
+    if challenge["slot"] != slot:
+        raise Refused("slot_mismatch")
+    lst.signer(signer, now)
+    if now >= challenge["expires_at"]:
+        raise Refused("expired")
+    return {
+        "type": "atem-verifier-report", "v": 1, "account_id": lst.account_id, "genesis_hash": lst.genesis_hash,
+        "head": lst.head(), "signer": signer, "slot": slot,
+        "challenge": {k: challenge[k] for k in VR_ECHO_FIELDS}, "verifier": inventory,
+    }
+
+
+def vr_sign(keys, name, message):
+    """A signature by an r9-vectors-keys key (`<name>/<part>`), P-256 low S."""
+    key_name, part = name.split("/")
+    entry = keys.keys[key_name]
+    key = entry if part == "" else entry[part]
+    secret = unhex(key["secret_hex"])
+    if key["alg"] == "ed25519":
+        return ed25519.Ed25519PrivateKey.from_private_bytes(secret).sign(message)
+    from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+
+    der = ec.derive_private_key(int.from_bytes(secret, "big"), ec.SECP256R1()).sign(message, ec.ECDSA(hashes.SHA256()))
+    r, s = decode_dss_signature(der)
+    s = min(s, P256_N - s)
+    return r.to_bytes(32, "big") + s.to_bytes(32, "big")
+
+
+def check_verifier_report(file, data, report, context):
+    """Every case's verdict derived here from the file's note (R9.2's report
+    as agreed on Astation #101): each challenge text read or refused; each
+    report's code in the agreed order, or its verified fields, against log
+    L and the case's chain (the entries' signatures verified with dev-mac's
+    key, the hashes recomputed), the valid reports' jcs, signing input and
+    signature by their signer's key; the builder's bodies (but their
+    process) and refusals; and the immutable request's finishes, signed
+    here (P-256 with a fresh nonce) over the held body with the vectors'
+    process."""
+    keys = context["keys"]
+    mlog = context["membership_log"]
+    inventory = {"version": 2, "actions": sorted(R9_2_ACTIONS, key=str.encode)}
+    log_l = [v["entry"]["body"] for v in mlog["log"]]
+    others = {v["label"]: v["entry"]["body"] for v in mlog["log"] + mlog["others"]}
+    entries = {e["label"]: e for e in data["entries"]}
+    def base_of(labels):
+        return log_l + [entries[label]["entry"]["body"] for label in labels]
+
+    with report.case(file, "entries") as case:
+        for e in data["entries"]:
+            body = e["entry"]["body"]
+            base = base_of(e["on"])
+            case.equal(body["prev_hash"], sha256(enc(["atem-membership-hash-v1", jcs(base[-1])])).hex(), f"{e['label']} chains on L + {e['on']}")
+            case.equal(body["seq"], len(base) + 1, f"{e['label']} seq")
+            case.equal(sha256(enc(["atem-membership-hash-v1", jcs(body)])).hex(), e["entry_hash"], f"{e['label']} entry_hash")
+            # Its signer's key on the list it extends: a current member's
+            # auth_key, or the recovery key of L's genesis.
+            if body["signer"] == "recovery":
+                key = base[0]["recovery_key"]
+            else:
+                member = VrList(base, False).members.get(body["signer"], {})
+                key = member.get("auth_key") if member.get("standing") == "active" else None
+            case.check(
+                key is not None and verify(key["alg"], b64u_decode(key["pub"]), b64u_decode(e["entry"]["sig"]), enc(["atem-membership-entry-v1", jcs(body)])),
+                f"{e['label']} signed by {body['signer']}",
+            )
+        desk = entries["VR7_add_desk"]["entry"]["body"]["member"]
+        case.equal((desk["auth_key"]["alg"], b64u_decode(desk["auth_key"]["pub"])), ("ed25519", keys.public("dev-desk", "auth")), "dev-desk's Ed25519 key")
+        case.equal(jcs(entries["VR7_recovery_add_newmac"]["entry"]), jcs(next(v["entry"] for v in mlog["others"] if v["label"] == "R7")), "VR7_recovery_add_newmac is R7, byte for byte")
+
+    def lst(c):
+        for i, label in enumerate(c["chain"]):
+            if entries[label]["on"] != c["chain"][:i]:
+                raise ValueError(f"{label} doesn't extend {c['chain'][:i]}")
+        bodies = base_of(c["chain"])
+        frozen = False
+        if "freeze" in c:
+            # A carriage at a position the list holds, by a current
+            # manager, another body: the conflict rule freezes (R9.4).
+            other = others[c["freeze"]]
+            signer = VrList(bodies, False).members.get(other["signer"], {})
+            frozen = (
+                other["seq"] <= len(bodies)
+                and jcs(other) != jcs(bodies[other["seq"] - 1])
+                and signer.get("standing") == "active"
+                and "manage" in signer.get("roles", [])
+            )
+        return VrList(bodies, frozen)
+
+    for c in data["challenges"]:
+        with report.case(file, f"challenge {c['label']}") as case:
+            try:
+                fields = read_vr_challenge(c["text"])
+                case.equal(fields, c.get("fields"), "read, its fields")
+            except Refused as e:
+                case.equal(e.code, c.get("code"), "refused")
+    codes = set()
+    for c in data["valid"] + data["invalid"]:
+        with report.case(file, f"report {c['label']}") as case:
+            expected = read_vr_challenge(json.dumps(c["challenge"]))
+            try:
+                verified = vr_verify(c["report"], lst(c), expected, c["now_ms"])
+                case.equal(verified, c.get("expect"), "verified")
+                body = json.loads(c["report"])["body"]
+                case.equal(jcs(body), c["jcs"], "jcs")
+                case.equal(enc([VR_LABEL, jcs(body)]).hex(), c["signing_input_hex"], "signing input")
+                name, part = c["signed_with"].split("/")
+                case.check(
+                    verify(keys.keys[name][part]["alg"], keys.public(name, part), b64u_decode(json.loads(c["report"])["sig"]), enc([VR_LABEL, jcs(body)])),
+                    f"signed by {c['signed_with']}",
+                )
+            except Refused as e:
+                case.equal(e.code, c.get("code"), "refused")
+                codes.add(e.code)
+                if c["label"] == "high_s_signature":
+                    # A genuine malleation: S above n / 2, and its low-S twin
+                    # is the signer's valid signature.
+                    report_ = json.loads(c["report"])
+                    sig = b64u_decode(report_["sig"])
+                    s_ = int.from_bytes(sig[32:], "big")
+                    case.check(s_ > P256_N // 2, "S is high")
+                    twin = sig[:32] + (P256_N - s_).to_bytes(32, "big")
+                    case.check(verify("p256", keys.public("dev-phone", "auth"), twin, enc([VR_LABEL, jcs(report_["body"])])), "its low-S twin verifies")
+    with report.case(file, "coverage") as case:
+        case.equal(sorted(codes), sorted(["malformed", "frozen", "wrong_account", "unknown_signer", "signer_expired", "bad_signature", "stale_log", "fork", "signer_mismatch", "slot_mismatch", "challenge_mismatch", "expired"]), "every verifier code")
+        labels = {c["label"] for c in data["valid"] + data["invalid"]}
+        for label in ("native_after_set_roles", "native_after_set_roles_at_head", "pending_recovery_subject", "high_s_signature"):
+            case.check(label in labels, f"{label} present")
+    for c in data["builder"] + data["request"]:
+        with report.case(file, f"builder {c['label']}") as case:
+            try:
+                body = vr_build(c, lst(c), inventory)
+                case.equal(body, c.get("body_but_process"), "the body but its process")
+            except Refused as e:
+                case.equal(e.code, c.get("code"), "refused")
+    for c in data["request"]:
+        with report.case(file, f"request {c['label']}") as case:
+            case.equal(c["sign_request"], {"purpose": "verifier_report", "fresh_confirmation": False, "label": VR_LABEL}, "sign request")
+            held = dict(c["body_but_process"], process=b64u_encode(b"vectors-process!"))
+            signer_alg = keys.keys[c["key"].split("/")[0]]["auth"]["alg"]
+            signer_pub = keys.public(c["key"].split("/")[0], "auth")
+            for f in c["finishes"]:
+                if f["over"] == "held":
+                    over = held
+                else:
+                    over = dict(held, slot=f["over"]["slot"])
+                sig = vr_sign(keys, f["signed_with"], enc([VR_LABEL, jcs(over)]))
+                ok = verify(signer_alg, signer_pub, sig, enc([VR_LABEL, jcs(held)]))
+                case.equal(ok, "code" not in f, f"{f['label']}: {'taken' if ok else 'refused'}")
+                if not ok:
+                    case.equal(f["code"], "bad_signature", f"{f['label']}: bad_signature")
+
+
 # ------------------------------------------- host-work/requests-v1 (task ops)
 
 # The requests naming a task (host-work-v1 §4 "Query, cancel, complete",
@@ -4071,6 +4464,7 @@ CHECKERS = [
     ("r9-vectors-host-envelope", check_host_envelope),
     ("r9-vectors-station-calls", check_station_calls),
     ("r9-vectors-mailbox-calls", check_mailbox_calls),
+    ("r9-vectors-verifier-report", check_verifier_report),
 ]
 
 

@@ -128,6 +128,9 @@ pub fn not_expressible(scenario: &Value) -> Option<String> {
         (Some("vectors"), _) if name == "r9-vectors-required-verifier" => {
             "unsigned device-list entry bodies and the signing gate's requirement of each (R9.2), no host process: crates/atem-client/tests/required_verifier.rs (the shared core's required_version) and crates/atem-client-ffi/tests/required_verifier.rs (the production export); scripts/check-r9-vectors.py doesn't check it".into()
         }
+        (Some("vectors"), _) if name == "r9-vectors-verifier-report" => {
+            "a member's signed verifier report (R9.2 \"How a verifier reports itself\"), between a native app, an SDK process or a bot and the signer that minted its challenge, no host process: crates/atem-client/tests/verifier_report.rs (the shared core's member_report), crates/atem-client-ffi/tests/verifier_report.rs (the production export) and scripts/check-r9-vectors.py".into()
+        }
         (Some("vectors"), _) => "known-answer vectors (exact bytes), no host process: crates/atem-client/tests/vectors.rs (and channel_fixtures.rs for the handshake)".into(),
         (_, Some("client")) if name == "r9-handshake-wrong-head" => {
             "the client refusing an accept with the wrong head: no host acts in it (crates/atem-client/tests/channel_fixtures.rs)".into()

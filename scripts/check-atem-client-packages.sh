@@ -6,8 +6,8 @@
 # §7): the SHA-256 sums, the source pin, the shared vectors listed in the sums
 # and unchanged (host-work requests, prompt framing, framing size, the
 # host-result header's framing; r9 control, push-hint, delegated-wire,
-# host-envelope, Station-call and required-verifier vectors; the
-# acknowledgment fixtures), no test-only or host-role export in
+# host-envelope, Station-call, required-verifier and verifier-report
+# vectors; the acknowledgment fixtures), no test-only or host-role export in
 # the shipped bindings (the framing's vectors-only rendering and host mail
 # included), and each package used once: the Node build of the WASM package
 # runs the packaged framing vectors (escaping, Unicode version, the preflight
@@ -44,6 +44,7 @@ SHIPPED_VECTORS=(
   r9-vectors-host-envelope.json:r9-vectors-host-envelope.json
   r9-vectors-station-calls.json:r9-vectors-station-calls.json
   r9-vectors-required-verifier.json:r9-vectors-required-verifier.json
+  r9-vectors-verifier-report.json:r9-vectors-verifier-report.json
 )
 for fixture in "$ROOT"/designs/protocol/fixtures/r9-control-ack-*.json; do
   SHIPPED_VECTORS+=("$(basename "$fixture"):$(basename "$fixture")")
