@@ -845,15 +845,20 @@ impl AckLedgerHandle {
 /// snapshot, the first failure answered: `invalid_record` (not valid at the
 /// head; a removed manager's original is `removed_manager`: a current
 /// manager signs it again), `wrong_origin`, `not_candidate_feed` (a record
-/// the service's own key signed names the candidate feed; a current
-/// manager's stop may name any feed of the origin, so an unchanged
-/// original is carried as it is), `cover_not_first` (a covered principal's
-/// cover comes first, a hold or release after it; a covered principal
-/// with no cover), `not_above_mark` (the service's own key, issued at or
-/// below its principal's mark or with none), `uncovered_cover`, then
+/// signed anew with the service's own key names the candidate feed; a
+/// cover, hold or release is always signed anew), `cover_not_first` (a
+/// covered principal's cover comes first, a hold or release after it; a
+/// covered principal with no cover), `not_above_mark` (signed anew with
+/// the service's own key, issued at or below its principal's mark or with
+/// none), `uncovered_cover`, then
 /// `stop_lost` (a revocation or its interrupt in force from the retained
 /// records, not from the snapshot alone on a fresh state; holds and
-/// releases aren't compared: the Portal's current state decides them).
+/// releases aren't compared: the Portal's current state decides them). A
+/// snapshot `revoke` or `interrupt_running` whose signed object (body and
+/// signature) is a retained record's is that stop carried as it is,
+/// whoever signed it (a current manager or the service's own key): it
+/// needs neither the candidate feed nor the mark, but is still valid at
+/// the head and of your origin.
 ///
 /// Errors: a record its parse refuses is `Invalid{code}` (its parse code);
 /// any other input outside its grammar (an origin not in its exact form, a

@@ -1584,18 +1584,20 @@ Station that recovers from a rollback publishes a replacement feed: a new
 reconstructed safety clock (a revoke counts from any feed, rule 3, and a
 native's `issued_at` is display only):
 
-- A current native manager's original `revoke` or `interrupt_running` is
-  carried as it is, though it names the old `feed_id`: on a host that
-  applied it from the old feed each effect is a `duplicate`, on one that
-  never read it each applies. Only a removed manager's original needs a
-  current manager's fresh signature, a new `record_id` (`removed_manager`,
-  I.5.4). "As they are" above is such a stop.
-- A record the service's own key signs in the snapshot (a cover, hold,
-  release, revoke or `interrupt_running`) is signed anew: it names the
-  candidate feed and is issued after its principal's mark (the Station's
-  high-water mark, `U_p` after a rollback, #114 item 1). A cover issued no
-  later than a host's evicted floor is refused there as a possible replay
-  (rule 1).
+- "As they are" above covers any retained stop carried unchanged: a
+  `revoke` or `interrupt_running` whose signed object (body and
+  signature) is a retained record's, whether a current manager or the
+  service's own key signed it. It is carried though it names the old
+  `feed_id` and was issued before the mark: on a host that applied it
+  from the old feed each effect is a `duplicate`, on one that never read
+  it each applies. Only a removed manager's original needs a current
+  manager's fresh signature, a new `record_id` (`removed_manager`, I.5.4).
+- A retained cover, hold or release is never carried as it is: the
+  snapshot's are signed anew, as is any other record the service's own
+  key signs there. Each names the candidate feed and is issued after its
+  principal's mark (the Station's high-water mark, `U_p` after a
+  rollback, #114 item 1). A cover issued no later than a host's evicted
+  floor is refused there as a possible replay (rule 1).
 - The replacement ledger starts with no carried settlement: only freshly
   proved associations, and acks naming the candidate feed on sockets
   opened after the recovery, settle it. The Station enforces that at
@@ -1617,13 +1619,17 @@ revoke_seq?}`:
 |---|---|
 | `invalid_record` | the record isn't valid at the head (`reason`: `verify_control`'s pending or refusal code; a removed manager's original is `removed_manager`) |
 | `wrong_origin` | a service's record names another Station's origin |
-| `not_candidate_feed` | a record the service's own key signed doesn't name the candidate feed (a current manager's stop may name any feed of the origin) |
+| `not_candidate_feed` | a record signed anew with the service's own key doesn't name the candidate feed (a cover, hold or release always is signed anew; a current manager's stop, and a retained stop carried unchanged, may name any feed of the origin) |
 | `cover_not_first` | a covered principal's first record isn't its cover, or a hold or release comes before its principal's cover; at the end (`index`: the snapshot's length), a covered principal with no cover |
-| `not_above_mark` | a record the service's own key signed is issued at or below its principal's mark, or the principal has none |
+| `not_above_mark` | a record signed anew with the service's own key is issued at or below its principal's mark, or the principal has none (a retained stop carried unchanged needs no mark) |
 | `uncovered_cover` | a cover of a principal outside the covered set |
 | `stop_lost` | at the end: a revocation, or its interrupt, in force in a `ControlState` built from the retained records but not after the snapshot alone is applied to a fresh state (`reason`: `revocation` or `interrupt`; `record_id`: the retained revoke that revoked a service; `revoke_seq`: a host principal's interrupt). Holds and releases aren't compared: the Portal's current state decides them |
 
-Both states are built at the head as a host builds its own, the retained
+A snapshot `revoke` or `interrupt_running` whose signed object (body and
+signature) is a retained record's is that stop carried unchanged
+(**ruling R52**, from "Resets" above): it skips `not_candidate_feed` and
+`not_above_mark`, whoever signed it, and must still be valid at the head
+and of this origin. Both states are built at the head as a host builds its own, the retained
 records at no position, the snapshot at its positions in the candidate
 feed, a record left pending applied once more after the rest. **It checks
 consistency only:** never that the retained records are the whole
@@ -1779,8 +1785,10 @@ a counted id each refusing a release.
 (**New with #114, items 2 and 6, agreed with Astation 2026-11-22.**) The
 records `M7_revoke_interrupt` (a current manager's revoke with
 `interrupt_running`, naming the old feed), `M8_revoke_resigned_a2` (M3's
-stop signed again for the replacement feed), `M9_revoke_other_station`
-and `A2_cover_at_floor`; the sequences `Q28`…`Q31` (a current manager's
+stop signed again for the replacement feed), `M9_revoke_other_station`,
+`A2_cover_at_floor`, `S12_revoke_signed_anew_for_the_old_feed` and
+`A2_revoke_at_mark` (the Station's own revoke signed anew, naming the old
+feed, and at the mark); the sequences `Q28`…`Q31` (a current manager's
 original stop carried unchanged into the replacement feed: each effect a
 `duplicate` on a host that read the old feed, applied on one that
 didn't), `Q32` (a removed manager's original refused there, its copy

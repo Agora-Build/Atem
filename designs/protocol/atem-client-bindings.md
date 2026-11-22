@@ -1888,8 +1888,8 @@ Start the replacement feed's ledger empty, with no carried settlement
 (`AckLedgerHandle::new`, never the restored state), and admit only acks
 naming the candidate feed, on sockets opened after the recovery: the
 ledger checks the origin, never the `feed_id`, so that rule is yours.
-Record the snapshot's records as any others; a current manager's original
-stop is carried as it is (it names the old feed), and each host reports it
+Record the snapshot's records as any others; a retained stop is carried as
+it is (it names the old feed), and each host reports it
 again as it reads the snapshot (`r9-control-ack-replacement-feed`).
 
 ### The snapshot checker
@@ -1908,7 +1908,7 @@ you: what a rollback lost, nothing here can see (#114, items 1, 3 and 4).
 | `origin`, `candidate_feed_id` | your exact origin (as `AckLedgerHandle::new` takes it) and the replacement feed's `feed_id` (a UUID v4) |
 | `retained_json` | the records the restored Station retained, in their feed's order (each record's JSON) |
 | `snapshot_json` | the snapshot's records, in publication order |
-| `marks` | `ControlSnapshotMark{principal, mark_ms}` per service principal, once each: a record its own key signs is issued strictly after `mark_ms` (`U_p` after a rollback, or the mark you sign above) |
+| `marks` | `ControlSnapshotMark{principal, mark_ms}` per service principal, once each: a record its own key signs anew is issued strictly after `mark_ms` (`U_p` after a rollback, or the mark you sign above) |
 | `covered` | the principals the snapshot covers (`service:<id>`), once each |
 
 It answers `ControlSnapshotConsistency::Consistent`, or `Inconsistent{index,
@@ -1917,17 +1917,21 @@ failed, record by record in publication order, then over the whole
 snapshot (`index` the snapshot's length then): `invalid_record` (not valid
 at the head; `reason` the verifier's code, a removed manager's original
 `removed_manager`: have a current manager sign it again),
-`wrong_origin`, `not_candidate_feed` (a record the service's own key signed
-names the candidate feed; a current manager's stop may name any feed of
-your origin), `cover_not_first` (each covered principal's cover first, a
-hold or release after it; a covered principal with no cover),
-`not_above_mark` (the service's own key, issued at or below the mark, or
-no mark), `uncovered_cover`, and `stop_lost` (a revocation, or its
+`wrong_origin`, `not_candidate_feed` (a record signed anew with the
+service's own key names the candidate feed; a cover, hold or release is
+always signed anew), `cover_not_first` (each covered principal's cover
+first, a hold or release after it; a covered principal with no cover),
+`not_above_mark` (signed anew with the service's own key, issued at or
+below the mark, or no mark), `uncovered_cover`, and `stop_lost` (a revocation, or its
 interrupt, in force from the retained records but not from the snapshot
 alone on a fresh host; `reason` `revocation` or `interrupt`, `record_id`
 the retained revoke that revoked a service, `revoke_seq` a host
 principal's interrupt). Holds and releases aren't compared: the Portal's
-current state decides them. Errors: a record its parse refuses is
+current state decides them. A snapshot `revoke` or `interrupt_running`
+whose signed object (body and signature) is a retained record's is that
+stop carried as it is (ruling R52), whoever signed it, a current manager
+or the service's own key: it may name the old feed and needs no mark, but
+must still be valid at the head and of your origin. Errors: a record its parse refuses is
 `Invalid{code}`; any other input outside its grammar (an origin not in its
 exact form, a candidate that isn't a UUID v4, a principal that isn't
 `service:<id>`, marked or covered twice, a mark above 2^53 − 1, a frozen

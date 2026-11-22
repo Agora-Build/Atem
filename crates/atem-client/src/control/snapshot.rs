@@ -20,24 +20,34 @@
 //!    refusal code). A removed manager's original is `removed_manager`: a
 //!    current manager signs it again, a new `record_id` (I.5.4).
 //! 2. `wrong_origin`: a service's record naming another Station's origin.
-//! 3. `not_candidate_feed`: a record the service's own key signed (a
-//!    cover, hold, release, revoke or interrupt) that doesn't name the
-//!    candidate feed: in a snapshot it is signed anew. A current manager's
-//!    stop may name any feed of this origin: carried unchanged, it still
-//!    names the old feed, and hosts apply a stop from any feed (rule 3;
-//!    #114 item 2).
+//! 3. `not_candidate_feed`: a record signed anew with the service's own
+//!    key that doesn't name the candidate feed. A cover, hold or release is
+//!    always signed anew, even when it is a retained record's bytes. A
+//!    current manager's stop may name any feed of this origin, and so may
+//!    a retained stop carried as it is (below).
 //! 4. `cover_not_first`: a covered principal's first record isn't its
 //!    cover, or a hold or release comes before its principal's cover; at
 //!    the end, a covered principal the snapshot holds no cover for.
-//! 5. `not_above_mark`: a record the service's own key signed, issued at
-//!    or below its principal's mark (`U_p`, or the mark the Station signs
-//!    above), or for a principal with no mark given.
+//! 5. `not_above_mark`: a record signed anew with the service's own key,
+//!    issued at or below its principal's mark (`U_p`, or the mark the
+//!    Station signs above), or for a principal with no mark given.
 //! 6. `uncovered_cover`: a cover for a principal outside the covered set.
 //! 7. `stop_lost`, at the end: a revocation, or the interrupt of one, in
 //!    force in a [`ControlState`] built from the retained records but not
 //!    in force after the snapshot alone is applied to a fresh state (a
 //!    host that never read the old feed). Holds and releases aren't
 //!    compared: the Portal's current state decides those.
+//!
+//! **Carried as it is** (ruling R52, from §11.1 "Resets": the snapshot's
+//! revoke and interrupt records "as they are or signed anew"). A snapshot
+//! `revoke` or `interrupt_running` whose signed object (body and signature)
+//! is a retained record's is that record carried unchanged, whoever signed
+//! it (a current manager or the service's own key): it needs neither the
+//! candidate feed nor the mark (a stop applies from any feed, rule 3, and
+//! needs no safety clock, #114 R4 and item 2). It must still be valid at
+//! the head (a removed manager's original is `invalid_record`) and of this
+//! origin. Any other record the service's own key signs in a snapshot is
+//! signed anew.
 //!
 //! **Both states** are built at the verifying head, as a host builds its
 //! own ([`ControlState::apply`], `host_applied_seq` the head's `seq`): the
@@ -76,7 +86,8 @@ pub struct SnapshotInput<'a> {
     /// The snapshot's records, in publication order.
     pub snapshot: &'a [ControlRecord],
     /// Each service principal's mark (`service:<id>` → ms since the
-    /// epoch): a record its own key signs is issued strictly after it.
+    /// epoch): a record its own key signs anew is issued strictly after
+    /// it.
     pub marks: &'a BTreeMap<String, u64>,
     /// The principals the snapshot covers (`service:<id>`).
     pub covered: &'a BTreeSet<String>,
@@ -186,13 +197,15 @@ pub fn check_snapshot_consistency(input: &SnapshotInput<'_>) -> Result<SnapshotC
             ControlCheck::Refused(reason) => return at(Code::InvalidRecord, Some(reason.code())),
         }
         // Valid, so the service's own key signed it when it names its
-        // principal as its signer.
+        // principal as its signer. A retained stop carried as it is (ruling
+        // R52) is no record signed anew, whoever signed it.
         let own_key = *rec.signer() == ControlSigner::Principal;
+        let signed_anew = own_key && !carried_stop(input, rec);
         if let Some((origin, feed_id)) = rec.feed() {
             if origin != input.origin {
                 return at(Code::WrongOrigin, None);
             }
-            if own_key && feed_id != input.candidate_feed_id {
+            if signed_anew && feed_id != input.candidate_feed_id {
                 return at(Code::NotCandidateFeed, None);
             }
         }
@@ -206,7 +219,7 @@ pub fn check_snapshot_consistency(input: &SnapshotInput<'_>) -> Result<SnapshotC
             return at(Code::CoverNotFirst, None);
         }
         let mark = input.marks.get(&principal);
-        if own_key && mark.is_none_or(|mark| rec.issued_at() <= *mark) {
+        if signed_anew && mark.is_none_or(|mark| rec.issued_at() <= *mark) {
             return at(Code::NotAboveMark, None);
         }
         if cover {
@@ -224,6 +237,17 @@ pub fn check_snapshot_consistency(input: &SnapshotInput<'_>) -> Result<SnapshotC
         Some(lost) => SnapshotConsistency::Inconsistent(lost),
         None => SnapshotConsistency::Consistent,
     })
+}
+
+/// Whether `rec` is a retained stop carried as it is (ruling R52): a
+/// `revoke` or `interrupt_running` whose signed object, body and signature,
+/// is a retained record's. A cover, hold or release is never one: it is
+/// always signed anew.
+fn carried_stop(input: &SnapshotInput<'_>, rec: &ControlRecord) -> bool {
+    matches!(
+        rec.action(),
+        ControlAction::Revoke { .. } | ControlAction::InterruptRunning { .. }
+    ) && input.retained.iter().any(|r| r.object() == rec.object())
 }
 
 /// The input's grammar (the docs of [`check_snapshot_consistency`]).

@@ -1258,9 +1258,10 @@ data_enum! {
 
 record! {
     /// A service principal's mark for `check_control_snapshot_consistency`:
-    /// a record the service's own key signs in the snapshot is issued
-    /// strictly after `mark_ms` (`U_p`, or the mark the Station signs
-    /// above; ms since the epoch).
+    /// a record the service's own key signs anew in the snapshot is
+    /// issued strictly after `mark_ms` (`U_p`, or the mark the Station
+    /// signs above; ms since the epoch). A retained stop carried unchanged
+    /// needs no mark.
     pub struct ControlSnapshotMark {
         /// `service:<id>`.
         pub principal: String,

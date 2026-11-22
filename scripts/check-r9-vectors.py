@@ -1010,12 +1010,16 @@ def derive_snapshot(case, snap, by_label, entries):
     Rust runner and the suites pin those); then, record by record in
     publication order, invalid_record (not valid; reason: the verdict's),
     wrong_origin (a service's record naming another origin),
-    not_candidate_feed (a record the service's own key signed, signer =
-    principal, naming another feed than the candidate: a current manager's
-    stop may name any feed of the origin), cover_not_first (a covered
+    not_candidate_feed (a record signed anew with the service's own key,
+    signer = principal, naming another feed than the candidate: a current
+    manager's stop may name any feed of the origin, and so may a retained
+    revoke or interrupt_running carried unchanged, its wire record (body
+    and sig) a retained one's, whoever signed it (ruling R52); a cover,
+    hold or release is always signed anew), cover_not_first (a covered
     principal's first record isn't its cover, or a hold or release before
-    its principal's cover), not_above_mark (the service's own key, issued at
-    or below its principal's mark or with no mark), uncovered_cover; then a
+    its principal's cover), not_above_mark (signed anew with the service's
+    own key, issued at or below its principal's mark or with no mark),
+    uncovered_cover; then a
     covered principal with no cover (index: the snapshot's length); then
     stop_lost: the first principal (sorted) whose revocation, or interrupt
     (a host principal's lowest revoke_seq), is in force after the retained
@@ -1057,17 +1061,24 @@ def derive_snapshot(case, snap, by_label, entries):
             v = verdict(label)
             if v["verdict"] != "valid":
                 return at(i, "invalid_record", body, p, v.get("reason"))
-            own = body["signer"] == p
+            # Ruling R52: a retained revoke or interrupt_running carried
+            # unchanged (the same wire record, body and sig) is no record
+            # signed anew, whoever signed it; a cover, hold or release
+            # always is.
+            carried = action in ("revoke", "interrupt_running") and any(
+                by_label[r]["record"] == by_label[label]["record"] for r in snap["retained"]
+            )
+            anew = body["signer"] == p and not carried
             if "origin" in body:
                 if body["origin"] != snap["origin"]:
                     return at(i, "wrong_origin", body, p)
-                if own and body["feed_id"] != snap["candidate_feed_id"]:
+                if anew and body["feed_id"] != snap["candidate_feed_id"]:
                     return at(i, "not_candidate_feed", body, p)
             first = p not in seen
             seen.add(p)
             if (first and action != "cover" and p in covered) or (action in ("hold", "release") and p not in covers):
                 return at(i, "cover_not_first", body, p)
-            if own and (p not in marks or body["issued_at"] <= marks[p]):
+            if anew and (p not in marks or body["issued_at"] <= marks[p]):
                 return at(i, "not_above_mark", body, p)
             if action == "cover":
                 if p not in covered:
