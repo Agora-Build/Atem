@@ -1280,17 +1280,22 @@ data_enum! {
         /// Nothing handed in contradicts the snapshot.
         Consistent,
         /// The first check that failed. `code`, in the order the checks
-        /// run: `invalid_record` (`reason`: the verifier's pending or
-        /// refusal code), `wrong_origin`, `not_signed_anew`,
-        /// `not_candidate_feed`, `cover_not_first`, `uncovered_cover`,
-        /// `not_above_mark`, then `stop_lost` or `stop_not_resigned`
-        /// (`reason`: the verifier's code for the retained stop, which
-        /// isn't valid at the head; `effect`: `revocation` or `interrupt`;
-        /// `revoke_seq`: a host principal's interrupt). `index` is the
-        /// snapshot record's position (from 0), or the snapshot's length
-        /// for what only the whole snapshot shows (a covered principal
-        /// with no cover, a retained stop's effect not in force).
-        /// `record_id` is that snapshot record's, or the retained stop's.
+        /// run: `invalid_retained` (a retained record that isn't valid at
+        /// the head, but a removed manager's stop; `reason`: the
+        /// verifier's code; `index`: its position in the retained
+        /// records: verify them at a head that includes them, or drop what
+        /// doesn't verify, never re-sign it), `invalid_record` (`reason`:
+        /// the verifier's pending or refusal code), `wrong_origin`,
+        /// `not_signed_anew`, `not_candidate_feed`, `cover_not_first`,
+        /// `uncovered_cover`, `not_above_mark`, then `stop_lost` or
+        /// `stop_not_resigned` (a removed manager's retained stop, `reason`
+        /// `removed_manager`: a current manager signs it again; `effect`:
+        /// `revocation` or `interrupt`; `revoke_seq`: a host principal's
+        /// interrupt). `index` is otherwise the snapshot record's position
+        /// (from 0), or the snapshot's length for what only the whole
+        /// snapshot shows (a covered principal with no cover, a retained
+        /// stop's effect not in force). `record_id` is that snapshot
+        /// record's, or the retained record's.
         Inconsistent {
             index: u64,
             code: String,

@@ -1893,11 +1893,13 @@ names the old feed; a current manager's, **agreed with Astation, #114
 comment 7082464868, item 2**; your own service key's, Atem's reading of
 §11.1 "Resets", for Astation's confirmation on #114), and each host
 reports it again as it reads the snapshot
-(`r9-control-ack-replacement-feed`). A retained stop that isn't valid at
-your head can't be carried: have a current manager sign it again (a
-removed manager's), or verify at a head where it is valid (one pending,
-its signer not yet in your list); until then the checker below answers
-`stop_not_resigned`, never `Consistent`.
+(`r9-control-ack-replacement-feed`). A removed manager's retained stop
+can't be carried: have a current manager sign it again (the checker below
+answers `stop_not_resigned` until the copy is in the snapshot). Any other
+retained record that doesn't verify at your head is `invalid_retained`:
+verify the retained records at a head that includes them (a signer not
+yet in your list), or drop what doesn't verify (a forgery, another
+account's record); never re-sign it.
 
 ### The snapshot checker
 
@@ -1920,7 +1922,11 @@ you: what a rollback lost, nothing here can see (#114, items 1, 3 and 4).
 
 It answers `ControlSnapshotConsistency::Consistent`, or `Inconsistent{index,
 code, principal, record_id, reason, effect, revoke_seq}`, the first check
-that failed. Record by record in publication order: `invalid_record` (not
+that failed. First over the retained records: `invalid_retained`, one
+that isn't valid at your head but a removed manager's stop (`reason` the
+verifier's code, `index` its position in `retained_json`; verify at a
+head that includes them, or drop what doesn't verify, never re-sign it).
+Record by record in publication order: `invalid_record` (not
 valid at the head; `reason` the verifier's code, a removed manager's
 original `removed_manager`: have a current manager sign it again),
 `wrong_origin`, `not_signed_anew` (a cover, hold or release that is a
@@ -1931,10 +1937,10 @@ release after it), `uncovered_cover`, `not_above_mark` (signed anew with
 the service's own key, issued at or below the mark, or no mark). Then,
 with `index` the snapshot's length: `cover_not_first` for a covered
 principal with no cover, and each effect of each retained `revoke` or
-`interrupt_running`, valid at your head or not, that isn't in force after
-the snapshot alone on a fresh host: `stop_lost` when that retained stop is
-valid at the head, `stop_not_resigned` (`reason` the verifier's) when it
-isn't; `record_id` the retained stop, `effect` `revocation` or
+`interrupt_running` that isn't in force after the snapshot alone on a
+fresh host: `stop_lost` when that retained stop is valid at the head,
+`stop_not_resigned` (`reason` `removed_manager`) when a removed manager
+signed it, a stop a current manager signs again; `record_id` the retained stop, `effect` `revocation` or
 `interrupt`, `revoke_seq` a host principal's interrupt. Holds and
 releases aren't compared: the Portal's current state decides them. A
 snapshot `revoke` or `interrupt_running` whose signed object (body and

@@ -12,9 +12,17 @@
 //! here can see. Those stay the Station's and the owner's open
 //! obligations (#114, items 1, 3 and 4).
 //!
-//! **The checks**, record by record in publication order, then over the
-//! whole snapshot; the first that fails is the answer
-//! ([`SnapshotInconsistency`]):
+//! **The checks**, first over the retained records, then record by record
+//! in publication order, then over the whole snapshot; the first that
+//! fails is the answer ([`SnapshotInconsistency`]):
+//! 0. `invalid_retained`: a retained record that isn't valid at the
+//!    verifying head (`reason`: [`verify_control`]'s pending or refusal
+//!    code; `index`: its position in the retained records), but a stop a
+//!    removed manager signed (below). The input itself is in question:
+//!    verify the retained records at a head that includes them, or drop
+//!    what doesn't verify from what is passed as retained. Never a request
+//!    to sign anything again: a record whose signature nobody verified
+//!    (a forgery, another account's) is never a stop to re-sign.
 //! 1. `invalid_record`: the record isn't valid at the verifying head
 //!    ([`verify_control`] on the list given; `reason` is its pending or
 //!    refusal code). A removed manager's original is `removed_manager`: a
@@ -39,13 +47,12 @@
 //! 9. `stop_lost` or `stop_not_resigned`: an effect of a retained `revoke`
 //!    or `interrupt_running` (its principal's revocation, and the
 //!    interrupt with it) that isn't in force after the snapshot alone is
-//!    applied to a fresh state, a host that never read the old feed. Every
-//!    retained stop counts, valid at the head or not, in the retained
-//!    order: `stop_lost` when that stop is valid at the head (the snapshot
-//!    drops what it could carry), `stop_not_resigned` when it isn't
-//!    (`reason`: the verifier's; a removed manager's stop needs a current
-//!    manager's fresh signature, I.5.4, and one pending at the head, such
-//!    as `signer_unknown`, a head where it is valid). A retained service's
+//!    applied to a fresh state, a host that never read the old feed, in the
+//!    retained order: `stop_lost` when that stop is valid at the head (the
+//!    snapshot drops what it could carry), `stop_not_resigned` when it is
+//!    refused `removed_manager` (`reason`): a genuine stop, its signature
+//!    verified under the former manager's key, which a current manager
+//!    signs again (I.5.4). A retained service's
 //!    `interrupt_running` counts when its principal is revoked, by a
 //!    retained revoke or after the snapshot: until then it waits on every
 //!    host. A host principal's interrupt is in force when its device-list
@@ -79,7 +86,7 @@ use crate::station_route::normalize_relay;
 
 use super::record::{ControlAction, ControlPrincipal, ControlRecord, ControlSigner};
 use super::state::{ApplicationResult, ControlState, EffectKind, FeedPos};
-use super::verify::{ControlCheck, verify_control};
+use super::verify::{ControlCheck, RefusalReason, verify_control};
 
 /// What [`check_snapshot_consistency`] compares.
 #[derive(Debug, Clone, Copy)]
@@ -119,17 +126,19 @@ pub enum SnapshotConsistency {
 pub struct SnapshotInconsistency {
     /// The snapshot record's position (from 0); the snapshot's length for
     /// what only the whole snapshot shows (a covered principal with no
-    /// cover, a retained stop's effect not in force).
+    /// cover, a retained stop's effect not in force); for
+    /// `invalid_retained`, the record's position in the retained records.
     pub index: usize,
-    /// The snapshot record's `record_id`; for `stop_lost` and
-    /// `stop_not_resigned`, the retained stop's; `None` for a covered
-    /// principal with no cover.
+    /// The snapshot record's `record_id`; for `invalid_retained`,
+    /// `stop_lost` and `stop_not_resigned`, the retained record's; `None`
+    /// for a covered principal with no cover.
     pub record_id: Option<String>,
     /// The principal it is about (`service:<id>`, `host:<host_id>`).
     pub principal: String,
     pub code: InconsistencyCode,
-    /// `invalid_record` and `stop_not_resigned`: [`verify_control`]'s
-    /// pending or refusal code.
+    /// `invalid_retained`, `invalid_record` and `stop_not_resigned`
+    /// (always `removed_manager`): [`verify_control`]'s pending or refusal
+    /// code.
     pub reason: Option<String>,
     /// `stop_lost` and `stop_not_resigned`: the effect not in force,
     /// [`EffectKind::Revocation`] or [`EffectKind::Interrupt`].
@@ -142,6 +151,7 @@ pub struct SnapshotInconsistency {
 /// Why a snapshot is inconsistent (the module docs give each check).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InconsistencyCode {
+    InvalidRetained,
     InvalidRecord,
     WrongOrigin,
     NotSignedAnew,
@@ -157,6 +167,7 @@ impl InconsistencyCode {
     /// A stable name.
     pub fn code(self) -> &'static str {
         match self {
+            InconsistencyCode::InvalidRetained => "invalid_retained",
             InconsistencyCode::InvalidRecord => "invalid_record",
             InconsistencyCode::WrongOrigin => "wrong_origin",
             InconsistencyCode::NotSignedAnew => "not_signed_anew",
@@ -170,7 +181,8 @@ impl InconsistencyCode {
     }
 
     /// Every code, in the order the checks run.
-    pub const ALL: [InconsistencyCode; 9] = [
+    pub const ALL: [InconsistencyCode; 10] = [
+        InconsistencyCode::InvalidRetained,
         InconsistencyCode::InvalidRecord,
         InconsistencyCode::WrongOrigin,
         InconsistencyCode::NotSignedAnew,
@@ -205,6 +217,26 @@ pub fn check_snapshot_consistency(input: &SnapshotInput<'_>) -> Result<SnapshotC
             }))
         };
     use InconsistencyCode as Code;
+    // The retained records first: the input itself. Only a removed
+    // manager's stop may fail to verify (it is a genuine stop, its
+    // signature verified under its signer's key from the list's history).
+    for (i, rec) in input.retained.iter().enumerate() {
+        let reason = match verify_control(rec, input.list) {
+            ControlCheck::Valid(_) | ControlCheck::Refused(RefusalReason::RemovedManager) => {
+                continue;
+            }
+            ControlCheck::Pending(r) => r.code(),
+            ControlCheck::Refused(r) => r.code(),
+        };
+        let principal = rec.principal().name();
+        return found(
+            i,
+            Some(rec),
+            &principal,
+            Code::InvalidRetained,
+            Some(reason),
+        );
+    }
     // The principals with a record so far, and those with a cover.
     let mut seen = BTreeSet::new();
     let mut covers = BTreeSet::new();
@@ -300,7 +332,8 @@ fn is_service(name: &str) -> bool {
 /// The first effect of a retained stop, in the retained order (a
 /// record's revocation, then its interrupt), not in force after the
 /// snapshot alone: `stop_lost` when that stop is valid at the head,
-/// `stop_not_resigned` when it isn't (the module docs).
+/// `stop_not_resigned` when a removed manager signed it (the module docs;
+/// every other retained record verified at the head already).
 fn stop_lost(input: &SnapshotInput<'_>, end: usize) -> Option<SnapshotInconsistency> {
     let list = input.list;
     let fresh = in_force(list, input.snapshot, input.origin, input.candidate_feed_id);
@@ -319,10 +352,13 @@ fn stop_lost(input: &SnapshotInput<'_>, end: usize) -> Option<SnapshotInconsiste
         };
         let principal = rec.principal().name();
         let has = fresh.standing(&principal);
+        // Every other failure was reported as `invalid_retained` first.
         let (code, reason) = match verify_control(rec, list) {
-            ControlCheck::Valid(_) => (InconsistencyCode::StopLost, None),
-            ControlCheck::Pending(r) => (InconsistencyCode::StopNotResigned, Some(r.code())),
-            ControlCheck::Refused(r) => (InconsistencyCode::StopNotResigned, Some(r.code())),
+            ControlCheck::Refused(RefusalReason::RemovedManager) => (
+                InconsistencyCode::StopNotResigned,
+                Some(RefusalReason::RemovedManager.code()),
+            ),
+            _ => (InconsistencyCode::StopLost, None),
         };
         let lost = |effect, revoke_seq| SnapshotInconsistency {
             index: end,

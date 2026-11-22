@@ -965,7 +965,7 @@ def check_host_work_control(file, data, report, context):
 
 # check_snapshot_consistency's codes, in the order its checks run.
 SNAPSHOT_CODES = [
-    "invalid_record", "wrong_origin", "not_signed_anew", "not_candidate_feed",
+    "invalid_retained", "invalid_record", "wrong_origin", "not_signed_anew", "not_candidate_feed",
     "cover_not_first", "uncovered_cover", "not_above_mark", "stop_lost",
     "stop_not_resigned",
 ]
@@ -1008,8 +1008,10 @@ def snapshot_stops(labels, verdict, by_label, entry_at):
 def derive_snapshot(case, snap, by_label, entries):
     """A snapshot case (Astation #114, items 2 and 6), derived from the file
     alone: each record's verdict is its `checks` on the case's chain (the
-    Rust runner and the suites pin those). Record by record in publication
-    order: invalid_record (not valid; reason: the verdict's), wrong_origin
+    Rust runner and the suites pin those). First the retained records:
+    invalid_retained for the first that isn't valid (reason: the
+    verdict's; index: its position in retained), a removed manager's stop
+    excepted. Then record by record in publication order: invalid_record (not valid; reason: the verdict's), wrong_origin
     (a service's record naming another origin), not_signed_anew (a cover,
     hold or release whose wire record, body and sig, is a retained one's),
     not_candidate_feed (a record signed anew with the service's own key,
@@ -1021,14 +1023,15 @@ def derive_snapshot(case, snap, by_label, entries):
     not_above_mark (signed anew with the service's own key, issued at or
     below its principal's mark or with no mark). Then, at index the
     snapshot's length, cover_not_first for a covered principal with no
-    cover; then each effect of each retained revoke or interrupt_running,
-    valid at the head or not, in the retained order (the revocation, then
+    cover; then each effect of each retained revoke or interrupt_running
+    (valid, or a removed manager's), in the retained order (the revocation, then
     the interrupt), not in force after the snapshot alone (snapshot_stops;
     a service's interrupt is due once its principal is revoked by a
     retained revoke or after the snapshot, a host principal's is in force
     too when its device-list revoke carried interrupt_running): stop_lost
-    when that stop is valid at the head, stop_not_resigned (reason: the
-    verdict's) when it isn't, record_id that stop. The answer must be
+    when that stop is valid at the head, stop_not_resigned (reason
+    removed_manager) when a removed manager signed it, record_id that
+    stop. The answer must be
     `expect`, and `in_force` the stops derived after the retained records,
     the snapshot alone and both in order; a host that read the old feed
     keeps every stop. Returns the answer's code, or `consistent`."""
@@ -1063,6 +1066,11 @@ def derive_snapshot(case, snap, by_label, entries):
                 out["revoke_seq"] = revoke_seq
             return out
 
+        for i, label in enumerate(snap["retained"]):
+            v = verdict(label)
+            if v["verdict"] != "valid" and v.get("reason") != "removed_manager":
+                body = by_label[label]["record"]["body"]
+                return at(i, "invalid_retained", body, body["principal"], v.get("reason"))
         seen, covers = set(), set()
         for i, label in enumerate(snap["snapshot"]):
             body = by_label[label]["record"]["body"]
@@ -1109,7 +1117,7 @@ def derive_snapshot(case, snap, by_label, entries):
                 continue
             v = verdict(label)
             valid = v["verdict"] == "valid"
-            code, reason = ("stop_lost", None) if valid else ("stop_not_resigned", v.get("reason"))
+            code, reason = ("stop_lost", None) if valid else ("stop_not_resigned", "removed_manager")
             has = fresh.get(p, {"interrupted": []})
             if p.startswith("host:"):
                 seq = body["revoke_seq"]

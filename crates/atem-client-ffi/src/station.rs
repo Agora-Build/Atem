@@ -841,23 +841,28 @@ impl AckLedgerHandle {
 /// principal's mark, once each; `covered` the principals the snapshot
 /// covers (`service:<id>`), once each.
 ///
-/// Checked record by record in publication order, then over the whole
-/// snapshot, the first failure answered: `invalid_record` (not valid at the
-/// head; a removed manager's original is `removed_manager`: a current
-/// manager signs it again), `wrong_origin`, `not_signed_anew` (a cover,
-/// hold or release whose signed object is a retained record's: those are
-/// always signed anew), `not_candidate_feed` (a record signed anew with
-/// the service's own key names the candidate feed), `cover_not_first` (a
-/// covered principal's cover comes first, a hold or release after it),
+/// Checked first over the retained records: `invalid_retained` for one
+/// that isn't valid at the head, but a removed manager's stop (`reason` the
+/// verifier's code, `index` its position in `retained_json`): verify them
+/// at a head that includes them, or drop what doesn't verify from what you
+/// pass as retained; it is never a request to re-sign. Then record by
+/// record in publication order, then over the whole snapshot, the first
+/// failure answered: `invalid_record` (not valid at the head; a removed
+/// manager's original is `removed_manager`: a current manager signs it
+/// again), `wrong_origin`, `not_signed_anew` (a cover, hold or release
+/// whose signed object is a retained record's: those are always signed
+/// anew), `not_candidate_feed` (a record signed anew with the service's
+/// own key names the candidate feed), `cover_not_first` (a covered
+/// principal's cover comes first, a hold or release after it),
 /// `uncovered_cover`, `not_above_mark` (signed anew with the service's own
 /// key, issued at or below its principal's mark or with none); then a
 /// covered principal with no cover (`cover_not_first`), then each effect
-/// of each retained `revoke` or `interrupt_running`, valid at the head or
-/// not, that isn't in force after the snapshot alone on a fresh state:
+/// of each retained `revoke` or `interrupt_running` that isn't in force
+/// after the snapshot alone on a fresh state:
 /// `stop_lost` when that retained stop is valid at the head,
-/// `stop_not_resigned` (`reason`: the verifier's) when it isn't, a stop a
-/// current manager signs again (I.5.4), or verify at a head where it is
-/// valid. Holds and releases aren't compared: the Portal's current state
+/// `stop_not_resigned` (`reason` `removed_manager`) when a removed manager
+/// signed it, a genuine stop a current manager signs again (I.5.4).
+/// Holds and releases aren't compared: the Portal's current state
 /// decides them. A snapshot `revoke` or `interrupt_running` whose signed
 /// object (body and signature) is a retained record's is that stop
 /// carried as it is, whoever signed it (a current manager or the service's

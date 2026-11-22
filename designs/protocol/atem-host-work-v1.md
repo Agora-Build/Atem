@@ -1592,11 +1592,13 @@ reconstructed safety clock (a revoke counts from any feed, rule 3, and
   Astation (2026-11-22, #114 comment 7082464868, item 2)**; the service's
   own key's (a Station's own revoke or interrupt carried unchanged) is
   **Atem's reading of "Resets" and #114's R4 and item 2, for Astation's
-  confirmation on #114**: item 2 names only manager stops. A retained stop
-  that isn't valid at the head can't be carried: a removed manager's
-  original needs a current manager's fresh signature, a new `record_id`
-  (`removed_manager`, I.5.4), and one pending at the head (its signer not
-  yet in the list, say) a head where it is valid.
+  confirmation on #114**: item 2 names only manager stops. A removed
+  manager's original can't be carried: it needs a current manager's fresh
+  signature, a new `record_id` (`removed_manager`, I.5.4). Any other
+  retained record that doesn't verify at the head isn't the snapshot's to
+  fix: verify the retained records at a head that includes them (a
+  signer not yet in the list, say), or drop what doesn't verify (a
+  forgery, another account's record); it is never re-signed.
 - A retained cover, hold or release is never carried as it is: the
   snapshot's are signed anew, as is any other record the service's own
   key signs there. Each names the candidate feed and is issued after its
@@ -1623,6 +1625,7 @@ effect?, revoke_seq?}`, the codes in the order they are checked:
 
 | Code | When |
 |---|---|
+| `invalid_retained` | before any snapshot record: a retained record that isn't valid at the head, but a stop a removed manager signed (`reason`: `verify_control`'s pending or refusal code, such as `signer_unknown`, `bad_signature` or `wrong_account`; `index`: its position in the retained records; `record_id`: it). The input is in question: verify the retained records at a head that includes them, or drop what doesn't verify from what is passed as retained. Never a request to re-sign: nobody verified that record's signature |
 | `invalid_record` | the record isn't valid at the head (`reason`: `verify_control`'s pending or refusal code; a removed manager's original is `removed_manager`) |
 | `wrong_origin` | a service's record names another Station's origin |
 | `not_signed_anew` | a cover, hold or release whose signed object is a retained record's: those are always signed anew |
@@ -1631,10 +1634,11 @@ effect?, revoke_seq?}`, the codes in the order they are checked:
 | `uncovered_cover` | a cover of a principal outside the covered set |
 | `not_above_mark` | a record signed anew with the service's own key is issued at or below its principal's mark, or the principal has none (a retained stop carried unchanged needs no mark) |
 | `stop_lost` | after the last record: an effect of a retained `revoke` or `interrupt_running` that is valid at the head (its principal's revocation, and the interrupt with it) isn't in force after the snapshot alone is applied to a fresh state (`effect`: `revocation` or `interrupt`; `record_id`: that retained stop; `revoke_seq`: a host principal's interrupt) |
-| `stop_not_resigned` | the same for a retained stop that isn't valid at the head (`reason`: `verify_control`'s code): a current manager signs it again (I.5.4), or, pending at the head, the snapshot is verified at a head where it is valid |
+| `stop_not_resigned` | the same for a retained stop refused `removed_manager` (`reason`), a genuine stop whose signature verifies under its signer's key from the list's history: a current manager signs it again (I.5.4) |
 
-Every retained stop counts, in the retained order, valid at the head or
-not: a stop dropped from the snapshot is never `Consistent`. A retained
+Every retained stop counts, in the retained order: a stop dropped from
+the snapshot is never `Consistent`, and a retained record that doesn't
+verify is reported before anything is compared. A retained
 service's `interrupt_running` counts once its principal is revoked, by a
 retained revoke or after the snapshot (until then it waits on every
 host); a host principal's interrupt is in force too when its device-list
