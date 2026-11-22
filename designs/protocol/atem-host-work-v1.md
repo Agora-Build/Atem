@@ -4983,7 +4983,7 @@ sender's task"). Earlier: the receiving host's mailbox readings
 comment 6903887341][c-6903887341]). All of it runs only behind the
 debug-only hook.
 
-- **Routine encryption-key rotation**, a separate proposal still to write. As Astation said, it must define the manager's request, the owner's confirmation, the refusal of a reused key, the publication order and the old key's retention and retirement; `host_enc_key_get` is no rotation, and in-place re-verification is no way to one (session-v1 R9.13 item 8, R9.14 item 8).
+- **Routine encryption-key rotation**, proposed on 2026-11-22 ([#120 comment 7086542274](https://github.com/Agora-Build/Atem/issues/120#issuecomment-7086542274)), for Astation's agreement: a manager's `host_enc_key_new` makes the host's next key (pending, durable before its answer), the host promotes it when it commits the entry, and keeps the previous key 24 h on the delegated clock (none with `retire_previous`). As Astation said, it must define the manager's request, the owner's confirmation, the refusal of a reused key, the publication order and the old key's retention and retirement; `host_enc_key_get` is no rotation, and in-place re-verification is no way to one (session-v1 R9.13 item 8, R9.14 item 8).
 - **The shared pieces for Astation's own run:** the host-result framing vectors and renderers (`framing-host-result-v1.json`, [atem-client-bindings.md](atem-client-bindings.md)), published in the SDK pin `atem-client-sdk-bd19a6358885` with #190's `required_version` helper, whose shape Astation agreed on 2026-11-22 (session-v1 R9.2, "How the signing gate uses it").
 
 [c-6903887341]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-6903887341
