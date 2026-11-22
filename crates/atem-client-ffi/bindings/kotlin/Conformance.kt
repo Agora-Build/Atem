@@ -1,9 +1,9 @@
 // The shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json), the
 // host-work prompt-framing vectors (fixtures/host-work/prompt-framing-v1.json,
-// framing-size-v1.json) and the host-work result_id vectors
-// (fixtures/host-work/requests-v1.json) run through the Kotlin binding
-// (UniFFI + JNA), the same checks as the WASM (bindings/js/conformance.mjs)
-// and Swift runs. Usage:
+// framing-size-v1.json) and the host-work request, result_id, answers and
+// reply result vectors (fixtures/host-work/requests-v1.json) run through the
+// Kotlin binding (UniFFI + JNA), the same checks as the WASM
+// (bindings/js/conformance.mjs) and Swift runs. Usage:
 //   java -Djna.library.path=<dir of libatem_client_ffi.so> -cp … \
 //     atem.bindings.test.ConformanceKt <fixtures dir>
 package atem.bindings.test
@@ -1908,8 +1908,10 @@ fun main(args: Array<String>) {
         val known = requests["result_ids"].arr()
         eq(known.size, 2)
         for (c in known) eq(hostWorkResultId(c["task_id"].s()), c["result_id"].s(), c["name"].s())
-        val replies = requests["answers"].arr().filter { it["result"]["result"]["kind"] == "reply" }
-        eq(replies.size, 3)
+        val replies = requests["answers"].arr().filter {
+            it["result"]["result"]["kind"] == "reply" && it["request"]["data"]["op"] == "reply_query"
+        }
+        eq(replies.size, 9)
         for (c in replies) {
             val reply = c["result"]["result"]["reply"]
             val ok = reply == null || reply["result_id"].s() == hostWorkResultId(c["request"]["data"]["task_id"].s())
@@ -1917,22 +1919,23 @@ fun main(args: Array<String>) {
         }
     }
     // Every request case read as the core reads it (what sendJson seals):
-    // the owner's work_query, work_interrupt and work_resolve name a host
-    // sender's selector task (its UUID v5, host-work-v1 §11.2, §11.5), read
-    // as strictly as a UUID v4; the other task ops keep a UUID v4. And every
-    // answers case correlated as the connection correlates a result it reads.
+    // the owner's work_query, reply_query, work_interrupt and work_resolve
+    // name a host sender's selector task (its UUID v5, host-work-v1 §11.2,
+    // §11.5), read as strictly as a UUID v4; the other task ops keep a UUID
+    // v4. And every answers case correlated as the connection correlates a
+    // result it reads.
     check("host work: request vectors and result correlation (§11.2, §11.5)") {
         val cases = requests["cases"].arr()
         for (c in cases) {
             val text = if (c.obj().containsKey("raw")) c["raw"].s() else Json.write(c["message"])
             eq(hostWorkRequestValid(text), c["valid"] as Boolean, c["name"].s())
         }
-        for (name in listOf("work_query_selector_task", "work_interrupt_selector_task", "work_resolve_selector_task")) {
+        for (name in listOf("work_query_selector_task", "reply_query_selector_task", "work_interrupt_selector_task", "work_resolve_selector_task")) {
             eq(cases.any { it["name"] == name && it["valid"] == true }, true, name)
         }
         eq(hostWorkRequestValid("not json"), false)
         val answers = requests["answers"].arr()
-        eq(answers.size, 5)
+        eq(answers.size, 13)
         for (c in answers) {
             eq(hostWorkResultAnswers(Json.write(c["request"]), Json.write(c["result"])), c["answers"] as Boolean, c["name"].s())
         }
@@ -1941,6 +1944,85 @@ fun main(args: Array<String>) {
         val answering = answers.first { it["answers"] == true }
         val doubled = "{\"re\":\"99999999-9999-4999-8999-999999999999\"," + Json.write(answering["result"]).substring(1)
         eq(hostWorkResultAnswers(Json.write(answering["request"]), doubled), false, "a duplicate key")
+    }
+
+    // The owner's reply_query of a host sender's selector task (host-work-v1
+    // §11.2; Astation's ask, #120 comment 7082465179): the request reads and
+    // its uppercase, version 3 and variant forms don't; no reply yet and a
+    // reply in each state answer it, each with the selector task's own
+    // result_id; another task's reply, the same reply to a work_query and a
+    // status to the reply_query answer nothing.
+    check("host work: the owner's reply_query of a selector task (§11.2)") {
+        fun named(list: String, name: String) =
+            requests[list].arr().firstOrNull { it["name"] == name } ?: throw AssertionError("$name missing")
+        for ((name, valid) in listOf(
+            "reply_query_selector_task" to true,
+            "reply_query_selector_task_upper_case" to false,
+            "reply_query_task_id_version_3" to false,
+            "reply_query_task_id_variant" to false,
+        )) {
+            eq(named("cases", name)["valid"], valid, name)
+            eq(hostWorkRequestValid(Json.write(named("cases", name)["message"])), valid, name)
+        }
+        val selector = named("cases", "reply_query_selector_task")["message"]["data"]["task_id"].s()
+        for ((name, state) in listOf(
+            "null_reply_answers_its_selector_task" to null,
+            "reply_publishing_answers_its_selector_task" to "publishing",
+            "reply_submitted_answers_its_selector_task" to "submitted",
+            "reply_refused_answers_its_selector_task" to "refused",
+            "reply_dropped_answers_its_selector_task" to "submitted",
+        )) {
+            val c = named("answers", name)
+            eq(c["request"]["data"]["op"], "reply_query", name)
+            eq(c["request"]["data"]["task_id"], selector, name)
+            val reply = c["result"]["result"]["reply"]
+            if (state == null) {
+                eq(reply, null, name)
+            } else {
+                eq(reply["state"], state, name)
+                eq(reply["result_id"], hostWorkResultId(selector), name)
+            }
+            eq(hostWorkResultAnswers(Json.write(c["request"]), Json.write(c["result"])), true, name)
+        }
+        eq(named("answers", "reply_dropped_answers_its_selector_task")["result"]["result"]["reply"]["dropped"], true)
+        for (name in listOf(
+            "another_tasks_reply_does_not_answer_a_selector_task",
+            "a_reply_does_not_answer_a_work_query",
+            "a_work_status_does_not_answer_a_reply_query",
+        )) {
+            val c = named("answers", name)
+            eq(c["request"]["data"]["task_id"], selector, name)
+            eq(hostWorkResultAnswers(Json.write(c["request"]), Json.write(c["result"])), false, name)
+        }
+    }
+
+    // Every reply result of the vectors (results, host-work-v1 §4 "Reply")
+    // through hostWorkResultAnswers, as the answer to the owner's reply_query
+    // of the selector task (reply_query_selector_task, whose id and host every
+    // result names): as written, a case answers exactly when it is valid and
+    // its result_id is the selector task's (reply_submitted's and
+    // reply_dropped's name no task, so they don't); moved to the selector
+    // task's result_id (each case whose own is a lowercase UUID v5: not the two
+    // about the id's form), exactly when it is valid.
+    check("host work: reply results read as the core reads them (§4, §11.2)") {
+        val request = requests["cases"].arr().first { it["name"] == "reply_query_selector_task" }["message"]
+        val derived = hostWorkResultId(request["data"]["task_id"].s())
+        val replies = requests["results"].arr().filter { it["result"]["result"]["kind"] == "reply" }
+        eq(replies.size, 15)
+        val lowercaseV5 = Regex("[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+        var moved = 0
+        for (c in replies) {
+            val valid = c["valid"] as Boolean
+            val id = c["result"]["result"]["reply"]["result_id"].s()
+            eq(hostWorkResultAnswers(Json.write(request), Json.write(c["result"])), valid && id == derived, c["name"].s())
+            if (lowercaseV5.matches(id)) {
+                val text = Json.write(c["result"]).replace("\"result_id\":\"$id\"", "\"result_id\":\"$derived\"")
+                eq(text.contains("\"result_id\":\"$derived\""), true, c["name"].s())
+                eq(hostWorkResultAnswers(Json.write(request), text), valid, "${c["name"].s()}: as the selector task's")
+                moved++
+            }
+        }
+        eq(moved, 13)
     }
 
     println("kotlin conformance: $passed passed, ${failures.size} failed")

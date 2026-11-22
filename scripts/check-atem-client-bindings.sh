@@ -3,7 +3,8 @@
 # shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json), the
 # host-work prompt-framing vectors (fixtures/host-work/prompt-framing-v1.json,
 # framing-size-v1.json, framing-host-result-v1.json) and the host-work
-# request, result_id and answers vectors (fixtures/host-work/requests-v1.json):
+# request, result_id, answers and reply result vectors
+# (fixtures/host-work/requests-v1.json):
 #
 #   kotlin  UniFFI-generated Kotlin + JNA on the JVM (Linux, macOS)
 #   wasm    the wasm-bindgen build under Node (vectors, then the stateful flows)

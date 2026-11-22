@@ -1894,7 +1894,8 @@ impl HostBridge {
             | Request::Cancel { task_id, .. }
             | Request::Complete { task_id, .. } => {
                 // A UUID v5 names a host sender's selector task, the
-                // owner's alone, or is a missing task (§11.2, §11.5).
+                // owner's alone (its status and, a read, its reply), or is
+                // a missing task (§11.2, §11.5).
                 self.selector_task_named(&a, task_id)?;
                 let mut r = store
                     .work(task_id)
@@ -1928,9 +1929,16 @@ impl HostBridge {
                         }
                     }
                 }
+                // Reconciled from its receipt first, and written only when
+                // that changed it: a query (`work_query`, `reply_query`, a
+                // read) of a task whose record already says what its
+                // receipt decided writes nothing (as `follow_receipt`).
                 if r.status.state == WorkState::OutcomeUnknown {
+                    let before = r.status.clone();
                     self.reconcile_work(&mut r).map_err(|_| "busy")?;
-                    store.save_work(&r).map_err(|_| "busy")?;
+                    if r.status != before {
+                        store.save_work(&r).map_err(|_| "busy")?;
+                    }
                 }
                 // A delegated task's cancel withdraws a live attempt first.
                 if r.delegated.is_some() && matches!(req, Request::Cancel { .. }) {

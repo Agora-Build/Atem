@@ -348,9 +348,9 @@ pub fn host_work_result_id(task_id: String) -> String {
 }
 
 /// Whether the shared core's strict reader takes a whole host-work request
-/// (what `sendJson` seals): the owner's `work_query`, `work_interrupt` and
-/// `work_resolve` may name a host sender's selector task (its UUID v5,
-/// host-work-v1 §11.2, §11.5).
+/// (what `sendJson` seals): the owner's `work_query`, `reply_query`,
+/// `work_interrupt` and `work_resolve` may name a host sender's selector
+/// task (its UUID v5, host-work-v1 §11.2, §11.5).
 #[wasm_bindgen(js_name = hostWorkRequestValid)]
 pub fn host_work_request_valid(message_json: String) -> bool {
     crate::host_work::host_work_request_valid(message_json)

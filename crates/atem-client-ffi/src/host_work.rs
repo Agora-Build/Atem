@@ -17,8 +17,9 @@
 //!   it holds or shows;
 //! - [`host_work_request_valid`] is the reader `send_json` applies, for an
 //!   app's own check before it sends (the owner's `work_query`,
-//!   `work_interrupt` and `work_resolve` name a host sender's selector task,
-//!   its UUID v5, as well as a UUID v4: host-work-v1 §11.2, §11.5);
+//!   `reply_query`, `work_interrupt` and `work_resolve` name a host sender's
+//!   selector task, its UUID v5, as well as a UUID v4: host-work-v1 §11.2,
+//!   §11.5);
 //! - [`host_work_result_answers`] is the strict reader and the request
 //!   correlation the connection applies to a result, for a result an app
 //!   holds (not its binding to the channel, which it has none of).
@@ -40,10 +41,11 @@ pub fn host_work_result_id(task_id: String) -> String {
 /// host-work request (`{"type":"session","data":{…}}`, host-work-v1 §1):
 /// the check `ClientConnection::send_json` makes before it seals one (the
 /// welcome's features and host aside). The owner's `work_query`,
-/// `work_interrupt` and `work_resolve` may name a host sender's selector
-/// task (a lowercase UUID v5, §11.2, §11.5); every other op naming a task
-/// takes a UUID v4. Valid says nothing of who may name the task: the host
-/// answers a caller that may not exactly as it answers a missing task.
+/// `reply_query`, `work_interrupt` and `work_resolve` may name a host
+/// sender's selector task (a lowercase UUID v5, §11.2, §11.5); every other
+/// op naming a task takes a UUID v4. Valid says nothing of who may name
+/// the task: the host answers a caller that may not exactly as it answers
+/// a missing task.
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 pub fn host_work_request_valid(message_json: String) -> bool {
     Request::decode(message_json.as_bytes()).is_ok()
