@@ -381,13 +381,20 @@ Auth). Every ledger call is made at the Station's clock.
 | `{"report_failure": {"report_id", "status": n \| "no_answer", "code"?, "reached"?: true, "answer", "alerts"?: [alert]}}` | the Station POSTs that report and the Portal's answer is `status` (`no_answer`: a network error or a timeout; `reached`: the Portal recorded it before the answer was lost; `code`: the Portal's error code, for the reader). `answer` is its class (`ReportAnswer`: `retry`, `refuse`, `stop_reporting`): `retry` changes nothing, `refuse` is `refuse(report_id)` and `stop_reporting` is `stop_reporting(client_id)` under the Station's current report client ID, committed, and `alerts` are the operator alerts that transition raised (`{"kind": "report_refused", "report_id"}`, `{"kind": "reporting_stopped", "client_id"}`; none when absent) |
 | `{"resume_reporting": client_id, "alerts": [alert]}` | the Station restarts as the report client `client_id` (its current one from then on) and calls `resume_reporting(client_id)`, committed: the same ID as the stop's keeps every report, another ID drops the reports pending at that moment and nothing else (`{"kind": "reports_dropped", "client_id": <the stopped ID>, "dropped": [report_id]}`; every revocation reports on) |
 | `{"expect_resign_alerts": [label]}` | the records still alerted for re-signing (`resign_alerts`), by label |
+| `{"expect_counts": [count]}` | the ledger's counts, exactly as its state writes them (`to_json`'s `done`): each effect in force on a host, `{"effect", "host", "principal", "record_id", "revoke_seq"?}` (the record whose result first said so; `revoke_seq`, a host principal's interrupt), sorted by principal, effect (`revocation` first), `revoke_seq` and host |
 | `{"expect_refused": [report_id]}`, `{"expect_dropped": [report_id]}`, `{"expect_stopped": client_id \| false}` | the reports refused for good, sorted; the reports a resume under another report client ID dropped, sorted; the report client ID reporting is stopped under, or `false` |
 | `{"expect_portal": [report_id]}` | the report ids the Portal recorded, sorted, each with one body (a runner without a Portal model skips it) |
 
 An unknown step or key fails the run. The report ids are known answers:
 `scripts/check-r9-vectors.py` recomputes every one in these files from its
 definition (host-work-v1 §11.4, "Reports") and its report's integration
-and host. They run in `crates/atem-client/tests/r9_fixtures.rs` and in the
+and host, and derives each `expect_counts` from the steps alone (the
+records tracked and the acks taken). `r9-control-ack-replacement-feed`
+(Astation #114, items 2 and 6, agreed 2026-11-22): a Station's
+replacement feed carries a current manager's original stop unchanged
+(`M7_revoke_interrupt`, naming the old feed), a fresh ledger (no carried
+settlement) counts it per host from acks naming the new feed, and its
+re-sign alert ends once both covered hosts have each effect in force. They run in `crates/atem-client/tests/r9_fixtures.rs` and in the
 Swift, Kotlin and WASM conformance suites (through `AckLedgerHandle`).
 
 Delegated host work (`r9-delegated-*`, `side: "host"`; session-v1 R9.14,

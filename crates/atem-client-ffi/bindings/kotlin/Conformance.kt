@@ -1067,7 +1067,7 @@ fun main(args: Array<String>) {
     val ackNames = dir.list()!!.filter { it.startsWith("r9-control-ack-") && it.endsWith(".json") }
         .map { it.removeSuffix(".json") }.sorted()
     for (name in ackNames) check("Station acks: $name through AckLedgerHandle") {
-        eq(ackNames.size, 6, "the acknowledgment fixtures")
+        eq(ackNames.size, 7, "the acknowledgment fixtures")
         val f = load(name)
         val setup = f["setup"]
         val st = setup["station"]
@@ -1150,6 +1150,8 @@ fun main(args: Array<String>) {
                 }
                 "expect_resign_alerts" in o -> eq(ledger.resignAlerts(),
                     strs(o["expect_resign_alerts"]).map { ctlByLabel.getValue(it)["record"]["body"]["record_id"].s() }.sorted(), "$name resign alerts")
+                // The ledger's counts, as its state writes them (`done`).
+                "expect_counts" in o -> eq(canon(Json.parse(ledger.toJson())["done"]), canon(o["expect_counts"]), "$name counts")
                 "expect_refused" in o -> eq(ledger.refusedReports(), strs(o["expect_refused"]), "$name refused")
                 "expect_dropped" in o -> eq(ledger.droppedReports(), strs(o["expect_dropped"]), "$name dropped")
                 "resume_reporting" in o -> {

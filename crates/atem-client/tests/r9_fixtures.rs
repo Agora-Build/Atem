@@ -536,7 +536,7 @@ impl AckRun {
 
     /// Every step kind and the keys it takes (an unknown step or key
     /// fails the run).
-    const KINDS: [(&'static str, &'static [&'static str]); 15] = [
+    const KINDS: [(&'static str, &'static [&'static str]); 16] = [
         (
             "control_record",
             &["revoked_at_ms", "covered_hosts", "made", "commit"],
@@ -551,6 +551,7 @@ impl AckRun {
         ("report_failure", &[]),
         ("resume_reporting", &["alerts"]),
         ("expect_resign_alerts", &[]),
+        ("expect_counts", &[]),
         ("expect_refused", &[]),
         ("expect_dropped", &[]),
         ("expect_stopped", &[]),
@@ -674,6 +675,15 @@ impl AckRun {
                     .collect();
                 want.sort();
                 assert_eq!(self.ledger.resign_alerts(), want, "{}", self.name());
+            }
+            "expect_counts" => {
+                // The ledger's counts, as its state writes them (`done`).
+                assert_eq!(
+                    self.ledger.to_json()["done"],
+                    step["expect_counts"],
+                    "{}",
+                    self.name()
+                );
             }
             "expect_refused" => {
                 assert_eq!(
@@ -1251,7 +1261,7 @@ fn r9_control_ack_scenarios() {
         .map(|n| n.trim_end_matches(".json").to_owned())
         .collect();
     names.sort();
-    assert_eq!(names.len(), 6, "{names:?}");
+    assert_eq!(names.len(), 7, "{names:?}");
     let mut passed = 0;
     for name in &names {
         let file = load(name);
@@ -1265,4 +1275,156 @@ fn r9_control_ack_scenarios() {
         passed += report.passed;
     }
     eprintln!("total: {passed} checked");
+}
+
+/// Astation #114, item 2, end to end: a current manager's original stop
+/// carried unchanged into a Station's replacement feed (it names the old
+/// feed) as two hosts apply it with `ControlState::apply` (one that read
+/// the old feed: each effect a duplicate; one that never did: applied),
+/// their acks built from those results naming the new feed and its cursor
+/// are exactly `r9-control-ack-replacement-feed`'s, and they settle a fresh
+/// ledger (item 6: the replacement ledger starts with no carried
+/// settlement), each effect counted per host through that record.
+#[test]
+fn replacement_feed_acks_are_the_hosts_results_and_settle_a_fresh_ledger() {
+    use atem_client::control::{AckResult, ControlAck, ControlState, FeedPos};
+
+    let file = load("r9-control-ack-replacement-feed");
+    let control = load("r9-vectors-host-work-control");
+    let record = |label: &str| {
+        let v = control["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["label"] == label)
+            .unwrap_or_else(|| panic!("no control record {label}"));
+        ControlRecord::parse(v["record"].to_string().as_bytes()).unwrap()
+    };
+    let feed = |name: &str| {
+        let st = &control["stations"][name];
+        (
+            st["origin"].as_str().unwrap().to_owned(),
+            st["feed_id"].as_str().unwrap().to_owned(),
+        )
+    };
+    let ((origin, old), (_, new)) = (feed("A"), feed("A2"));
+    let at = |feed_id: &str, feed_seq| {
+        Some(FeedPos {
+            origin: origin.clone(),
+            feed_id: feed_id.to_owned(),
+            feed_seq,
+        })
+    };
+    let v = Vectors::load();
+    let clock = Clock::at(1_793_621_000_000);
+    let l = Membership::verify_chain(
+        ACCOUNT,
+        &genesis_hash(),
+        &v.entries(&["E1", "E2", "E3", "E4", "E5", "E6"]),
+        &clock.now,
+    )
+    .unwrap()
+    .membership;
+
+    // The fixture's acks, read as the Station reads them.
+    let steps = file["steps"].as_array().unwrap();
+    let fixture_ack = |host: &str| {
+        steps
+            .iter()
+            .filter_map(|step| step.get("control_ack"))
+            .find(|ack| ack["host_id"] == host)
+            .unwrap_or_else(|| panic!("no ack of {host}"))
+            .clone()
+    };
+
+    // The snapshot as a host reads the replacement feed from 0: each
+    // record's per-effect results, as its ack carries them.
+    let snapshot = ["A2_cover", "M7_revoke_interrupt"];
+    let read_new_feed = |mut state: ControlState, host: &str| {
+        let mut results = Vec::new();
+        for (i, label) in snapshot.iter().enumerate() {
+            let rec = record(label);
+            let t = state.apply(&rec, &l, at(&new, i as u64 + 1), 6);
+            results.push(AckResult::Record {
+                record_id: rec.record_id().to_owned(),
+                effects: t.applied.effects,
+            });
+            state = t.next;
+        }
+        let ack = ControlAck {
+            account_id: ACCOUNT.into(),
+            genesis_hash: genesis_hash(),
+            host_id: host.into(),
+            host_trust_gen: 1,
+            origin: origin.clone(),
+            feed_id: new.clone(),
+            cursor: snapshot.len() as u64,
+            results,
+        };
+        (state, ack)
+    };
+    // host-b applied S1_cover and M7 from the old feed; host-c never read it.
+    let mut b = ControlState::new(&l);
+    for (i, label) in ["S1_cover", "M7_revoke_interrupt"].iter().enumerate() {
+        b = b.apply(&record(label), &l, at(&old, i as u64 + 1), 6).next;
+    }
+    let (b, ack_b) = read_new_feed(b, "host-b");
+    let (c, ack_c) = read_new_feed(ControlState::new(&l), "host-c");
+    let m7 = record("M7_revoke_interrupt");
+    for (state, ack, result) in [(&b, &ack_b, "duplicate"), (&c, &ack_c, "applied")] {
+        let AckResult::Record { effects, .. } = &ack.results[1] else {
+            unreachable!()
+        };
+        assert!(effects.iter().all(|e| e.result.code() == result), "{ack:?}");
+        assert_eq!(
+            state.standing("service:svc-discord").revoked.as_deref(),
+            Some(m7.record_id())
+        );
+        assert_eq!(
+            ack.to_json().unwrap(),
+            fixture_ack(&ack.host_id),
+            "{}'s ack",
+            ack.host_id
+        );
+    }
+
+    // A fresh ledger: nothing counted until a host's ack on the new feed.
+    let link = |name: &str| {
+        let l = &file["setup"]["links"][name];
+        LinkAssociation {
+            account_id: l["account_id"].as_str().unwrap().into(),
+            genesis_hash: Hash32::from_hex(l["genesis_hash"].as_str().unwrap()).unwrap(),
+            host_id: l["host_id"].as_str().unwrap().into(),
+            host_trust_gen: l["host_trust_gen"].as_u64().unwrap(),
+            connection_id: l["connection_id"].as_str().unwrap().into(),
+        }
+    };
+    let now = file["setup"]["station_now_ms"].as_u64().unwrap();
+    let mut ledger = AckLedger::new(&origin, ACCOUNT, genesis_hash()).unwrap();
+    let hosts = ["host-b".to_owned(), "host-c".to_owned()];
+    for label in snapshot {
+        let t = ledger.record(&record(label), now, &hosts, now).unwrap();
+        assert!(t.made.is_empty());
+        ledger = t.next;
+    }
+    assert_eq!(ledger.to_json()["done"], json!([]));
+    assert_eq!(ledger.resign_alerts(), vec![m7.record_id().to_owned()]);
+    for ack in [&ack_b, &ack_c] {
+        let t = ledger.ack(&link(&ack.host_id), ack, now).unwrap();
+        assert!(t.made.is_empty() && t.alerts.is_empty());
+        ledger = t.next;
+    }
+    assert!(ledger.resign_alerts().is_empty(), "settled on both hosts");
+    let counts = steps
+        .iter()
+        .filter_map(|step| step.get("expect_counts"))
+        .next_back()
+        .unwrap();
+    assert_eq!(ledger.to_json()["done"], *counts);
+    assert_eq!(
+        counts.as_array().unwrap().len(),
+        4,
+        "two effects, two hosts"
+    );
+    assert!(ledger.pending_reports().is_empty());
 }

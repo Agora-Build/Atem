@@ -1235,7 +1235,8 @@ def check_control_ack(file, data, report, context):
     claims its link's association at the Station's origin and names records
     of the vectors, and every report id it names is one of its reports',
     recomputed here: each expected report's id from its own kind,
-    integration and host. Which reports are made, and when, is the ledger's
+    integration and host; and each `expect_counts`, the ledger's counts
+    (derive_counts). Which reports are made, and when, is the ledger's
     (the Rust runner and the binding suites, R9.12)."""
     mlog = context["membership_log"]
     control = context["host_work_control"]
@@ -1323,6 +1324,73 @@ def check_control_ack(file, data, report, context):
             if not all(r.get("record_id", "") in ids for r in a["results"]):
                 bad.append(f"{step['link']}'s ack names a record outside the vectors")
         case.check(not bad, f"{len(acks)} acks: each claims its link's association (or is refused not_the_link), at the station's origin, naming records of the vectors", "; ".join(bad))
+
+    if any("expect_counts" in step for step in data["steps"]):
+        with report.case(file, "counts") as case:
+            derive_counts(case, data, records)
+
+
+# A count's effect, in the ledger's order: the revocation before the interrupt.
+COUNT_EFFECTS = {"revocation": 0, "interrupt": 1}
+
+
+def derive_counts(case, data, records):
+    """The ledger's counts (its state's `done`), derived from the steps
+    alone (no ledger): the Station tracks each `revoke` and
+    `interrupt_running` it records (once per record_id), and each ack it
+    takes (not refused, committed) counts, for the link's host, every
+    effect of a tracked record whose result is `applied` or `duplicate`,
+    once per principal, effect (an interrupt at a host principal's
+    revoke_seq) and host, through the first record that said so; a cover,
+    hold or release, a pending or refused result, the cursor and the feed
+    the ack names count nothing. A `replica` step counts once, a step with
+    `commit: false` not at all, a restart keeps what was committed. Each
+    `expect_counts` must be those counts, sorted by principal, effect
+    (revocation first), revoke_seq and host."""
+    hosts = {name: link["host_id"] for name, link in data["setup"]["links"].items()}
+    tracked, counts, wrong = {}, {}, []
+
+    def apply(step):
+        if step.get("commit") is False:
+            return
+        if "control_record" in step:
+            body = records[step["control_record"]]
+            effects = {"revoke": ["revocation", "interrupt"] if body.get("interrupt_running") else ["revocation"],
+                       "interrupt_running": ["interrupt"]}.get(body["action"])
+            if effects is not None:
+                tracked.setdefault(body["record_id"], (body["principal"], effects, body.get("revoke_seq")))
+        if "control_ack" in step and "refused" not in step:
+            host = hosts[step["link"]]
+            for result in step["control_ack"]["results"]:
+                if result.get("record_id") not in tracked:
+                    continue
+                principal, effects, revoke_seq = tracked[result["record_id"]]
+                for e in result["effects"]:
+                    if e["result"] in ("applied", "duplicate"):
+                        seq = revoke_seq if e["effect"] == "interrupt" else None
+                        counts.setdefault((principal, e["effect"], seq, host), result["record_id"])
+        if "replica" in step:
+            apply(step["replica"])
+
+    checked = 0
+    for i, step in enumerate(data["steps"], 1):
+        apply(step)
+        if "expect_counts" in step:
+            checked += 1
+            keys = sorted(counts, key=lambda k: (k[0], COUNT_EFFECTS[k[1]], -1 if k[2] is None else k[2], k[3]))
+            want = []
+            for principal, effect, seq, host in keys:
+                count = {"effect": effect, "host": host, "principal": principal, "record_id": counts[(principal, effect, seq, host)]}
+                if seq is not None:
+                    count["revoke_seq"] = seq
+                want.append(count)
+            if step["expect_counts"] != want:
+                wrong.append(i)
+    case.check(
+        not wrong,
+        f"{checked} expect_counts: each the counts derived from the records tracked and the acks taken, per principal, effect and host, through the first record that said so"
+        + (f" (not: steps {wrong})" if wrong else ""),
+    )
 
 
 # ------------------------------------------------- r9-vectors-push-hint

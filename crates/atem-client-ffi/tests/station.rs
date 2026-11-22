@@ -268,6 +268,10 @@ impl Station {
                 .collect();
             want.sort();
             assert_eq!(self.ledger.resign_alerts(), want, "{}", self.name);
+        } else if let Some(want) = step.get("expect_counts") {
+            // The ledger's counts, as its state writes them (`done`).
+            let state: Value = serde_json::from_str(&self.ledger.to_json()).unwrap();
+            assert_eq!(state["done"], *want, "{}", self.name);
         } else if let Some(want) = step.get("expect_dropped") {
             assert_eq!(json!(self.ledger.dropped_reports()), *want, "{}", self.name);
         } else if let Some(want) = step.get("expect_refused") {
@@ -301,7 +305,7 @@ fn ack_fixtures() -> Vec<Value> {
         .map(|n| n.trim_end_matches(".json").to_owned())
         .collect();
     names.sort();
-    assert_eq!(names.len(), 6);
+    assert_eq!(names.len(), 7);
     names.iter().map(|n| load(n)).collect()
 }
 

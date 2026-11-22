@@ -1327,7 +1327,7 @@ final class ConformanceTests: XCTestCase {
             .sorted()
         for name in ackNames {
             check("Station acks: \(name) through AckLedgerHandle") {
-                try eq(ackNames.count, 6, "the acknowledgment fixtures")
+                try eq(ackNames.count, 7, "the acknowledgment fixtures")
                 let f = try load(name)
                 let setup = o(f["setup"])
                 let st = o(setup["station"])
@@ -1407,6 +1407,10 @@ final class ConformanceTests: XCTestCase {
                     } else if let labels = step["expect_resign_alerts"] {
                         let want = a(labels).map { s(o(o(ctlByLabel[s($0)]!["record"])["body"])["record_id"]) }.sorted()
                         try eq(ledger.resignAlerts(), want, "\(name) resign alerts")
+                    } else if let want = step["expect_counts"] {
+                        // The ledger's counts, as its state writes them (`done`).
+                        let state = o(try JSONSerialization.jsonObject(with: Data(ledger.toJson().utf8)))
+                        try eq(canon(state["done"]!), canon(want), "\(name) counts")
                     } else if let want = step["expect_dropped"] {
                         try eq(ledger.droppedReports(), a(want).map(s), "\(name) dropped")
                     } else if let want = step["expect_refused"] {

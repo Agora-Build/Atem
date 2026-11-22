@@ -872,7 +872,7 @@ const ACKS = readdirSync(fixturesDir)
   .sort();
 for (const name of ACKS) {
   check(`Station acks: ${name} through AckLedgerHandle`, () => {
-    eq(ACKS.length, 6, "the acknowledgment fixtures");
+    eq(ACKS.length, 7, "the acknowledgment fixtures");
     const f = load(name);
     const setup = f.setup;
     const st = setup.station;
@@ -938,6 +938,9 @@ for (const name of ACKS) {
         if (t !== undefined) commit(t);
       } else if ("expect_resign_alerts" in step) {
         eq(ledger.resignAlerts(), step.expect_resign_alerts.map((l) => ctlByLabel[l].record.body.record_id).sort(), `${name} resign alerts`);
+      } else if ("expect_counts" in step) {
+        // The ledger's counts, as its state writes them (`done`).
+        eq(canon(JSON.parse(ledger.toJson()).done), canon(step.expect_counts), `${name} counts`);
       } else if ("expect_dropped" in step) {
         eq(ledger.droppedReports(), step.expect_dropped, `${name} dropped`);
       } else if ("expect_refused" in step) {
