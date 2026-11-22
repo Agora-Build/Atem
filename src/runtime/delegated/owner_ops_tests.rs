@@ -348,12 +348,13 @@ fn every_other_caller_and_id_is_answered_as_a_missing_task() {
         );
         assert_eq!(oo_answers(&mut rig, &owner, &nothing), vec![forbidden(); 3]);
         // The owner, naming a UUID v5 task whose recorded provenance isn't
-        // a host sender's selector task: the phone's own delegated task,
-        // the runtime's `local` task, and B's task under an id its message
-        // doesn't derive (another recipient's), each of unknown outcome.
+        // a host sender's selector task: the phone's own v1 task (not
+        // delegated), its own delegated task (queued), the runtime's
+        // `local` task, and B's task under an id its message doesn't derive
+        // (another recipient's), the others of unknown outcome.
         let store = rig.bridge.work.store.as_ref().unwrap();
         let mut copies = Vec::new();
-        for kind in ["member", "local", "underived"] {
+        for kind in ["member", "delegated member", "local", "underived"] {
             let mut r = record.clone();
             let id = atem_client::session::select::selector_task_id(
                 &message.message_id,
@@ -368,6 +369,15 @@ fn every_other_caller_and_id_is_answered_as_a_missing_task() {
                     r.principal = PHONE.into();
                     r.delegated = None;
                 }
+                "delegated member" => {
+                    r.principal = PHONE.into();
+                    let admission = r.delegated.as_mut().unwrap();
+                    admission.principal = PHONE.into();
+                    admission.sender = DelegatedSender::Native {
+                        device_id: "dev-phone".into(),
+                    };
+                    admission.host = None;
+                }
                 "local" => {
                     r.principal = "local".into();
                     r.delegated = None;
@@ -376,8 +386,13 @@ fn every_other_caller_and_id_is_answered_as_a_missing_task() {
                 _ => {}
             }
             assert!(store.enqueue(&r).unwrap());
-            r.status.state = WorkState::OutcomeUnknown;
-            store.save_work(&r).unwrap();
+            // Of unknown outcome, but the delegated native's: the store
+            // raises no alert for a member's task under a UUID v5 (its
+            // alert couldn't be read), so it stays queued.
+            if kind != "delegated member" {
+                r.status.state = WorkState::OutcomeUnknown;
+                store.save_work(&r).unwrap();
+            }
             copies.push((kind, id));
         }
         for (kind, id) in &copies {
@@ -415,5 +430,133 @@ fn every_other_caller_and_id_is_answered_as_a_missing_task() {
         // And the hidden task is still the owner's.
         let (req, reply) = oo_resolve(&mut rig, &owner, &task, "agent exited");
         assert_eq!(oo_read(&req, reply).state, WorkState::Failed);
+    });
+}
+
+/// Review L2: each condition of the provenance gate (`host_selector_task`)
+/// on its own. B's selector task copied under a message of its own, stored
+/// as admission stores one (its id derived from that message, its recipient
+/// and the session, its receipt listing it): served to the owner. Then one
+/// condition broken at a time, everything else as in that copy: the
+/// admission's sender kind (a native's, the principals still B's), the
+/// record's principal, the stored message's sender, its receipt's sender,
+/// the recipient's host (this host at another trust generation), the
+/// recipient's destination (a host notice, not a `select`), and a receipt
+/// that doesn't list the task. Each is answered as a missing task, for all
+/// three ops, and nothing of it changes.
+#[test]
+fn the_gate_checks_each_condition_of_a_host_senders_selector_task() {
+    use atem_client::session::messages::{Delivery, Destination};
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        let (message, task) = oo_admitted(&mut rig, &mut host, "OO_GATE");
+        let record = stored_record(&rig, &task);
+        let stored = rig
+            .bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .message(&message.message_id)
+            .unwrap()
+            .unwrap();
+        let owner = host.s.phone.clone();
+        let sid = rig.sid.as_str().to_owned();
+        // A copy of B's task under a message of its own, `broken` applied
+        // to its record and message as stored: its id.
+        let copy =
+            |rig: &mut LocalRig,
+             broken: &dyn Fn(&mut WorkRecord, &mut crate::runtime::host_work::MessageRecord)|
+             -> String {
+                let mut m = stored.clone();
+                let message_id = uuid::Uuid::new_v4().to_string();
+                m.message.message_id = message_id.clone();
+                m.receipt.message_id = message_id.clone();
+                let recipient = m.message.recipients[0].recipient_id.clone();
+                let id =
+                    atem_client::session::select::selector_task_id(&message_id, &recipient, &sid);
+                let mut r = record.clone();
+                r.task.task_id = id.clone();
+                r.status.task_id = id.clone();
+                r.status.state = WorkState::Queued;
+                r.message.as_mut().unwrap().message_id = message_id.clone();
+                m.receipt.recipients[0].delivery = Delivery::Resolved {
+                    tasks: vec![(&r.status).into()],
+                };
+                broken(&mut r, &mut m);
+                let store = rig.bridge.work.store.as_ref().unwrap();
+                store
+                    .db
+                    .execute(
+                        "INSERT INTO messages(id,record) VALUES(?1,?2)",
+                        rusqlite::params![message_id, serde_json::to_string(&m).unwrap()],
+                    )
+                    .unwrap();
+                assert!(store.enqueue(&r).unwrap());
+                id
+            };
+        // The construction is right: the copy itself is the owner's.
+        let whole = copy(&mut rig, &|_, _| {});
+        assert_eq!(
+            status(oo_q(&mut rig, &owner, Q::Query(&whole))),
+            stored_record(&rig, &whole).status
+        );
+        type Break<'a> =
+            Box<dyn Fn(&mut WorkRecord, &mut crate::runtime::host_work::MessageRecord) + 'a>;
+        let cases: Vec<(&str, Break<'_>)> = vec![
+            (
+                "the admission's sender is a native's",
+                Box::new(|r, _| {
+                    r.delegated.as_mut().unwrap().sender = DelegatedSender::Native {
+                        device_id: "dev-phone".into(),
+                    }
+                }),
+            ),
+            (
+                "the record's principal is another host's",
+                Box::new(|r, _| r.principal = "host:host-x".into()),
+            ),
+            (
+                "the admission's principal is another host's",
+                Box::new(|r, _| r.delegated.as_mut().unwrap().principal = "host:host-x".into()),
+            ),
+            (
+                "the stored message's sender is another host",
+                Box::new(|_, m| m.message.sender = "host:host-x".into()),
+            ),
+            (
+                "the stored receipt's sender is another host",
+                Box::new(|_, m| m.receipt.sender = "host:host-x".into()),
+            ),
+            (
+                "the recipient is this host at another trust generation",
+                Box::new(|_, m| m.message.recipients[0].host.host_trust_gen = 2),
+            ),
+            (
+                "the recipient is a host notice, not a select",
+                Box::new(|_, m| m.message.recipients[0].destination = Destination::Host),
+            ),
+            (
+                "the receipt doesn't list the task",
+                Box::new(|_, m| {
+                    m.receipt.recipients[0].delivery = Delivery::Resolved {
+                        tasks: vec![(&record.status).into()],
+                    }
+                }),
+            ),
+        ];
+        for (what, broken) in &cases {
+            let id = copy(&mut rig, broken.as_ref());
+            let before = stored_record(&rig, &id).status;
+            assert_eq!(
+                oo_answers(&mut rig, &owner, &id),
+                vec![forbidden(); 3],
+                "{what}"
+            );
+            assert_eq!(stored_record(&rig, &id).status, before, "{what}");
+        }
+        assert_eq!(escs(&rig), 0);
     });
 }

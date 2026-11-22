@@ -2341,9 +2341,12 @@ fn a_withheld_revoke_carried_by_a_native_cancels_and_refuses() {
 /// agent exits mid-turn (`outcome_unknown`, `agent exited`) `work_resolve`
 /// marks it failed, `resolved` by the Mac, and the status the sending host
 /// gets shows it failed. The client core sends each request and takes each
-/// result (a UUID v5 task id). A UUID v5 that names no task, and a viewer
-/// (a native member without `control`) naming the task, are answered
-/// `forbidden`, exactly as a missing task.
+/// result (a UUID v5 task id). Answered `forbidden`, exactly as a missing
+/// task: the Mac naming a UUID v5 of no task; a service holding `notify` on
+/// this host naming the task (its channel lets the request through, the
+/// host's control state reads, so the runtime's gate answers it); and a
+/// viewer (a native member without `control`), which its channel refuses
+/// before decoding, as it refuses every directed-work request of it.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
@@ -2368,8 +2371,15 @@ fn the_owner_manages_a_host_senders_selector_task_over_its_channel() {
     };
     let mut r = Router::on(&rig.astation, rig.link());
     let viewer = rig.log.add_native("dev-viewer", &["view"]);
+    let service = rig.log.add_service(
+        "svc-hm",
+        &[HOST],
+        None,
+        &["message", "notify", "prompt", "view"],
+        support::r9log::host_now().wall_ms + 3 * 3_600_000,
+    );
     let mut mac = Dev::new_via(&mut r, "direct", ids, &rig.log, support::r9log::MAC, false);
-    mac.carry(&mut r, &[viewer]);
+    mac.carry(&mut r, &[viewer, service]);
     let ask = |dev: &mut Dev, r: &mut Router, op: &str, task: &Value| {
         let mut data = json!({"op": op, "host": ids.json(), "task_id": task});
         if op == "work_resolve" {
@@ -2408,11 +2418,21 @@ fn the_owner_manages_a_host_senders_selector_task_over_its_channel() {
         let absent = ask(&mut mac, &mut r, op, &missing);
         same(&refused, &absent, op);
     }
+    // The service reaches the runtime: its channel takes a directed-work
+    // request of it (it holds `notify`), its own task id reads as a task
+    // the host doesn't have, and the task the owner's gate keeps from it
+    // answers the same.
+    let mut service = Dev::new_via(&mut r, "direct", ids, &rig.log, "svc-hm", true);
+    for op in ["work_query", "work_interrupt", "work_resolve"] {
+        let refused = ask(&mut service, &mut r, op, &task);
+        let absent = ask(&mut service, &mut r, op, &missing);
+        same(&refused, &absent, &format!("service {op}"));
+    }
     let mut viewer = Dev::new_via(&mut r, "direct", ids, &rig.log, "dev-viewer", false);
     for op in ["work_query", "work_interrupt", "work_resolve"] {
         let refused = ask(&mut viewer, &mut r, op, &task);
         let absent = ask(&mut viewer, &mut r, op, &missing);
-        same(&refused, &absent, op);
+        same(&refused, &absent, &format!("viewer {op}"));
     }
     assert_eq!(escs(&rig), 0);
     let interrupt = ask(&mut mac, &mut r, "work_interrupt", &task);
