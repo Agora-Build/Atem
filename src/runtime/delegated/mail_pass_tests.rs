@@ -948,7 +948,8 @@ fn a_cancel_left_again_on_a_reread_holds_the_gate_until_read_again() {
 /// to open while the inbox is full: it keeps waiting and holds host senders'
 /// gate. Admission takes B's row: until C's is judged again, the gate stays
 /// closed (a step that publishes it without judging, as an answer to a
-/// done does); judged, it opens into the inbox.
+/// done does); judged, it opens into the inbox, where it holds C's task
+/// starts only (final readings item 6's proviso), not B's.
 #[test]
 fn a_waiting_object_with_no_room_holds_the_gate() {
     use crate::session_protocol::membership::r9log::secret;
@@ -997,13 +998,15 @@ fn a_waiting_object_with_no_room_holds_the_gate() {
             "{:?}",
             rig.bridge.mail_status()
         );
-        // Judged again: it opens, then waits for admission.
+        // Judged again: it opens, then waits for admission, holding C's
+        // starts only.
         mb_tick(&mut rig, &mut host, 2_000);
         let observed = mb_store(&rig);
         assert_eq!((observed.inbox, observed.waiting_for_room), (1, 0));
-        assert!(!mb_gate(&rig));
+        assert!(!ad_gate_for(&rig, "host-c"));
+        assert!(mb_gate(&rig), "not B's");
         admit(&rig);
         mb_tick(&mut rig, &mut host, 2_000);
-        assert!(mb_gate(&rig));
+        assert!(ad_gate_for(&rig, "host-c"));
     });
 }

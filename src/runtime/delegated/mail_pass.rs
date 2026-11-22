@@ -463,10 +463,10 @@ impl HostBridge {
             eprintln!("{line}");
         }
         let open = station.mailbox.open();
-        let held = station.mailbox.held();
+        let undecided = station.mailbox.undecided();
         let mut view = self.start_view();
         view.gates.set_mailbox(open);
-        view.gates.set_mailbox_held(held);
+        view.gates.set_mailbox_undecided(undecided);
     }
 
     /// `atem status`'s mailbox part, on the `Control feeds:` line (with
@@ -476,9 +476,12 @@ impl HostBridge {
             return None;
         }
         let station = self.station.as_ref()?;
-        let part = match station.mailbox.closed() {
-            None => "host senders' mailbox read to its head".to_string(),
-            Some(why) => format!("host senders' mailbox not checked ({why})"),
+        let part = match (station.mailbox.closed(), station.mailbox.holding()) {
+            (None, None) => "host senders' mailbox read to its head".to_string(),
+            (None, Some(holding)) => {
+                format!("host senders' mailbox read to its head; {holding}")
+            }
+            (Some(why), _) => format!("host senders' mailbox not checked ({why})"),
         };
         Some(match station.mailbox.alerts() {
             (0, _) | (_, None) => part,

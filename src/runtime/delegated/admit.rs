@@ -12,7 +12,8 @@
 //!   object's expiry (the mailbox's minute prune drops it, never under a
 //!   clock anchor: [`prune_stops`]); at most [`MAX_EARLY_STOPS`] per sender
 //!   (one more stays in the inbox, held, back-pressure as ruling R31's,
-//!   holding only its sender's task starts, ruling R47). Its request's
+//!   holding its sender's task starts only, as every inbox row does,
+//!   ruling R47). Its request's
 //!   admission takes it ([`take_stops`]) in its own transaction.
 //! - **Whole refusals** (`mail_refusals`): a request admission refused as a
 //!   whole (the sender, the message id, its digest and the code), kept
@@ -255,7 +256,7 @@ pub fn refuse_unreadable(tx: &Transaction, row: &InboxRow, now_ms: u64) -> Resul
 }
 
 /// Inbox row `n` held (ruling R47): a stop waiting for room, holding its
-/// own sender's task starts only.
+/// own sender's task starts only, as every inbox row does.
 pub fn hold_row(tx: &Transaction, n: i64) -> Result<()> {
     tx.execute("UPDATE mailbox_inbox SET held=1 WHERE n=?1", [n])?;
     Ok(())
