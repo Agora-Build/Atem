@@ -290,9 +290,16 @@ action_names! {
 /// was refused, refused where it was accepted, another refusal reason,
 /// another derived state), whether or not a vector covered it before. The
 /// device-list vectors (`r9-vectors-membership-log`, `r9-vectors-recovery`,
-/// the `r9-chain-*` fixtures) then pin the new rule.
-/// `verifier_version_pins_its_action_set` pins the set; the rules have no
-/// mechanical guard.
+/// the `r9-chain-*` fixtures) then pin the new rule. And
+/// [`required_version`](fn@super::required_version) must change with any
+/// verifier rule: it must name the first version that accepts the changed
+/// entries, so that an entry some released verifier refuses never reads as
+/// needing none (R9.2 "How the signing gate uses it"; its vectors are
+/// `r9-vectors-required-verifier`).
+/// `verifier_version_pins_its_action_set` pins the set, and
+/// `required_version` classifies each action by an exhaustive match and
+/// each op of [`OPS`] by a table a test pins to `OPS`; the other rules have
+/// no mechanical guard.
 pub const VERIFIER_VERSION: u32 = 2;
 
 /// A verifier reports at most this many actions.

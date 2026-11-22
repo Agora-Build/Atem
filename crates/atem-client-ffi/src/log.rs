@@ -38,10 +38,24 @@ pub const MAX_STORED_JSON: usize = 16 << 20;
 /// than its own (`Stored{unsupported_version}`).
 pub const STORED_VERSION: u64 = 1;
 
-/// R9.2 compatibility requirement for a strictly checked unsigned membership
-/// body. `None` is a known body predating reported inventories; malformed or
-/// unknown bodies throw. This neither verifies chain authority nor permits
-/// signing without authenticated, current evidence for every participant.
+/// The signing gate's requirement of one unsigned membership-entry body
+/// (session-v1 R9.2 "How the signing gate uses it";
+/// `atem_client::membership::required_version`; **Atem's proposal, for
+/// Astation's agreement**). `body_json` is the body's JSON text (not the
+/// `{body, sig}` object). `None` for an entry every release from v0.8.0 to
+/// v0.8.5 accepts, else the action and the first verifier version that
+/// accepts it: 2 for the five delegated host-work actions, 1 for a service
+/// `add` or `set_roles` whose scope carries `launch`, `message` or
+/// `notify`.
+///
+/// A body that doesn't parse as an entry throws `AtemError::Membership{code:
+/// "membership_invalid", detail, index: None}`, `detail` the verifier's code
+/// for that shape (`malformed`, `too_large`, `unknown_field`,
+/// `array_not_canonical`, `wrong_alg`, `bad_scope`, `bad_project`, …). An
+/// action this build doesn't know is `malformed`, like any malformed field:
+/// to tell it from a damaged body, compare the body's `action` with
+/// `verifier_inventory()`'s `actions`. This checks no signature or chain
+/// and authenticates no verifier: it never authorizes a signature alone.
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 pub fn membership_required_version(
     body_json: String,
