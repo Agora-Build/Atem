@@ -1598,31 +1598,83 @@ const requests = loadWork("requests-v1");
 check("host work: result_id known answers and the reply check (§11.5)", () => {
   eq(requests.result_ids.length, 2);
   for (const c of requests.result_ids) eq(m.hostWorkResultId(c.task_id), c.result_id, c.name);
-  const replies = requests.answers.filter((c) => c.result.result.kind === "reply");
-  eq(replies.length, 3);
+  const replies = requests.answers.filter((c) => c.result.result.kind === "reply" && c.request.data.op === "reply_query");
+  eq(replies.length, 9);
   for (const c of replies) {
     const reply = c.result.result.reply;
     eq(reply === null || reply.result_id === m.hostWorkResultId(c.request.data.task_id), c.answers, c.name);
   }
 });
 // Every request case read as the core reads it (what sendJson seals): the
-// owner's work_query, work_interrupt and work_resolve name a host sender's
-// selector task (its UUID v5, host-work-v1 §11.2, §11.5), read as strictly
-// as a UUID v4; the other task ops keep a UUID v4. And every answers case
-// correlated as the connection correlates a result it reads.
+// owner's work_query, reply_query, work_interrupt and work_resolve name a
+// host sender's selector task (its UUID v5, host-work-v1 §11.2, §11.5), read
+// as strictly as a UUID v4; the other task ops keep a UUID v4. And every
+// answers case correlated as the connection correlates a result it reads.
 check("host work: request vectors and result correlation (§11.2, §11.5)", () => {
   for (const c of requests.cases) eq(m.hostWorkRequestValid(c.raw !== undefined ? c.raw : str(c.message)), c.valid, c.name);
-  for (const name of ["work_query_selector_task", "work_interrupt_selector_task", "work_resolve_selector_task"]) {
+  for (const name of ["work_query_selector_task", "reply_query_selector_task", "work_interrupt_selector_task", "work_resolve_selector_task"]) {
     if (!requests.cases.some((c) => c.name === name && c.valid)) throw new Error(`${name} missing`);
   }
   eq(m.hostWorkRequestValid("not json"), false);
-  eq(requests.answers.length, 5);
+  eq(requests.answers.length, 13);
   for (const c of requests.answers) eq(m.hostWorkResultAnswers(str(c.request), str(c.result)), c.answers, c.name);
   // Read as strictly as the connection reads a record: a duplicate key
   // (here a wrong `re` before the right one) is no result.
   const answering = requests.answers.find((c) => c.answers);
   const doubled = '{"re":"99999999-9999-4999-8999-999999999999",' + str(answering.result).slice(1);
   eq(m.hostWorkResultAnswers(str(answering.request), doubled), false, "a duplicate key");
+});
+
+// The owner's reply_query of a host sender's selector task (host-work-v1
+// §11.2; Astation's ask, #120 comment 7082465179): the request reads and its
+// uppercase, version 3 and variant forms don't; no reply yet and a reply in
+// each state answer it, each with the selector task's own result_id; another
+// task's reply, the same reply to a work_query and a status to the
+// reply_query answer nothing.
+check("host work: the owner's reply_query of a selector task (§11.2)", () => {
+  const named = (list, name) => {
+    const c = requests[list].find((x) => x.name === name);
+    if (!c) throw new Error(`${name} missing`);
+    return c;
+  };
+  for (const [name, valid] of [
+    ["reply_query_selector_task", true],
+    ["reply_query_selector_task_upper_case", false],
+    ["reply_query_task_id_version_3", false],
+    ["reply_query_task_id_variant", false],
+  ]) {
+    eq(named("cases", name).valid, valid, name);
+    eq(m.hostWorkRequestValid(str(named("cases", name).message)), valid, name);
+  }
+  const selector = named("cases", "reply_query_selector_task").message.data.task_id;
+  for (const [name, state] of [
+    ["null_reply_answers_its_selector_task", null],
+    ["reply_publishing_answers_its_selector_task", "publishing"],
+    ["reply_submitted_answers_its_selector_task", "submitted"],
+    ["reply_refused_answers_its_selector_task", "refused"],
+    ["reply_dropped_answers_its_selector_task", "submitted"],
+  ]) {
+    const c = named("answers", name);
+    eq(c.request.data.op, "reply_query", name);
+    eq(c.request.data.task_id, selector, name);
+    const reply = c.result.result.reply;
+    if (state === null) eq(reply, null, name);
+    else {
+      eq(reply.state, state, name);
+      eq(reply.result_id, m.hostWorkResultId(selector), name);
+    }
+    eq(m.hostWorkResultAnswers(str(c.request), str(c.result)), true, name);
+  }
+  eq(named("answers", "reply_dropped_answers_its_selector_task").result.result.reply.dropped, true);
+  for (const name of [
+    "another_tasks_reply_does_not_answer_a_selector_task",
+    "a_reply_does_not_answer_a_work_query",
+    "a_work_status_does_not_answer_a_reply_query",
+  ]) {
+    const c = named("answers", name);
+    eq(c.request.data.task_id, selector, name);
+    eq(m.hostWorkResultAnswers(str(c.request), str(c.result)), false, name);
+  }
 });
 
 console.log(`wasm conformance: ${passed} passed, ${failures.length} failed`);

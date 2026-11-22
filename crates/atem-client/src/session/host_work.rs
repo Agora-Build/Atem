@@ -391,15 +391,16 @@ impl Resolution {
     }
 }
 
-/// The task id `work_query`, `work_interrupt` and `work_resolve` name, and
-/// a `work` status carries (host-work-v1 §11.2): a UUID v4, or a UUID v5,
-/// the selector task id a host sender's `select` resolved to on the host
-/// (§11.5, "The selector task id"), so that the owner manages those tasks
-/// from a channel. Lowercase with hyphens, the version and RFC 9562's
-/// variant checked. It grants nothing: whose task a v5 id may name, and
-/// who may name it, is the host's (only the owner, and only a host
-/// sender's selector task: anything else is answered as a missing task).
-/// `reply_query`, `work_cancel` and `work_complete` keep a UUID v4.
+/// The task id `work_query`, `reply_query`, `work_interrupt` and
+/// `work_resolve` name, and a `work` status carries (host-work-v1 §11.2): a
+/// UUID v4, or a UUID v5, the selector task id a host sender's `select`
+/// resolved to on the host (§11.5, "The selector task id"), so that the
+/// owner manages those tasks, and reads their replies, from a channel.
+/// Lowercase with hyphens, the version and RFC 9562's variant checked. It
+/// grants nothing: whose task a v5 id may name, and who may name it, is the
+/// host's (only the owner, and only a host sender's selector task: anything
+/// else is answered as a missing task). `work_cancel` and `work_complete`
+/// keep a UUID v4.
 pub fn is_owner_task_id(task_id: &str) -> bool {
     is_uuid_v4(task_id) || is_uuid_v5(task_id)
 }
@@ -538,12 +539,10 @@ impl Request {
                 }
                 // The owner's ops also name a host sender's selector task
                 // (§11.2, §11.5); the others a UUID v4 only.
-                Self::WorkQuery { task_id, .. } | Self::WorkInterrupt { task_id, .. } => {
-                    is_owner_task_id(task_id)
-                }
-                Self::ReplyQuery { task_id, .. } | Self::Cancel { task_id, .. } => {
-                    is_uuid_v4(task_id)
-                }
+                Self::WorkQuery { task_id, .. }
+                | Self::ReplyQuery { task_id, .. }
+                | Self::WorkInterrupt { task_id, .. } => is_owner_task_id(task_id),
+                Self::Cancel { task_id, .. } => is_uuid_v4(task_id),
                 Self::WorkResolve {
                     task_id,
                     resolution,
@@ -1012,6 +1011,10 @@ mod tests {
             ("work_query_selector_task_upper_case", false),
             ("work_query_task_id_version_3", false),
             ("work_query_task_id_variant", false),
+            ("reply_query_selector_task", true),
+            ("reply_query_selector_task_upper_case", false),
+            ("reply_query_task_id_version_3", false),
+            ("reply_query_task_id_variant", false),
             ("work_interrupt_selector_task", true),
             ("work_interrupt_selector_task_upper_case", false),
             ("work_interrupt_task_id_version_1", false),
@@ -1020,7 +1023,6 @@ mod tests {
             ("work_resolve_selector_task_upper_case", false),
             ("work_resolve_task_id_version_3", false),
             ("work_resolve_task_id_variant", false),
-            ("reply_query_task_id_must_be_uuid_v4", false),
             ("work_cancel_task_id_must_be_uuid_v4", false),
             ("work_complete_task_id_must_be_uuid_v4", false),
         ] {
@@ -1156,6 +1158,27 @@ mod tests {
                 "{name}"
             );
         }
+        // A reply in each state it has (a host sender's selector task's,
+        // its `result_id` the selector's), and what a reply may not carry.
+        for (name, valid) in [
+            ("reply_selector_task_publishing", true),
+            ("reply_selector_task_submitted", true),
+            ("reply_selector_task_refused", true),
+            ("reply_selector_task_dropped", true),
+            ("reply_publishing_has_no_submitted_at", false),
+            ("reply_publishing_keeps_no_context", false),
+            ("reply_refused_keeps_no_context", false),
+            ("reply_submitted_needs_its_time", false),
+            ("reply_result_id_upper_case", false),
+            ("reply_result_id_must_be_uuid_v5", false),
+        ] {
+            assert!(
+                cases
+                    .iter()
+                    .any(|c| c["name"] == name && c["valid"] == valid),
+                "{name}"
+            );
+        }
         // A host sender's selector task's status (its UUID v5), as strict.
         for (name, valid) in [
             ("work_status_selector_task", true),
@@ -1217,6 +1240,18 @@ mod tests {
             ("null_reply_answers", true),
             ("work_status_answers_its_selector_task", true),
             ("another_tasks_status_does_not_answer", false),
+            // The owner's `reply_query` of a selector task (§11.2): no reply
+            // yet, and a reply in each state with the selector's
+            // `result_id`; another task's reply, a reply to a `work_query`
+            // and a status to a `reply_query` answer nothing.
+            ("null_reply_answers_its_selector_task", true),
+            ("reply_publishing_answers_its_selector_task", true),
+            ("reply_submitted_answers_its_selector_task", true),
+            ("reply_refused_answers_its_selector_task", true),
+            ("reply_dropped_answers_its_selector_task", true),
+            ("another_tasks_reply_does_not_answer_a_selector_task", false),
+            ("a_reply_does_not_answer_a_work_query", false),
+            ("a_work_status_does_not_answer_a_reply_query", false),
         ] {
             assert!(
                 cases
@@ -1350,8 +1385,11 @@ mod tests {
             Request::decode(request.to_json().to_string().as_bytes()),
             Ok(request)
         );
+        // A task id: a UUID v4, or a selector's UUID v5 (the owner's,
+        // `the_owners_reply_query_reads_a_selector_tasks_reply`), no more.
         for (field, value) in [
-            ("task_id", json!("6ba7b810-9dad-51d1-80b4-00c04fd430c8")),
+            ("task_id", json!("6ba7b810-9dad-31d1-80b4-00c04fd430c8")),
+            ("task_id", json!("6BA7B810-9DAD-51D1-80B4-00C04FD430C8")),
             ("task_id", json!("not a uuid")),
             ("extra", json!(1)),
             ("result_id", json!("6ba7b810-9dad-51d1-80b4-00c04fd430c8")),
@@ -1882,13 +1920,13 @@ mod tests {
         assert!(!reply.answers(&interrupt));
     }
 
-    /// Host-work-v1 §11.2 (Astation's ask, #120 comment 7028723996): the
-    /// owner's three ops name a host sender's selector task, the UUID v5 its
-    /// `select` resolved to on the host (§11.5), as well as a UUID v4.
-    /// Strict otherwise: lowercase with hyphens, version 4 or 5, RFC 9562's
-    /// variant. Every other op naming a task keeps a UUID v4 only. A `work`
-    /// result naming the v5 task answers the request that named it, and no
-    /// other task's.
+    /// Host-work-v1 §11.2 (Astation's asks, #120 comments 7028723996 and
+    /// 7082465179): the owner's four ops name a host sender's selector task,
+    /// the UUID v5 its `select` resolved to on the host (§11.5), as well as
+    /// a UUID v4. Strict otherwise: lowercase with hyphens, version 4 or 5,
+    /// RFC 9562's variant. `work_cancel` and `work_complete` keep a UUID v4
+    /// only. A `work` result naming the v5 task answers the request that
+    /// named it, and no other task's.
     #[test]
     fn the_owners_ops_name_a_selector_task() {
         const SELECTOR: &str = "80160896-4fcd-5e6e-adac-98bac5497321";
@@ -1916,7 +1954,12 @@ mod tests {
             }
             data
         };
-        for op in ["work_query", "work_interrupt", "work_resolve"] {
+        for op in [
+            "work_query",
+            "reply_query",
+            "work_interrupt",
+            "work_resolve",
+        ] {
             for task_id in [SELECTOR, V4] {
                 let request = Request::from_data(&data(op, task_id))
                     .unwrap_or_else(|e| panic!("{op} {task_id}: {e}"));
@@ -1933,7 +1976,7 @@ mod tests {
                 );
             }
         }
-        for op in ["reply_query", "work_cancel", "work_complete"] {
+        for op in ["work_cancel", "work_complete"] {
             assert!(Request::from_data(&data(op, V4)).is_ok(), "{op}");
             assert!(Request::from_data(&data(op, SELECTOR)).is_err(), "{op}");
         }
@@ -1979,6 +2022,100 @@ mod tests {
                 "{task_id}"
             );
         }
+    }
+
+    /// Host-work-v1 §11.2 (Astation's ask, #120 comment 7082465179): the
+    /// owner's `reply_query` names a host sender's selector task (its UUID
+    /// v5), read as strictly as the other owner's ops, and its result is
+    /// correlated as any reply's: `null` (no reply yet) answers it, and a
+    /// reply only with the selector task's own `result_id`
+    /// (`UUIDv5(NAMESPACE_OID, "result:" + task_id)`), in every state a
+    /// reply has (`publishing`, `submitted`, `refused`, and `submitted` once
+    /// dropped). A reply naming another task's `result_id` answers nothing,
+    /// a reply never answers a `work_query`, and a `work` status never
+    /// answers a `reply_query`.
+    #[test]
+    fn the_owners_reply_query_reads_a_selector_tasks_reply() {
+        const SELECTOR: &str = "80160896-4fcd-5e6e-adac-98bac5497321";
+        const V4: &str = "22222222-2222-4222-8222-222222222222";
+        let query = |task_id: &str| {
+            Request::from_data(&json!({
+                "v": 1, "id": super::super::new_id(), "host": reply_host(),
+                "op": "reply_query", "task_id": task_id,
+            }))
+        };
+        let request = query(SELECTOR).expect("the owner's reply_query of a selector task");
+        assert_eq!(
+            Request::decode(request.to_json().to_string().as_bytes()),
+            Ok(request.clone())
+        );
+        assert_eq!(request.feature(), REPLY_FEATURE);
+        for task_id in [
+            "80160896-4FCD-5E6E-ADAC-98BAC5497321",
+            "80160896-4fcd-3e6e-adac-98bac5497321",
+            "80160896-4fcd-1e6e-adac-98bac5497321",
+            "80160896-4fcd-5e6e-cdac-98bac5497321",
+            "80160896-4fcd-5e6e-7dac-98bac5497321",
+            "801608964fcd5e6eadac98bac5497321",
+            "{80160896-4fcd-5e6e-adac-98bac5497321}",
+        ] {
+            assert_eq!(query(task_id), Err("invalid_request"), "{task_id}");
+        }
+        // The selector task's one result_id, §11.5's known answer.
+        assert_eq!(result_id(SELECTOR), "996a448a-cf99-5e86-aa67-7f9a582a7eaa");
+        assert!(reply_answer(&request, None).answers(&request));
+        let submitted = reply_for(&request);
+        assert_eq!(submitted.result_id, result_id(SELECTOR));
+        let mut publishing = submitted.clone();
+        publishing.state = ReplyState::Publishing;
+        publishing.context.clear();
+        publishing.submitted_at = None;
+        let mut refused = publishing.clone();
+        refused.state = ReplyState::Refused;
+        let mut dropped = submitted.clone();
+        dropped.text.clear();
+        dropped.context.clear();
+        dropped.dropped = true;
+        for (state, reply) in [
+            ("submitted", &submitted),
+            ("publishing", &publishing),
+            ("refused", &refused),
+            ("dropped", &dropped),
+        ] {
+            assert!(
+                reply_answer(&request, Some(reply.clone())).answers(&request),
+                "{state}"
+            );
+            // Another task's result_id (the v4 task's) answers nothing.
+            let mut wrong = reply.clone();
+            wrong.result_id = result_id(V4);
+            assert!(
+                !reply_answer(&request, Some(wrong)).answers(&request),
+                "{state}: another task's"
+            );
+            // Nor does the selector task's reply answer the v4 task's query.
+            let v4 = query(V4).unwrap();
+            assert!(
+                !reply_answer(&v4, Some(reply.clone())).answers(&v4),
+                "{state}: the v4 task's query"
+            );
+        }
+        // A reply answers no `work_query` of the same task; a status no
+        // `reply_query`.
+        let Request::ReplyQuery { v, id, host, .. } = request.clone() else {
+            unreachable!()
+        };
+        let work_query = Request::WorkQuery {
+            v,
+            id,
+            host,
+            task_id: SELECTOR.into(),
+        };
+        assert!(!reply_answer(&request, Some(submitted.clone())).answers(&work_query));
+        assert!(!reply_answer(&request, None).answers(&work_query));
+        let status = work_answer(&request, work_status(SELECTOR, WorkState::Submitted)).unwrap();
+        assert!(status.answers(&work_query));
+        assert!(!status.answers(&request));
     }
 
     /// `receipt_id` is the current attempt's id (I.6.4): two statuses of one

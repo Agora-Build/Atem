@@ -2312,8 +2312,10 @@ final class ConformanceTests: XCTestCase {
             for c in known {
                 try eq(hostWorkResultId(taskId: s(c["task_id"])), s(c["result_id"]), s(c["name"]))
             }
-            let replies = a(requests["answers"]).map(o).filter { s(o(o($0["result"])["result"])["kind"]) == "reply" }
-            try eq(replies.count, 3)
+            let replies = a(requests["answers"]).map(o).filter {
+                s(o(o($0["result"])["result"])["kind"]) == "reply" && s(o(o($0["request"])["data"])["op"]) == "reply_query"
+            }
+            try eq(replies.count, 9)
             for c in replies {
                 let reply = o(o(c["result"])["result"])["reply"]
                 let task = s(o(o(c["request"])["data"])["task_id"])
@@ -2322,23 +2324,23 @@ final class ConformanceTests: XCTestCase {
             }
         }
         // Every request case read as the core reads it (what sendJson
-        // seals): the owner's work_query, work_interrupt and work_resolve
-        // name a host sender's selector task (its UUID v5, host-work-v1
-        // §11.2, §11.5), read as strictly as a UUID v4; the other task ops
-        // keep a UUID v4. And every answers case correlated as the
-        // connection correlates a result it reads.
+        // seals): the owner's work_query, reply_query, work_interrupt and
+        // work_resolve name a host sender's selector task (its UUID v5,
+        // host-work-v1 §11.2, §11.5), read as strictly as a UUID v4; the
+        // other task ops keep a UUID v4. And every answers case correlated
+        // as the connection correlates a result it reads.
         check("host work: request vectors and result correlation (§11.2, §11.5)") {
             let cases = a(requests["cases"]).map(o)
             for c in cases {
                 let text = c["raw"] != nil ? s(c["raw"]) : js(o(c["message"]))
                 try eq(hostWorkRequestValid(messageJson: text), c["valid"] as! Bool, s(c["name"]))
             }
-            for name in ["work_query_selector_task", "work_interrupt_selector_task", "work_resolve_selector_task"] {
+            for name in ["work_query_selector_task", "reply_query_selector_task", "work_interrupt_selector_task", "work_resolve_selector_task"] {
                 try eq(cases.contains { s($0["name"]) == name && ($0["valid"] as! Bool) }, true, name)
             }
             try eq(hostWorkRequestValid(messageJson: "not json"), false)
             let answers = a(requests["answers"]).map(o)
-            try eq(answers.count, 5)
+            try eq(answers.count, 13)
             for c in answers {
                 try eq(hostWorkResultAnswers(requestJson: js(o(c["request"])), resultJson: js(o(c["result"]))), c["answers"] as! Bool, s(c["name"]))
             }
@@ -2349,9 +2351,70 @@ final class ConformanceTests: XCTestCase {
             try eq(hostWorkResultAnswers(requestJson: js(o(answering["request"])), resultJson: doubled), false, "a duplicate key")
         }
 
+        // The owner's reply_query of a host sender's selector task
+        // (host-work-v1 §11.2; Astation's ask, #120 comment 7082465179): the
+        // request reads and its uppercase, version 3 and variant forms
+        // don't; no reply yet and a reply in each state answer it, each with
+        // the selector task's own result_id; another task's reply, the same
+        // reply to a work_query and a status to the reply_query answer
+        // nothing.
+        check("host work: the owner's reply_query of a selector task (§11.2)") {
+            func named(_ list: String, _ name: String) throws -> [String: Any] {
+                guard let c = a(requests[list]).map(o).first(where: { s($0["name"]) == name }) else {
+                    throw Failure(description: "\(name) missing")
+                }
+                return c
+            }
+            for (name, valid) in [
+                ("reply_query_selector_task", true),
+                ("reply_query_selector_task_upper_case", false),
+                ("reply_query_task_id_version_3", false),
+                ("reply_query_task_id_variant", false),
+            ] {
+                let c = try named("cases", name)
+                try eq(c["valid"] as! Bool, valid, name)
+                try eq(hostWorkRequestValid(messageJson: js(o(c["message"]))), valid, name)
+            }
+            let selectorCase = try named("cases", "reply_query_selector_task")
+            let selector = s(o(o(selectorCase["message"])["data"])["task_id"])
+            let states: [(String, String?)] = [
+                ("null_reply_answers_its_selector_task", nil),
+                ("reply_publishing_answers_its_selector_task", "publishing"),
+                ("reply_submitted_answers_its_selector_task", "submitted"),
+                ("reply_refused_answers_its_selector_task", "refused"),
+                ("reply_dropped_answers_its_selector_task", "submitted"),
+            ]
+            for (name, state) in states {
+                let c = try named("answers", name)
+                let data = o(o(c["request"])["data"])
+                try eq(s(data["op"]), "reply_query", name)
+                try eq(s(data["task_id"]), selector, name)
+                let reply = o(o(c["result"])["result"])["reply"]
+                if let state {
+                    try eq(s(o(reply)["state"]), state, name)
+                    try eq(s(o(reply)["result_id"]), hostWorkResultId(taskId: selector), name)
+                } else {
+                    try eq(reply is NSNull, true, name)
+                }
+                try eq(hostWorkResultAnswers(requestJson: js(o(c["request"])), resultJson: js(o(c["result"]))), true, name)
+            }
+            let droppedCase = try named("answers", "reply_dropped_answers_its_selector_task")
+            let dropped = o(o(o(droppedCase["result"])["result"])["reply"])
+            try eq(dropped["dropped"] as! Bool, true)
+            for name in [
+                "another_tasks_reply_does_not_answer_a_selector_task",
+                "a_reply_does_not_answer_a_work_query",
+                "a_work_status_does_not_answer_a_reply_query",
+            ] {
+                let c = try named("answers", name)
+                try eq(s(o(o(c["request"])["data"])["task_id"]), selector, name)
+                try eq(hostWorkResultAnswers(requestJson: js(o(c["request"])), resultJson: js(o(c["result"]))), false, name)
+            }
+        }
+
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 135)
+        XCTAssertEqual(passed, 136)
     }
 }

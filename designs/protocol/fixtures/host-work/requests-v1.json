@@ -207,7 +207,25 @@
       }
     },
     {
-      "name": "reply_query_task_id_must_be_uuid_v4",
+      "name": "reply_query_selector_task",
+      "valid": true,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "reply_query",
+          "task_id": "80160896-4fcd-5e6e-adac-98bac5497321"
+        }
+      }
+    },
+    {
+      "name": "reply_query_selector_task_upper_case",
       "valid": false,
       "message": {
         "type": "session",
@@ -220,7 +238,43 @@
             "host_trust_gen": 1
           },
           "op": "reply_query",
-          "task_id": "6ba7b810-9dad-51d1-80b4-00c04fd430c8"
+          "task_id": "80160896-4FCD-5E6E-ADAC-98BAC5497321"
+        }
+      }
+    },
+    {
+      "name": "reply_query_task_id_version_3",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "reply_query",
+          "task_id": "80160896-4fcd-3e6e-adac-98bac5497321"
+        }
+      }
+    },
+    {
+      "name": "reply_query_task_id_variant",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "reply_query",
+          "task_id": "80160896-4fcd-5e6e-cdac-98bac5497321"
         }
       }
     },
@@ -2424,6 +2478,344 @@
               }
             ],
             "submitted_at": 1793620800000
+          }
+        }
+      }
+    },
+    {
+      "name": "reply_selector_task_publishing",
+      "valid": true,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "reply",
+          "reply": {
+            "result_id": "996a448a-cf99-5e86-aa67-7f9a582a7eaa",
+            "state": "publishing",
+            "digest": "2384bd5d46eee434f1ffcc9fa1a0c3d5b9f26554c1120d37814e88778cd81941",
+            "text": "Done: /v2/orders is live",
+            "context": [],
+            "submitted_at": null,
+            "dropped": false
+          }
+        }
+      }
+    },
+    {
+      "name": "reply_selector_task_submitted",
+      "valid": true,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "reply",
+          "reply": {
+            "result_id": "996a448a-cf99-5e86-aa67-7f9a582a7eaa",
+            "state": "submitted",
+            "digest": "2384bd5d46eee434f1ffcc9fa1a0c3d5b9f26554c1120d37814e88778cd81941",
+            "text": "Done: /v2/orders is live",
+            "context": [
+              {
+                "kind": "vault",
+                "id": "v-notes:entry",
+                "version": 2,
+                "digest": "78e896bb405b866c60c8430bfe24597c500d8fe78a1184903a1afe15f291fa3d",
+                "text": "the notes"
+              }
+            ],
+            "submitted_at": 1793620800000,
+            "dropped": false
+          }
+        }
+      }
+    },
+    {
+      "name": "reply_selector_task_refused",
+      "valid": true,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "reply",
+          "reply": {
+            "result_id": "996a448a-cf99-5e86-aa67-7f9a582a7eaa",
+            "state": "refused",
+            "digest": "2384bd5d46eee434f1ffcc9fa1a0c3d5b9f26554c1120d37814e88778cd81941",
+            "text": "Done: /v2/orders is live",
+            "context": [],
+            "submitted_at": null,
+            "dropped": false
+          }
+        }
+      }
+    },
+    {
+      "name": "reply_selector_task_dropped",
+      "valid": true,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "reply",
+          "reply": {
+            "result_id": "996a448a-cf99-5e86-aa67-7f9a582a7eaa",
+            "state": "submitted",
+            "digest": "2384bd5d46eee434f1ffcc9fa1a0c3d5b9f26554c1120d37814e88778cd81941",
+            "text": "",
+            "context": [],
+            "submitted_at": 1793620800000,
+            "dropped": true
+          }
+        }
+      }
+    },
+    {
+      "name": "reply_publishing_has_no_submitted_at",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "reply",
+          "reply": {
+            "result_id": "996a448a-cf99-5e86-aa67-7f9a582a7eaa",
+            "state": "publishing",
+            "digest": "2384bd5d46eee434f1ffcc9fa1a0c3d5b9f26554c1120d37814e88778cd81941",
+            "text": "Done: /v2/orders is live",
+            "context": [],
+            "submitted_at": 1793620800000,
+            "dropped": false
+          }
+        }
+      }
+    },
+    {
+      "name": "reply_publishing_keeps_no_context",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "reply",
+          "reply": {
+            "result_id": "996a448a-cf99-5e86-aa67-7f9a582a7eaa",
+            "state": "publishing",
+            "digest": "2384bd5d46eee434f1ffcc9fa1a0c3d5b9f26554c1120d37814e88778cd81941",
+            "text": "Done: /v2/orders is live",
+            "context": [
+              {
+                "kind": "vault",
+                "id": "v-notes:entry",
+                "version": 2,
+                "digest": "78e896bb405b866c60c8430bfe24597c500d8fe78a1184903a1afe15f291fa3d",
+                "text": "the notes"
+              }
+            ],
+            "submitted_at": null,
+            "dropped": false
+          }
+        }
+      }
+    },
+    {
+      "name": "reply_refused_keeps_no_context",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "reply",
+          "reply": {
+            "result_id": "996a448a-cf99-5e86-aa67-7f9a582a7eaa",
+            "state": "refused",
+            "digest": "2384bd5d46eee434f1ffcc9fa1a0c3d5b9f26554c1120d37814e88778cd81941",
+            "text": "Done: /v2/orders is live",
+            "context": [
+              {
+                "kind": "vault",
+                "id": "v-notes:entry",
+                "version": 2,
+                "digest": "78e896bb405b866c60c8430bfe24597c500d8fe78a1184903a1afe15f291fa3d",
+                "text": "the notes"
+              }
+            ],
+            "submitted_at": null,
+            "dropped": false
+          }
+        }
+      }
+    },
+    {
+      "name": "reply_submitted_needs_its_time",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "reply",
+          "reply": {
+            "result_id": "996a448a-cf99-5e86-aa67-7f9a582a7eaa",
+            "state": "submitted",
+            "digest": "2384bd5d46eee434f1ffcc9fa1a0c3d5b9f26554c1120d37814e88778cd81941",
+            "text": "Done: /v2/orders is live",
+            "context": [
+              {
+                "kind": "vault",
+                "id": "v-notes:entry",
+                "version": 2,
+                "digest": "78e896bb405b866c60c8430bfe24597c500d8fe78a1184903a1afe15f291fa3d",
+                "text": "the notes"
+              }
+            ],
+            "submitted_at": null,
+            "dropped": false
+          }
+        }
+      }
+    },
+    {
+      "name": "reply_result_id_upper_case",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "reply",
+          "reply": {
+            "result_id": "996A448A-CF99-5E86-AA67-7F9A582A7EAA",
+            "state": "submitted",
+            "digest": "2384bd5d46eee434f1ffcc9fa1a0c3d5b9f26554c1120d37814e88778cd81941",
+            "text": "Done: /v2/orders is live",
+            "context": [
+              {
+                "kind": "vault",
+                "id": "v-notes:entry",
+                "version": 2,
+                "digest": "78e896bb405b866c60c8430bfe24597c500d8fe78a1184903a1afe15f291fa3d",
+                "text": "the notes"
+              }
+            ],
+            "submitted_at": 1793620800000,
+            "dropped": false
+          }
+        }
+      }
+    },
+    {
+      "name": "reply_result_id_must_be_uuid_v5",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "reply",
+          "reply": {
+            "result_id": "22222222-2222-4222-8222-222222222222",
+            "state": "submitted",
+            "digest": "2384bd5d46eee434f1ffcc9fa1a0c3d5b9f26554c1120d37814e88778cd81941",
+            "text": "Done: /v2/orders is live",
+            "context": [
+              {
+                "kind": "vault",
+                "id": "v-notes:entry",
+                "version": 2,
+                "digest": "78e896bb405b866c60c8430bfe24597c500d8fe78a1184903a1afe15f291fa3d",
+                "text": "the notes"
+              }
+            ],
+            "submitted_at": 1793620800000,
+            "dropped": false
           }
         }
       }
@@ -4636,6 +5028,364 @@
           "kind": "work",
           "work": {
             "task_id": "22222222-2222-4222-8222-222222222222",
+            "receipt_id": "55555555-5555-4555-8555-555555555555",
+            "state": "submitted",
+            "detail": "the agent is working",
+            "result": null
+          }
+        }
+      }
+    },
+    {
+      "name": "null_reply_answers_its_selector_task",
+      "answers": true,
+      "request": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "reply_query",
+          "task_id": "80160896-4fcd-5e6e-adac-98bac5497321"
+        }
+      },
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "reply",
+          "reply": null
+        }
+      }
+    },
+    {
+      "name": "reply_publishing_answers_its_selector_task",
+      "answers": true,
+      "request": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "reply_query",
+          "task_id": "80160896-4fcd-5e6e-adac-98bac5497321"
+        }
+      },
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "reply",
+          "reply": {
+            "result_id": "996a448a-cf99-5e86-aa67-7f9a582a7eaa",
+            "state": "publishing",
+            "digest": "2384bd5d46eee434f1ffcc9fa1a0c3d5b9f26554c1120d37814e88778cd81941",
+            "text": "Done: /v2/orders is live",
+            "context": [],
+            "submitted_at": null,
+            "dropped": false
+          }
+        }
+      }
+    },
+    {
+      "name": "reply_submitted_answers_its_selector_task",
+      "answers": true,
+      "request": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "reply_query",
+          "task_id": "80160896-4fcd-5e6e-adac-98bac5497321"
+        }
+      },
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "reply",
+          "reply": {
+            "result_id": "996a448a-cf99-5e86-aa67-7f9a582a7eaa",
+            "state": "submitted",
+            "digest": "2384bd5d46eee434f1ffcc9fa1a0c3d5b9f26554c1120d37814e88778cd81941",
+            "text": "Done: /v2/orders is live",
+            "context": [
+              {
+                "kind": "vault",
+                "id": "v-notes:entry",
+                "version": 2,
+                "digest": "78e896bb405b866c60c8430bfe24597c500d8fe78a1184903a1afe15f291fa3d",
+                "text": "the notes"
+              }
+            ],
+            "submitted_at": 1793620800000,
+            "dropped": false
+          }
+        }
+      }
+    },
+    {
+      "name": "reply_refused_answers_its_selector_task",
+      "answers": true,
+      "request": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "reply_query",
+          "task_id": "80160896-4fcd-5e6e-adac-98bac5497321"
+        }
+      },
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "reply",
+          "reply": {
+            "result_id": "996a448a-cf99-5e86-aa67-7f9a582a7eaa",
+            "state": "refused",
+            "digest": "2384bd5d46eee434f1ffcc9fa1a0c3d5b9f26554c1120d37814e88778cd81941",
+            "text": "Done: /v2/orders is live",
+            "context": [],
+            "submitted_at": null,
+            "dropped": false
+          }
+        }
+      }
+    },
+    {
+      "name": "reply_dropped_answers_its_selector_task",
+      "answers": true,
+      "request": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "reply_query",
+          "task_id": "80160896-4fcd-5e6e-adac-98bac5497321"
+        }
+      },
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "reply",
+          "reply": {
+            "result_id": "996a448a-cf99-5e86-aa67-7f9a582a7eaa",
+            "state": "submitted",
+            "digest": "2384bd5d46eee434f1ffcc9fa1a0c3d5b9f26554c1120d37814e88778cd81941",
+            "text": "",
+            "context": [],
+            "submitted_at": 1793620800000,
+            "dropped": true
+          }
+        }
+      }
+    },
+    {
+      "name": "another_tasks_reply_does_not_answer_a_selector_task",
+      "answers": false,
+      "request": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "reply_query",
+          "task_id": "80160896-4fcd-5e6e-adac-98bac5497321"
+        }
+      },
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "reply",
+          "reply": {
+            "result_id": "005c9723-949b-57f6-bfb1-db9b896dcfed",
+            "state": "submitted",
+            "digest": "2384bd5d46eee434f1ffcc9fa1a0c3d5b9f26554c1120d37814e88778cd81941",
+            "text": "Done: /v2/orders is live",
+            "context": [
+              {
+                "kind": "vault",
+                "id": "v-notes:entry",
+                "version": 2,
+                "digest": "78e896bb405b866c60c8430bfe24597c500d8fe78a1184903a1afe15f291fa3d",
+                "text": "the notes"
+              }
+            ],
+            "submitted_at": 1793620800000,
+            "dropped": false
+          }
+        }
+      }
+    },
+    {
+      "name": "a_reply_does_not_answer_a_work_query",
+      "answers": false,
+      "request": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "work_query",
+          "task_id": "80160896-4fcd-5e6e-adac-98bac5497321"
+        }
+      },
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "reply",
+          "reply": {
+            "result_id": "996a448a-cf99-5e86-aa67-7f9a582a7eaa",
+            "state": "submitted",
+            "digest": "2384bd5d46eee434f1ffcc9fa1a0c3d5b9f26554c1120d37814e88778cd81941",
+            "text": "Done: /v2/orders is live",
+            "context": [
+              {
+                "kind": "vault",
+                "id": "v-notes:entry",
+                "version": 2,
+                "digest": "78e896bb405b866c60c8430bfe24597c500d8fe78a1184903a1afe15f291fa3d",
+                "text": "the notes"
+              }
+            ],
+            "submitted_at": 1793620800000,
+            "dropped": false
+          }
+        }
+      }
+    },
+    {
+      "name": "a_work_status_does_not_answer_a_reply_query",
+      "answers": false,
+      "request": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "reply_query",
+          "task_id": "80160896-4fcd-5e6e-adac-98bac5497321"
+        }
+      },
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel",
+        "result": {
+          "kind": "work",
+          "work": {
+            "task_id": "80160896-4fcd-5e6e-adac-98bac5497321",
             "receipt_id": "55555555-5555-4555-8555-555555555555",
             "state": "submitted",
             "detail": "the agent is working",

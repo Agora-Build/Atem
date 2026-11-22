@@ -2275,11 +2275,12 @@ mod delegated_work_ops {
         );
     }
 
-    /// Host-work-v1 §11.2 (Astation's ask, #120 comment 7028723996): the
-    /// owner's `work_query`, `work_interrupt` and `work_resolve` go naming a
-    /// host sender's selector task (its UUID v5, §11.5), and are tracked as
-    /// any; `reply_query` and `work_cancel` naming one, or any op naming an
-    /// id that is no lowercase UUID v4 or v5, are refused before anything is
+    /// Host-work-v1 §11.2 (Astation's asks, #120 comments 7028723996 and
+    /// 7082465179): the owner's `work_query`, `reply_query`,
+    /// `work_interrupt` and `work_resolve` go naming a host sender's
+    /// selector task (its UUID v5, §11.5), and are tracked as any;
+    /// `work_cancel` and `work_complete` naming one, or any op naming an id
+    /// that is no lowercase UUID v4 or v5, are refused before anything is
     /// sealed. Whose task the id is, the host decides.
     #[test]
     fn the_owners_ops_go_naming_a_selector_task() {
@@ -2315,6 +2316,7 @@ mod delegated_work_ops {
             (1, "work_query"),
             (2, "work_interrupt"),
             (3, "work_resolve"),
+            (4, "reply_query"),
         ] {
             let sent = named(&attached, n, op, SELECTOR);
             attached
@@ -2332,11 +2334,7 @@ mod delegated_work_ops {
                 "{op}"
             );
         }
-        for (n, op) in [
-            (0x21, "reply_query"),
-            (0x22, "work_cancel"),
-            (0x23, "work_complete"),
-        ] {
+        for (n, op) in [(0x22, "work_cancel"), (0x23, "work_complete")] {
             assert_eq!(
                 attached
                     .send(&named(&attached, n, op, SELECTOR), now())

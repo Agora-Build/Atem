@@ -27,7 +27,7 @@ It also recomputes every Station report id of the acknowledgment fixtures
 reference ledger's `report_id`; and, from host-work-v1 §4 and §11.2, the
 verdicts of `host-work/requests-v1`'s requests that name a task (the
 owner's ops naming a host sender's selector task among them), of its `work`
-results and of its `answers` correlation.
+and `reply` results and of its `answers` correlation.
 
 Usage: python3 -I scripts/check-r9-vectors.py designs/protocol/fixtures
 
@@ -3789,7 +3789,8 @@ TASK_OPS = {
 }
 # The owner's ops (§11.2): they name a host sender's selector task (its
 # UUID v5, §11.5) as well as a UUID v4; the others a UUID v4 only.
-OWNER_TASK_OPS = {"work_query", "work_interrupt", "work_resolve"}
+# `reply_query` among them: Astation's ask, #120 comment 7082465179.
+OWNER_TASK_OPS = {"work_query", "reply_query", "work_interrupt", "work_resolve"}
 WORK_STATES = {
     "queued", "blocked", "submitting", "submitted", "awaiting_result",
     "completed", "failed", "cancelled", "expired", "outcome_unknown",
@@ -3924,6 +3925,54 @@ def work_result_ok(r):
     )
 
 
+def channel_reply_ok(r):
+    """A reply as `reply_query` returns it (§4 "Reply"), in any state (the
+    host envelope's `reply_ok` takes a submitted one only): exactly its fields
+    (`submitted_at` null, or omitted, before it is submitted), a lowercase
+    UUID v5 `result_id`, a state, a SHA-256 hex digest, a text of at most
+    16 KiB with no control character but newline and tab, 0-8 context
+    snapshots (§4's) only once submitted, `submitted_at` exactly when
+    submitted (a safe integer), and once `dropped` no text and no
+    context."""
+    if not isinstance(r, dict):
+        return False
+    keys = {"result_id", "state", "digest", "text", "context", "dropped"}
+    if set(r) not in (keys, keys | {"submitted_at"}):
+        return False
+    import unicodedata
+
+    text, context, at = r["text"], r["context"], r.get("submitted_at")
+    return (
+        is_uuid(r["result_id"], 5)
+        and r["state"] in ("publishing", "submitted", "refused")
+        and isinstance(r["digest"], str) and re.fullmatch(HEX64, r["digest"]) is not None
+        and isinstance(text, str) and len(text.encode()) <= 16 * 1024
+        and not any(unicodedata.category(c) == "Cc" and c not in "\n\t" for c in text)
+        and isinstance(context, list) and len(context) <= 8
+        and all(task_snapshot_ok(c) for c in context)
+        and (r["state"] == "submitted" or context == [])
+        and (r["state"] == "submitted") == (at is not None)
+        and (at is None or safe_int(at))
+        and type(r["dropped"]) is bool
+        and (not r["dropped"] or text == "" and context == [])
+    )
+
+
+def reply_result_ok(r):
+    """A `host_work_result` of kind `reply` (§7), as its data: no reply yet
+    (`null`) or a reply."""
+    return (
+        isinstance(r, dict)
+        and sorted(r) == ["attachment_gen", "channel_id", "host", "id", "op", "re", "result", "v"]
+        and r["v"] == 1 and type(r["v"]) is int and r["op"] == "host_work_result"
+        and all(is_uuid(r[k], 4) for k in ("id", "re", "attachment_gen"))
+        and host_target_ok(r["host"])
+        and isinstance(r["channel_id"], str) and r["channel_id"] != ""
+        and isinstance(r["result"], dict) and sorted(r["result"]) == ["kind", "reply"] and r["result"]["kind"] == "reply"
+        and (r["result"]["reply"] is None or channel_reply_ok(r["result"]["reply"]))
+    )
+
+
 def task_answer(request, result):
     """Whether a result (its data) answers a request naming a task: its `re`
     and host, then a reply naming the task's `result_id` (or none yet), or
@@ -3950,12 +3999,13 @@ def task_answer(request, result):
 def check_host_work_task_requests(file, data, report):
     """host-work/requests-v1's requests that name a task (§4, §11.2): each
     case's verdict recomputed from the rules as written there (the owner's
-    `work_query`, `work_interrupt` and `work_resolve` take a host sender's
-    selector task, its UUID v5, as well as a UUID v4, Astation's ask on #120
-    comment 7028723996; the other ops a UUID v4 only); its `work` results'
-    (a selector task's status among them); and the `answers` cases'
-    correlation. The file's other cases are the Rust runner's and the
-    binding suites'."""
+    `work_query`, `reply_query`, `work_interrupt` and `work_resolve` take a
+    host sender's selector task, its UUID v5, as well as a UUID v4,
+    Astation's asks on #120 comments 7028723996 and 7082465179; the other
+    ops a UUID v4 only); its `work` results' (a selector task's status among
+    them) and `reply` results' (a selector task's reply in each state among
+    them); and the `answers` cases' correlation, each result read first.
+    The file's other cases are the Rust runner's and the binding suites'."""
 
     def op_of(c):
         m = c.get("message")
@@ -3985,11 +4035,27 @@ def check_host_work_task_requests(file, data, report):
         case.check(any(c["valid"] and is_uuid(c["result"]["result"]["work"]["task_id"], 5) for c in works), "a selector task's status read")
         for c in works:
             case.equal(work_result_ok(c["result"]), c["valid"], f"{c['name']}: {'read' if c['valid'] else 'refused'}")
+    with report.case(file, "reply results") as case:
+        replies = [c for c in data["results"] if isinstance(c["result"].get("result"), dict) and c["result"]["result"].get("kind") == "reply"]
+        selector_result = result_id_of("80160896-4fcd-5e6e-adac-98bac5497321")
+        for state in ("publishing", "submitted", "refused"):
+            case.check(
+                any(c["valid"] and c["result"]["result"]["reply"]["state"] == state and c["result"]["result"]["reply"]["result_id"] == selector_result for c in replies),
+                f"a selector task's {state} reply read",
+            )
+        case.check(any(c["valid"] and c["result"]["result"]["reply"]["dropped"] is True for c in replies), "a dropped reply read")
+        for c in replies:
+            case.equal(reply_result_ok(c["result"]), c["valid"], f"{c['name']}: {'read' if c['valid'] else 'refused'}")
     with report.case(file, "answers") as case:
         for c in data["answers"]:
             text = json.dumps(c["request"], ensure_ascii=False)
             case.check(task_request_ok(text), f"{c['name']}: its request reads")
+            case.check(work_result_ok(c["result"]) or reply_result_ok(c["result"]), f"{c['name']}: its result reads")
             case.equal(task_answer(c["request"], c["result"]), c["answers"], f"{c['name']}: answers")
+        case.check(
+            any(c["answers"] and c["request"]["data"]["op"] == "reply_query" and is_uuid(c["request"]["data"]["task_id"], 5) and c["result"]["result"]["kind"] == "reply" and c["result"]["result"]["reply"] is not None for c in data["answers"]),
+            "a selector task's reply answers its reply_query",
+        )
 
 
 # ---------------------------------------------------------------------- main

@@ -7,8 +7,10 @@
 //! always does); the core's request reader (`host_work_request_valid`) over
 //! every request case, the owner's ops naming a host sender's selector task
 //! (§11.2) among them; and its result correlation
-//! (`host_work_result_answers`) over every `answers` case. The Swift,
-//! Kotlin and JS suites run the same vectors against the same exports.
+//! (`host_work_result_answers`) over every `answers` case, the owner's
+//! `reply_query` of a selector task in each reply state among them. The
+//! Swift, Kotlin and JS suites run the same vectors against the same
+//! exports.
 use atem_client_ffi::host_work::host_work_result_id;
 use serde_json::Value;
 
@@ -40,7 +42,8 @@ fn result_ids_match_the_known_answers() {
 
 /// An app that holds a `reply_query` and its result checks the reply as
 /// the core does (`Response::answers`, applied by `ClientConnection` to
-/// every result it reads).
+/// every result it reads): every `reply_query` answered by a reply, a host
+/// sender's selector task's among them.
 #[test]
 fn an_app_checks_a_reply_against_its_task() {
     let file = vectors();
@@ -48,9 +51,11 @@ fn an_app_checks_a_reply_against_its_task() {
         .as_array()
         .unwrap()
         .iter()
-        .filter(|c| c["result"]["result"]["kind"] == "reply")
+        .filter(|c| {
+            c["result"]["result"]["kind"] == "reply" && c["request"]["data"]["op"] == "reply_query"
+        })
         .collect();
-    assert_eq!(cases.len(), 3);
+    assert_eq!(cases.len(), 9);
     for case in cases {
         let task = case["request"]["data"]["task_id"].as_str().unwrap();
         let reply = &case["result"]["result"]["reply"];
@@ -90,6 +95,7 @@ fn every_request_case_reads_as_the_vectors_say() {
     }
     for name in [
         "work_query_selector_task",
+        "reply_query_selector_task",
         "work_interrupt_selector_task",
         "work_resolve_selector_task",
     ] {
@@ -111,7 +117,7 @@ fn every_answers_case_correlates_as_the_vectors_say() {
     use atem_client_ffi::host_work::host_work_result_answers;
     let file = vectors();
     let cases = file["answers"].as_array().unwrap();
-    assert_eq!(cases.len(), 5);
+    assert_eq!(cases.len(), 13);
     for case in cases {
         assert_eq!(
             host_work_result_answers(case["request"].to_string(), case["result"].to_string()),
@@ -128,6 +134,95 @@ fn every_answers_case_correlates_as_the_vectors_say() {
         first["request"].to_string(),
         bad.to_string()
     ));
+}
+
+/// The owner's `reply_query` of a host sender's selector task (host-work-v1
+/// §11.2; Astation's ask, #120 comment 7082465179), through the exports:
+/// the request reads, its uppercase, version 3 and variant forms don't; no
+/// reply yet and a reply in each state (`publishing`, `submitted`,
+/// `refused`, dropped) answer it, each with the selector task's own
+/// `result_id`; another task's reply, the same reply to a `work_query` and
+/// a status to the `reply_query` answer nothing.
+#[test]
+fn the_owners_reply_query_of_a_selector_task() {
+    use atem_client_ffi::host_work::{host_work_request_valid, host_work_result_answers};
+    let file = vectors();
+    let named = |list: &str, name: &str| -> Value {
+        file[list]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("{name}"))
+            .clone()
+    };
+    for (name, valid) in [
+        ("reply_query_selector_task", true),
+        ("reply_query_selector_task_upper_case", false),
+        ("reply_query_task_id_version_3", false),
+        ("reply_query_task_id_variant", false),
+    ] {
+        let case = named("cases", name);
+        assert_eq!(case["valid"], valid, "{name}");
+        assert_eq!(
+            host_work_request_valid(case["message"].to_string()),
+            valid,
+            "{name}"
+        );
+    }
+    let selector = named("cases", "reply_query_selector_task")["message"]["data"]["task_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for (name, state) in [
+        ("null_reply_answers_its_selector_task", None),
+        (
+            "reply_publishing_answers_its_selector_task",
+            Some("publishing"),
+        ),
+        (
+            "reply_submitted_answers_its_selector_task",
+            Some("submitted"),
+        ),
+        ("reply_refused_answers_its_selector_task", Some("refused")),
+        ("reply_dropped_answers_its_selector_task", Some("submitted")),
+    ] {
+        let case = named("answers", name);
+        assert_eq!(case["request"]["data"]["op"], "reply_query", "{name}");
+        assert_eq!(case["request"]["data"]["task_id"], selector, "{name}");
+        let reply = &case["result"]["result"]["reply"];
+        match state {
+            None => assert!(reply.is_null(), "{name}"),
+            Some(state) => {
+                assert_eq!(reply["state"], state, "{name}");
+                assert_eq!(
+                    reply["result_id"].as_str(),
+                    Some(host_work_result_id(selector.clone()).as_str()),
+                    "{name}"
+                );
+            }
+        }
+        assert!(
+            host_work_result_answers(case["request"].to_string(), case["result"].to_string()),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        named("answers", "reply_dropped_answers_its_selector_task")["result"]["result"]["reply"]["dropped"],
+        true
+    );
+    for name in [
+        "another_tasks_reply_does_not_answer_a_selector_task",
+        "a_reply_does_not_answer_a_work_query",
+        "a_work_status_does_not_answer_a_reply_query",
+    ] {
+        let case = named("answers", name);
+        assert_eq!(case["request"]["data"]["task_id"], selector, "{name}");
+        assert!(
+            !host_work_result_answers(case["request"].to_string(), case["result"].to_string()),
+            "{name}"
+        );
+    }
 }
 
 /// `host_work_result_answers` reads a result as strictly as the connection
