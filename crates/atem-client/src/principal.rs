@@ -189,9 +189,7 @@ impl Need {
                 "work_enqueue" | "work_query" | "reply_query" | "work_cancel" | "work_complete"
                 | "work_interrupt" | "work_resolve",
             ) => Need::Op(Op::Notify),
-            ("session", "message_publish" | "message_query" | "attachment_put") => {
-                Need::Op(Op::Message)
-            }
+            ("session", "message_publish" | "message_query" | "attachment_put") => Need::Op(Op::Message),
             ("session", "membership") => Need::Op(Op::View),
             ("terminal", "input" | "resize") => Need::Op(Op::Terminal),
             ("terminal", "stop") => Need::Op(Op::Stop),

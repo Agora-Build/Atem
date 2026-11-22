@@ -23,17 +23,17 @@
 use rand_core::{OsRng, RngCore};
 
 pub mod alerts;
-pub mod attachments;
 pub mod chat;
 pub mod client;
 pub mod framing;
 pub mod host_policy;
 pub mod host_work;
-pub mod mark;
 pub mod messages;
+pub mod select;
+pub mod attachments;
+pub mod mark;
 pub mod r9;
 pub mod revision;
-pub mod select;
 pub mod terminal;
 pub mod wire;
 
