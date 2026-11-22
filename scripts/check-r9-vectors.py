@@ -3775,9 +3775,6 @@ def check_host_route(file, data, report, context):
         case.equal(codes, {(v, c) for v in ROUTE_KINDS for c in ("malformed", "bad_signature")}, "each verifier refuses the other kind and a relabelled proof")
 
 
-# ---------------------------------------------------------------------- main
-
-# In order: a checker may use what an earlier one recorded in `context`.
 # ------------------------------------------- host-work/requests-v1 (task ops)
 
 # The requests naming a task (host-work-v1 §4 "Query, cancel, complete",
@@ -3995,6 +3992,9 @@ def check_host_work_task_requests(file, data, report):
             case.equal(task_answer(c["request"], c["result"]), c["answers"], f"{c['name']}: answers")
 
 
+# ---------------------------------------------------------------------- main
+
+# In order: a checker may use what an earlier one recorded in `context`.
 CHECKERS = [
     ("r9-vectors-keys", check_keys),
     ("r9-vectors-membership-log", check_membership_log),

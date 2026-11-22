@@ -1770,7 +1770,13 @@ selector task id"), and a `work` status carries that id.
   v5 that names no such task (none at all, the runtime's `local` task, a
   channel sender's, or a task whose id its message doesn't derive) get
   exactly what a task the host doesn't have gets: `forbidden`, no detail,
-  nothing read or changed. A UUID v5 grants nothing. A service is `busy`
+  nothing changed. For a caller that isn't the owner nothing is read
+  either: it is refused on who it is and the id's form, before any store
+  read, so neither its answer nor how it is reached depends on whether the
+  task exists (a v5 skips the read a v4's lookup makes, which tells the
+  caller only the form of the id it chose, never existence). The owner's
+  v5 that isn't such a task is read, task and message, then refused. A UUID
+  v5 grants nothing. A service is `busy`
   while the host's control state doesn't read, whatever task it names
   (§11.6), the missing task's answer too.
 - **What each does** is what it does for any delegated task the owner may
