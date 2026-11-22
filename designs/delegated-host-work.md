@@ -184,8 +184,10 @@ app's part (Astation's, the five device-list actions signed only behind the sign
 encryption key in the ceremony (Atem's side is draft PR #176, held for Astation's, II.4.1); a host sender's revoke
 reported to the Station as applied, and a later answer on its channel for a carried record left `pending`
 (II.3.1); the directory (II.6). Astation agreed the wire on 2026-11-16 (#120
-comment 6903887341) and the receiving host's mailbox readings on 2026-11-17 (#120 comment 6938206284); the readings
-still waiting are listed in host-work-v1 §11.5, "Readings waiting for Astation". Activation is a later owner
+comment 6903887341), the receiving host's mailbox readings on 2026-11-17 (#120 comment 6938206284) and the rest of
+Atem's host-sender readings on 2026-11-20 (#120 comment 7028723996), each marked where it is written; project
+narrowing is judged per entry, as Astation asked, by the owner's decision of 2026-11-22. What is still open is listed
+in host-work-v1 §11.5, "Readings waiting for Astation". Activation is a later owner
 decision, after VII.A's and VII.B's joint checks; a dev host turns host senders on as
 [agent-hosting.md](agent-hosting.md) section 14 says ("Host senders on a dev host").
 
@@ -1901,7 +1903,8 @@ receiving host as signed data (I.1.3):
 the objects' checks; behind the debug-only hook, on the receiving host: the effects of `host_sender_revoke`,
 `remove_host` and project entries on its tasks, written with host-work's applied device-list `seq` in one transaction
 and replayed after a crash (in host-work's own pass, a pass after the device list's commit, while the start check
-already refuses from the committed list: Atem's reading, for Astation), the start check's standing (a revoke, a removal
+already refuses from the committed list: Atem's reading, agreed with Astation, 2026-11-20, #120 comment 7028723996), the
+start check's standing (a revoke, a removal
 or a readmit since admission), and a native's later `interrupt_running` about a host principal, from a feed or a
 native's channel (`control_records`) (host-work-v1 §11.6, §11.1). **Not built:** the host's report of a host sender's
 revoke as applied to its Station (the entry form, with the applied `seq`, "Reporting a revoke as applied" below), and
@@ -2094,7 +2097,8 @@ document calls the key `enc_key`.
 step 3 and its step-4 amendments, with the host-envelope vectors); behind the debug-only hook, the sending host seals
 its requests, cancels and completes, and the receiving host judges each object its mailbox serves and runs step 7 at
 admission (host-work-v1 §11.5). A `complete` may also name the task's own reply (host-work-v1 §11.5, "A `complete`
-naming the reply"; Atem's reading, for Astation).
+naming the reply"; Atem's reading, agreed with Astation, 2026-11-20, #120 comment 7028723996, once every strict consumer
+adopts the shared vectors and readers).
 
 **Needs agreement.** An envelope from a host sender is origin-signed with its `host_key` and sealed to the receiving
 host's `enc_key`. It follows R9.9's push hint: a signed body that names both hosts and the hash of the sealed part,
@@ -2457,7 +2461,8 @@ opened before its request kept until its request comes. **The sending host's sid
 (host-work-v1 §11.5, "On the sending host"): `atem message cancel` and `complete` of a task another host's status
 named seal a `cancel` or `complete` of their own, put until a status shows its effect, the host refuses it by its own
 id, or it expires; a complete names the reply that host sent back (a `result` snapshot of the task's own
-`result:<result_id>`, Atem's reading, for Astation). The table's last row stays as it says: no query, interrupt or
+`result:<result_id>`, Atem's reading, agreed with Astation, 2026-11-20, #120 comment 7028723996). The table's last row
+stays as it says: no query, interrupt or
 resolution from a host sender in this version.
 
 A host sender has no channel (II.2.1), so the source's interaction authority (I.3.1) maps onto objects:

@@ -4633,7 +4633,9 @@ sets versus sequences (R9.2). Still open:
    start of a build that knows it. The agreed design's rotation within a
    trust generation (II.4.1), its answer to `enc_key_reused`, and its
    compromise remedy (`retire_previous`) need a way to ask the host for a
-   new key: a flag on the op, or a local command. Needed before step 4.
+   new key: a flag on the op, or a local command. Still open, as a
+   separate proposal Astation asked for (2026-11-20, #120 comment 7028723996;
+   R9.14 item 8).
 
 ### R9.14 Delegated host work (items 1-7 and item 8's `host_enc_key_get` built behind a debug-only hook; not advertised by release builds)
 
@@ -4724,7 +4726,7 @@ below. Item 8's request stays open.
 
    | Field | Value |
    |---|---|
-   | `task_id` | the delegated task this attempt runs (host-work-v1 §11.6): a UUID v4, or for a `host:` sender the UUID v5 of a selector's fixed resolution (host-work-v1 §11.5; Atem's reading, for Astation's agreement: this row named a UUID v4 before host senders' `select` existed) |
+   | `task_id` | the delegated task this attempt runs (host-work-v1 §11.6): a UUID v4, or for a `host:` sender the UUID v5 of a selector's fixed resolution (host-work-v1 §11.5; Atem's reading, agreed with Astation (2026-11-20, #120 comment 7028723996, "Admission" item 1) for `host:` senders only: this row named a UUID v4 before host senders' `select` existed, and every other sender's task id stays one) |
    | `sender` | the principal that enqueued the task: `member:<device_id>`, `service:<device_id>` or `host:<host_id>`, the id 1–128 bytes of `[A-Za-z0-9._:-]` |
 
    - **Both or neither, and only on a `prompt` receipt**, the one kind the
@@ -5045,8 +5047,9 @@ below. Item 8's request stays open.
        unavailable`, nothing handed out (**changed to match the design's
        amendment for step 4, agreed with Astation 2026-11-13, #120 comment
        6848326392; this op's handling of it, a record written on request
-       and `busy` when that write fails, is Atem's reading, for
-       Astation**).
+       and `busy` when that write fails, is Atem's reading, agreed with
+       Astation (2026-11-20, #120 comment 7028723996, final readings item
+       11)**).
      - **The client** takes an answer only for a request it sent on that
        channel, from the channel's host (`atem_device_id`) at its trust
        generation. Anything else is a malformed host message (`unbound
@@ -5071,8 +5074,13 @@ below. Item 8's request stays open.
          `bad_enc_sig`).
        - A relay or a channel can't offer a key the host didn't vouch for
          in this generation.
-     - **Open (needs Astation's agreement before step 4):** how a manager
-       asks a host for a *new* key.
+     - **Open, a separate proposal still to write:** how a manager asks a
+       host for a *new* key. Astation (2026-11-20, #120 comment 7028723996):
+       routine rotation stays a separate, unresolved operation; this op is
+       no rotation, and in-place re-verification is no way to one; the
+       proposal must define the manager's request, the owner's
+       confirmation, the refusal of a reused key, the publication order and
+       the old key's retention and retirement.
        - **What needs it.** The agreed design relies on a new key for a
          routine rotation (II.4.1), after `enc_key_reused`, and after a
          suspected compromise (`retire_previous`, VI "Plain host keys";

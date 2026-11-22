@@ -1091,7 +1091,10 @@ frozen (R9.4) or the host is held after a write fault (R9.3).
   welcomed before the pause); a welcome during the pause lists no
   host-work feature, and the host refuses it from such a channel
   (`unsupported_version`, `host.senders is not advertised`). **One rule for its results (Atem's
-  reading, for Astation):** §11.4's acknowledgments are for what the
+  reading, agreed with Astation (2026-11-20, #120 comment 7028723996, final
+  readings item 10): carriage over a channel gives evidence on that
+  channel only, and the Station gets no acknowledgment until its own feed
+  carries the record):** §11.4's acknowledgments are for what the
   host's own Station's feed delivered, so a record only a channel carried
   is reported on that channel only and never acknowledged to the Station,
   whether it applied at once or was `pending` and applied at a later
@@ -1999,7 +2002,7 @@ alerts.)
 | `kind` | `outcome_unknown`, the one kind; a reader refuses any other |
 | `host_id` | the host's own `atem_device_id`, the `host` of the result; another host's is refused |
 | `session_id` | the task's target session (`ses-` and 12 characters) |
-| `task_id` | the task: a UUID v4 (a delegated task's id), or a host sender's selector task's UUID v5 (§11.5, "On the receiving host"; Atem's reading, for Astation) |
+| `task_id` | the task: a UUID v4 (a delegated task's id), or a host sender's selector task's UUID v5 (§11.5, "On the receiving host"; Atem's reading, agreed with Astation (2026-11-20, #120 comment 7028723996, "Admission" item 1) for `host:` senders only: every other sender's task id stays a UUID v4) |
 | `sender` | the delegated sender that enqueued the task: `member:<id>`, `service:<id>` or `host:<id>` (an id of 1-128 bytes of `[A-Za-z0-9._:-]`), as a receipt's provenance names it (session-v1 R9.14). Never `local` or `browser:` |
 | `reason` | why the outcome is unknown, for people: 1-256 bytes, not blank (something besides White_Space; amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**), no control or Cf character. Atem gives one of §11.6's `outcome_unknown` reasons as the task's receipt says (`agent exited`, `outcome could not be established`, `write interrupted`), with the note below at 32. Kept as raised: the task's `detail` changes at its deadline, the alert's `reason` doesn't |
 | `created_at` | Unix ms on the host's wall clock: when the task became `outcome_unknown`. For people only: it orders nothing |
@@ -3267,7 +3270,10 @@ strips and re-signs as its own doesn't open.
 A task id is the recipient's UUID v4, or the UUID v5 of a selector's fixed
 resolution (collaboration §5).
 
-**A `complete` naming the reply** (**Atem's reading, for Astation**;
+**A `complete` naming the reply** (**Atem's reading, agreed with
+Astation (2026-11-20, #120 comment 7028723996, final readings item 1), with
+its proviso: every strict consumer adopts the shared vectors and readers
+before using it**;
 collaboration §10 calls naming the reply as the result a later contract
 addition, and `atem message complete` completes a local task with its
 reply). A host sender completes a task on another host with the reply
@@ -3783,8 +3789,15 @@ exactly as without this section):
   are decided, at most 128 a pass, each in its own `BEGIN IMMEDIATE`
   transaction of the host-work store, with the row's removal and the
   status owed to its sender enqueued in the put engine (until stored);
-  nothing reaches an agent or is put before it commits (**Atem's reading,
-  for Astation:** "`select` from host senders" and design II.4.2 step 7
+  nothing reaches an agent or is put before it commits (**Atem's reading;
+  its commit order agreed with Astation (2026-11-20, #120 comment 7028723996,
+  final readings item 6), with its proviso, in its words: "Persisted
+  inbox obligations block that sender's starts until decided, including
+  restart and storage failure. No task/effect/put before its commit, and
+  other senders are not globally blocked." The host's gate holds every
+  host sender's starts, not only that sender's, while any inbox row waits
+  ("host senders' gate" above), so that part is open ("Readings waiting
+  for Astation"):** "`select` from host senders" and design II.4.2 step 7
   and II.6 commit the resolution with the object's verdict and its
   cursor; here the opened object commits with the cursor as a durable
   inbox row, which stands in for the verdict and holds its sender's task
@@ -3811,7 +3824,8 @@ exactly as without this section):
     outage) is refused whole `busy` (never judged so under a clock
     anchor): no task past its deadline. The
     sender's standing is checked again on the committed list against the
-    head it signed at (**Atem's reading, for Astation:** a revoke and a
+    head it signed at (**Atem's reading, agreed with Astation (2026-11-20,
+    #120 comment 7028723996, final readings item 7):** a revoke and a
     readmit, or a removal and a re-add, between its opening and its
     admission refuse it `forbidden`, as check 3 would at that head). Then
     step 7, with the sender's permit (design II.2.3) in place of a channel
@@ -3832,7 +3846,8 @@ exactly as without this section):
     the 256 unfinished tasks and the store's records, the sender's
     unresolved outcomes. Each whole refusal is recorded and reported as
     `{"kind":"status","object_id":<message_id>,"refused":<code>}`
-    (**Atem's reading, for Astation:** `request_id_reused` and `busy` are
+    (**Atem's reading, agreed with Astation (2026-11-20, #120 comment 7028723996,
+    "Admission" items 2 and 3):** `request_id_reused` and `busy` are
     object refusals, since a recipient's receipt carries only `forbidden`
     or `stale_target`; `busy` is final for that `message_id`, a resend
     gets it again: the sender sends anew). A recorded refusal is kept 48
@@ -3846,7 +3861,10 @@ exactly as without this section):
     send now: a cancel reaches it while it hasn't started (design II.8):
     `queued` or `blocked` it is cancelled at once (`cancelled before
     submission`), and one whose attempt waits `accepted` (**Atem's
-    reading, for Astation:** design II.8's unstarted tasks include it) is
+    reading, agreed with Astation (2026-11-20, #120 comment 7028723996,
+    "Admission" item 5), its durable fence before the withdrawal included,
+    and running work never reported cancelled:** design II.8's unstarted
+    tasks include it) is
     marked cancelled on its record in that transaction and has the attempt
     withdrawn after the commit, as a revoke withdraws it, the task settling
     `cancelled` from that. The mark is durable: the start check refuses the
@@ -3859,8 +3877,9 @@ exactly as without this section):
     covering a task and completes it with the snapshot, as `work_complete`
     does. Otherwise it isn't reached. Either way the message's current
     status goes, and one
-    not reached is also answered by its own id (**Atem's reading, for
-    Astation:** design II.8's "`busy` in the status", which a task's `work`
+    not reached is also answered by its own id (**Atem's reading, agreed
+    with Astation (2026-11-20, #120 comment 7028723996, "Admission" item 4):**
+    design II.8's "`busy` in the status", which a task's `work`
     receipt can't carry, so that the sending host stops resending it):
     `{"kind":"status","object_id":<the cancel's or complete's id>,
     "refused":"busy"}` when the task's state doesn't allow it (running or
@@ -3869,8 +3888,9 @@ exactly as without this section):
     narrowed since, the sender revoked, or a task admitted before a revoke
     and a readmit, or a removal and a re-add: the owner's alone). One
     whose task isn't here yet (a free between pages can open a later
-    object first) is kept as an early stop (**Atem's reading, for
-    Astation**), bound to its sender at its
+    object first) is kept as an early stop (**Atem's reading, agreed with
+    Astation (2026-11-20, #120 comment 7028723996, "Admission" item 6)**),
+    bound to its sender at its
     current generation and epoch (after a revoke and a readmit, or a
     removal and a re-add, it no longer applies), its object and the task
     it names, until its expiry (dropped by the mailbox's minute prune,
@@ -3898,8 +3918,9 @@ exactly as without this section):
     old outbox gone) gets none: the record keeps the state for the owner.
     The sender's resend of an admitted request that the mailbox reads as a
     duplicate (its claim held) marks the message's status owed again
-    (**Atem's reading, for Astation:** the Station may have lost the
-    first), but only once the latest status was stored: one still waiting
+    (**Atem's reading, agreed with Astation (2026-11-20, #120 comment 7028723996,
+    "Admission" item 7), to this refined wording:** the Station may have
+    lost the first), but only once the latest status was stored: one still waiting
     to be stored is put again anyway, the same object, never superseded by
     a copy of itself, so that resend owes nothing. A resend of a request
     refused whole marks its recorded refusal owed again on every such
@@ -3910,8 +3931,13 @@ exactly as without this section):
     position past the furthest the host ever read under that mailbox id.
     The same copy read again after a rewind, or after a reset under the
     same mailbox id, owes nothing; nor does a copy of a `cancel` or
-    `complete`. **Atem's reading, for Astation:** what remains is a
-    status the Station loses after it stored it. The sender resends its
+    `complete`. **Atem's reading, agreed with Astation (2026-11-20,
+    #120 comment 7028723996, final readings item 3) as an explicitly documented
+    Station durability-fault residual, not normal delivery semantics
+    (`stored` follows the Station's durable commit, a Station reset or
+    restore stays fenced until its recovery obligations are met, and
+    expiry proves no completion):** what remains is a status the Station
+    loses after it stored it. The sender resends its
     request only until it has recorded a status of the message, so once
     it has, a later status lost that way isn't repaired: nothing owes it
     again until the task's state changes here (the next status carries the
@@ -3926,14 +3952,15 @@ exactly as without this section):
     `{"kind":"status","object_id","refused":"invalid_request"}` once, its
     mark cleared in that transaction.
   - **A host sender's selector task id** is a delegated task id
-    (**Atem's reading, for Astation:** session-v1 R9.14 item 2's
+    (**Atem's reading, agreed with Astation (2026-11-20, #120 comment 7028723996,
+    "Admission" item 1) for `host:` senders only, every other sender
+    keeping its restriction:** session-v1 R9.14 item 2's
     provenance and §11.3's alerts named a UUID v4 before host senders'
     `select` existed): a receipt's provenance and an owner's alert take a
     UUID v4, or the UUID v5 of a selector's resolution when the sender is
     `host:<host_id>` (`wire::is_delegated_task_id`; the provenance vector
-    `receipt_provenance_host_selector_task`). **Agreed with Astation
-    ([#120 comment 7028723996][c-7028723996], "Admission" item 1)**, which
-    asked for the owner's ops on such a task, **built**: the owner's
+    `receipt_provenance_host_selector_task`). Astation also asked there
+    for the owner's ops on such a task, **built**: the owner's
     `work_query`, `work_interrupt` and `work_resolve` over a channel name
     it, served only to the owner and only for a task whose recorded
     provenance is a host sender's selector task; every other caller and
@@ -3947,12 +3974,15 @@ exactly as without this section):
     message reply`, or its context's publication), so the mark commits with
     the reply, and the status pass seals it as it seals a status and
     enqueues it until stored, recorded sent in that transaction. **Atem's
-    readings, for Astation:** one result per task, only once `submitted`
-    (a reply still publishing waits; a refused one sends nothing, a
-    corrected one sends one once submitted); none to a sender with no
-    current key, no longer a current host or re-verified since its message
-    (the owner still reads the reply); signed while this host is a current
-    host at its own trust generation, `authorized` or not, as statuses are.
+    readings, agreed with Astation (2026-11-20, #120 comment 7028723996, "Results"
+    item 5), but for the last clause of this sentence:** one result per
+    task, only once `submitted` (a reply still publishing waits; a refused
+    one sends nothing, a corrected one sends one once submitted); none to a
+    sender with no current key, no longer a current host or re-verified
+    since its message (the owner still reads the reply); signed while this
+    host is a current host at its own trust generation, `authorized` or
+    not, as statuses are (**still Atem's reading, for Astation**: signing
+    while this host is revoked as a sender).
     A result goes only once, so one that a store fault keeps from sealing
     stays owed and goes on a later pass, each on its own (one that keeps
     failing holds none of the others), and is settled, its mark cleared
@@ -3971,7 +4001,8 @@ exactly as without this section):
     that route of the same sender (reserved by an earlier request of its
     and still starting, or started while its session's launch project
     isn't known yet) is shared, as stage 1 shares one (**Atem's reading,
-    for Astation:** never another sender's, whose admission and expiry it
+    agreed with Astation (2026-11-20, #120 comment 7028723996, final readings
+    item 4):** never another sender's, whose admission and expiry it
     carries); else one is reserved, one per profile per message, in the
     admission transaction with the
     tasks that wait for it, within the launch records' limit (else the
@@ -3985,9 +4016,13 @@ exactly as without this section):
     approved route`, holding its session); a launch that failed (the
     detail its spawn check gave, `approved route launch not started:
     <detail>`, as the launcher's reason), or whose
-    outcome is unknown after a restart, fails them (**Atem's reading, for
-    Astation:** they never started, so their own outcome is known; stage
-    1's local task becomes `outcome_unknown` there). Without every
+    outcome is unknown after a restart, fails them (**Atem's reading,
+    agreed with Astation (2026-11-20, #120 comment 7028723996, final readings
+    item 5), with its proviso: when an uncertain or failed launch has
+    provably never started its waiting tasks, those tasks fail, and the
+    launch's own unknown outcome is retained and is not permission to
+    launch again:** they never started, so their own outcome is known;
+    stage 1's local task becomes `outcome_unknown` there). Without every
     condition the recipient resolves to the running agents only.
 
 **On the sending host** (built behind the debug-only hook's
@@ -4054,10 +4089,15 @@ exactly as without this section):
   (sealed, made in the last 48 h), each with its `ExpectedResult` (the
   message id, its cancel and complete envelopes, the tasks of the recorded
   resolution); its verdict is `accept_result`'s against the first row the
-  plaintext answers (**the shared core's addition, no wire change:** a host
-  can't tell which of its rows a result answers before it opens it). Then,
+  plaintext answers (**the shared core's addition, no wire change, agreed
+  with Astation (2026-11-20, #120 comment 7028723996, "Results" item 6):**
+  a host can't tell which of its rows a result answers before it opens
+  it). Then,
   in one `BEGIN IMMEDIATE` transaction, its effect and its removal from the
-  kept results. **Atem's readings, for Astation:**
+  kept results. **Atem's readings: "A status", "A result", "What waits,
+  what goes" and "The delivery" agreed with Astation (2026-11-20,
+  #120 comment 7028723996, "Results" items 1 to 4), "Task ids" still for
+  Astation:**
   - **A status.** The first status naming this host's resolution of the
     row's recipient records it (each task with its receipt, state and
     detail, or `no_match`, `stored` or `refused` with no task) and moves the
@@ -4174,8 +4214,10 @@ exactly as without this section):
   `cancelled`, or `completed`: the row `accepted`), the host refuses it by
   its own id (`busy`, `forbidden`: `refused` with the code), or it expires.
   As stage 1: only the task's sending session (for a complete, its process
-  too) or the owner outside any session. **Atem's readings, for
-  Astation:** what the newest status shows decides what can't change, so a
+  too) or the owner outside any session. **Atem's readings, agreed with
+  Astation (2026-11-20, #120 comment 7028723996, final readings item 2), which
+  adds: a queued or held complete is never reported sent or effective:**
+  what the newest status shows decides what can't change, so a
   cancel of a task it shows started or ended is refused here, as is a
   complete of one it shows failed, cancelled, expired or of unknown outcome
   (that host's owner resolves those); one it shows completed is done. A
@@ -4748,67 +4790,28 @@ R9.2's ("Pairing (ceremony changes)"):
 
 #### Readings waiting for Astation
 
-Atem's readings for host senders that Astation hasn't agreed yet, one line
-each: what it says, where it is written (the bullet's name in quotes), and
-the #120 comment that asked. All are behind the debug-only hook: no release
-build runs any of them. A reading Astation agreed is marked agreed where it
-is written; the latest are the receiving host's mailbox readings (a reset,
-a page's `head`, back-pressure, bounded storage, results kept unjudged),
-agreed on 2026-11-17 ([#120 comment 6938206284][c-6938206284]), and the
-wire of this section with its 512 KiB mailbox calls, agreed on 2026-11-16
-([#120 comment 6903887341][c-6903887341]).
+What of Atem's host-sender readings Astation hasn't agreed yet. Astation
+agreed the rest on 2026-11-20 ([#120 comment 7028723996][c-7028723996]):
+"Admission" items 1 to 7, "Results" items 1 to 6 and final readings items
+1 to 8, 10 and 11, each marked agreed where it is written, with the
+proviso Astation attached where it attached one. Final readings item 9,
+project narrowing, is settled by the owner's decision of 2026-11-22, which
+judges each entry on its own as Astation asked (§11.6, "Project entries
+are judged per entry"). Earlier: the receiving host's mailbox readings
+([#120 comment 6938206284][c-6938206284]) and this section's wire ([#120
+comment 6903887341][c-6903887341]). All of it runs only behind the
+debug-only hook.
 
-Item 1 of [#120 comment 6945317466][c-6945317466] is settled: Astation
-agreed that a host sender's selector task id (UUID v5) is a delegated task
-id ([On the receiving host][mailbox-calls], "A host sender's selector task
-id"; [§11.3](#113-alert_list-hostalerts)'s `task_id`; session-v1 R9.14 item
-2), and answered its open point (should the owner's `work_query`,
-`work_resolve` and `work_interrupt` take that UUID v5?) by asking for it
-([#120 comment 7028723996][c-7028723996], "Admission" item 1). Built:
-§11.2, "The owner's ops on a host sender's task".
-
-Asked in [#120 comment 6945317466][c-6945317466] (admission on the
-receiving host):
-- Whole refusals `request_id_reused` and `busy` as object refusals, and `busy` final for its message id: [On the receiving host][mailbox-calls], "A request" (items 2 and 3).
-- An unreached `cancel` or `complete` answered by its own id: [On the receiving host][mailbox-calls], "`cancel` and `complete`" (item 4).
-- A cancel reaches a task whose attempt waits `accepted`, its record marked durably first: the same bullet (item 5).
-- Early stops, kept for their request and bound to the sender's generation and epoch: the same bullet (item 6).
-- A resend of an admitted request owes its status again, refined since: only once the latest status was stored: [On the receiving host][mailbox-calls], "Status objects" (item 7).
-
-Asked in [#120 comment 6951602509][c-6951602509] (results back):
-- No result that verified or may still verify is dropped: [On the sending host][mailbox-calls], "What waits, what goes" (item 2).
-- A reply is delivered only while its sender is still a host this host takes work from, at the generation and epoch its result was accepted under: the same section, "The delivery" (item 3).
-- Delivery rows, statuses and remote task ids: [On the sending host][mailbox-calls], "A status" and "Task ids" (item 4).
-- One result per task, sent only once `submitted`, never settled for a fault of the whole store: [On the receiving host][mailbox-calls], "Results back" (item 5).
-- `accept_result_among`, an addition to the shared core's API with no wire change: [On the sending host][mailbox-calls], "The results back" (item 6).
-
-Not yet asked on #120 (cancel and complete across hosts, and launch on
-message; PR #187):
-- A `complete` naming the task's own reply, a wire extension (the shared core, two host-envelope vectors and the independent checker): [the plaintexts][s-11-5], "A `complete` naming the reply".
-- Stops across hosts: their lifetime (the message's, at most 24 h), what the newest status decides, a complete held until the task awaits its result, the resends and their end: [On the sending host][mailbox-calls], "`cancel` and `complete` across hosts".
-- A status the Station loses after storing it isn't repaired until the task's state changes, bounded by the message's expiry: [On the receiving host][mailbox-calls], "Status objects".
-- A launch under way is shared only with the same sender's requests: [On the receiving host][mailbox-calls], "A `select`'s `launch`".
-- A launch that failed, or whose outcome is unknown, fails its tasks: the same bullet.
-
-Not yet asked on #120 (earlier PRs):
-- The opened object commits with the cursor as an inbox row, its resolution in admission's later transaction (PR #185): [On the receiving host][mailbox-calls], "admission".
-- The sender's standing checked again at admission against the head it signed at (PR #185): [On the receiving host][mailbox-calls], "A request".
-- The device list's effects on host senders' tasks written in host-work's own pass (PR #171): [§11.6, "Host senders on the receiving host"](#host-senders-on-the-receiving-host), "Crash safety".
-- A record only a channel carried is reported on that channel only, never acknowledged to the Station unless the Station's feed delivers it too (PR #171): [§11.1, "Carriage"](#carriage), "Channels, as built".
-- `host_enc_key_get` records the key's id on request and answers `busy` when that write fails (PR #169): session-v1 R9.14 item 8, "The record first".
-
-Also open: how a manager asks a host for a new encryption key (a routine
-rotation, `enc_key_reused`, `retire_previous`), session-v1 R9.13 item 8
-and R9.14 item 8. Today a host makes one only at pairing, at `atem pair
-verify` and at a start that finds none.
+- **A proviso the host doesn't meet.** Astation agreed admission's commit order with "persisted inbox obligations block that sender's starts until decided … and other senders are not globally blocked"; the host's gate holds every host sender's starts while any inbox row waits: [On the receiving host][mailbox-calls], "admission" and "host senders' gate" (final readings item 6).
+- **Signing while revoked.** Statuses and results are signed while this host is a current host at its own trust generation, `authorized` as a sender or not; "Results" item 5 doesn't name that part, and no comment asked it: [On the receiving host][mailbox-calls], "Results back".
+- **Remote task ids.** A remote task id is one message's (a status naming one that another message holds doesn't take it), and each delivery has its own task id; "Results" item 4 doesn't name it: [On the sending host][mailbox-calls], "Task ids".
+- **Routine encryption-key rotation**, a separate proposal still to write. As Astation said, it must define the manager's request, the owner's confirmation, the refusal of a reused key, the publication order and the old key's retention and retirement; `host_enc_key_get` is no rotation, and in-place re-verification is no way to one (session-v1 R9.13 item 8, R9.14 item 8).
+- **Offered: the owner's `reply_query` for a host sender's selector task**, so the owner reads its reply from Astation or a phone as it already queries, interrupts and resolves it; `reply_query` takes a UUID v4 only today (§11.2, "The owner's ops on a host sender's task").
+- **The shared pieces Astation asked for, for its sign-off:** the host-result framing vectors and renderers (`framing-host-result-v1.json`, [atem-client-bindings.md](atem-client-bindings.md)), and the signing gate's `required_version` helper as merged (session-v1 R9.2, "How the signing gate uses it").
 
 [c-6903887341]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-6903887341
 [c-6938206284]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-6938206284
-[c-6945317466]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-6945317466
-[c-6951602509]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-6951602509
-[c-7028723996]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-7028723996
 [mailbox-calls]: #the-mailbox-calls-agreed-with-astation-2026-11-16
-[s-11-5]: #115-envelopes-and-results-atems-side-built-behind-a-debug-only-hook-not-advertised
 
 ### 11.6 Delegated lifecycle (built behind a debug-only hook; not advertised)
 
@@ -4964,8 +4967,11 @@ rules into each host sender's task, and the start check asks them again.
   sees it), and at a start before the recovery of delegated tasks (so the
   recovery's interrupt-intent step sees its intents). A crash between an
   entry's commit and its effects is replayed from that `seq`, keyed by
-  the entry's `seq`, idempotently. **Atem's reading, for Astation:** the
-  design places these effects inside R9.3's step 4, before
+  the entry's `seq`, idempotently. **Atem's reading, agreed with Astation
+  (2026-11-20, #120 comment 7028723996, final readings item 8: a committed
+  membership change already fences dispatch, `executing` and the spawn,
+  and a delayed effect pass reopens no authority and loses no interrupt
+  obligation):** the design places these effects inside R9.3's step 4, before
   `membership_applied`; Atem writes them in host-work's own pass instead,
   so they can lag the device list's commit by one pass, while the start
   check already refuses from the committed list; and until host-work's
@@ -4980,10 +4986,11 @@ rules into each host sender's task, and the start check asks them again.
   the recovery settles. A live attempt's stop is on its
   task's record (below), so what follows the commit (a crash, a
   receipt-database fault, a halted journal) never loses it.
-- **Project entries are judged per entry. Owner decision 2026-11-22;
-  Astation's integration requirement** ([#120 comment
-  7028723996][c-7028723996], final readings item 9: no start may cross a
-  missing stop; design II.2.2 "Effects on a receiving host", II.8). Each
+- **Project entries are judged per entry. Owner decision 2026-11-22,
+  which settles final readings item 9 of [#120 comment
+  7028723996][c-7028723996] as Astation's integration requirement asked**
+  (no start may cross a missing stop; design II.2.2 "Effects on a
+  receiving host", II.8). Each
   `project_set` or `project_remove` at `seq` in a catch-up judges the host
   senders' tasks that wait, or whose attempt is live, admitted on a list
   before it (their admission's `device_list_seq` below `seq`), on the
@@ -5011,7 +5018,7 @@ rules into each host sender's task, and the start check asks them again.
   list that already had the entry was judged on it at admission. The start
   check holds a host sender's task until these effects are written up to
   the committed head ("Crash safety"), since the head alone may cover a
-  task an earlier entry stopped. A spawn is a start (ruling R51): a
+  task an earlier entry stopped. A spawn is a start: a
   `select`'s launch on message this run queued and hasn't spawned,
   admitted before the entry, that the list as of `seq` no longer covers
   for a launch on message (`launch` and a task's ops) fails in the same
