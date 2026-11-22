@@ -1279,22 +1279,25 @@ data_enum! {
     pub enum ControlSnapshotConsistency {
         /// Nothing handed in contradicts the snapshot.
         Consistent,
-        /// The first check that failed. `code`: `invalid_record`
-        /// (`reason`: the verifier's pending or refusal code),
-        /// `wrong_origin`, `not_candidate_feed`, `cover_not_first`,
-        /// `not_above_mark`, `uncovered_cover` or `stop_lost` (`reason`:
-        /// `revocation` or `interrupt`; `revoke_seq`: a host principal's
-        /// interrupt). `index` is the snapshot record's position (from 0),
-        /// or the snapshot's length for what only the whole snapshot shows
-        /// (a covered principal with no cover, a stop lost). `record_id`
-        /// is that record's, or for a service's stop lost the retained
-        /// revoke's that revoked it.
+        /// The first check that failed. `code`, in the order the checks
+        /// run: `invalid_record` (`reason`: the verifier's pending or
+        /// refusal code), `wrong_origin`, `not_signed_anew`,
+        /// `not_candidate_feed`, `cover_not_first`, `uncovered_cover`,
+        /// `not_above_mark`, then `stop_lost` or `stop_not_resigned`
+        /// (`reason`: the verifier's code for the retained stop, which
+        /// isn't valid at the head; `effect`: `revocation` or `interrupt`;
+        /// `revoke_seq`: a host principal's interrupt). `index` is the
+        /// snapshot record's position (from 0), or the snapshot's length
+        /// for what only the whole snapshot shows (a covered principal
+        /// with no cover, a retained stop's effect not in force).
+        /// `record_id` is that snapshot record's, or the retained stop's.
         Inconsistent {
             index: u64,
             code: String,
             principal: String,
             record_id: Option<String>,
             reason: Option<String>,
+            effect: Option<String>,
             revoke_seq: Option<u64>,
         },
     }

@@ -844,21 +844,25 @@ impl AckLedgerHandle {
 /// Checked record by record in publication order, then over the whole
 /// snapshot, the first failure answered: `invalid_record` (not valid at the
 /// head; a removed manager's original is `removed_manager`: a current
-/// manager signs it again), `wrong_origin`, `not_candidate_feed` (a record
-/// signed anew with the service's own key names the candidate feed; a
-/// cover, hold or release is always signed anew), `cover_not_first` (a
-/// covered principal's cover comes first, a hold or release after it; a
-/// covered principal with no cover), `not_above_mark` (signed anew with
-/// the service's own key, issued at or below its principal's mark or with
-/// none), `uncovered_cover`, then
-/// `stop_lost` (a revocation or its interrupt in force from the retained
-/// records, not from the snapshot alone on a fresh state; holds and
-/// releases aren't compared: the Portal's current state decides them). A
-/// snapshot `revoke` or `interrupt_running` whose signed object (body and
-/// signature) is a retained record's is that stop carried as it is,
-/// whoever signed it (a current manager or the service's own key): it
-/// needs neither the candidate feed nor the mark, but is still valid at
-/// the head and of your origin.
+/// manager signs it again), `wrong_origin`, `not_signed_anew` (a cover,
+/// hold or release whose signed object is a retained record's: those are
+/// always signed anew), `not_candidate_feed` (a record signed anew with
+/// the service's own key names the candidate feed), `cover_not_first` (a
+/// covered principal's cover comes first, a hold or release after it),
+/// `uncovered_cover`, `not_above_mark` (signed anew with the service's own
+/// key, issued at or below its principal's mark or with none); then a
+/// covered principal with no cover (`cover_not_first`), then each effect
+/// of each retained `revoke` or `interrupt_running`, valid at the head or
+/// not, that isn't in force after the snapshot alone on a fresh state:
+/// `stop_lost` when that retained stop is valid at the head,
+/// `stop_not_resigned` (`reason`: the verifier's) when it isn't, a stop a
+/// current manager signs again (I.5.4), or verify at a head where it is
+/// valid. Holds and releases aren't compared: the Portal's current state
+/// decides them. A snapshot `revoke` or `interrupt_running` whose signed
+/// object (body and signature) is a retained record's is that stop
+/// carried as it is, whoever signed it (a current manager or the service's
+/// own key): it needs neither the candidate feed nor the mark, but is
+/// still valid at the head and of your origin.
 ///
 /// Errors: a record its parse refuses is `Invalid{code}` (its parse code);
 /// any other input outside its grammar (an origin not in its exact form, a
@@ -911,6 +915,7 @@ pub fn check_control_snapshot_consistency(
             principal: i.principal,
             record_id: i.record_id,
             reason: i.reason,
+            effect: i.effect.map(|e| e.code().into()),
             revoke_seq: i.revoke_seq,
         },
     })

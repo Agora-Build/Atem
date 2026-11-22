@@ -5336,25 +5336,22 @@ impl ControlGen<'_> {
         })
     }
 
-    /// An inconsistency as the vectors write it, the record by label.
+    /// An inconsistency as the vectors write it, the record by label;
+    /// `more` its other fields (`reason`, `effect`, `revoke_seq`).
     fn inconsistent(
         &self,
         index: usize,
         code: &str,
         record: Option<&str>,
         principal: &str,
-        reason: Option<&str>,
-        revoke_seq: Option<u64>,
+        more: &[(&str, Value)],
     ) -> Value {
         let mut v = serde_json::json!({"consistent": false, "index": index, "code": code, "principal": principal});
         if let Some(label) = record {
             v["record_id"] = self.record(label).record_id().into();
         }
-        if let Some(r) = reason {
-            v["reason"] = r.into();
-        }
-        if let Some(seq) = revoke_seq {
-            v["revoke_seq"] = seq.into();
+        for (key, value) in more {
+            v[*key] = value.clone();
         }
         v
     }
@@ -5442,6 +5439,9 @@ fn consistency_json(answer: &SnapshotConsistency) -> Value {
     v["principal"] = i.principal.as_str().into();
     if let Some(r) = &i.reason {
         v["reason"] = r.as_str().into();
+    }
+    if let Some(e) = i.effect {
+        v["effect"] = e.code().into();
     }
     if let Some(seq) = i.revoke_seq {
         v["revoke_seq"] = seq.into();
@@ -6247,6 +6247,15 @@ fn control_vectors(book: &Book) -> Value {
         &body,
         vec![(l, own_())],
     );
+    let mut body = g.svc(106, SVC, revoke(false), FEED_A, "owner");
+    body.record_id = control_rid(4);
+    g.push(
+        "S13_revoke_under_s4_id",
+        "svc-discord's own revoke under S4_revoke's record_id with another body (issued later): not S4 carried as it is",
+        "svc-discord",
+        &body,
+        vec![(l, own_())],
+    );
 
     // ---- sequences: one host's control state, step by step
     let a = |n| Some((FEED_A, n));
@@ -6806,7 +6815,7 @@ fn control_vectors(book: &Book) -> Value {
         )),
         g.snapshot_case(case(
             "N3_removed_manager_signed_again",
-            "a removed manager's original isn't in force at the head, so nothing retained is lost; its copy signed again by a current manager for A2 is in force (its re-signing is the re-sign alert's, never this check's)",
+            "a removed manager's retained original, not valid at the head, signed again by a current manager for A2: the copy puts each of its effects in force",
             &["S1_cover", "M3_revoke_by_removed_manager"],
             &["A2_cover", "M8_revoke_resigned_a2"],
             consistent(),
@@ -6840,35 +6849,35 @@ fn control_vectors(book: &Book) -> Value {
             "a removed manager's original carried as it is isn't valid at the head",
             &["S1_cover", "M3_revoke_by_removed_manager"],
             &["A2_cover", "M3_revoke_by_removed_manager"],
-            g.inconsistent(1, "invalid_record", Some("M3_revoke_by_removed_manager"), SVC, Some("removed_manager"), None),
+            g.inconsistent(1, "invalid_record", Some("M3_revoke_by_removed_manager"), SVC, &[("reason", "removed_manager".into())]),
         )),
         g.snapshot_case(case(
             "I2_wrong_origin",
             "a current manager's revoke naming another Station's feed: no record of station-dev's snapshot",
             &["S1_cover"],
             &["A2_cover", "M9_revoke_other_station"],
-            g.inconsistent(1, "wrong_origin", Some("M9_revoke_other_station"), SVC, None, None),
+            g.inconsistent(1, "wrong_origin", Some("M9_revoke_other_station"), SVC, &[]),
         )),
         g.snapshot_case(case(
             "I3_new_revoke_naming_the_old_feed",
             "the Station's own revoke signed anew (a new record_id), naming the old feed: a record newly signed with the service's key names the candidate feed",
             &["S1_cover", "S4_revoke"],
             &["A2_cover", "S12_revoke_signed_anew_for_the_old_feed"],
-            g.inconsistent(1, "not_candidate_feed", Some("S12_revoke_signed_anew_for_the_old_feed"), SVC, None, None),
+            g.inconsistent(1, "not_candidate_feed", Some("S12_revoke_signed_anew_for_the_old_feed"), SVC, &[]),
         )),
         g.snapshot_case(case(
             "I4_cover_not_first",
             "the hold before the cover",
             &["S1_cover", "S2_hold"],
             &["A2_hold", "A2_cover"],
-            g.inconsistent(0, "cover_not_first", Some("A2_hold"), SVC, None, None),
+            g.inconsistent(0, "cover_not_first", Some("A2_hold"), SVC, &[]),
         )),
         g.snapshot_case(case(
             "I5_covered_without_a_cover",
             "a principal the snapshot covers, with no cover in it (found once the whole snapshot is read: index is its length)",
             &["S1_cover"],
             &[],
-            g.inconsistent(0, "cover_not_first", None, SVC, None, None),
+            g.inconsistent(0, "cover_not_first", None, SVC, &[]),
         )),
         g.snapshot_case(SnapshotCase {
             marks: &[(SVC, control_issued(14))],
@@ -6877,7 +6886,7 @@ fn control_vectors(book: &Book) -> Value {
                 "the snapshot's cover issued at the principal's mark, not after it",
                 &["S1_cover"],
                 &["A2_cover"],
-                g.inconsistent(0, "not_above_mark", Some("A2_cover"), SVC, None, None),
+                g.inconsistent(0, "not_above_mark", Some("A2_cover"), SVC, &[]),
             )
         }),
         g.snapshot_case(SnapshotCase {
@@ -6887,7 +6896,7 @@ fn control_vectors(book: &Book) -> Value {
                 "a record the service's key signs for a principal with no mark given: no time is known to be after the old deployment's",
                 &["S1_cover"],
                 &["A2_cover"],
-                g.inconsistent(0, "not_above_mark", Some("A2_cover"), SVC, None, None),
+                g.inconsistent(0, "not_above_mark", Some("A2_cover"), SVC, &[]),
             )
         }),
         g.snapshot_case(SnapshotCase {
@@ -6897,7 +6906,7 @@ fn control_vectors(book: &Book) -> Value {
                 "a cover for a principal outside the covered set",
                 &["S1_cover"],
                 &["A2_cover"],
-                g.inconsistent(0, "uncovered_cover", Some("A2_cover"), SVC, None, None),
+                g.inconsistent(0, "uncovered_cover", Some("A2_cover"), SVC, &[]),
             )
         }),
         g.snapshot_case(case(
@@ -6905,14 +6914,14 @@ fn control_vectors(book: &Book) -> Value {
             "a revocation in force from the retained records, in force nowhere after the snapshot alone (a host that never read the old feed); record_id names the retained revoke",
             &["S1_cover", "M7_revoke_interrupt"],
             &["A2_cover"],
-            g.inconsistent(1, "stop_lost", Some("M7_revoke_interrupt"), SVC, Some("revocation"), None),
+            g.inconsistent(1, "stop_lost", Some("M7_revoke_interrupt"), SVC, &[("effect", "revocation".into())]),
         )),
         g.snapshot_case(case(
             "I10_interrupt_lost",
             "the revocation kept by another revoke, its interrupt lost",
             &["S1_cover", "M7_revoke_interrupt"],
             &["A2_cover", "M1_revoke"],
-            g.inconsistent(2, "stop_lost", Some("M7_revoke_interrupt"), SVC, Some("interrupt"), None),
+            g.inconsistent(2, "stop_lost", Some("M7_revoke_interrupt"), SVC, &[("effect", "interrupt".into())]),
         )),
         g.snapshot_case(SnapshotCase {
             label: "I11_host_interrupt_lost",
@@ -6922,12 +6931,12 @@ fn control_vectors(book: &Book) -> Value {
             snapshot: &[],
             marks: &[],
             covered: &[],
-            expect: g.inconsistent(0, "stop_lost", None, HOST_A, Some("interrupt"), Some(7)),
+            expect: g.inconsistent(0, "stop_lost", Some("H1_interrupt_7"), HOST_A, &[("effect", "interrupt".into()), ("revoke_seq", 7.into())]),
         }),
-        // Ruling R52: a retained stop carried unchanged (its signed object,
-        // body and sig, a retained record's) is exempt from the candidate
-        // feed and the mark, whoever signed it; a cover, hold or release
-        // never is.
+        // A retained stop carried unchanged (its signed object, body and
+        // sig, a retained record's) needs neither the candidate feed nor the
+        // mark, whoever signed it; a cover, hold or release is always signed
+        // anew (Atem's reading of §11.1 "Resets").
         g.snapshot_case(case(
             "N7_station_stops_carried_unchanged",
             "the Station's own revoke, and its revoke with interrupt_running, carried unchanged from the old feed and issued below the mark: retained stops carried as they are need neither the candidate feed nor the mark",
@@ -6940,22 +6949,76 @@ fn control_vectors(book: &Book) -> Value {
             "the Station's own revoke signed anew for the candidate feed, issued at the mark: a newly signed record of the service's key is issued after it",
             &["S1_cover", "S4_revoke"],
             &["A2_cover", "A2_revoke_at_mark"],
-            g.inconsistent(1, "not_above_mark", Some("A2_revoke_at_mark"), SVC, None, None),
+            g.inconsistent(1, "not_above_mark", Some("A2_revoke_at_mark"), SVC, &[]),
         )),
         g.snapshot_case(case(
             "I13_cover_carried_unchanged",
-            "a retained cover carried as it is names the old feed: a cover is always signed anew",
+            "a retained cover carried as it is: a cover is always signed anew",
             &["S1_cover"],
             &["S1_cover"],
-            g.inconsistent(0, "not_candidate_feed", Some("S1_cover"), SVC, None, None),
+            g.inconsistent(0, "not_signed_anew", Some("S1_cover"), SVC, &[]),
         )),
         g.snapshot_case(case(
             "I14_hold_carried_unchanged",
-            "a retained hold carried as it is names the old feed: a hold or release is always signed anew",
+            "a retained hold carried as it is: a hold or release is always signed anew",
             &["S1_cover", "S2_hold"],
             &["A2_cover", "S2_hold"],
-            g.inconsistent(1, "not_candidate_feed", Some("S2_hold"), SVC, None, None),
+            g.inconsistent(1, "not_signed_anew", Some("S2_hold"), SVC, &[]),
         )),
+        // Every retained stop's effects, valid at the head or not.
+        g.snapshot_case(case(
+            "I15_removed_manager_stop_dropped",
+            "a removed manager's retained revoke, dropped: it isn't valid at the head, so a current manager signs it again (I.5.4); its revocation in force nowhere after the snapshot",
+            &["S1_cover", "M3_revoke_by_removed_manager"],
+            &["A2_cover"],
+            g.inconsistent(1, "stop_not_resigned", Some("M3_revoke_by_removed_manager"), SVC, &[("reason", "removed_manager".into()), ("effect", "revocation".into())]),
+        )),
+        g.snapshot_case(case(
+            "I16_pending_stop_dropped",
+            "a retained revoke whose signer the list doesn't hold at the head (pending, signer_unknown), dropped: a host reading the old feed would apply it once its list catches up",
+            &["S1_cover", "M5_revoke_by_pending_member"],
+            &["A2_cover"],
+            g.inconsistent(1, "stop_not_resigned", Some("M5_revoke_by_pending_member"), SVC, &[("reason", "signer_unknown".into()), ("effect", "revocation".into())]),
+        )),
+        g.snapshot_case(case(
+            "I17_retained_interrupt_dropped",
+            "a retained interrupt_running whose revocation the snapshot puts in force through another revoke, dropped: a host that read the old feed applies it once revoked, a new host never",
+            &["S1_cover", "M2_interrupt"],
+            &["A2_cover", "M1_revoke"],
+            g.inconsistent(2, "stop_lost", Some("M2_interrupt"), SVC, &[("effect", "interrupt".into())]),
+        )),
+        g.snapshot_case(case(
+            "I18_revoke_under_a_retained_id",
+            "the Station's own revoke under S4_revoke's record_id with another body: not S4 carried as it is, so it names the candidate feed",
+            &["S1_cover", "S4_revoke"],
+            &["A2_cover", "S13_revoke_under_s4_id"],
+            g.inconsistent(1, "not_candidate_feed", Some("S13_revoke_under_s4_id"), SVC, &[]),
+        )),
+        g.snapshot_case(case(
+            "I19_native_stop_before_the_cover",
+            "a covered principal's first record is a current manager's revoke, not its cover",
+            &["S1_cover", "M1_revoke"],
+            &["M1_revoke", "A2_cover"],
+            g.inconsistent(0, "cover_not_first", Some("M1_revoke"), SVC, &[]),
+        )),
+        g.snapshot_case(case(
+            "I20_cover_retained_naming_the_candidate_feed",
+            "a retained cover carried as it is, though it names the candidate feed and is issued after the mark: a cover is always signed anew",
+            &["A2_cover"],
+            &["A2_cover"],
+            g.inconsistent(0, "not_signed_anew", Some("A2_cover"), SVC, &[]),
+        )),
+        g.snapshot_case(SnapshotCase {
+            marks: &[],
+            covered: &[],
+            ..case(
+                "I21_uncovered_cover_with_no_mark",
+                "a cover for a principal outside the covered set, with no mark given: uncovered_cover, checked before the mark",
+                &[],
+                &["A2_cover"],
+                g.inconsistent(0, "uncovered_cover", Some("A2_cover"), SVC, &[]),
+            )
+        }),
     ];
 
     let svc_key = book.signer_public("svc-discord");
@@ -6963,7 +7026,7 @@ fn control_vectors(book: &Book) -> Value {
         "name": "r9-vectors-host-work-control",
         "kind": "vectors",
         "requires": "r9",
-        "note": "Control records (delegated host-work I.5.3 to I.5.5, II.3.1; host-work-v1 §11.1; planned: host.senders, not advertised). Wire {\"body\":{…},\"sig\"}; signing input enc([\"atem-host-work-control-v1\", jcs(body)]) (R9.1). The device list is r9-vectors-membership-log's log L followed by `chain` (labels of its others); signers' keys are r9-vectors-keys' (`signed_with`). A service record's principal_key is the r9_svc of the principal's auth_key (SHA-256 of its raw bytes, decision 8), written beside it. `checks`: verify_control's verdict on each chain (valid with the verified signer and, for the principal's own key, the seq that enrolled it; pending or refused with its reason); `parse_error`: the record's parse refuses it (in a feed, refused per record and kept as evidence; over a channel the whole control_records message is invalid_request). `sequences`: ControlState::apply on one host, step by step (the record, the list of the transaction, its feed position or none over a channel, host-work's applied device-list seq) with the record's result, each effect's result, the host's actions and whether the record is kept as evidence; each step applies to the state the step before it left; `state` is ControlState::to_json after the last step (v2: one part per principal, `principals`; each part names its device list, account_id and genesis_hash, and its `records` are the [record_id, digest, issued_at] triples that counted, oldest first; `order` holds one feed per Station origin). A step's position is {origin, feed_id, feed_seq}: a record counts as read at its own feed's position only when origin and feed_id are its body's. Record ids are UUID v4 numbered by record (the X* records and V6_conflicting_id reuse another record's id on purpose). Atem's proposals, for Astation's and Auth/Portal's agreement: covers are ordered by (issued_at, record_id); a hold applies from any feed, a release only from the covering feed after its cover and after that feed's last hold or release; record ids are per principal, and another body under an id the same principal's record counted with is evidence (a stop still applies, a cover or release is refused). Each step's `standing` is ControlState::standing of its record's principal after it (held, interrupted, and revoked and coverage {origin, feed_id} when there are). Its `expect.why` is Applied::why's code (host-work-v1 §11.1: the verifier's pending or refusal reason, or list_frozen, not_revoked, revoke_not_applied, order, after_revoke, collision, not_newer, possible_replay, not_after_hold), present exactly when the record is pending or refused or kept as evidence. A sequence with `initial` starts from that state (ControlState::to_json) instead of a new one: its records of svc-discord that aren't the file's are the record `fill`'s body under those record ids (each signed by svc-discord's key and counted, at no position), so svc-discord's records start full. A principal keeps at most 256 counted record ids (MAX_RECORD_IDS): the next evicts the oldest, never the revocation's record nor the coverage's cover, and raises the part's `evicted_floor` to the newest issued_at evicted; a cover or release of a principal not revoked, under an id not counted and issued no later than the floor, is refused as a possible replay and kept as evidence; a hold, revoke or interrupt never is (decision 19, rulings T4a and T4d, agreed with Astation on 2026-11-13, #120 comment 6848326392). A service's part keeps `hold_issued_at`, the newest issued_at of every hold verified while it wasn't revoked (one that held or found it held, read out of order, from another feed, at no position or under a counted id), never lowered or cleared; a release taken in feed order while held lifts the hold only when issued strictly after it, else it is refused with why not_after_hold (no evidence) and takes no position in the feed's order (O1, requested in Astation's review of PR 2, #120 comment 6848326392; for Astation's sign-off). Each effect pending or refused in `expect` carries the step's why (O5, for Astation's sign-off). `snapshots` (Astation #114, items 2 and 6, agreed 2026-11-22): check_snapshot_consistency on station-dev's replacement feed (`candidate_feed_id`, stations.A2) against what the restored Station retained, on L + `chain`: `retained` (record labels, in its feed's order), `snapshot` (in publication order), `origin`, `marks` (each service principal's mark, ms: a record its own key signs is issued after it) and `covered`; `expect` is {consistent: true} or the first inconsistency {consistent: false, index, code, principal, record_id?, reason?, revoke_seq?} (invalid_record with verify_control's code as reason, wrong_origin, not_candidate_feed, cover_not_first, not_above_mark, uncovered_cover, stop_lost with the effect lost as reason; index is the snapshot's length for what only the whole snapshot shows). A retained revoke or interrupt_running carried unchanged (its signed object, body and sig, a retained record's) may name any feed of the origin and needs no mark, whoever signed it (item 2; ruling R52); a cover, hold or release, and any record newly signed with the service's own key, names the candidate feed and is issued after the mark. Consistency with what is retained only, never the completeness of a history or a clock. `in_force`: the stops each host state has in force (each principal's `revoked` and `interrupted`, only those with one) after the retained records (at no position), after the snapshot alone on a fresh state (a host that never read the old feed) and after the snapshot over the retained state (a host that did), at the list's head, a pending record applied once more after the rest.",
+        "note": "Control records (delegated host-work I.5.3 to I.5.5, II.3.1; host-work-v1 §11.1; planned: host.senders, not advertised). Wire {\"body\":{…},\"sig\"}; signing input enc([\"atem-host-work-control-v1\", jcs(body)]) (R9.1). The device list is r9-vectors-membership-log's log L followed by `chain` (labels of its others); signers' keys are r9-vectors-keys' (`signed_with`). A service record's principal_key is the r9_svc of the principal's auth_key (SHA-256 of its raw bytes, decision 8), written beside it. `checks`: verify_control's verdict on each chain (valid with the verified signer and, for the principal's own key, the seq that enrolled it; pending or refused with its reason); `parse_error`: the record's parse refuses it (in a feed, refused per record and kept as evidence; over a channel the whole control_records message is invalid_request). `sequences`: ControlState::apply on one host, step by step (the record, the list of the transaction, its feed position or none over a channel, host-work's applied device-list seq) with the record's result, each effect's result, the host's actions and whether the record is kept as evidence; each step applies to the state the step before it left; `state` is ControlState::to_json after the last step (v2: one part per principal, `principals`; each part names its device list, account_id and genesis_hash, and its `records` are the [record_id, digest, issued_at] triples that counted, oldest first; `order` holds one feed per Station origin). A step's position is {origin, feed_id, feed_seq}: a record counts as read at its own feed's position only when origin and feed_id are its body's. Record ids are UUID v4 numbered by record (the X* records, V6_conflicting_id and S13_revoke_under_s4_id reuse another record's id on purpose). Atem's proposals, for Astation's and Auth/Portal's agreement: covers are ordered by (issued_at, record_id); a hold applies from any feed, a release only from the covering feed after its cover and after that feed's last hold or release; record ids are per principal, and another body under an id the same principal's record counted with is evidence (a stop still applies, a cover or release is refused). Each step's `standing` is ControlState::standing of its record's principal after it (held, interrupted, and revoked and coverage {origin, feed_id} when there are). Its `expect.why` is Applied::why's code (host-work-v1 §11.1: the verifier's pending or refusal reason, or list_frozen, not_revoked, revoke_not_applied, order, after_revoke, collision, not_newer, possible_replay, not_after_hold), present exactly when the record is pending or refused or kept as evidence. A sequence with `initial` starts from that state (ControlState::to_json) instead of a new one: its records of svc-discord that aren't the file's are the record `fill`'s body under those record ids (each signed by svc-discord's key and counted, at no position), so svc-discord's records start full. A principal keeps at most 256 counted record ids (MAX_RECORD_IDS): the next evicts the oldest, never the revocation's record nor the coverage's cover, and raises the part's `evicted_floor` to the newest issued_at evicted; a cover or release of a principal not revoked, under an id not counted and issued no later than the floor, is refused as a possible replay and kept as evidence; a hold, revoke or interrupt never is (decision 19, rulings T4a and T4d, agreed with Astation on 2026-11-13, #120 comment 6848326392). A service's part keeps `hold_issued_at`, the newest issued_at of every hold verified while it wasn't revoked (one that held or found it held, read out of order, from another feed, at no position or under a counted id), never lowered or cleared; a release taken in feed order while held lifts the hold only when issued strictly after it, else it is refused with why not_after_hold (no evidence) and takes no position in the feed's order (O1, requested in Astation's review of PR 2, #120 comment 6848326392; for Astation's sign-off). Each effect pending or refused in `expect` carries the step's why (O5, for Astation's sign-off). `snapshots` (Astation #114, items 2 and 6, agreed 2026-11-22): check_snapshot_consistency on station-dev's replacement feed (`candidate_feed_id`, stations.A2) against what the restored Station retained, on L + `chain`: `retained` (record labels, in its feed's order), `snapshot` (in publication order), `origin`, `marks` (each service principal's mark, ms: a record its own key signs is issued after it) and `covered`; `expect` is {consistent: true} or the first inconsistency {consistent: false, index, code, principal, record_id?, reason?, effect?, revoke_seq?}: record by record, invalid_record (reason: verify_control's code), wrong_origin, not_signed_anew (a cover, hold or release whose signed object is a retained record's), not_candidate_feed, cover_not_first, uncovered_cover, not_above_mark; then, at index the snapshot's length, cover_not_first for a covered principal with no cover, and each effect of each retained revoke or interrupt_running, in the retained order, that isn't in force after the snapshot alone: stop_lost when that retained stop is valid at the head, stop_not_resigned (reason: verify_control's code) when it isn't, with record_id that stop, effect `revocation` or `interrupt` and a host principal's revoke_seq. A retained revoke or interrupt_running carried unchanged (its signed object, body and sig, a retained record's) may name any feed of the origin and needs no mark, whoever signed it (Atem's reading of host-work-v1 §11.1 \"Resets\": a current manager's, agreed with Astation, #114 comment 7082464868, item 2; the service's own key's, for Astation's confirmation on #114); a cover, hold or release is always signed anew, and a record newly signed with the service's own key names the candidate feed and is issued after the mark. Consistency with what is retained only, never the completeness of a history or a clock. `in_force`: the stops each host state has in force (each principal's `revoked` and `interrupted`, only those with one) after the retained records (at no position), after the snapshot alone on a fresh state (a host that never read the old feed) and after the snapshot over the retained state (a host that did), at the list's head, a pending record applied once more after the rest.",
         "account_id": "acct-test-1",
         "genesis_hash": genesis_hash().to_hex(),
         "stations": {

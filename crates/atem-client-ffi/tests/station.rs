@@ -1289,6 +1289,7 @@ fn consistency_json(answer: &ControlSnapshotConsistency) -> Value {
             principal,
             record_id,
             reason,
+            effect,
             revoke_seq,
         } => {
             let mut v = json!({"consistent": false, "index": index, "code": code,
@@ -1298,6 +1299,9 @@ fn consistency_json(answer: &ControlSnapshotConsistency) -> Value {
             }
             if let Some(r) = reason {
                 v["reason"] = json!(r);
+            }
+            if let Some(e) = effect {
+                v["effect"] = json!(e);
             }
             if let Some(seq) = revoke_seq {
                 v["revoke_seq"] = json!(seq);

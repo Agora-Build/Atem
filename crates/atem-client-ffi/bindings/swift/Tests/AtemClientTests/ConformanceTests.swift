@@ -1442,10 +1442,11 @@ final class ConformanceTests: XCTestCase {
             switch answer {
             case .consistent:
                 return ["consistent": true]
-            case let .inconsistent(index, code, principal, recordId, reason, revokeSeq):
+            case let .inconsistent(index, code, principal, recordId, reason, effect, revokeSeq):
                 var v: [String: Any] = ["consistent": false, "index": index, "code": code, "principal": principal]
                 if let id = recordId { v["record_id"] = id }
                 if let r = reason { v["reason"] = r }
+                if let e = effect { v["effect"] = e }
                 if let seq = revokeSeq { v["revoke_seq"] = seq }
                 return v
             }

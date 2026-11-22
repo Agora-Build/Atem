@@ -1179,6 +1179,7 @@ fun main(args: Array<String>) {
             "index" to a.index.toLong(), "code" to a.code, "principal" to a.principal).also { v ->
             a.recordId?.let { v["record_id"] = it }
             a.reason?.let { v["reason"] = it }
+            a.effect?.let { v["effect"] = it }
             a.revokeSeq?.let { v["revoke_seq"] = it.toLong() }
         }
     }

@@ -1848,7 +1848,7 @@ impl AckTransition {
 /// history, a clock or an author's stops are complete. `marks` is an array
 /// of `{principal, markMs}`; `covered` the principals the snapshot covers.
 /// Returns `{type: "consistent"}` or `{type: "inconsistent", index, code,
-/// principal, recordId, reason, revokeSeq}` (`null` where none).
+/// principal, recordId, reason, effect, revokeSeq}` (`null` where none).
 #[wasm_bindgen(js_name = checkControlSnapshotConsistency)]
 pub fn check_control_snapshot_consistency(
     log: &MembershipLog,

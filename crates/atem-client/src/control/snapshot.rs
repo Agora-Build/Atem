@@ -20,55 +20,65 @@
 //!    refusal code). A removed manager's original is `removed_manager`: a
 //!    current manager signs it again, a new `record_id` (I.5.4).
 //! 2. `wrong_origin`: a service's record naming another Station's origin.
-//! 3. `not_candidate_feed`: a record signed anew with the service's own
-//!    key that doesn't name the candidate feed. A cover, hold or release is
-//!    always signed anew, even when it is a retained record's bytes. A
-//!    current manager's stop may name any feed of this origin, and so may
-//!    a retained stop carried as it is (below).
-//! 4. `cover_not_first`: a covered principal's first record isn't its
-//!    cover, or a hold or release comes before its principal's cover; at
-//!    the end, a covered principal the snapshot holds no cover for.
-//! 5. `not_above_mark`: a record signed anew with the service's own key,
+//! 3. `not_signed_anew`: a cover, hold or release whose signed object is a
+//!    retained record's: those are always signed anew.
+//! 4. `not_candidate_feed`: a record signed anew with the service's own
+//!    key that doesn't name the candidate feed. A current manager's stop
+//!    may name any feed of this origin, and so may a retained stop carried
+//!    as it is (below).
+//! 5. `cover_not_first`: a covered principal's first record isn't its
+//!    cover, or a hold or release comes before its principal's cover.
+//! 6. `uncovered_cover`: a cover for a principal outside the covered set.
+//! 7. `not_above_mark`: a record signed anew with the service's own key,
 //!    issued at or below its principal's mark (`U_p`, or the mark the
 //!    Station signs above), or for a principal with no mark given.
-//! 6. `uncovered_cover`: a cover for a principal outside the covered set.
-//! 7. `stop_lost`, at the end: a revocation, or the interrupt of one, in
-//!    force in a [`ControlState`] built from the retained records but not
-//!    in force after the snapshot alone is applied to a fresh state (a
-//!    host that never read the old feed). Holds and releases aren't
+//!
+//! Then, at `index` the snapshot's length:
+//! 8. `cover_not_first`: a covered principal the snapshot holds no cover
+//!    for.
+//! 9. `stop_lost` or `stop_not_resigned`: an effect of a retained `revoke`
+//!    or `interrupt_running` (its principal's revocation, and the
+//!    interrupt with it) that isn't in force after the snapshot alone is
+//!    applied to a fresh state, a host that never read the old feed. Every
+//!    retained stop counts, valid at the head or not, in the retained
+//!    order: `stop_lost` when that stop is valid at the head (the snapshot
+//!    drops what it could carry), `stop_not_resigned` when it isn't
+//!    (`reason`: the verifier's; a removed manager's stop needs a current
+//!    manager's fresh signature, I.5.4, and one pending at the head, such
+//!    as `signer_unknown`, a head where it is valid). A retained service's
+//!    `interrupt_running` counts when its principal is revoked, by a
+//!    retained revoke or after the snapshot: until then it waits on every
+//!    host. A host principal's interrupt is in force when its device-list
+//!    revoke itself carried `interrupt_running`. Holds and releases aren't
 //!    compared: the Portal's current state decides those.
 //!
-//! **Carried as it is** (ruling R52, from §11.1 "Resets": the snapshot's
-//! revoke and interrupt records "as they are or signed anew"). A snapshot
-//! `revoke` or `interrupt_running` whose signed object (body and signature)
-//! is a retained record's is that record carried unchanged, whoever signed
-//! it (a current manager or the service's own key): it needs neither the
+//! **Carried as it is** (Atem's reading of host-work-v1 §11.1, "Resets":
+//! the snapshot's revoke and interrupt records "as they are or signed
+//! anew"; a current manager's, agreed with Astation, #114 comment
+//! 7082464868, item 2; the service's own key's, for Astation's
+//! confirmation on #114). A snapshot `revoke` or `interrupt_running` whose
+//! signed object (body and signature) is a retained record's is that
+//! record carried unchanged, whoever signed it: it needs neither the
 //! candidate feed nor the mark (a stop applies from any feed, rule 3, and
-//! needs no safety clock, #114 R4 and item 2). It must still be valid at
-//! the head (a removed manager's original is `invalid_record`) and of this
-//! origin. Any other record the service's own key signs in a snapshot is
-//! signed anew.
+//! needs no safety clock, #114 R4). It must still be valid at the head and
+//! of this origin. Any other record the service's own key signs in a
+//! snapshot is signed anew.
 //!
-//! **Both states** are built at the verifying head, as a host builds its
-//! own ([`ControlState::apply`], `host_applied_seq` the head's `seq`): the
-//! retained records in the order given, at no feed position (only stops
-//! are compared, and a stop applies from any feed or none), the snapshot
-//! at its positions in the candidate feed (`feed_seq` from 1); a record
-//! left pending is applied once more after the rest, as a host applies its
-//! pending records again after a revocation. A retained record that isn't
-//! valid at the head (a removed manager's original, say) is in force in
-//! neither: its re-signing is the re-sign alert's
-//! ([`super::AckLedger::resign_alerts`]), not this check's.
+//! **The snapshot alone** is applied at the verifying head, as a host
+//! applies a feed ([`ControlState::apply`], `host_applied_seq` the head's
+//! `seq`), each record at its position in the candidate feed (`feed_seq`
+//! from 1), a record left pending applied once more after the rest, as a
+//! host applies its pending records again after a revocation.
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::canonical::MAX_SAFE_INTEGER;
 use crate::error::{Error, Result};
-use crate::membership::Membership;
+use crate::membership::{Action, Membership};
 use crate::session::wire::is_uuid_v4;
 use crate::station_route::normalize_relay;
 
 use super::record::{ControlAction, ControlPrincipal, ControlRecord, ControlSigner};
-use super::state::{ApplicationResult, ControlState, FeedPos};
+use super::state::{ApplicationResult, ControlState, EffectKind, FeedPos};
 use super::verify::{ControlCheck, verify_control};
 
 /// What [`check_snapshot_consistency`] compares.
@@ -109,20 +119,23 @@ pub enum SnapshotConsistency {
 pub struct SnapshotInconsistency {
     /// The snapshot record's position (from 0); the snapshot's length for
     /// what only the whole snapshot shows (a covered principal with no
-    /// cover, a stop lost).
+    /// cover, a retained stop's effect not in force).
     pub index: usize,
-    /// The snapshot record's `record_id`; for a service's stop lost, the
-    /// `record_id` of the retained revoke that revoked it; `None` for a
-    /// covered principal with no cover and for a host principal's
-    /// interrupt lost.
+    /// The snapshot record's `record_id`; for `stop_lost` and
+    /// `stop_not_resigned`, the retained stop's; `None` for a covered
+    /// principal with no cover.
     pub record_id: Option<String>,
     /// The principal it is about (`service:<id>`, `host:<host_id>`).
     pub principal: String,
     pub code: InconsistencyCode,
-    /// `invalid_record`: [`verify_control`]'s pending or refusal code;
-    /// `stop_lost`: the effect lost, `revocation` or `interrupt`.
+    /// `invalid_record` and `stop_not_resigned`: [`verify_control`]'s
+    /// pending or refusal code.
     pub reason: Option<String>,
-    /// `stop_lost` of a host principal's interrupt: its `revoke_seq`.
+    /// `stop_lost` and `stop_not_resigned`: the effect not in force,
+    /// [`EffectKind::Revocation`] or [`EffectKind::Interrupt`].
+    pub effect: Option<EffectKind>,
+    /// `stop_lost` or `stop_not_resigned` of a host principal's interrupt:
+    /// its `revoke_seq`.
     pub revoke_seq: Option<u64>,
 }
 
@@ -131,11 +144,13 @@ pub struct SnapshotInconsistency {
 pub enum InconsistencyCode {
     InvalidRecord,
     WrongOrigin,
+    NotSignedAnew,
     NotCandidateFeed,
     CoverNotFirst,
-    NotAboveMark,
     UncoveredCover,
+    NotAboveMark,
     StopLost,
+    StopNotResigned,
 }
 
 impl InconsistencyCode {
@@ -144,23 +159,27 @@ impl InconsistencyCode {
         match self {
             InconsistencyCode::InvalidRecord => "invalid_record",
             InconsistencyCode::WrongOrigin => "wrong_origin",
+            InconsistencyCode::NotSignedAnew => "not_signed_anew",
             InconsistencyCode::NotCandidateFeed => "not_candidate_feed",
             InconsistencyCode::CoverNotFirst => "cover_not_first",
-            InconsistencyCode::NotAboveMark => "not_above_mark",
             InconsistencyCode::UncoveredCover => "uncovered_cover",
+            InconsistencyCode::NotAboveMark => "not_above_mark",
             InconsistencyCode::StopLost => "stop_lost",
+            InconsistencyCode::StopNotResigned => "stop_not_resigned",
         }
     }
 
     /// Every code, in the order the checks run.
-    pub const ALL: [InconsistencyCode; 7] = [
+    pub const ALL: [InconsistencyCode; 9] = [
         InconsistencyCode::InvalidRecord,
         InconsistencyCode::WrongOrigin,
+        InconsistencyCode::NotSignedAnew,
         InconsistencyCode::NotCandidateFeed,
         InconsistencyCode::CoverNotFirst,
-        InconsistencyCode::NotAboveMark,
         InconsistencyCode::UncoveredCover,
+        InconsistencyCode::NotAboveMark,
         InconsistencyCode::StopLost,
+        InconsistencyCode::StopNotResigned,
     ];
 }
 
@@ -181,6 +200,7 @@ pub fn check_snapshot_consistency(input: &SnapshotInput<'_>) -> Result<SnapshotC
                 principal: principal.to_owned(),
                 code,
                 reason: reason.map(str::to_owned),
+                effect: None,
                 revoke_seq: None,
             }))
         };
@@ -197,20 +217,29 @@ pub fn check_snapshot_consistency(input: &SnapshotInput<'_>) -> Result<SnapshotC
             ControlCheck::Refused(reason) => return at(Code::InvalidRecord, Some(reason.code())),
         }
         // Valid, so the service's own key signed it when it names its
-        // principal as its signer. A retained stop carried as it is (ruling
-        // R52) is no record signed anew, whoever signed it.
+        // principal as its signer.
         let own_key = *rec.signer() == ControlSigner::Principal;
-        let signed_anew = own_key && !carried_stop(input, rec);
+        let action = rec.action();
+        let stop = matches!(
+            action,
+            ControlAction::Revoke { .. } | ControlAction::InterruptRunning { .. }
+        );
+        let retained = input.retained.iter().any(|r| r.object() == rec.object());
+        // A retained stop carried as it is is no record signed anew,
+        // whoever signed it.
+        let signed_anew = own_key && !(stop && retained);
         if let Some((origin, feed_id)) = rec.feed() {
             if origin != input.origin {
                 return at(Code::WrongOrigin, None);
+            }
+            if retained && !stop {
+                return at(Code::NotSignedAnew, None);
             }
             if signed_anew && feed_id != input.candidate_feed_id {
                 return at(Code::NotCandidateFeed, None);
             }
         }
         let first = seen.insert(principal.clone());
-        let action = rec.action();
         let cover = action == ControlAction::Cover;
         let hold_or_release = matches!(action, ControlAction::Hold | ControlAction::Release);
         if (first && !cover && input.covered.contains(&principal))
@@ -218,14 +247,14 @@ pub fn check_snapshot_consistency(input: &SnapshotInput<'_>) -> Result<SnapshotC
         {
             return at(Code::CoverNotFirst, None);
         }
+        if cover && !input.covered.contains(&principal) {
+            return at(Code::UncoveredCover, None);
+        }
         let mark = input.marks.get(&principal);
         if signed_anew && mark.is_none_or(|mark| rec.issued_at() <= *mark) {
             return at(Code::NotAboveMark, None);
         }
         if cover {
-            if !input.covered.contains(&principal) {
-                return at(Code::UncoveredCover, None);
-            }
             covers.insert(principal);
         }
     }
@@ -237,17 +266,6 @@ pub fn check_snapshot_consistency(input: &SnapshotInput<'_>) -> Result<SnapshotC
         Some(lost) => SnapshotConsistency::Inconsistent(lost),
         None => SnapshotConsistency::Consistent,
     })
-}
-
-/// Whether `rec` is a retained stop carried as it is (ruling R52): a
-/// `revoke` or `interrupt_running` whose signed object, body and signature,
-/// is a retained record's. A cover, hold or release is never one: it is
-/// always signed anew.
-fn carried_stop(input: &SnapshotInput<'_>, rec: &ControlRecord) -> bool {
-    matches!(
-        rec.action(),
-        ControlAction::Revoke { .. } | ControlAction::InterruptRunning { .. }
-    ) && input.retained.iter().any(|r| r.object() == rec.object())
 }
 
 /// The input's grammar (the docs of [`check_snapshot_consistency`]).
@@ -279,49 +297,78 @@ fn is_service(name: &str) -> bool {
     ControlPrincipal::parse(name).is_some_and(|p| !p.is_host() && p.name() == name)
 }
 
-/// The first stop in force from the retained records that the snapshot
-/// alone doesn't put in force: by principal (sorted), its revocation, then
-/// its interrupt (a host principal's by `revoke_seq`, ascending).
+/// The first effect of a retained stop, in the retained order (a
+/// record's revocation, then its interrupt), not in force after the
+/// snapshot alone: `stop_lost` when that stop is valid at the head,
+/// `stop_not_resigned` when it isn't (the module docs).
 fn stop_lost(input: &SnapshotInput<'_>, end: usize) -> Option<SnapshotInconsistency> {
-    let retained = in_force(input.list, input.retained, None);
-    let feed = (input.origin, input.candidate_feed_id);
-    let fresh = in_force(input.list, input.snapshot, Some(feed));
-    for principal in retained.principals() {
-        let (had, has) = (retained.standing(&principal), fresh.standing(&principal));
-        let lost = |reason: &str, revoke_seq| SnapshotInconsistency {
+    let list = input.list;
+    let fresh = in_force(list, input.snapshot, input.origin, input.candidate_feed_id);
+    // The services a retained revoke names, valid or not.
+    let revoked: BTreeSet<String> = input
+        .retained
+        .iter()
+        .filter(|r| matches!(r.action(), ControlAction::Revoke { .. }))
+        .map(|r| r.principal().name())
+        .collect();
+    for rec in input.retained {
+        let (revokes, interrupts) = match rec.action() {
+            ControlAction::Revoke { interrupt_running } => (true, interrupt_running),
+            ControlAction::InterruptRunning { .. } => (false, true),
+            _ => continue,
+        };
+        let principal = rec.principal().name();
+        let has = fresh.standing(&principal);
+        let (code, reason) = match verify_control(rec, list) {
+            ControlCheck::Valid(_) => (InconsistencyCode::StopLost, None),
+            ControlCheck::Pending(r) => (InconsistencyCode::StopNotResigned, Some(r.code())),
+            ControlCheck::Refused(r) => (InconsistencyCode::StopNotResigned, Some(r.code())),
+        };
+        let lost = |effect, revoke_seq| SnapshotInconsistency {
             index: end,
-            // A service's revocation and its interrupt are named by the
-            // retained revoke that revoked it.
-            record_id: had.revoked.clone(),
+            record_id: Some(rec.record_id().to_owned()),
             principal: principal.clone(),
-            code: InconsistencyCode::StopLost,
-            reason: Some(reason.to_owned()),
+            code,
+            reason: reason.map(str::to_owned),
+            effect: Some(effect),
             revoke_seq,
         };
-        if had.revoked.is_some() && has.revoked.is_none() {
-            return Some(lost("revocation", None));
-        }
-        if ControlPrincipal::parse(&principal).is_some_and(|p| p.is_host()) {
-            // A host principal's interrupts, one per `revoke_seq`.
-            let mut seqs: Vec<u64> = had
-                .interrupted
-                .difference(&has.interrupted)
-                .filter_map(|seq| seq.parse().ok())
-                .collect();
-            seqs.sort_unstable();
-            if let Some(seq) = seqs.first() {
-                return Some(lost("interrupt", Some(*seq)));
+        match (rec.principal(), rec.action()) {
+            (
+                ControlPrincipal::Host(host_id),
+                ControlAction::InterruptRunning {
+                    revoke_seq: Some(seq),
+                },
+            ) => {
+                // In force through a record, or through its device-list
+                // revoke itself.
+                let by_entry = matches!(
+                    list.entry(seq).map(|entry| &entry.action),
+                    Some(Action::HostSenderRevoke { host_id: h, interrupt_running: true })
+                        if h == host_id
+                );
+                if !by_entry && !has.interrupted.contains(&seq.to_string()) {
+                    return Some(lost(EffectKind::Interrupt, Some(seq)));
+                }
             }
-        } else if !had.interrupted.is_empty() && has.interrupted.is_empty() {
-            return Some(lost("interrupt", None));
+            _ => {
+                if revokes && has.revoked.is_none() {
+                    return Some(lost(EffectKind::Revocation, None));
+                }
+                // An interrupt waits for its principal's revocation.
+                let due = revokes || revoked.contains(&principal) || has.revoked.is_some();
+                if interrupts && due && has.interrupted.is_empty() {
+                    return Some(lost(EffectKind::Interrupt, None));
+                }
+            }
         }
     }
     None
 }
 
 /// The state `records` leave on a fresh state of `list`, applied in order
-/// at its head, each at its position in `feed` (`feed_seq` from 1) or at
-/// none; a record left pending is applied once more after the rest, as a
+/// at its head, each at its position in `feed` (`feed_seq` from 1); a
+/// record left pending is applied once more after the rest, as a
 /// host applies its pending records again after a revocation (only a
 /// service's interrupt waits on a later record here: a verdict doesn't
 /// change on one list, and a host principal's interrupt verified at the
@@ -329,11 +376,12 @@ fn stop_lost(input: &SnapshotInput<'_>, end: usize) -> Option<SnapshotInconsiste
 fn in_force(
     list: &Membership,
     records: &[ControlRecord],
-    feed: Option<(&str, &str)>,
+    origin: &str,
+    feed_id: &str,
 ) -> ControlState {
     let head = list.head().seq;
     let pos = |i: usize| {
-        feed.map(|(origin, feed_id)| FeedPos {
+        Some(FeedPos {
             origin: origin.to_owned(),
             feed_id: feed_id.to_owned(),
             feed_seq: i as u64 + 1,

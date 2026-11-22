@@ -969,6 +969,7 @@ const snapshotOut = (a) => {
   const v = { consistent: false, index: a.index, code: a.code, principal: a.principal };
   if (a.recordId !== null) v.record_id = a.recordId;
   if (a.reason !== null) v.reason = a.reason;
+  if (a.effect !== null) v.effect = a.effect;
   if (a.revokeSeq !== null) v.revoke_seq = a.revokeSeq;
   return v;
 };
