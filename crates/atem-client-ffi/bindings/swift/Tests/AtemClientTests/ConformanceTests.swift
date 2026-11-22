@@ -1434,6 +1434,47 @@ final class ConformanceTests: XCTestCase {
                 }
             }
         }
+        // The snapshot checker (Astation #114, items 2 and 6): every case of
+        // the control vectors' `snapshots` through
+        // checkControlSnapshotConsistency, and its input refused outside its
+        // grammar.
+        func snapshotOut(_ answer: ControlSnapshotConsistency) -> [String: Any] {
+            switch answer {
+            case .consistent:
+                return ["consistent": true]
+            case let .inconsistent(index, code, principal, recordId, reason, revokeSeq):
+                var v: [String: Any] = ["consistent": false, "index": index, "code": code, "principal": principal]
+                if let id = recordId { v["record_id"] = id }
+                if let r = reason { v["reason"] = r }
+                if let seq = revokeSeq { v["revoke_seq"] = seq }
+                return v
+            }
+        }
+        func snapshotRun(_ c: [String: Any], origin: String? = nil, candidate: String? = nil, snapshot: [String]? = nil,
+                         marks: [ControlSnapshotMark]? = nil, covered: [String]? = nil) throws -> ControlSnapshotConsistency {
+            let defaultMarks = o(c["marks"]).map { ControlSnapshotMark(principal: $0.key, markMs: u($0.value)) }
+            return try checkControlSnapshotConsistency(
+                log: logAfter(a(c["chain"]).map(s)), origin: origin ?? s(c["origin"]),
+                candidateFeedId: candidate ?? s(c["candidate_feed_id"]),
+                retainedJson: a(c["retained"]).map { ctlRecord(s($0)) },
+                snapshotJson: snapshot ?? a(c["snapshot"]).map { ctlRecord(s($0)) },
+                marks: marks ?? defaultMarks, covered: covered ?? a(c["covered"]).map(s))
+        }
+        check("control snapshots: every case through checkControlSnapshotConsistency") {
+            let cases = a(ctl["snapshots"]).map(o)
+            try eq(cases.count >= 8, true, "snapshot cases")
+            for c in cases {
+                try eq(canon(snapshotOut(try snapshotRun(c))), canon(c["expect"]!), s(c["label"]))
+            }
+            let n1 = cases.first { s($0["label"]) == "N1_retained_native_revoke" }!
+            let mark = ControlSnapshotMark(principal: "service:svc-discord", markMs: u(o(n1["marks"])["service:svc-discord"]))
+            try throwsCode("unknown_field") { _ = try snapshotRun(n1, snapshot: [ctlRecord("A2_cover"), ctlRecord("P4_unknown_field")]) }
+            try throwsCode("malformed") { _ = try snapshotRun(n1, origin: s(n1["origin"]) + "/") }
+            try throwsCode("malformed") { _ = try snapshotRun(n1, candidate: s(n1["candidate_feed_id"]).uppercased()) }
+            try throwsCode("malformed") { _ = try snapshotRun(n1, marks: [mark, mark]) }
+            try throwsCode("malformed") { _ = try snapshotRun(n1, marks: [ControlSnapshotMark(principal: "member:dev-mac", markMs: 1)]) }
+            try throwsCode("malformed") { _ = try snapshotRun(n1, covered: ["service:svc-discord", "service:svc-discord"]) }
+        }
         check("Station acks: a call never changes its handle; the state loads only as written") {
             let f = try load("r9-control-ack-per-effect")
             let setup = o(f["setup"])
@@ -2635,6 +2676,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 142)
+        XCTAssertEqual(passed, 144)
     }
 }

@@ -16,17 +16,17 @@ use std::sync::Arc;
 
 use atem_client_ffi::AtemError;
 use atem_client_ffi::station::{
-    AckLedgerHandle, AckTransition, relay_control_ack, relay_control_ack_refused,
-    relay_control_sync, relay_control_sync_answers, relay_control_sync_refused,
-    relay_control_sync_result, relay_decode_to_host, relay_decode_to_station, relay_heads,
-    relay_membership_fetch, relay_membership_fetch_refused, relay_membership_fetch_result,
-    report_answer,
+    AckLedgerHandle, AckTransition, check_control_snapshot_consistency, relay_control_ack,
+    relay_control_ack_refused, relay_control_sync, relay_control_sync_answers,
+    relay_control_sync_refused, relay_control_sync_result, relay_decode_to_host,
+    relay_decode_to_station, relay_heads, relay_membership_fetch, relay_membership_fetch_refused,
+    relay_membership_fetch_result, report_answer,
 };
 use atem_client_ffi::types::{
-    ControlAckInfo, ControlEffectKind, ControlEffectResult, ControlResultKind, LedgerAlertInfo,
-    LinkAssociationInfo, LogHead, RelayAckResult, RelayFeedHead, RelayFeedRecord, RelayRefusalCode,
-    RelaySyncVerdict, RelayToHost, RelayToStation, ReportAnswerKind, ReportIntentInfo,
-    StationReport,
+    ControlAckInfo, ControlEffectKind, ControlEffectResult, ControlResultKind,
+    ControlSnapshotConsistency, ControlSnapshotMark, LedgerAlertInfo, LinkAssociationInfo, LogHead,
+    RelayAckResult, RelayFeedHead, RelayFeedRecord, RelayRefusalCode, RelaySyncVerdict,
+    RelayToHost, RelayToStation, ReportAnswerKind, ReportIntentInfo, StationReport,
 };
 use serde_json::{Value, json};
 use support::*;
@@ -1253,4 +1253,152 @@ fn matching_through_the_bindings() {
     ] {
         assert_eq!(code(relay_control_sync_answers(c, r).unwrap_err()), want);
     }
+}
+
+// ------------------------------------------- the replacement feed's snapshot
+
+/// Log L, then a chain of membership-log labels.
+fn log_after(chain: &[String]) -> Arc<atem_client_ffi::log::MembershipLog> {
+    let v = Vectors::load();
+    let wires =
+        |labels: &[&str]| -> Vec<String> { labels.iter().map(|l| v.wire(l).to_string()).collect() };
+    let now = atem_client_ffi::types::HostClock {
+        wall_ms: 1_793_264_001_000,
+        mono_ms: 1_000,
+        boot_id: "boot-1".into(),
+    };
+    let log = atem_client_ffi::log::MembershipLog::verify(
+        ACCOUNT.into(),
+        genesis_hash().to_hex(),
+        wires(&["E1", "E2", "E3", "E4", "E5", "E6"]),
+        now.clone(),
+    )
+    .unwrap();
+    let chain: Vec<&str> = chain.iter().map(String::as_str).collect();
+    assert_eq!(log.extend(wires(&chain), now).unwrap().stop, None);
+    log
+}
+
+/// The checker's answer as the vectors write it.
+fn consistency_json(answer: &ControlSnapshotConsistency) -> Value {
+    match answer {
+        ControlSnapshotConsistency::Consistent => json!({"consistent": true}),
+        ControlSnapshotConsistency::Inconsistent {
+            index,
+            code,
+            principal,
+            record_id,
+            reason,
+            revoke_seq,
+        } => {
+            let mut v = json!({"consistent": false, "index": index, "code": code,
+                "principal": principal});
+            if let Some(id) = record_id {
+                v["record_id"] = json!(id);
+            }
+            if let Some(r) = reason {
+                v["reason"] = json!(r);
+            }
+            if let Some(seq) = revoke_seq {
+                v["revoke_seq"] = json!(seq);
+            }
+            v
+        }
+    }
+}
+
+/// One case of the control vectors' `snapshots`, its inputs as the export
+/// takes them.
+struct SnapshotArgs {
+    log: Arc<atem_client_ffi::log::MembershipLog>,
+    origin: String,
+    candidate: String,
+    retained: Vec<String>,
+    snapshot: Vec<String>,
+    marks: Vec<ControlSnapshotMark>,
+    covered: Vec<String>,
+}
+
+impl SnapshotArgs {
+    fn of(case: &Value) -> Self {
+        let records = records();
+        let strs =
+            |key: &str| -> Vec<String> { case[key].as_array().unwrap().iter().map(s).collect() };
+        let wires = |key: &str| -> Vec<String> {
+            strs(key).iter().map(|l| records[l].to_string()).collect()
+        };
+        SnapshotArgs {
+            log: log_after(&strs("chain")),
+            origin: s(&case["origin"]),
+            candidate: s(&case["candidate_feed_id"]),
+            retained: wires("retained"),
+            snapshot: wires("snapshot"),
+            marks: case["marks"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(p, m)| ControlSnapshotMark {
+                    principal: p.clone(),
+                    mark_ms: m.as_u64().unwrap(),
+                })
+                .collect(),
+            covered: strs("covered"),
+        }
+    }
+
+    fn check(self) -> Result<ControlSnapshotConsistency, AtemError> {
+        check_control_snapshot_consistency(
+            self.log,
+            self.origin,
+            self.candidate,
+            self.retained,
+            self.snapshot,
+            self.marks,
+            self.covered,
+        )
+    }
+}
+
+/// Every case of the snapshot checker (Astation #114, items 2 and 6)
+/// through the export beside the ledger gives the vector's answer; input
+/// outside its grammar is `Invalid`: a record its parse refuses (its
+/// code), and, `malformed`, an origin not in its exact form, a candidate
+/// feed that isn't a UUID v4, a mark or covered principal that isn't a
+/// service's, a principal marked twice or covered twice.
+#[test]
+fn every_snapshot_case_through_the_binding() {
+    let control = load("r9-vectors-host-work-control");
+    let cases = control["snapshots"].as_array().unwrap();
+    assert!(cases.len() >= 8);
+    for case in cases {
+        let got = SnapshotArgs::of(case).check().unwrap();
+        assert_eq!(consistency_json(&got), case["expect"], "{}", case["label"]);
+    }
+
+    let n1 = cases
+        .iter()
+        .find(|c| c["label"] == "N1_retained_native_revoke")
+        .unwrap();
+    let refused = |edit: &dyn Fn(&mut SnapshotArgs), want: &str| {
+        let mut args = SnapshotArgs::of(n1);
+        edit(&mut args);
+        assert_eq!(code(args.check().unwrap_err()), want);
+    };
+    let unknown_field = records()["P4_unknown_field"].to_string();
+    refused(&|a| a.snapshot.push(unknown_field.clone()), "unknown_field");
+    refused(&|a| a.retained.push("{".into()), "not_strict_json");
+    refused(&|a| a.origin.push('/'), "malformed");
+    refused(&|a| a.candidate = a.candidate.to_uppercase(), "malformed");
+    refused(&|a| a.covered.push("host:host-a".into()), "malformed");
+    refused(&|a| a.covered.push(a.covered[0].clone()), "malformed");
+    refused(
+        &|a| {
+            a.marks.push(ControlSnapshotMark {
+                principal: "member:dev-mac".into(),
+                mark_ms: 1,
+            })
+        },
+        "malformed",
+    );
+    refused(&|a| a.marks.push(a.marks[0].clone()), "malformed");
 }

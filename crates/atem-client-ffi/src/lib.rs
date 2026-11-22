@@ -30,9 +30,10 @@
 //!   verify) and the reference control state with its per-effect results,
 //!   production exports for Station builders;
 //! - [`station`]: the Station's side of delegated host work: the relay
-//!   calls (strict readers and builders) and the reference acknowledgment
-//!   ledger with its reports to the Portal, production exports for Station
-//!   builders;
+//!   calls (strict readers and builders), the reference acknowledgment
+//!   ledger with its reports to the Portal, and a replacement feed's
+//!   snapshot checked for consistency (never completeness) with what a
+//!   restored Station retained, production exports for Station builders;
 //! - `host_mail` (feature `host`; planned, host role only): envelopes and
 //!   results between hosts, sealed and judged by the receiver's checks;
 //! - [`member_report`]: a member's signed verifier report (session-v1 R9.2,

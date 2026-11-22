@@ -1170,6 +1170,37 @@ fun main(args: Array<String>) {
             }
         }
     }
+    // The snapshot checker (Astation #114, items 2 and 6): every case of the
+    // control vectors' `snapshots` through checkControlSnapshotConsistency,
+    // and its input refused outside its grammar.
+    fun snapshotOut(a: ControlSnapshotConsistency): Map<String, Any?> = when (a) {
+        is ControlSnapshotConsistency.Consistent -> mapOf("consistent" to true)
+        is ControlSnapshotConsistency.Inconsistent -> linkedMapOf<String, Any?>("consistent" to false,
+            "index" to a.index.toLong(), "code" to a.code, "principal" to a.principal).also { v ->
+            a.recordId?.let { v["record_id"] = it }
+            a.reason?.let { v["reason"] = it }
+            a.revokeSeq?.let { v["revoke_seq"] = it.toLong() }
+        }
+    }
+    fun snapshotRun(c: Any?, origin: String = c["origin"].s(), candidate: String = c["candidate_feed_id"].s(),
+                    snapshot: List<String> = strs(c["snapshot"]).map { ctlRecord(it) },
+                    marks: List<ControlSnapshotMark> = c["marks"].obj().map { (p, m) -> ControlSnapshotMark(p, m.l().toULong()) },
+                    covered: List<String> = strs(c["covered"])) =
+        checkControlSnapshotConsistency(logAfter(strs(c["chain"])), origin, candidate,
+            strs(c["retained"]).map { ctlRecord(it) }, snapshot, marks, covered)
+    check("control snapshots: every case through checkControlSnapshotConsistency") {
+        val cases = ctl["snapshots"].arr()
+        eq(cases.size >= 8, true, "snapshot cases")
+        for (c in cases) eq(canon(snapshotOut(snapshotRun(c))), canon(c["expect"]), c["label"].s())
+        val n1 = cases.first { it["label"] == "N1_retained_native_revoke" }
+        val mark = ControlSnapshotMark("service:svc-discord", n1["marks"]["service:svc-discord"].l().toULong())
+        throwsCode("unknown_field") { snapshotRun(n1, snapshot = listOf(ctlRecord("A2_cover"), ctlRecord("P4_unknown_field"))) }
+        throwsCode("malformed") { snapshotRun(n1, origin = n1["origin"].s() + "/") }
+        throwsCode("malformed") { snapshotRun(n1, candidate = n1["candidate_feed_id"].s().uppercase()) }
+        throwsCode("malformed") { snapshotRun(n1, marks = listOf(mark, mark)) }
+        throwsCode("malformed") { snapshotRun(n1, marks = listOf(ControlSnapshotMark("member:dev-mac", 1uL))) }
+        throwsCode("malformed") { snapshotRun(n1, covered = listOf("service:svc-discord", "service:svc-discord")) }
+    }
     check("Station acks: a call never changes its handle; the state loads only as written") {
         val f = load("r9-control-ack-per-effect")
         val st = f["setup"]["station"]
