@@ -23,7 +23,10 @@
 //! purpose `VerifierReport`, which never prompts: it signs only a key that
 //! needs no interaction, else it returns `ProviderError::Cancelled` and the
 //! report fails (`signing_failed`); nothing creates, rekeys or enrolls a
-//! key.
+//! key. A provider signs such a request without a prompt only once it
+//! checked that its `label` is `atem-verifier-report-v1`, and never another
+//! label so. The process is per loaded image: a child forked without
+//! `exec` shares its parent's.
 use std::sync::Arc;
 
 use atem_client::KeyId;

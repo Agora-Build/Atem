@@ -2147,7 +2147,8 @@ which entries:
     `origin` the Station, exact as `normalize_relay` writes it;
     `connection` the slot's generation, 1 to 2^53 − 1; `nonce` 32 random
     bytes, base64url; `0 < expires_at − issued_at ≤ 30000` ms. A challenge
-    is read strictly, in at most 4,096 bytes.
+    is read strictly, in at most 4,096 bytes (that bound is **Atem's
+    reading, for Astation's confirmation on #101**).
   - The reporter answers with a signed object in R9.1's form: type
     `atem-verifier-report`, `v` 1, label `atem-verifier-report-v1`, the
     body `{account_id, genesis_hash, head{seq, hash}, signer, slot,
@@ -2160,20 +2161,34 @@ which entries:
   - Signers: a current `native` member with its own `auth_key`, or a
     current, unexpired `service` with its own key, under the algorithm
     the list pins. Nothing else: no browser grant, host, `recovery` or
-    delegation; none reports for another member.
+    delegation; none reports for another member. A native member whose
+    roles changed is still a current native member and reports; the
+    subject of a `recovery_add` still waiting is no current member
+    (`unknown_signer`).
   - The builder takes nothing that matters from its caller. The head,
     account and genesis are the reporter's own verified log's (a frozen log
-    refuses); `verifier` is the loaded core's `VerifierInventory::ours()`;
-    `process` is 16 CSPRNG bytes drawn once per loaded core (per process
-    image, per WASM instance), readable for logs. It refuses a challenge
-    whose `origin` isn't its configured Station normalized
-    (`origin_mismatch`), whose `signer` isn't itself or whose `slot` isn't
-    its configured slot, whose lease is out of range, or that has expired.
-    The signing purpose `VerifierReport` never prompts: the provider signs
-    only with a key that needs no interaction (R9.6 rule 3's live window
-    included), else it returns `Cancelled` and the slot stays unconfirmed.
-    Nothing creates, rekeys or enrolls a key for it, and the signing input
-    is built only inside the core from the typed body.
+    refuses; a client's log has no held state, held being a host's
+    recorded device-list fault (R9.3), so only frozen refuses: **Atem's
+    reading, for Astation's confirmation on #101**); `verifier` is the
+    loaded core's `VerifierInventory::ours()`; `process` is 16 CSPRNG
+    bytes drawn once per loaded core (per process image, per WASM
+    instance), readable for logs. A process image means what it says: a
+    child forked without `exec` shares its parent's `process`; a native
+    app never forks, and an SDK consumer that forks workers after loading
+    the core must not count them as separate reporters. It refuses a
+    challenge whose `origin` isn't its configured Station normalized
+    (`origin_mismatch`, a refusal of the reporter's own that the verifier
+    never gives: **Atem's reading, for Astation's confirmation on #101**),
+    whose `signer` isn't itself or whose `slot` isn't its configured slot,
+    whose lease is out of range, or that has expired. The signing purpose
+    `VerifierReport` never prompts: the provider signs only with a key
+    that needs no interaction (R9.6 rule 3's live window included), else
+    it returns `Cancelled` and the slot stays unconfirmed. Before it signs
+    without a prompt, the provider checks that the request's `label` is
+    `atem-verifier-report-v1` and its `purpose` `VerifierReport`, and it
+    never signs a request of any other label without its prompt. Nothing
+    creates, rekeys or enrolls a key for it, and the report API builds the
+    signing input only from its typed body.
   - The verifier, `verify_verifier_report(log, report, expected challenge,
     now_ms)`, reads membership and keys at its own current head. The first
     failure is the code: `malformed`, `frozen`, `wrong_account` (account
@@ -2190,6 +2205,14 @@ which entries:
     slot, a missing slot, a replaced process and the single use of a
     challenge are the consumer's to judge. A live browser grant runs the
     verifier and has no report, so it stays unconfirmed.
+  - Freshness is the minter's. The primitive checks only the lease and
+    `now_ms < expires_at` on the caller's clock: the builder on the
+    reporter's, the verifier on the minter's. It doesn't compare
+    `issued_at` with the reporter's clock, so a challenge whose
+    `issued_at` is far from it would still be signed; such a challenge is
+    the minter's never to mint. The minter's stored expectation and its
+    own monotonic deadline for the challenge are what bound how long a
+    report counts.
   - Vectors: `r9-vectors-verifier-report` (R9.12).
 
 Each of the five is signed by a native manager, like every
@@ -4483,9 +4506,10 @@ doesn't check it, since it holds no cryptographic value) and
 `r9-vectors-verifier-report` (R9.2 "A member's signed verifier report",
 agreed for implementation on Astation #101: the minter's challenges read
 or refused; native P-256 and Ed25519 reports at the head and at an
-ancestor, a service's, an inventory naming a later action; every malformed
-shape, signed where the body allows; every refusal in its order,
-substitution by another member and another slot included; the builder's
+ancestor, a service's, an inventory naming a later action, a native whose
+roles changed; every malformed shape, signed where the body allows; every
+refusal in its order, substitution by another member and another slot, the
+subject of a recovery still waiting and a high-S signature included; the builder's
 bodies and refusals; and the immutable request's finishes; its runners
 are `crates/atem-client/tests/verifier_report.rs`, the FFI's, the binding
 conformance suites and `scripts/check-r9-vectors.py`, which derives every

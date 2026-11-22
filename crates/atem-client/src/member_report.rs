@@ -33,6 +33,11 @@
 //! minter's own monotonic deadline, which slots exist, two processes in one
 //! slot, and every lifecycle rule are the consumer's (Astation's), as is
 //! whether a report at an ancestor head (`at_head: false`) is enough.
+//! Freshness is the minter's too: the builder doesn't compare `issued_at`
+//! with the reporter's clock, so a challenge whose `issued_at` is far from
+//! it would still be signed; such a challenge is the minter's never to
+//! mint, and its stored expectation and its own monotonic deadline bound
+//! how long a report counts.
 use std::sync::OnceLock;
 
 use serde_json::{Map, Value, json};
@@ -441,7 +446,10 @@ impl ReportChallenge {
 /// system's CSPRNG, drawn once per process image (once per WASM instance)
 /// and the same for every report it builds. No API sets it; read it for
 /// logs. It tells two processes that share a member key apart; it proves
-/// nothing about how many processes hold the key.
+/// nothing about how many processes hold the key. Per image: a child
+/// forked without `exec` after the first draw shares its parent's (a
+/// native app never forks; an SDK consumer that forks workers can't tell
+/// them apart by it).
 pub fn process_generation() -> [u8; PROCESS_BYTES] {
     static PROCESS: OnceLock<[u8; PROCESS_BYTES]> = OnceLock::new();
     *PROCESS.get_or_init(|| {

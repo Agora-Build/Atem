@@ -90,9 +90,12 @@ unit_enum! {
         /// verifier this app's core runs, for a minter's challenge. **Never
         /// prompts**: sign only when the key can sign with no interaction
         /// (R9.6 rule 3's live window included), else return
-        /// `ProviderError::Cancelled` and the slot stays unconfirmed. The
-        /// core never creates, rekeys or enrolls a key for it, and builds
-        /// the body itself (`body_json` shows it).
+        /// `ProviderError::Cancelled` and the slot stays unconfirmed. Before
+        /// signing without a prompt, check that `label` is
+        /// `atem-verifier-report-v1` (and `input` is `enc([label,
+        /// body_json])`); never sign another label without its own prompt.
+        /// The core never creates, rekeys or enrolls a key for it, and
+        /// builds the body itself (`body_json` shows it).
         VerifierReport,
     }
 }
