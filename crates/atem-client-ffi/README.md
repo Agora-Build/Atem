@@ -50,7 +50,8 @@ run every `r9-vectors-*` file, the host-work prompt-framing vectors
 (`prompt-framing-v1.json`, `framing-size-v1.json`) and the `result_id`,
 request and `answers` vectors of `requests-v1.json` (`host_work_result_id`,
 `host_work_request_valid`, `host_work_result_answers`: the owner's ops naming
-a host sender's selector task among them) through the generated
+a host sender's selector task among them, its `reply_query` with a reply in
+each state) through the generated
 bindings; the end-to-end
 test drives a Kotlin phone and a Node/WASM browser against a test host over
 loopback TCP. Toolchains are passed in by environment (`KOTLINC`, `JNA_JAR`,
