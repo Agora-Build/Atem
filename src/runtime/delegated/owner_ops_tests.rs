@@ -1,10 +1,11 @@
 // The owner's channel ops on a host sender's selector task (host-work-v1
 // §11.2, §11.5; design I.4.5; Astation's asks, #120 comments 7028723996 and
-// 7082465179, the second for `reply_query`), in the bridge: the receiving host of the admission tests (`sp_host`: host B
-// with an encryption key, project `build` granting a task's ops, route `rh`
-// consenting to `project:build`), B's `select` admitted through the
-// mailbox into a task whose id is the selector's UUID v5, and the phone (a
-// native member holding `control`: the owner) asking over its channel.
+// 7082465179, the second for `reply_query`), in the bridge: the receiving
+// host of the admission tests (`sp_host`: host B with an encryption key,
+// project `build` granting a task's ops, route `rh` consenting to
+// `project:build`), B's `select` admitted through the mailbox into a task
+// whose id is the selector's UUID v5, and the phone (a native member
+// holding `control`: the owner) asking over its channel.
 // Every other caller, and every v5 id that names no host sender's selector
 // task, is answered exactly as a missing task is. Every name here starts
 // with `oo_`.
@@ -801,5 +802,159 @@ fn the_owner_reads_a_host_senders_selector_tasks_reply() {
                 .unwrap()
         );
         assert_eq!(oo_q(&mut rig, &owner, Q::Reply(&underived)), forbidden());
+    });
+}
+
+/// Review L1 (Astation's "a read, not `work_complete`, cancellation or
+/// authority to resend"): the owner's `reply_query` of a host sender's
+/// selector task of unknown outcome writes nothing. The task's agent exits
+/// in its turn: its receipt ends `outcome_unknown` (`agent exited`), the
+/// task becomes so with its alert raised and its status owed to B (sealed
+/// by the status pass). Then, in each standing such a task has, the phone
+/// and the Mac (both owners) read it, and nothing is written: no row of the
+/// host-work store is written at all (not even rewritten as it was: the
+/// task's record is read, reconciled from its receipt and found unchanged),
+/// and every row reads as before, the task's state, detail and alert, no
+/// status or result owed or put to B, also after a status pass. The
+/// standings: no reply; a reply whose publication was refused (as the host
+/// refuses one: its row, then the task written with it); and past the
+/// task's deadline on the delegated clock (`deadline passed; outcome
+/// unknown`), the refused reply still there.
+#[test]
+fn the_owners_reply_query_of_an_unknown_outcome_writes_nothing() {
+    use crate::runtime::collab::results::{self, Binding, Reply, ResultRow};
+    use atem_client::session::host_work::ReplyState;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        let (message, task) = oo_admitted(&mut rig, &mut host, "OO_UNKNOWN");
+        rig.bridge.start_view().gates.set_mailbox(true);
+        turn_journaled(&mut rig, &task, "OO_UNKNOWN").await;
+        // Its agent exits in its turn.
+        std::fs::write(rig.fake.join("exit"), "").unwrap();
+        rig.until(|r| settled(r, &task).0 == WorkState::OutcomeUnknown)
+            .await;
+        passes(&mut rig, 3);
+        assert_eq!(
+            settled(&rig, &task),
+            (WorkState::OutcomeUnknown, details::AGENT_EXITED.into())
+        );
+        let unresolved = |rig: &LocalRig| {
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .unresolved()
+                .unwrap()
+                .0
+        };
+        assert_eq!(unresolved(&rig), 1, "its alert");
+        let owner = host.s.phone.clone();
+        let callers = oo_callers(&mut rig, &mut host);
+        count_writes(&rig);
+        let owed = |rig: &LocalRig, table: &str| -> i64 {
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        // Each owner reads `expected`: nothing written, nothing changed.
+        let reads = |rig: &mut LocalRig, expected: Option<&ResultRow>, standing: &str| {
+            rig.bridge.mail_statuses();
+            assert_eq!(owed(rig, "mail_status_owed"), 0, "{standing}");
+            assert_eq!(owed(rig, "mail_result_owed"), 0, "{standing}");
+            let before = oo_store(rig);
+            let record = stored_record(rig, &task);
+            let alerts = unresolved(rig);
+            let written = writes(rig, "work") + writes(rig, "results");
+            for who in [&owner, &callers.mac] {
+                assert_eq!(
+                    oo_reply(rig, who, &task),
+                    expected.map(ResultRow::wire),
+                    "{standing}"
+                );
+            }
+            assert_eq!(
+                writes(rig, "work") + writes(rig, "results"),
+                written,
+                "{standing}: no write"
+            );
+            assert_eq!(oo_store(rig), before, "{standing}: every row as it was");
+            let after = stored_record(rig, &task);
+            assert_eq!(
+                serde_json::to_string(&after).unwrap(),
+                serde_json::to_string(&record).unwrap(),
+                "{standing}"
+            );
+            assert_eq!(after.status.state, WorkState::OutcomeUnknown, "{standing}");
+            assert_eq!(unresolved(rig), alerts, "{standing}: its alert");
+            assert_eq!(owed(rig, "mail_status_owed"), 0, "{standing}");
+            assert_eq!(owed(rig, "mail_result_owed"), 0, "{standing}");
+            // Nothing owed shows after a status pass either.
+            rig.bridge.mail_statuses();
+            assert_eq!(oo_store(rig), before, "{standing}: after a status pass");
+        };
+
+        reads(&mut rig, None, "no reply");
+
+        // A reply whose publication was refused, as the host records one.
+        let record = stored_record(&rig, &task);
+        let publishing = ResultRow::new(
+            Reply {
+                binding: Binding {
+                    task_id: task.clone(),
+                    session_id: rig.sid.to_string(),
+                    process_gen: record.task.target.process_gen.clone(),
+                    turn_id: record.turn_id.clone().expect("its turn"),
+                },
+                text: "OO_UNKNOWN_REPLY".into(),
+                references: vec![crate::runtime::collab_context::ContextSpec::Vault {
+                    reference: crate::runtime::collab_context::VaultRef::parse("v-oo:1@2").unwrap(),
+                }],
+                context: vec![],
+                dropped: false,
+            },
+            host_now().wall_ms,
+        );
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        let tx = store.db.unchecked_transaction().unwrap();
+        results::submit(&tx, &publishing).unwrap();
+        results::refuse(&tx, &task, crate::runtime::collab_context::VAULT_CREDENTIAL).unwrap();
+        let refused = results::load(&tx, &task).unwrap().unwrap();
+        let mut record = stored_record(&rig, &task);
+        collab_bridge::apply_reply(&mut record, &refused);
+        store.save_work(&record).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(refused.state, ReplyState::Refused);
+        assert_eq!(
+            settled(&rig, &task),
+            (WorkState::OutcomeUnknown, details::AGENT_EXITED.into())
+        );
+        reads(&mut rig, Some(&refused), "a refused reply");
+
+        // Past its deadline on the delegated clock.
+        os.pass(2 * HOUR);
+        passes(&mut rig, 3);
+        assert_eq!(
+            settled(&rig, &task),
+            (
+                WorkState::OutcomeUnknown,
+                details::DEADLINE_PASSED_OUTCOME_UNKNOWN.into()
+            )
+        );
+        assert!(stored_record(&rig, &task).deadline_passed);
+        reads(&mut rig, Some(&refused), "past its deadline");
+        // B was told the task's outcome is unknown, once: nothing more.
+        let receipts = ad_receipts(&rig, &message);
+        assert_eq!(
+            ad_resolved(&receipts[0])[0].state,
+            WorkState::OutcomeUnknown
+        );
     });
 }

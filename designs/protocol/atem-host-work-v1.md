@@ -390,9 +390,10 @@ renews or takes over a lease for it.
 
 Each names the caller's own task under a route that still allows the caller;
 anything else is `forbidden`. An `outcome_unknown` task is reconciled from its
-receipt first. Authority is checked on reads too: once the caller's
-`control_gen` moved on, or the route's revision, principals or profile
-changed, its own task is `forbidden`, a failed one included.
+receipt first, and written only when that changed it. Authority is checked on
+reads too: once the caller's `control_gen` moved on, or the route's revision,
+principals or profile changed, its own task is `forbidden`, a failed one
+included.
 
 - `work_query` returns the status.
 - `work_cancel` moves `queued` or `blocked` to `cancelled` (again on
@@ -461,7 +462,8 @@ the answer `work_query` gives them for that task, `forbidden`. A task of the
 host's own `local` sender can't be asked at all: its id is a UUID v5, which
 the host answers, whoever asks, as a missing task (`forbidden`; a UUID v5
 names only a host sender's selector task, and only for the owner, §11.2). An
-`outcome_unknown` task is reconciled from its receipt first. Storage failure is
+`outcome_unknown` task is reconciled from its receipt first, and written only
+when that changed it. Storage failure is
 `busy`. A reply may exist while the task is still `submitted` (the agent
 replies in its turn), and a task can end with no reply (a silent turn): poll
 `reply_query` for the reply and `work_query` for the task.
@@ -1800,12 +1802,17 @@ Astation or a phone: `work_query`, `reply_query`, `work_interrupt` and
   `work_interrupt` the running turn interrupted once, as below.
 - **`reply_query` is a read.** It completes, cancels and changes nothing:
   not the task, not its reply, not the status or the result owed to the
-  sending host, which go as they would have, and nothing is sent again;
-  like `work_query` it reconciles an `outcome_unknown` task from its
-  receipt first (§4 "Reply"). Completing such a task stays its sender's
-  (`complete`, §11.5): the owner's `work_complete` and `work_cancel` don't
-  decode naming a UUID v5, and of a delegated task are `forbidden`, as
-  before.
+  sending host, which go as they would have, and nothing is sent again.
+  Like `work_query` it reconciles an `outcome_unknown` task from its
+  receipt first (§4 "Reply"), and writes the task only when that changed
+  it. A host sender's task of unknown outcome is delegated: its receipt's
+  `outcome_unknown` is terminal, its record already holds the reason (or
+  `deadline passed; outcome unknown`) and every reply transition already
+  applied to it, so the reconcile finds nothing to change and nothing is
+  written (no state change, no alert ended, no status owed). Completing
+  such a task stays its sender's (`complete`, §11.5): the owner's
+  `work_complete` and `work_cancel` don't decode naming a UUID v5, and of
+  a delegated task are `forbidden`, as before.
 - **A UUID v4 behaves as before**, for every caller and every op.
 - Vectors: `fixtures/host-work/requests-v1.json` (the four requests
   naming a selector task, their uppercase, another version and variant
