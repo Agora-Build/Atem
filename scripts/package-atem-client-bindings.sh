@@ -26,7 +26,8 @@
 #           are checked before it is packaged.
 #
 # Next to them: the shared host-work vectors (atem-client-<version>-host-work-
-# {requests,prompt-framing,framing-size}-v1.json), atem-client-<version>-SOURCE.json
+# {requests,prompt-framing,framing-size,framing-host-result}-v1.json),
+# atem-client-<version>-SOURCE.json
 # (commit, crate versions, features, toolchains; scripts/atem-client-source-pin.sh)
 # and atem-client-<version>-SHA256SUMS.txt over every file. Archives are
 # deterministic (sorted, mtime 0, numeric owner 0, gzip -n).
@@ -209,6 +210,10 @@ FILES+=("$FRAMING_VECTOR")
 FRAMING_SIZE_VECTOR="atem-client-${VERSION}-host-work-framing-size-v1.json"
 cp designs/protocol/fixtures/host-work/framing-size-v1.json "$OUT/$FRAMING_SIZE_VECTOR"
 FILES+=("$FRAMING_SIZE_VECTOR")
+# The host-result header's prompts (another host's reply; III.2, II.4.4).
+FRAMING_HOST_VECTOR="atem-client-${VERSION}-host-work-framing-host-result-v1.json"
+cp designs/protocol/fixtures/host-work/framing-host-result-v1.json "$OUT/$FRAMING_HOST_VECTOR"
+FILES+=("$FRAMING_HOST_VECTOR")
 CONTROL_VECTOR="atem-client-${VERSION}-r9-vectors-host-work-control.json"
 cp designs/protocol/fixtures/r9-vectors-host-work-control.json "$OUT/$CONTROL_VECTOR"
 FILES+=("$CONTROL_VECTOR")

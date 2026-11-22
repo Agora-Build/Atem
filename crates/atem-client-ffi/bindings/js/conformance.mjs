@@ -1443,10 +1443,12 @@ check("verifyCommit host_trust_gen (r9-vectors-pairing)", () => {
 // The prompt framing (delegated host-work design III.2) over
 // designs/protocol/fixtures/host-work/: the escaping and the marker check,
 // the Unicode version they are pinned to, the preflight size check and (a
-// test-vectors build only) the rendering, byte for byte.
+// test-vectors build only) the rendering, byte for byte, the host-result
+// header's included (framing-host-result-v1.json).
 const loadWork = (name) => JSON.parse(readFileSync(join(fixturesDir, "host-work", `${name}.json`), "utf8"));
 const framing = loadWork("prompt-framing-v1");
 const framingSize = loadWork("framing-size-v1");
+const framingHost = loadWork("framing-host-result-v1");
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 // A tag's 60 bits as written (XXXX-XXXX-XXXX, Crockford base32): a BigInt,
 // which is what the binding takes (60 bits don't fit a JS number).
@@ -1509,6 +1511,38 @@ check("framing: rendered prompts byte for byte, tags from their bits (vectors on
   const headless = JSON.parse(str(input));
   delete headless.header;
   throwsCode(() => m.framingRenderForVectors(str(headless), 1n), "malformed");
+});
+check("framing: the host-result header's prompts byte for byte, its refusals and its size (vectors only)", () => {
+  // Another host's reply names that host and no session; the file's tag,
+  // rule line and Unicode version are prompt-framing-v1.json's.
+  for (const key of ["tag", "rule", "unicode_version"]) eq(framingHost[key], framing[key], key);
+  const bits = tagBitsOf(framingHost.tag);
+  eq(framingHost.prompts.length, 4);
+  for (const p of framingHost.prompts) {
+    const h = p.input.header;
+    eq(h.kind, "host_result", p.name);
+    eq("session" in h, false, `${p.name}: no session`);
+    const rendered = m.framingRenderForVectors(str(p.input), bits);
+    eq(rendered, p.rendered, p.name);
+    eq(Buffer.byteLength(rendered, "utf8"), p.bytes, `${p.name}: bytes`);
+    // The agreed first line, from the input's own verified fields.
+    const first = framingHost.first_line.split("<task_id>").join(h.task_id).split("host:<host_id>").join(h.sender);
+    eq(rendered.split("\n")[0], `[atem ${framingHost.tag}] ${first}`, `${p.name}: first line`);
+  }
+  // What is never rendered: a host result naming a session, a sender that
+  // isn't a host principal.
+  eq(framingHost.refused.length, 8);
+  for (const r of framingHost.refused) throwsCode(() => m.framingRenderForVectors(str(r.input), bits), r.code);
+  // The longest first and last lines are within the worst case the size
+  // checks count, which is prompt-framing-v1.json's: the bound doesn't move.
+  const size = framingHost.size;
+  eq(size.worst_case_lines, framing.size.worst_case_lines, "the worst case");
+  const outer = (rendered) => {
+    const lines = rendered.split("\n");
+    return Buffer.byteLength(lines[0], "utf8") + 1 + Buffer.byteLength(lines[lines.length - 1], "utf8") + 1;
+  };
+  eq(Math.max(...framingHost.prompts.map((p) => outer(p.rendered))), size.longest_host_result_lines, "the longest lines");
+  eq(size.longest_host_result_lines < size.worst_case_lines, true, "within the worst case");
 });
 check("framing: the size section (typical, worst, worst with a mark, at the bound)", () => {
   const size = framing.size;

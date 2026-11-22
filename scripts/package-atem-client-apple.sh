@@ -86,6 +86,8 @@ FRAMING_VECTOR="atem-client-${VERSION}-host-work-prompt-framing-v1.json"
 cp designs/protocol/fixtures/host-work/prompt-framing-v1.json "$OUT/$FRAMING_VECTOR"
 FRAMING_SIZE_VECTOR="atem-client-${VERSION}-host-work-framing-size-v1.json"
 cp designs/protocol/fixtures/host-work/framing-size-v1.json "$OUT/$FRAMING_SIZE_VECTOR"
+FRAMING_HOST_VECTOR="atem-client-${VERSION}-host-work-framing-host-result-v1.json"
+cp designs/protocol/fixtures/host-work/framing-host-result-v1.json "$OUT/$FRAMING_HOST_VECTOR"
 CONTROL_VECTOR="atem-client-${VERSION}-r9-vectors-host-work-control.json"
 cp designs/protocol/fixtures/r9-vectors-host-work-control.json "$OUT/$CONTROL_VECTOR"
 # The Station's acknowledgment fixtures (test 48), for Station builders.
@@ -107,6 +109,6 @@ cp designs/protocol/fixtures/r9-vectors-required-verifier.json "$OUT/$REQUIRED_V
 ./scripts/atem-client-source-pin.sh "$OUT/$PIN" apple-swiftpm "default (uniffi)" \
   "xcodebuild=$(xcodebuild -version | tr '\n' ' ' | sed 's/ *$//')" \
   "swift=$(swift --version 2>&1 | sed -n 1p)"
-(cd "$OUT" && shasum -a 256 "$ZIP" "atem-client-${VERSION}-atem_client_ffiFFI.h" "$PIN" "$VECTOR" "$WORK_VECTOR" "$FRAMING_VECTOR" "$FRAMING_SIZE_VECTOR" "$CONTROL_VECTOR" "$PUSH_VECTOR" "$WIRE_VECTOR" "$MAIL_VECTOR" "$STATION_VECTOR" "$REQUIRED_VECTOR" "${ACK_FIXTURES[@]}" > "atem-client-${VERSION}-SHA256SUMS.txt")
+(cd "$OUT" && shasum -a 256 "$ZIP" "atem-client-${VERSION}-atem_client_ffiFFI.h" "$PIN" "$VECTOR" "$WORK_VECTOR" "$FRAMING_VECTOR" "$FRAMING_SIZE_VECTOR" "$FRAMING_HOST_VECTOR" "$CONTROL_VECTOR" "$PUSH_VECTOR" "$WIRE_VECTOR" "$MAIL_VECTOR" "$STATION_VECTOR" "$REQUIRED_VECTOR" "${ACK_FIXTURES[@]}" > "atem-client-${VERSION}-SHA256SUMS.txt")
 echo "Packaged into $OUT:"
 ls -l "$OUT"

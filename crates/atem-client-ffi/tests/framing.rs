@@ -6,8 +6,10 @@
 //! run the same vectors against the same exports.
 //!
 //! The vectors are `designs/protocol/fixtures/host-work/prompt-framing-v1.json`
-//! (pinned in a cross-team agreement; this file never changes it) and
-//! `framing-size-v1.json` (the preflight's complete-input cases).
+//! (pinned in a cross-team agreement; this file never changes it),
+//! `framing-size-v1.json` (the preflight's complete-input cases) and
+//! `framing-host-result-v1.json` (the host-result header: another host's
+//! reply, naming that host and no session).
 use atem_client::session::framing as core;
 use atem_client::session::host_work::{ContextKind, ContextSnapshot, digest};
 use atem_client::session::wire::MAX_PROMPT_BYTES;
@@ -21,6 +23,13 @@ use serde_json::{Value, json};
 fn prompt_vectors() -> Value {
     serde_json::from_str(include_str!(
         "../../../designs/protocol/fixtures/host-work/prompt-framing-v1.json"
+    ))
+    .unwrap()
+}
+
+fn host_result_vectors() -> Value {
+    serde_json::from_str(include_str!(
+        "../../../designs/protocol/fixtures/host-work/framing-host-result-v1.json"
     ))
     .unwrap()
 }
@@ -318,6 +327,63 @@ mod rendering {
             let got = framing_render_for_vectors(case["input"].to_string(), bits).unwrap();
             assert_eq!(got, expected.join("\n"), "{}", str_of(tag, "bits"));
         }
+    }
+
+    /// The host-result header (another host's reply): every prompt byte for
+    /// byte, its first line the agreed one from the input's own fields (the
+    /// host, no session), every refusal `malformed`, and its longest lines
+    /// within the worst case the size checks count.
+    #[test]
+    fn render_matches_host_result_vectors() {
+        let file = host_result_vectors();
+        let pinned = prompt_vectors();
+        for key in ["tag", "rule", "unicode_version"] {
+            assert_eq!(file[key], pinned[key], "{key}");
+        }
+        let tag = str_of(&file, "tag");
+        let prompts = file["prompts"].as_array().unwrap();
+        assert_eq!(prompts.len(), 4);
+        for case in prompts {
+            let header = &case["input"]["header"];
+            assert_eq!(header["kind"], "host_result");
+            let rendered = framing_render_for_vectors(case["input"].to_string(), bits_of(tag))
+                .unwrap_or_else(|e| panic!("{}: {e}", case["name"]));
+            assert_eq!(rendered, str_of(case, "rendered"), "{}", case["name"]);
+            assert_eq!(rendered.len() as u64, case["bytes"].as_u64().unwrap());
+            let first = str_of(&file, "first_line")
+                .replace("<task_id>", str_of(header, "task_id"))
+                .replace("host:<host_id>", str_of(header, "sender"));
+            assert_eq!(
+                rendered.split('\n').next().unwrap(),
+                format!("[atem {tag}] {first}")
+            );
+            assert!(!first.contains(" session "));
+        }
+        let refused = file["refused"].as_array().unwrap();
+        assert_eq!(refused.len(), 8);
+        for case in refused {
+            let e = framing_render_for_vectors(case["input"].to_string(), bits_of(tag))
+                .expect_err(str_of(case, "name"));
+            assert_eq!(code_of(e), str_of(case, "code"), "{}", case["name"]);
+        }
+        let size = &file["size"];
+        assert_eq!(size["worst_case_lines"], pinned["size"]["worst_case_lines"]);
+        assert_eq!(
+            size["worst_case_lines"].as_u64().unwrap() as usize,
+            core::worst_case_lines()
+        );
+        let longest = prompts
+            .iter()
+            .map(|c| {
+                let rendered = str_of(c, "rendered");
+                let first = rendered.split('\n').next().unwrap().len();
+                let last = rendered.rsplit('\n').next().unwrap().len();
+                (first + 1 + last + 1) as u64
+            })
+            .max()
+            .unwrap();
+        assert_eq!(longest, size["longest_host_result_lines"].as_u64().unwrap());
+        assert!(longest < size["worst_case_lines"].as_u64().unwrap());
     }
 
     #[test]
