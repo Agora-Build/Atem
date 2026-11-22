@@ -5401,6 +5401,16 @@ const CONTROL_WHY: &[(&str, usize, &str)] = &[
     ),
     ("Q27_no_release_after_a_revoke", 4, "after_revoke"),
     ("Q27_no_release_after_a_revoke", 5, "after_revoke"),
+    (
+        "Q32_removed_manager_original_in_a_replacement_feed",
+        2,
+        "removed_manager",
+    ),
+    (
+        "Q33_snapshot_cover_at_the_floor_is_a_possible_replay",
+        3,
+        "possible_replay",
+    ),
 ];
 
 /// What a principal has in force as the vectors write it
@@ -6020,6 +6030,44 @@ fn control_vectors(book: &Book) -> Value {
         g.push(label, note, "svc-discord", &body, vec![(l, own_())]);
     }
 
+    // ---- a replacement feed after a Station's rollback (Astation #114,
+    // item 2): a current manager's stop is carried as it is, naming the
+    // old feed; a removed manager's is signed again
+    let body = g.svc(100, "member:dev-mac", revoke(true), FEED_A, "owner");
+    g.push(
+        "M7_revoke_interrupt",
+        "a current manager's revoke with interrupt_running, naming station-dev's feed before its reset (A): carried unchanged into the replacement feed A2",
+        "dev-mac",
+        &body,
+        vec![(l, mac())],
+    );
+    let mut body = g.svc(101, "member:dev-mac", revoke(true), FEED_A2, "owner");
+    body.issued_at = 1_792_400_004_500;
+    g.push(
+        "M8_revoke_resigned_a2",
+        "M3's stop signed again by dev-mac, a current manager, for the replacement feed: the same body but its feed, a new record_id",
+        "dev-mac",
+        &body,
+        vec![(l, mac())],
+    );
+    let body = g.svc(102, "member:dev-mac", revoke(false), FEED_B, "owner");
+    g.push(
+        "M9_revoke_other_station",
+        "a current manager's revoke naming station-b's feed: a stop every host applies, but no record of station-dev's",
+        "dev-mac",
+        &body,
+        vec![(l, mac())],
+    );
+    let mut body = g.svc(103, SVC, C::Cover, FEED_A2, "station");
+    body.issued_at = control_issued(3);
+    g.push(
+        "A2_cover_at_floor",
+        "station-dev's snapshot cover issued at S3_release's time: at the evicted floor of a host that evicted S3_release",
+        "svc-discord",
+        &body,
+        vec![(l, own_())],
+    );
+
     // ---- sequences: one host's control state, step by step
     let a = |n| Some((FEED_A, n));
     let b = |n| Some((FEED_B, n));
@@ -6436,6 +6484,107 @@ fn control_vectors(book: &Book) -> Value {
                 step("S3_release", a(5), applied("refused", &[("release", "refused")], none.clone(), false)),
             ],
         ),
+        // A replacement feed after a Station's rollback (Astation #114,
+        // item 2, agreed 2026-11-22): a current manager's original stop is
+        // carried as it is, naming the old feed.
+        g.sequence(
+            "Q28_old_feed_native_revoke_in_a_replacement_feed",
+            "a host that applied M1_revoke from station-dev's feed A reads the replacement feed A2: its snapshot cover, then M1_revoke carried unchanged (it names A, read at a position of A2): a duplicate",
+            vec![
+                step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
+                step("M1_revoke", a(2), applied("applied", &[("revocation", "applied")], vec![act("revoke", SVC)], false)),
+                step("A2_cover", a2(1), applied("duplicate", &[("cover", "duplicate")], none.clone(), false)),
+                step("M1_revoke", a2(2), applied("duplicate", &[("revocation", "duplicate")], none.clone(), false)),
+            ],
+        ),
+        g.sequence(
+            "Q29_old_feed_native_revoke_on_a_new_host",
+            "a host that never read feed A reads the replacement feed A2: M1_revoke, which names A, applies",
+            vec![
+                step("A2_cover", a2(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A2)], false)),
+                step("M1_revoke", a2(2), applied("applied", &[("revocation", "applied")], vec![act("revoke", SVC)], false)),
+            ],
+        ),
+        g.sequence(
+            "Q30_old_feed_native_revoke_interrupt_in_a_replacement_feed",
+            "a host that applied M7_revoke_interrupt from feed A reads the replacement feed A2, where it is carried unchanged: a duplicate for each effect",
+            vec![
+                step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
+                step(
+                    "M7_revoke_interrupt",
+                    a(2),
+                    applied(
+                        "applied",
+                        &[("revocation", "applied"), ("interrupt", "applied")],
+                        vec![act("revoke", SVC), act_interrupt(SVC, &control_rid(100))],
+                        false,
+                    ),
+                ),
+                step("A2_cover", a2(1), applied("duplicate", &[("cover", "duplicate")], none.clone(), false)),
+                step(
+                    "M7_revoke_interrupt",
+                    a2(2),
+                    applied("duplicate", &[("revocation", "duplicate"), ("interrupt", "duplicate")], none.clone(), false),
+                ),
+            ],
+        ),
+        g.sequence(
+            "Q31_old_feed_native_revoke_interrupt_on_a_new_host",
+            "a host that never read feed A reads the replacement feed A2: M7_revoke_interrupt, which names A, applies each effect",
+            vec![
+                step("A2_cover", a2(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A2)], false)),
+                step(
+                    "M7_revoke_interrupt",
+                    a2(2),
+                    applied(
+                        "applied",
+                        &[("revocation", "applied"), ("interrupt", "applied")],
+                        vec![act("revoke", SVC), act_interrupt(SVC, &control_rid(100))],
+                        false,
+                    ),
+                ),
+            ],
+        ),
+        g.sequence(
+            "Q32_removed_manager_original_in_a_replacement_feed",
+            "a removed manager's original carried into the replacement feed is refused (removed_manager, evidence); a current manager's copy signed again for it, a new record_id, applies",
+            vec![
+                step("A2_cover", a2(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A2)], false)),
+                step(
+                    "M3_revoke_by_removed_manager",
+                    a2(2),
+                    applied("refused", &[("revocation", "refused"), ("interrupt", "refused")], none.clone(), true),
+                ),
+                step(
+                    "M8_revoke_resigned_a2",
+                    a2(3),
+                    applied(
+                        "applied",
+                        &[("revocation", "applied"), ("interrupt", "applied")],
+                        vec![act("revoke", SVC), act_interrupt(SVC, &control_rid(101))],
+                        false,
+                    ),
+                ),
+            ],
+        ),
+        g.sequence_on(
+            "Q33_snapshot_cover_at_the_floor_is_a_possible_replay",
+            "a replacement feed's cover issued no later than a host's evicted floor is refused as a possible replay and kept as evidence, and the coverage stays on the old feed: from svc-discord covered, held, released and full (as Q19), F1_hold holds and evicts S2_hold, F2_hold evicts S3_release, so the floor is S3_release's time, which A2_cover_at_floor was issued at",
+            Some((
+                &g.filled(
+                    &[("S1_cover", a(1)), ("S2_hold", a(2)), ("S3_release", a(3))],
+                    "S3_release",
+                    "svc-discord",
+                    253,
+                ),
+                "S3_release",
+            )),
+            vec![
+                step("F1_hold", a(4), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("F2_hold", a(5), applied("duplicate", &[("hold", "duplicate")], none.clone(), false)),
+                step("A2_cover_at_floor", a2(1), applied("refused", &[("cover", "refused")], none.clone(), true)),
+            ],
+        ),
     ];
 
     let svc_key = book.signer_public("svc-discord");
@@ -6745,7 +6894,7 @@ fn host_work_control() {
             "{label}: every step's results, standing and touched, the state, its round trip and its parts"
         ));
     }
-    assert_eq!(evicting, 3, "the three eviction sequences");
+    assert_eq!(evicting, 4, "the four eviction sequences");
     run.finish();
 }
 
