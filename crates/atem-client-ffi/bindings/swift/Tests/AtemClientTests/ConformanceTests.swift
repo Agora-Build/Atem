@@ -2255,19 +2255,41 @@ final class ConformanceTests: XCTestCase {
             for c in known {
                 try eq(hostWorkResultId(taskId: s(c["task_id"])), s(c["result_id"]), s(c["name"]))
             }
-            let answers = a(requests["answers"]).map(o)
-            try eq(answers.count, 3)
-            for c in answers {
+            let replies = a(requests["answers"]).map(o).filter { s(o(o($0["result"])["result"])["kind"]) == "reply" }
+            try eq(replies.count, 3)
+            for c in replies {
                 let reply = o(o(c["result"])["result"])["reply"]
                 let task = s(o(o(c["request"])["data"])["task_id"])
                 let ok = reply is NSNull || s(o(reply)["result_id"]) == hostWorkResultId(taskId: task)
                 try eq(ok, c["answers"] as! Bool, s(c["name"]))
             }
         }
+        // Every request case read as the core reads it (what sendJson
+        // seals): the owner's work_query, work_interrupt and work_resolve
+        // name a host sender's selector task (its UUID v5, host-work-v1
+        // §11.2, §11.5), read as strictly as a UUID v4; the other task ops
+        // keep a UUID v4. And every answers case correlated as the
+        // connection correlates a result it reads.
+        check("host work: request vectors and result correlation (§11.2, §11.5)") {
+            let cases = a(requests["cases"]).map(o)
+            for c in cases {
+                let text = c["raw"] != nil ? s(c["raw"]) : js(o(c["message"]))
+                try eq(hostWorkRequestValid(messageJson: text), c["valid"] as! Bool, s(c["name"]))
+            }
+            for name in ["work_query_selector_task", "work_interrupt_selector_task", "work_resolve_selector_task"] {
+                try eq(cases.contains { s($0["name"]) == name && ($0["valid"] as! Bool) }, true, name)
+            }
+            try eq(hostWorkRequestValid(messageJson: "not json"), false)
+            let answers = a(requests["answers"]).map(o)
+            try eq(answers.count, 5)
+            for c in answers {
+                try eq(hostWorkResultAnswers(requestJson: js(o(c["request"])), resultJson: js(o(c["result"]))), c["answers"] as! Bool, s(c["name"]))
+            }
+        }
 
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 133)
+        XCTAssertEqual(passed, 134)
     }
 }

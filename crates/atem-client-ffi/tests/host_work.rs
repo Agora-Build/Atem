@@ -1,11 +1,14 @@
-//! Host work's `result_id` through the bindings' export
-//! (`host_work_result_id`, host-work-v1 §11.5, "`result_id`"): the shared
+//! Host work through the bindings' exports: a task's `result_id`
+//! (`host_work_result_id`, host-work-v1 §11.5, "`result_id`"), the shared
 //! core's one derivation, with the known answers of
 //! `designs/protocol/fixtures/host-work/requests-v1.json` (`result_ids`),
-//! and an app's own check of its `answers` cases (a reply answers its
+//! and an app's own check of its reply `answers` cases (a reply answers its
 //! `reply_query` only with the asked task's `result_id`; no reply yet
-//! always does). The Swift, Kotlin and JS suites run the same vectors
-//! against the same export.
+//! always does); the core's request reader (`host_work_request_valid`) over
+//! every request case, the owner's ops naming a host sender's selector task
+//! (§11.2) among them; and its result correlation
+//! (`host_work_result_answers`) over every `answers` case. The Swift,
+//! Kotlin and JS suites run the same vectors against the same exports.
 use atem_client_ffi::host_work::host_work_result_id;
 use serde_json::Value;
 
@@ -41,7 +44,12 @@ fn result_ids_match_the_known_answers() {
 #[test]
 fn an_app_checks_a_reply_against_its_task() {
     let file = vectors();
-    let cases = file["answers"].as_array().unwrap();
+    let cases: Vec<&Value> = file["answers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["result"]["result"]["kind"] == "reply")
+        .collect();
     assert_eq!(cases.len(), 3);
     for case in cases {
         let task = case["request"]["data"]["task_id"].as_str().unwrap();
@@ -55,4 +63,69 @@ fn an_app_checks_a_reply_against_its_task() {
             case["name"]
         );
     }
+}
+
+/// Every request case of the vectors through the bindings' export
+/// (`host_work_request_valid`): what the shared core's reader takes, so
+/// what `ClientConnection::send_json` seals; the owner's three ops with a
+/// host sender's selector task (its UUID v5, host-work-v1 §11.2, §11.5)
+/// among the valid, their uppercase, other versions and variants refused,
+/// and the other task ops keeping a UUID v4.
+#[test]
+fn every_request_case_reads_as_the_vectors_say() {
+    use atem_client_ffi::host_work::host_work_request_valid;
+    let file = vectors();
+    let cases = file["cases"].as_array().unwrap();
+    for case in cases {
+        let text = match case.get("raw") {
+            Some(raw) => raw.as_str().unwrap().to_owned(),
+            None => case["message"].to_string(),
+        };
+        assert_eq!(
+            host_work_request_valid(text),
+            case["valid"].as_bool().unwrap(),
+            "{}",
+            case["name"]
+        );
+    }
+    for name in [
+        "work_query_selector_task",
+        "work_interrupt_selector_task",
+        "work_resolve_selector_task",
+    ] {
+        assert!(
+            cases
+                .iter()
+                .any(|c| c["name"] == name && c["valid"] == true),
+            "{name}"
+        );
+    }
+    assert!(!host_work_request_valid("not json".into()));
+}
+
+/// Every `answers` case through `host_work_result_answers`: the result
+/// read as the connection reads it and taken only when it answers the
+/// request, a selector task's status answering what named it.
+#[test]
+fn every_answers_case_correlates_as_the_vectors_say() {
+    use atem_client_ffi::host_work::host_work_result_answers;
+    let file = vectors();
+    let cases = file["answers"].as_array().unwrap();
+    assert_eq!(cases.len(), 5);
+    for case in cases {
+        assert_eq!(
+            host_work_result_answers(case["request"].to_string(), case["result"].to_string()),
+            case["answers"].as_bool().unwrap(),
+            "{}",
+            case["name"]
+        );
+    }
+    // A result the reader refuses answers nothing.
+    let first = &cases[0];
+    let mut bad = first["result"].clone();
+    bad["id"] = serde_json::json!("not-a-uuid");
+    assert!(!host_work_result_answers(
+        first["request"].to_string(),
+        bad.to_string()
+    ));
 }

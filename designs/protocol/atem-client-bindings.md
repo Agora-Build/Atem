@@ -27,8 +27,17 @@ exported as `host_work_result_id`); a result that answers nothing fails
 `on_frame` with `malformed` and closes the channel, like any unbound result
 (the app reconnects and asks again with a new id). The core also refuses to
 seal a `message_publish` whose Message has a `select` recipient: no channel
-admits one (host-work-v1 §11.5). Apps still inspect errors and each result
-state.
+admits one (host-work-v1 §11.5). The owner's `work_query`, `work_interrupt`
+and `work_resolve` may name a host sender's selector task, its UUID v5
+(host-work-v1 §11.2, "The owner's ops on a host sender's task"; the other ops
+naming a task keep a UUID v4), and a `work` result names it back; a host
+answers anyone else, and an id of no such task, as a missing task. Two
+exports give an app the core's checks for its own use:
+`host_work_request_valid(message_json)` (the reader `send_json` applies) and
+`host_work_result_answers(request_json, result_json)` (the reader and
+correlation applied to every result); the conformance suites run
+`requests-v1.json`'s `cases` and `answers` through them. Apps still inspect
+errors and each result state.
 
 | Feature | Operations | Contract |
 |---|---|---|
@@ -37,7 +46,7 @@ state.
 | `host.reply` | `reply_query` | [Host work](atem-host-work-v1.md#reply) |
 | `host.messages` | `message_publish`, `message_query` | [Host work](atem-host-work-v1.md#5-messages) |
 | `host.attachments` | `attachment_put` | [Host work](atem-host-work-v1.md#6-attachments-and-mark) |
-| `host.delegated` (not advertised: only a debug build's runtime started with its debug-only hook lists it, step 4) | `work_interrupt`, `work_resolve` | [Host work §11.2](atem-host-work-v1.md#112-work_interrupt-and-work_resolve) |
+| `host.delegated` (not advertised: only a debug build's runtime started with its debug-only hook lists it, step 4) | `work_interrupt`, `work_resolve` (and, by the owner, these two and `work_query` naming a host sender's selector task) | [Host work §11.2](atem-host-work-v1.md#112-work_interrupt-and-work_resolve) |
 | `host.alerts` (not advertised: as `host.delegated`) | `alert_list` | [Host work §11.3](atem-host-work-v1.md#113-alert_list-hostalerts) |
 
 The two unadvertised features' results are host-work results too:
