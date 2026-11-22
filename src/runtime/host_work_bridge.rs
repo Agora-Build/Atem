@@ -1894,7 +1894,8 @@ impl HostBridge {
             | Request::Cancel { task_id, .. }
             | Request::Complete { task_id, .. } => {
                 // A UUID v5 names a host sender's selector task, the
-                // owner's alone, or is a missing task (§11.2, §11.5).
+                // owner's alone (its status and, a read, its reply), or is
+                // a missing task (§11.2, §11.5).
                 self.selector_task_named(&a, task_id)?;
                 let mut r = store
                     .work(task_id)

@@ -1,6 +1,6 @@
 // The owner's channel ops on a host sender's selector task (host-work-v1
-// §11.2, §11.5; design I.4.5; Astation's ask, #120 comment 7028723996), in
-// the bridge: the receiving host of the admission tests (`sp_host`: host B
+// §11.2, §11.5; design I.4.5; Astation's asks, #120 comments 7028723996 and
+// 7082465179, the second for `reply_query`), in the bridge: the receiving host of the admission tests (`sp_host`: host B
 // with an encryption key, project `build` granting a task's ops, route `rh`
 // consenting to `project:build`), B's `select` admitted through the
 // mailbox into a task whose id is the selector's UUID v5, and the phone (a
@@ -158,8 +158,9 @@ impl crate::runtime::delegated::ControlView for OoChecked {
     }
 }
 
-/// What every task-naming request (`work_query`, `work_interrupt`,
-/// `work_resolve`) of `who` naming `task` is answered with.
+/// What every owner's request naming a task (`work_query`, `reply_query`,
+/// `work_interrupt`, `work_resolve`) of `who` naming `task` is answered
+/// with.
 fn oo_answers(
     rig: &mut LocalRig,
     who: &Authority,
@@ -167,6 +168,7 @@ fn oo_answers(
 ) -> Vec<Result<ResultBody, HostWorkError>> {
     vec![
         oo_q(rig, who, Q::Query(task)),
+        oo_q(rig, who, Q::Reply(task)),
         oo_q(rig, who, Q::Interrupt(task)),
         oo_resolve(rig, who, task, "agent exited").1,
     ]
@@ -292,15 +294,16 @@ fn the_owner_interrupts_a_host_senders_selector_task() {
     });
 }
 
-/// No disclosure (Astation's ask): a host sender's selector task is
+/// No disclosure (Astation's asks): a host sender's selector task is
 /// answered to every caller but the owner exactly as a task the host
-/// doesn't have (the same code, no detail, nothing read or changed): a
-/// native member without `control`, a service, a browser grant. And to the
-/// owner too, a UUID v5 that names no task, one that names a task whose
-/// recorded provenance isn't a host sender's selector task (the phone's
-/// own task, a `local` one, or B's task under an id its message doesn't
-/// derive). A UUID v4 behaves as before: B's v4 task (a `work_enqueue`'s
-/// shape) is the owner's to query, interrupt and resolve, and nobody
+/// doesn't have (the same code, no detail, nothing read or changed), for
+/// each of the owner's ops, `reply_query` included: a native member
+/// without `control`, a service, a browser grant. And to the owner too, a
+/// UUID v5 that names no task, one that names a task whose recorded
+/// provenance isn't a host sender's selector task (the phone's own task, a
+/// `local` one, or B's task under an id its message doesn't derive). A
+/// UUID v4 behaves as before: B's v4 task (a `work_enqueue`'s shape) is the
+/// owner's to query, read the reply of, interrupt and resolve, and nobody
 /// else's.
 #[test]
 fn every_other_caller_and_id_is_answered_as_a_missing_task() {
@@ -346,7 +349,7 @@ fn every_other_caller_and_id_is_answered_as_a_missing_task() {
             &uuid::Uuid::new_v4().to_string(),
             rig.sid.as_str(),
         );
-        assert_eq!(oo_answers(&mut rig, &owner, &nothing), vec![forbidden(); 3]);
+        assert_eq!(oo_answers(&mut rig, &owner, &nothing), vec![forbidden(); 4]);
         // The owner, naming a UUID v5 task whose recorded provenance isn't
         // a host sender's selector task: the phone's own v1 task (not
         // delegated), its own delegated task (queued), the runtime's
@@ -399,7 +402,7 @@ fn every_other_caller_and_id_is_answered_as_a_missing_task() {
             let before = stored_record(&rig, id).status;
             assert_eq!(
                 oo_answers(&mut rig, &owner, id),
-                vec![forbidden(); 3],
+                vec![forbidden(); 4],
                 "{kind}"
             );
             assert_eq!(stored_record(&rig, id).status, before, "{kind}");
@@ -416,8 +419,12 @@ fn every_other_caller_and_id_is_answered_as_a_missing_task() {
             status(oo_q(&mut rig, &owner, Q::Query(&v4))),
             stored_record(&rig, &v4).status
         );
+        assert_eq!(
+            oo_q(&mut rig, &owner, Q::Reply(&v4)),
+            Ok(ResultBody::Reply { reply: None })
+        );
         for who in [&callers.viewer, &callers.service, &callers.browser] {
-            assert_eq!(oo_answers(&mut rig, who, &v4), vec![forbidden(); 3]);
+            assert_eq!(oo_answers(&mut rig, who, &v4), vec![forbidden(); 4]);
         }
         let v4_record = stored_record(&rig, &v4);
         ad_set_state(&rig, &v4_record, WorkState::OutcomeUnknown);
@@ -443,7 +450,7 @@ fn every_other_caller_and_id_is_answered_as_a_missing_task() {
 /// the recipient's host (this host at another trust generation), the
 /// recipient's destination (a host notice, not a `select`), and a receipt
 /// that doesn't list the task. Each is answered as a missing task, for all
-/// three ops, and nothing of it changes.
+/// four of the owner's ops, and nothing of it changes.
 #[test]
 fn the_gate_checks_each_condition_of_a_host_senders_selector_task() {
     use atem_client::session::messages::{Delivery, Destination};
@@ -503,6 +510,10 @@ fn the_gate_checks_each_condition_of_a_host_senders_selector_task() {
             status(oo_q(&mut rig, &owner, Q::Query(&whole))),
             stored_record(&rig, &whole).status
         );
+        assert_eq!(
+            oo_q(&mut rig, &owner, Q::Reply(&whole)),
+            Ok(ResultBody::Reply { reply: None })
+        );
         type Break<'a> =
             Box<dyn Fn(&mut WorkRecord, &mut crate::runtime::host_work::MessageRecord) + 'a>;
         let cases: Vec<(&str, Break<'_>)> = vec![
@@ -552,11 +563,243 @@ fn the_gate_checks_each_condition_of_a_host_senders_selector_task() {
             let before = stored_record(&rig, &id).status;
             assert_eq!(
                 oo_answers(&mut rig, &owner, &id),
-                vec![forbidden(); 3],
+                vec![forbidden(); 4],
                 "{what}"
             );
             assert_eq!(stored_record(&rig, &id).status, before, "{what}");
         }
         assert_eq!(escs(&rig), 0);
+    });
+}
+
+/// `reply`, the answer to the `reply_query` `req`, read back by the client
+/// core's strict reader as a channel reads it: the reply it carries (it
+/// answers `req`: no reply yet, or one with the asked task's `result_id`).
+fn oo_reply_read(
+    req: &hw::Request,
+    reply: Result<ResultBody, HostWorkError>,
+) -> Option<atem_client::session::host_work::ResultReply> {
+    let body = reply.expect("a reply result");
+    let json = hw::result(
+        &uuid::Uuid::new_v4().to_string(),
+        req.id(),
+        req.host(),
+        &uuid::Uuid::new_v4().to_string(),
+        "channel",
+        body.clone(),
+    );
+    let response = hw::Response::from_data(&json["data"]).expect("the reader takes it");
+    assert!(response.answers(req), "it answers the request: {body:?}");
+    match body {
+        ResultBody::Reply { reply } => reply,
+        other => panic!("a reply result: {other:?}"),
+    }
+}
+
+/// `who`'s `reply_query` of `task`, through [`oo_ask`], read back.
+fn oo_reply(
+    rig: &mut LocalRig,
+    who: &Authority,
+    task: &str,
+) -> Option<atem_client::session::host_work::ResultReply> {
+    let req = Q::Reply(task).request(rig.bridge.work_host());
+    let reply = oo_ask(rig, who, &req);
+    oo_reply_read(&req, reply)
+}
+
+/// Every row of every table of the host-work store, each table's rows
+/// sorted: what a request that only reads leaves exactly as it was.
+fn oo_store(rig: &LocalRig) -> std::collections::BTreeMap<String, Vec<String>> {
+    let db = &rig.bridge.work.store.as_ref().unwrap().db;
+    let tables: Vec<String> = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    tables
+        .into_iter()
+        .map(|table| {
+            let mut q = db.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+            let columns = q.column_count();
+            let mut rows: Vec<String> = q
+                .query_map([], |r| {
+                    (0..columns)
+                        .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .map(|row| format!("{row:?}"))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            rows.sort();
+            (table, rows)
+        })
+        .collect()
+}
+
+/// Astation's ask (#120 comment 7082465179; host-work-v1 §11.2): the owner
+/// (the phone, a native member holding `control`) reads a host sender's
+/// selector task's reply over its channel with `reply_query`, naming its
+/// UUID v5, in each state the reply goes through on this host: none yet
+/// (`null`); `publishing` (its vault context being published: no context,
+/// no time); `refused` (that publication refused); `submitted` (the agent's
+/// corrected reply, through `atem message reply`'s path); and once the task
+/// settled and its 30 days passed, `dropped` (no text, no context, the same
+/// digest). Each answer is the reply as the store holds it (`row.wire()`),
+/// its `result_id` the selector task's own, read by the client core's
+/// strict reader as the answer to its request.
+///
+/// It is a read: after each query (twice, the owner and the Mac, both
+/// owners) every row of the host-work store is as it was: the task, its
+/// reply, the status and result owed to B, the outbox. And the phone's
+/// `reply_query` naming a UUID v5 of no task, or B's task under an id its
+/// message doesn't derive, is answered as a missing task.
+#[test]
+fn the_owner_reads_a_host_senders_selector_tasks_reply() {
+    use crate::runtime::collab::results::{self, Binding, Reply, ResultRow};
+    use atem_client::session::host_work::ReplyState;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        let (message, task) = oo_admitted(&mut rig, &mut host, "OO_REPLY");
+        // Its turn ended, its turn known: the agent may reply.
+        let mut record = stored_record(&rig, &task);
+        record.status.state = WorkState::AwaitingResult;
+        record.turn_id = Some("turn-1".into());
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .save_work(&record)
+            .unwrap();
+        rig.bridge.mail_statuses();
+        let owner = host.s.phone.clone();
+        let callers = oo_callers(&mut rig, &mut host);
+        // Each owner reads `expected`; the store is as it was after both.
+        let reads = |rig: &mut LocalRig, expected: Option<&ResultRow>| {
+            let before = oo_store(rig);
+            assert!(["work", "messages"].iter().all(|t| !before[*t].is_empty()));
+            assert_eq!(before["results"].is_empty(), expected.is_none());
+            for who in [&owner, &callers.mac] {
+                let read = oo_reply(rig, who, &task);
+                assert_eq!(read, expected.map(ResultRow::wire));
+                if let Some(reply) = &read {
+                    assert_eq!(reply.result_id, hw::result_id(&task));
+                }
+            }
+            assert_eq!(oo_store(rig), before, "a read changes nothing");
+        };
+        let row = |rig: &LocalRig| {
+            results::load(&rig.bridge.work.store.as_ref().unwrap().db, &task)
+                .unwrap()
+                .unwrap()
+        };
+
+        // No reply yet.
+        reads(&mut rig, None);
+        // Publishing: a reply naming a vault entry, its context not yet
+        // published.
+        let publishing = ResultRow::new(
+            Reply {
+                binding: Binding {
+                    task_id: task.clone(),
+                    session_id: rig.sid.to_string(),
+                    process_gen: record.task.target.process_gen.clone(),
+                    turn_id: "turn-1".into(),
+                },
+                text: "OO_WITH_A_VAULT_ENTRY".into(),
+                references: vec![crate::runtime::collab_context::ContextSpec::Vault {
+                    reference: crate::runtime::collab_context::VaultRef::parse("v-oo:1@2").unwrap(),
+                }],
+                context: vec![],
+                dropped: false,
+            },
+            host_now().wall_ms,
+        );
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        let tx = store.db.unchecked_transaction().unwrap();
+        results::submit(&tx, &publishing).unwrap();
+        tx.commit().unwrap();
+        rig.bridge.mail_statuses();
+        let current = row(&rig);
+        assert_eq!(current.state, ReplyState::Publishing);
+        reads(&mut rig, Some(&current));
+        // Refused: its publication refused for good.
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        results::refuse(
+            &store.db,
+            &task,
+            crate::runtime::collab_context::VAULT_CREDENTIAL,
+        )
+        .unwrap();
+        rig.bridge.mail_statuses();
+        let current = row(&rig);
+        assert_eq!(current.state, ReplyState::Refused);
+        reads(&mut rig, Some(&current));
+        // Submitted: the agent's corrected reply, and its result owed to B,
+        // sealed once.
+        reply(&mut rig, &task, "OO_CORRECTED", &[]).unwrap();
+        rig.bridge.mail_statuses();
+        let current = row(&rig);
+        assert_eq!(
+            (current.state, current.reply.text.as_str()),
+            (ReplyState::Submitted, "OO_CORRECTED")
+        );
+        reads(&mut rig, Some(&current));
+        // Dropped: the task settled (`failed`), past its deadline a day,
+        // then 30 days on: the reply's text and context go, its digest
+        // stays.
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        let settled = stored_record(&rig, &task);
+        ad_set_state(&rig, &settled, WorkState::Failed);
+        let after = settled.task.expires_at + crate::runtime::host_work::PAYLOAD_RETENTION_MS + 1;
+        assert_eq!(store.drop_payloads(after).unwrap().tasks, 1);
+        let kept = store
+            .drop_kept_replies(
+                host_now().wall_ms + crate::runtime::host_work::KEPT_REPLY_MS + 1,
+                crate::runtime::host_work::KEPT_REPLY_BUDGET,
+            )
+            .unwrap();
+        assert_eq!(kept.expired, 1);
+        rig.bridge.mail_statuses();
+        let current = row(&rig);
+        assert!(current.reply.dropped && current.reply.text.is_empty());
+        let dropped = current.wire();
+        assert_eq!(
+            (dropped.state, dropped.digest.as_str(), dropped.dropped),
+            (ReplyState::Submitted, current.digest.as_str(), true)
+        );
+        reads(&mut rig, Some(&current));
+
+        // Still a missing task's answer for a UUID v5 of no task, or B's
+        // task under an id its message doesn't derive.
+        let nothing = atem_client::session::select::selector_task_id(
+            &uuid::Uuid::new_v4().to_string(),
+            &uuid::Uuid::new_v4().to_string(),
+            rig.sid.as_str(),
+        );
+        assert_eq!(oo_q(&mut rig, &owner, Q::Reply(&nothing)), forbidden());
+        let underived = atem_client::session::select::selector_task_id(
+            &message.message_id,
+            &uuid::Uuid::new_v4().to_string(),
+            rig.sid.as_str(),
+        );
+        let mut copy = stored_record(&rig, &task);
+        copy.task.task_id = underived.clone();
+        copy.status.task_id = underived.clone();
+        assert!(
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .enqueue(&copy)
+                .unwrap()
+        );
+        assert_eq!(oo_q(&mut rig, &owner, Q::Reply(&underived)), forbidden());
     });
 }

@@ -21,10 +21,12 @@ use crate::session_protocol::wire::ReceiptState;
 pub(super) use crate::runtime::delegated::start::CANCELLED_BEFORE_SUBMISSION;
 
 impl HostBridge {
-    /// A request naming a UUID v5 task (`work_query`, `work_interrupt`,
-    /// `work_resolve`; host-work-v1 §11.2, §11.5; Astation's ask, #120
-    /// comment 7028723996): a host sender's selector task, which the owner
-    /// manages from a channel. Served on only when both hold:
+    /// A request naming a UUID v5 task (`work_query`, `reply_query`,
+    /// `work_interrupt`, `work_resolve`; host-work-v1 §11.2, §11.5;
+    /// Astation's asks, #120 comments 7028723996 and 7082465179, the second
+    /// for `reply_query`): a host sender's selector task, which the owner
+    /// manages, and whose reply it reads, from a channel. Served on only
+    /// when both hold:
     ///
     /// - the caller is the owner (a native member holding `control` at the
     ///   head of the open list, under its own key), decided before the
@@ -36,7 +38,10 @@ impl HostBridge {
     /// (`forbidden`, no detail), whoever asks: a v5 id grants nothing. A
     /// UUID v4 passes untouched, its rules today's. Then the op's own path
     /// (the owner rule of `delegated_caller`, the op's effect) runs as for
-    /// any delegated task.
+    /// any delegated task: `reply_query`'s a read of the reply as stored,
+    /// nothing completed, cancelled or sent again. (`work_cancel` and
+    /// `work_complete` never name a v5: the core's reader refuses one, and
+    /// the owner may do neither; their arm calls this all the same.)
     pub(super) fn selector_task_named(
         &self,
         a: &Sender,

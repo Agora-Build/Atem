@@ -2538,6 +2538,145 @@ fn the_owner_manages_a_host_senders_selector_task_over_its_channel() {
     std::fs::remove_file(rig.fake_dir().join("exit")).unwrap();
 }
 
+/// Host-work-v1 §11.2 (Astation's ask, #120 comment 7082465179), over the
+/// Mac's native channel (the owner): a host sender's selector task's reply,
+/// read with `reply_query` naming its UUID v5. In the agent's turn there is
+/// none yet (`null`); once the agent replied (`atem message reply`), the
+/// reply as submitted, its `result_id` the task's own, exactly the reply
+/// the sending host got back as its result. The client core sends each
+/// request and takes each result. It is a read: asked twice, nothing is put
+/// or owed again, the store's result rows stay as they were, and the task
+/// still awaits its result. Answered `forbidden`, exactly as a missing
+/// task: the Mac naming a UUID v5 of no task; a service holding `notify` on
+/// this host naming the task (its channel lets the request through, the
+/// host's control state reads, so the runtime's gate answers it); and a
+/// viewer (a native member without `control`), which its channel refuses
+/// before decoding.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn the_owner_reads_a_host_senders_selector_tasks_reply_over_its_channel() {
+    use support::delegated::{Dev, HostIds, complete_turn, in_turn, stored};
+    use support::r9::Router;
+    let mut rig = Rig::admitting("");
+    rig.online();
+    let sid = rig.launch();
+    let to = rig.receiver(1);
+    let message = rig
+        .sender
+        .message(&to, &[&format!("atem:{HOST}")], 1, "HM_OWNER_READS");
+    rig.put(&rig.sender.request_of(&to, rig.log.log.head(), &message));
+    let task = task_of(&message, &sid);
+    in_turn(&rig, &task, "HM_OWNER_READS");
+    let ids = HostIds {
+        account: ACCOUNT,
+        host: HOST,
+    };
+    let mut r = Router::on(&rig.astation, rig.link());
+    let viewer = rig.log.add_native("dev-viewer", &["view"]);
+    let service = rig.log.add_service(
+        "svc-hm",
+        &[HOST],
+        None,
+        &["message", "notify", "prompt", "view"],
+        support::r9log::host_now().wall_ms + 3 * 3_600_000,
+    );
+    let mut mac = Dev::new_via(&mut r, "direct", ids, &rig.log, support::r9log::MAC, false);
+    mac.carry(&mut r, &[viewer, service]);
+    let ask = |dev: &mut Dev, r: &mut Router, task: &Value| {
+        dev.request(
+            r,
+            json!({"op": "reply_query", "host": ids.json(), "task_id": task}),
+        )
+    };
+    let none = ask(&mut mac, &mut r, &task);
+    assert_eq!(
+        none["result"],
+        json!({"kind": "reply", "reply": null}),
+        "{none}"
+    );
+    complete_turn(&rig, &task);
+    rig.until_status("awaiting its result", |s| {
+        resolved_state(s, &message.message_id) == Some(WorkState::AwaitingResult)
+    });
+    let tid = task.as_str().unwrap();
+    let out = rig.agent(1, &["message", "reply", "--task", tid, "HM_OWNER_READ"]);
+    assert_eq!(out["code"], 0, "{out}");
+    let result = rig.until_status("the result", |s| matches!(s, ResultPlain::Result { .. }));
+    let ResultPlain::Result { reply: sent, .. } = &result else {
+        unreachable!()
+    };
+    // Nothing goes on: what was put, owed and kept, before the reads.
+    rig.two_passes();
+    let at_rest = |rig: &Rig| {
+        (
+            rig.put_ids().len(),
+            rig.statuses().len(),
+            rig.count("mail_result_owed"),
+            rig.count("mail_result_sent"),
+            rig.count("mail_outbox"),
+            rig.count("mail_status_owed"),
+        )
+    };
+    let before = at_rest(&rig);
+    let read = ask(&mut mac, &mut r, &task);
+    let reply = &read["result"]["reply"];
+    assert_eq!(
+        (
+            &read["result"]["kind"],
+            &reply["state"],
+            &reply["text"],
+            &reply["result_id"]
+        ),
+        (
+            &json!("reply"),
+            &json!("submitted"),
+            &json!("HM_OWNER_READ"),
+            &json!(atem_client::session::host_work::result_id(tid))
+        ),
+        "{read}"
+    );
+    assert_eq!(*reply, serde_json::to_value(sent).unwrap(), "as B got it");
+    assert_eq!(ask(&mut mac, &mut r, &task)["result"], read["result"]);
+    rig.two_passes();
+    assert_eq!(at_rest(&rig), before, "a read: nothing put or owed again");
+    assert_eq!(stored(&rig, &task)["state"], "awaiting_result");
+
+    // The same answer as a missing task's: the code, and no field but the
+    // exchange's own ids differs.
+    let missing = json!(support::delegated::uuid());
+    let nothing = json!(atem_client::session::select::selector_task_id(
+        &support::delegated::uuid(),
+        &support::delegated::uuid(),
+        &sid
+    ));
+    let same = |refused: &Value, absent: &Value, what: &str| {
+        let strip = |v: &Value| {
+            let mut v = v.clone();
+            let o = v.as_object_mut().unwrap();
+            o.remove("id");
+            o.remove("re");
+            v
+        };
+        assert_eq!(refused["code"], "forbidden", "{what}: {refused}");
+        assert_eq!(strip(refused), strip(absent), "{what}: as a missing task");
+    };
+    let refused = ask(&mut mac, &mut r, &nothing);
+    let absent = ask(&mut mac, &mut r, &missing);
+    same(&refused, &absent, "the Mac, a UUID v5 of no task");
+    let mut service = Dev::new_via(&mut r, "direct", ids, &rig.log, "svc-hm", true);
+    let refused = ask(&mut service, &mut r, &task);
+    let absent = ask(&mut service, &mut r, &missing);
+    same(&refused, &absent, "the service");
+    let mut viewer = Dev::new_via(&mut r, "direct", ids, &rig.log, "dev-viewer", false);
+    let refused = ask(&mut viewer, &mut r, &task);
+    let absent = ask(&mut viewer, &mut r, &missing);
+    same(&refused, &absent, "the viewer");
+    assert_eq!(at_rest(&rig), before, "nothing for a refused read either");
+}
+
 /// VII.B 35: the sending host puts the same request again after this host
 /// admitted it and marked it done (a lost acknowledgment): the Station
 /// stores it again, the host reads it and takes it as a duplicate, so it
