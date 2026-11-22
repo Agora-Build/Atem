@@ -71,6 +71,18 @@
         "secret_hex": "e813b00518eedc5f85e1b036f168917ef9dc935806a410c2f73e624dbf0e0c1b"
       }
     },
+    "dev-desk": {
+      "auth": {
+        "alg": "ed25519",
+        "pub_hex": "0a54823e6fbf0352077ad2d8763cc07e57aad33ec07fccb68d30f64de59bbc4c",
+        "secret_hex": "85cb2a446f895316067f6454bedc5143c4a761b56a0270107e29e1b286800a55"
+      },
+      "enc": {
+        "pub_hex": "a1c85c3609084fbda735cb7a6e47b718b255b618849d091928646649f90afe48",
+        "secret_hex": "2dd57cef7a1ed159221bf19f3c40d9fe83ff6c9f0c063edd23b79773084f264e"
+      },
+      "note": "a native member with an Ed25519 auth_key, which r9-vectors-verifier-report's chain adds (labels \"dev-desk auth\" and \"dev-desk enc\")"
+    },
     "host-a": {
       "host_key": {
         "alg": "ed25519",

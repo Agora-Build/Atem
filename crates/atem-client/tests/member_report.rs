@@ -183,16 +183,10 @@ fn a_native_report_round_trips_at_the_head() {
 #[test]
 fn an_ed25519_native_reports_too() {
     let (v, mut keys, clock) = (Vectors::load(), Book::load().provider, clock());
-    let action = native(&mut keys, "dev-tablet", Alg::Ed25519);
+    let action = native(&mut keys, "dev-desk", Alg::Ed25519);
     let log = after(&keys, &log_l(&v, &clock), action, &clock);
-    let challenge = challenge("member:dev-tablet", SLOT, 1);
-    let text = report(
-        &keys,
-        "dev-tablet/auth",
-        &log,
-        "member:dev-tablet",
-        &challenge,
-    );
+    let challenge = challenge("member:dev-desk", SLOT, 1);
+    let text = report(&keys, "dev-desk/auth", &log, "member:dev-desk", &challenge);
     let verified = verify_verifier_report(&log, text.as_bytes(), &challenge, NOW).unwrap();
     assert_eq!(verified.kind, SignerKind::Native);
     assert!(verified.at_head);
