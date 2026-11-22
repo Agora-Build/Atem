@@ -1234,6 +1234,70 @@ fn a_host_senders_task_follows_its_route_and_the_own_stations_gate() {
     );
 }
 
+/// Final readings item 6's proviso (#120 comment 7028723996): the start
+/// check asks the gate for the task's own sender. A host sender with an
+/// inbox row waiting for admission (a request, cancel or complete
+/// committed, not yet decided) waits, `blocked` without holding its
+/// session, and so does its launch at the spawn boundary; another host
+/// sender's rows hold neither; the mailbox part closed holds both.
+#[test]
+fn a_host_senders_task_waits_for_its_own_undecided_inbox_rows_only() {
+    use atem_client::membership::{ProjectOp, project_set};
+    let log = host_log(|log| {
+        log.append(
+            crate::session_protocol::membership::r9log::MAC,
+            project_set(
+                "build",
+                [HOST, "host-b"],
+                [
+                    ProjectOp::Message,
+                    ProjectOp::Notify,
+                    ProjectOp::Prompt,
+                    ProjectOp::Launch,
+                ],
+                0,
+            )
+            .unwrap(),
+        );
+    });
+    let task = host_task(&log, &["project:build"], LATER);
+    let with = |undecided: &[&str], part: bool| {
+        let mut v = host_view(&log, &["project:build"]);
+        v.gates
+            .set_mailbox_undecided(undecided.iter().map(|s| s.to_string()).collect());
+        v.gates.set_mailbox(part);
+        v
+    };
+    assert_eq!(may_start(&with(&[], true), &task, Some(0)), Ok(()));
+    let own = with(&["host-b"], true);
+    assert_eq!(may_start(&own, &task, Some(0)), Err(Event::GateClosed));
+    assert!(!Event::GateClosed.holds_session());
+    assert_eq!(
+        may_start(&with(&["host-c"], true), &task, Some(0)),
+        Ok(()),
+        "another sender's rows"
+    );
+    assert_eq!(
+        may_start(&with(&["host-c"], false), &task, Some(0)),
+        Err(Event::GateClosed),
+        "the mailbox part closed"
+    );
+    // A launch on message of the sender waits at the spawn boundary.
+    let mut v = with(&["host-b"], true);
+    v.config.routes[1].launch = crate::runtime::host_work::RouteLaunch::OnMessage;
+    let launch = StartLaunch {
+        admission: task.admission.clone(),
+        profile: v.config.profiles[0].clone(),
+        expires_at: LATER,
+    };
+    assert!(matches!(
+        launch_check(&v, &launch, 0),
+        LaunchVerdict::Wait(_)
+    ));
+    v.gates.set_mailbox_undecided(BTreeSet::new());
+    assert_eq!(launch_check(&v, &launch, 0), LaunchVerdict::Go);
+}
+
 /// No start crosses a missing stop (the owner's decision, 2026-11-22; design
 /// II.8): while host-work's device-list effects aren't written up to the
 /// committed head (none read yet, behind it, or another list's), a host

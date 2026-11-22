@@ -9,6 +9,7 @@ use crate::runtime::delegated::station::{LinkKind, StationLink};
 use atem_client::encoding::Hash32;
 use atem_client::host_mail::mailbox::{MailboxDone, MailboxDoneResult, MailboxSyncResult};
 use atem_client::session::host_work::HostTarget;
+use std::collections::BTreeSet;
 
 const MAILBOX: &str = "9d2f6c1e-3b4a-4c5d-8e6f-7a8b9c0d1e2f";
 const MAILBOX_2: &str = "3e9fd05f-183e-4b70-be0e-3ffa66120f48";
@@ -65,7 +66,7 @@ fn observed(cursor: Option<(&str, u64)>) -> Observed {
         waiting_for_room: 0,
         rewind_due: false,
         skip_expires: None,
-        held: Default::default(),
+        undecided: Default::default(),
     }
 }
 
@@ -262,9 +263,10 @@ fn pacing_refusals_and_timeouts() {
 }
 
 /// The gate's mailbox part (design II.5): open only with a link, a
-/// mailbox announced and read to its head on this generation, no
-/// refusal, fault or reset waiting, and the inbox drained; a `heads`
-/// that names no mailbox closes it.
+/// mailbox announced and read to its head on this generation, and no
+/// refusal, fault or reset waiting; a `heads` that names no mailbox closes
+/// it. An inbox row waiting for admission holds only its own sender's
+/// starts (below), never the part.
 #[test]
 fn the_gate_part_follows_the_read() {
     let mut c = client(10 * SEC, Some((MAILBOX, 3)));
@@ -273,9 +275,10 @@ fn the_gate_part_follows_the_read() {
     assert!(c.open());
     c.observe(Some(Observed {
         inbox: 1,
+        undecided: BTreeSet::from(["host-b".to_string()]),
         ..observed(Some((MAILBOX, 3)))
     }));
-    assert!(!c.open(), "an inbox row waits for admission");
+    assert!(c.open(), "its sender's starts only: {:?}", c.closed());
     c.observe(Some(observed(Some((MAILBOX, 3)))));
     c.on_heads(None);
     assert!(!c.open(), "no mailbox announced");
@@ -288,6 +291,55 @@ fn the_gate_part_follows_the_read() {
     assert!(c.open());
     c.on_link(None);
     assert!(!c.open());
+}
+
+/// Final readings item 6's proviso (#120 comment 7028723996): committed
+/// inbox rows waiting for admission hold their own senders' task starts
+/// only ([`MailboxClient::undecided`], the senders the store names), never
+/// the gate's mailbox part, so other host senders aren't blocked. What
+/// nobody can say whose it is yet still closes the part for every host
+/// sender, rows or not: the mailbox not read to its head, a reset, a
+/// request, cancel or complete left on the Station or waiting for room
+/// (not committed), a store that isn't loaded.
+#[test]
+fn an_inbox_row_holds_only_its_own_senders_starts() {
+    let rows = || Observed {
+        inbox: 2,
+        undecided: BTreeSet::from(["host-b".to_string()]),
+        ..observed(Some((MAILBOX, 3)))
+    };
+    let mut c = client(10 * SEC, Some((MAILBOX, 3)));
+    c.observe(Some(rows()));
+    c.on_heads(head(MAILBOX, 3));
+    assert!(c.open(), "{:?}", c.closed());
+    assert_eq!(c.undecided(), BTreeSet::from(["host-b".to_string()]));
+    // Unread objects: whose they are isn't known yet.
+    c.on_heads(head(MAILBOX, 4));
+    assert_eq!(c.closed().as_deref(), Some("reading the mailbox (3 of 4)"));
+    c.on_heads(head(MAILBOX, 3));
+    assert!(c.open());
+    // A request, cancel or complete left on the Station for want of room,
+    // or waiting here with no room: not committed.
+    c.observe(Some(Observed {
+        skipped: true,
+        skipped_inbox: true,
+        ..rows()
+    }));
+    assert!(c.closed().unwrap().contains("room"), "{:?}", c.closed());
+    c.observe(Some(Observed {
+        waiting_for_room: 1,
+        ..rows()
+    }));
+    assert!(c.closed().unwrap().contains("room"), "{:?}", c.closed());
+    // A store that isn't loaded names nobody: closed for all.
+    c.observe(None);
+    assert!(!c.open());
+    assert!(c.undecided().is_empty());
+    // A reset (another mailbox announced).
+    c.observe(Some(rows()));
+    assert!(c.open());
+    c.on_heads(head(MAILBOX_2, 3));
+    assert!(c.closed().unwrap().contains("reset"), "{:?}", c.closed());
 }
 
 /// The dones owed `owed` (positions), as the store holds them.

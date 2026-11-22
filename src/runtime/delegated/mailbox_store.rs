@@ -323,17 +323,18 @@ fn own_cursor(db: &rusqlite::Connection, identity: &HostIdentity) -> Result<Opti
 /// The store as the mailbox client observes it for `identity`.
 pub fn read(store: &Store, identity: &HostIdentity) -> Result<Observed> {
     let cursor = own_cursor(&store.db, identity)?;
-    // Rows admission holds (ruling R47) hold their own sender's task starts
-    // only, not the gate.
+    // Every committed row waiting for admission (one admission holds for
+    // room among its sender's early stops included, ruling R47) holds its
+    // own sender's task starts only, never another sender's (final
+    // readings item 6's proviso): its senders, read from the rows
+    // themselves, so a restart has them again.
     let inbox = store
         .db
-        .query_row("SELECT count(*) FROM mailbox_inbox WHERE held=0", [], |r| {
-            r.get(0)
-        })?;
-    let held = {
+        .query_row("SELECT count(*) FROM mailbox_inbox", [], |r| r.get(0))?;
+    let undecided = {
         let mut q = store
             .db
-            .prepare("SELECT DISTINCT sender_host FROM mailbox_inbox WHERE held=1")?;
+            .prepare("SELECT DISTINCT sender_host FROM mailbox_inbox")?;
         q.query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?
     };
@@ -373,7 +374,7 @@ pub fn read(store: &Store, identity: &HostIdentity) -> Result<Observed> {
         )?,
         rewind_due,
         skip_expires,
-        held,
+        undecided,
     })
 }
 

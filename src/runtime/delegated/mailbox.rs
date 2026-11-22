@@ -63,14 +63,20 @@
 //! - **The gate's mailbox part** (design II.5; [`MailboxClient::open`]):
 //!   the link up, a mailbox announced on this generation and read up to its
 //!   head (the furthest position read: a rewind's re-read closes nothing on
-//!   its own), no refusal, fault or reset waiting, no request, cancel or
-//!   complete left on the Station, or waiting in the store, for want of
-//!   room ([`Observed::waiting_for_room`]), and the inbox drained (the
-//!   requests, cancels and completes committed but not yet admitted).
-//!   Objects waiting for a newer sender generation don't hold it (ruling
-//!   R39: design II.5 exempts only those), nor do results, kept or left on
-//!   the Station (ruling R35: they start no work, and a flood of them must
-//!   not hold task admission). Only host senders wait for it.
+//!   its own), no refusal, fault or reset waiting, and no request, cancel
+//!   or complete left on the Station, or waiting in the store, for want of
+//!   room ([`Observed::waiting_for_room`]): until then nobody can say whose
+//!   objects wait, so every host sender waits. Objects waiting for a newer
+//!   sender generation don't hold it (ruling R39: design II.5 exempts only
+//!   those), nor do results, kept or left on the Station (ruling R35: they
+//!   start no work, and a flood of them must not hold task admission). Only
+//!   host senders wait for it.
+//! - **The inbox's senders** ([`MailboxClient::undecided`]): a request,
+//!   cancel or complete committed with the cursor and not yet admitted
+//!   holds its own sender's task starts only, never another sender's
+//!   (final readings item 6's proviso, #120 comment 7028723996), read from
+//!   the store's rows each time it is observed, so a restart, or a store
+//!   fault that keeps a row undecided, still holds them.
 use super::fetch::{HEADS_PACE_MS, REFUSAL_BACKOFF_MS, STALL_PAUSE_MS};
 use super::station::StationLink;
 use super::sync::{ALERT_EVERY_MS, HostIdentity, RETIRED_KEPT, SYNC_TIMEOUT_MS};
@@ -88,6 +94,8 @@ use std::collections::VecDeque;
 pub struct Observed {
     pub identity: HostIdentity,
     pub cursor: Option<(String, u64)>,
+    /// The inbox rows waiting for admission (a request, cancel or complete
+    /// committed with the cursor, not yet decided; held ones included).
     pub inbox: u64,
     /// The dones owed to the cursor's mailbox (positions, the first 64),
     /// each written with its page's commit, and how many in all.
@@ -112,10 +120,11 @@ pub struct Observed {
     /// When every object left on the Station has expired (the Station drops
     /// them then): the rewind is due once `D` passes it, whatever the room.
     pub skip_expires: Option<u64>,
-    /// The senders of inbox rows admission holds (a `cancel` or `complete`
-    /// waiting for room among its sender's early stops, ruling R47): not
-    /// in `inbox`; each holds its own sender's task starts only.
-    pub held: std::collections::BTreeSet<String>,
+    /// The senders (`host_id`) of those rows: each row holds its own
+    /// sender's task starts only, never the gate's mailbox part (final
+    /// readings item 6's proviso, #120 comment 7028723996; ruling R47 for a
+    /// stop admission holds for room).
+    pub undecided: std::collections::BTreeSet<String>,
 }
 
 /// What a page is to the live call ([`MailboxClient::on_page`]).
@@ -326,16 +335,18 @@ impl MailboxClient {
         }
     }
 
-    /// The store as it is now for the host's current identity (`None`: not
-    /// loaded). A reset found against the announcement waits for its mark.
-    /// The senders whose task starts a held inbox row holds (ruling R47).
-    pub fn held(&self) -> std::collections::BTreeSet<String> {
+    /// The senders whose task starts their own inbox rows hold, as the
+    /// store was last observed (none while it isn't loaded: the gate's
+    /// mailbox part is closed for every host sender then).
+    pub fn undecided(&self) -> std::collections::BTreeSet<String> {
         self.observed
             .as_ref()
-            .map(|o| o.held.clone())
+            .map(|o| o.undecided.clone())
             .unwrap_or_default()
     }
 
+    /// The store as it is now for the host's current identity (`None`: not
+    /// loaded). A reset found against the announcement waits for its mark.
     pub fn observe(&mut self, observed: Option<Observed>) {
         self.observed = observed;
         self.check_reset();
@@ -669,13 +680,26 @@ impl MailboxClient {
                 observed.waiting_for_room
             ));
         }
-        if observed.inbox > 0 {
-            return Some(format!(
-                "{} mailbox object(s) wait for admission",
-                observed.inbox
-            ));
-        }
+        // An inbox row waiting for admission is committed, its sender known:
+        // it holds that sender's task starts only ([`Self::undecided`]).
         None
+    }
+
+    /// The inbox rows waiting for admission and the senders whose task
+    /// starts they hold, as `atem status` says it (`None`: none, or the
+    /// store isn't loaded).
+    pub fn holding(&self) -> Option<String> {
+        let observed = self.observed.as_ref().filter(|o| o.inbox > 0)?;
+        let senders: Vec<String> = observed
+            .undecided
+            .iter()
+            .map(|host_id| format!("host:{host_id}"))
+            .collect();
+        Some(format!(
+            "{} mailbox object(s) wait for admission, holding the tasks of {} only",
+            observed.inbox,
+            senders.join(", ")
+        ))
     }
 
     /// The positions of the live dones (tests).
@@ -706,6 +730,8 @@ impl MailboxClient {
             "announced": self.announced.as_ref().map(|a| json!({"mailbox_id": a.mailbox_id, "head": a.head})),
             "cursor": self.observed.as_ref().and_then(|o| o.cursor.as_ref()).map(|(id, at)| json!({"mailbox_id": id, "cursor": at})),
             "inbox": self.observed.as_ref().map(|o| o.inbox),
+            "undecided": self.observed.as_ref().map(|o| o.undecided.iter().collect::<Vec<_>>()),
+            "holding": self.holding(),
             "in_flight": self.in_flight.as_ref().map(|a| json!({"request_id": a.call.request_id, "after": a.call.after})),
             "open": self.open(),
             "closed": self.closed(),

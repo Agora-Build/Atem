@@ -3775,37 +3775,46 @@ exactly as without this section):
   (a reused id's, the sender's own signature over two sealed parts, is
   kept longest after the reported ones);
 - host senders' gate also needs the mailbox read to the announced head with
-  no refusal, fault or reset waiting, no request, cancel or complete left
-  on the Station, or waiting on this host, for want of room (a result left
-  there holds none), and every inbox row admitted (design II.5; a stop
-  waiting in the inbox for room among its sender's early stops holds only
-  that sender's task starts, below). `atem status`'s `Control feeds:` line
-  names this part.
+  no refusal, fault or reset waiting, and no request, cancel or complete
+  left on the Station, or waiting on this host, for want of room (a result
+  left there holds none): until then nobody can say whose objects wait, so
+  every host sender's task starts wait (design II.5). An inbox row waiting
+  for admission (a request, cancel or complete committed with the cursor, a
+  stop waiting for room among its sender's early stops included) holds only
+  its own sender's task starts, `host:<host_id>`'s (its launches on message
+  at the spawn boundary too), never another sender's (**as Astation's
+  proviso to final readings item 6 asks, 2026-11-20, #120 comment
+  7028723996**, "admission" below): the start check reads those senders from
+  the committed rows themselves, so a restart has them before any start, and
+  a row a store fault keeps undecided goes on holding its sender's starts; a
+  store whose rows can't be read holds every host sender. `atem status`'s
+  `Control feeds:` line names this part, and the senders the inbox holds
+  while it is open.
 - **admission** (`runtime/delegated/admit.rs`, `admit_pass.rs`; design
-  II.4.2 step 7, II.4.4, II.6, II.7): while hosting runs, on the pass
-  after a mailbox commit decided an object, else on host work's 100 ms
-  cadence (never on every 16 ms pass), host senders' gate open or not (it
-  waits for the inbox, so admission never waits for it), the inbox's rows
-  are decided, at most 128 a pass, each in its own `BEGIN IMMEDIATE`
-  transaction of the host-work store, with the row's removal and the
-  status owed to its sender enqueued in the put engine (until stored);
-  nothing reaches an agent or is put before it commits (**Atem's reading;
-  its commit order agreed with Astation (2026-11-20, #120 comment 7028723996,
-  final readings item 6), with its proviso, in its words: "Persisted
-  inbox obligations block that sender's starts until decided, including
-  restart and storage failure. No task/effect/put before its commit, and
-  other senders are not globally blocked." The host's gate holds every
-  host sender's starts, not only that sender's, while any inbox row waits
-  ("host senders' gate" above), so that part is open ("Readings waiting
-  for Astation"):** "`select` from host senders" and design II.4.2 step 7
-  and II.6 commit the resolution with the object's verdict and its
-  cursor; here the opened object commits with the cursor as a durable
+  II.4.2 step 7, II.4.4, II.6, II.7): while hosting runs, on the pass after
+  a mailbox commit decided an object, else on host work's 100 ms cadence
+  (never on every 16 ms pass), host senders' gate open or not (an inbox row
+  holds its own sender's starts, so admission never waits for the gate), the
+  inbox's rows are decided, at most 128 a pass, each in its own
+  `BEGIN IMMEDIATE` transaction of the host-work store, with the row's
+  removal and the status owed to its sender enqueued in the put engine
+  (until stored); nothing reaches an agent or is put before it commits
+  (**Atem's reading,
+  agreed with Astation (2026-11-20, #120 comment 7028723996, final readings
+  item 6), with its proviso, in its words: "Persisted inbox obligations
+  block that sender's starts until decided, including restart and storage
+  failure. No task/effect/put before its commit, and other senders are not
+  globally blocked." An inbox row holds its own sender's task starts only
+  ("host senders' gate" above):** "`select` from host senders" and design
+  II.4.2 step 7 and II.6 commit the resolution with the object's verdict and
+  its cursor; here the opened object commits with the cursor as a durable
   inbox row, which stands in for the verdict and holds its sender's task
-  starts, and the resolution commits in admission's later transaction,
-  after the done: it is decided before any task of the sender can start).
+  starts, and the resolution commits in admission's later transaction, after
+  the done: it is decided before any task of the sender can start).
   A row that can't be decided (a store fault, a record that doesn't read)
-  skips none of the others and is tried again at later passes; after 8
-  tries in a row and at least a minute since its first failure on the
+  skips none of the others, holds its sender's task starts meanwhile, and
+  is tried again at later passes; after 8 tries in a row and at least a
+  minute since its first failure on the
   monotonic clock (a passing fault settles nothing; the counts are the
   store's, none kept across another store or host identity) it is
   settled, as a task record that doesn't read is: refused
@@ -4802,7 +4811,6 @@ are judged per entry"). Earlier: the receiving host's mailbox readings
 comment 6903887341][c-6903887341]). All of it runs only behind the
 debug-only hook.
 
-- **A proviso the host doesn't meet.** Astation agreed admission's commit order with "persisted inbox obligations block that sender's starts until decided … and other senders are not globally blocked"; the host's gate holds every host sender's starts while any inbox row waits: [On the receiving host][mailbox-calls], "admission" and "host senders' gate" (final readings item 6).
 - **Signing while revoked.** Statuses and results are signed while this host is a current host at its own trust generation, `authorized` as a sender or not; "Results" item 5 doesn't name that part, and no comment asked it: [On the receiving host][mailbox-calls], "Results back".
 - **Remote task ids.** A remote task id is one message's (a status naming one that another message holds doesn't take it), and each delivery has its own task id; "Results" item 4 doesn't name it: [On the sending host][mailbox-calls], "Task ids".
 - **Routine encryption-key rotation**, a separate proposal still to write. As Astation said, it must define the manager's request, the owner's confirmation, the refusal of a reused key, the publication order and the old key's retention and retirement; `host_enc_key_get` is no rotation, and in-place re-verification is no way to one (session-v1 R9.13 item 8, R9.14 item 8).

@@ -1,12 +1,12 @@
 //! (`impl HostBridge`) Admission of host senders' mail on the receiving
 //! host (the delegated host-work design II.4.2 step 7, II.4.4, II.6, II.7;
 //! host-work-v1 §11.5, "On the receiving host"), with the debug-only hook's
-//! `host.senders` on. Each pass while hosting runs, gate open or not (the
-//! gate's mailbox part waits for the inbox, so admission never waits for
-//! it): every inbox row the mailbox committed becomes a decision in its
-//! own `BEGIN IMMEDIATE` transaction of the host-work store, with the row's
-//! removal and the status owed to its sender enqueued in the put engine
-//! (`outbox::enqueue`, until stored). Nothing reaches an agent, and
+//! `host.senders` on. Each pass while hosting runs, gate open or not (an
+//! inbox row holds its own sender's task starts, so admission never waits
+//! for the gate): every inbox row the mailbox committed becomes a decision
+//! in its own `BEGIN IMMEDIATE` transaction of the host-work store, with
+//! the row's removal and the status owed to its sender enqueued in the put
+//! engine (`outbox::enqueue`, until stored). Nothing reaches an agent, and
 //! nothing is put, before that commits. Its store is [`admit`].
 //!
 //! - **A request**: deduplicated against this host's own permanent records
@@ -337,9 +337,9 @@ impl HostBridge {
 
     /// Each pass while hosting runs, with `host.senders` on (and the
     /// store this identity's, its tables made): the refusals to report,
-    /// then every inbox row decided (the module docs). The gate's mailbox
-    /// part follows the inbox as it now stands. Debug builds: held while a
-    /// test says (`<pty faults>/hold_admission`).
+    /// then every inbox row decided (the module docs). The senders whose
+    /// task starts the inbox holds follow it as it now stands. Debug
+    /// builds: held while a test says (`<pty faults>/hold_admission`).
     pub(super) fn admit_mail(&mut self, cx: &mut Cx) {
         if !self.senders_on() || crate::runtime::test_hooks::admission_held() {
             return;
@@ -363,8 +363,8 @@ impl HostBridge {
         // still failing after `MAX_ADMIT_FAILURES` tries in a row and
         // `SETTLE_AFTER_MS` since its first failure on the monotonic clock
         // (review N2: a passing fault, a lock held a while, settles
-        // nothing) is settled, so it never holds the gate for good. A
-        // count goes once its row or report no longer fails.
+        // nothing) is settled, so it never holds its sender's starts for
+        // good. A count goes once its row or report no longer fails.
         let now = self.clock.now();
         let mut counts = std::mem::take(&mut self.work.admit_failures);
         for failure in failed {
@@ -378,8 +378,8 @@ impl HostBridge {
                 decided = true;
             }
         }
-        // The gate's mailbox part as the inbox now stands, before anything
-        // of this pass is dispatched.
+        // The senders the inbox holds as it now stands, before anything of
+        // this pass is dispatched.
         if decided {
             self.mail_observe();
             self.publish_mail_gate();
@@ -498,9 +498,10 @@ impl HostBridge {
         }
         let mut decided = false;
         for row in admit::inbox(&store.db, ROWS_PER_PASS)? {
-            // A row that can't be decided now stays, holding the gate (fail
-            // closed) until it is settled; the rows after it are decided all
-            // the same.
+            // A row that can't be decided now stays, holding its sender's
+            // task starts (fail closed) until it is settled, through a
+            // restart too (it is the store's); the rows after it, another
+            // sender's included, are decided all the same.
             match self.admit_row(store, signing, &row, sessions) {
                 Ok((taken, after, launched)) => {
                     decided |= taken;
@@ -611,8 +612,9 @@ impl HostBridge {
             }
         };
         if !decided {
-            // A stop waiting for room among its sender's early stops: held,
-            // holding only that sender's task starts (ruling R47).
+            // A stop waiting for room among its sender's early stops: held
+            // (ruling R47), holding that sender's task starts as every row
+            // does.
             if row.held {
                 return Ok((false, Vec::new(), Vec::new()));
             }

@@ -63,6 +63,18 @@ const PROJECT: &str = "hm";
 /// The mailbox's reasons, as `atem status` and the dump give them
 /// (`MailboxClient::closed`).
 const READ_TO_HEAD: &str = "host senders' mailbox read to its head";
+/// One opened object of the sending host's waiting for admission, as the
+/// dump and `atem status` give it (`MailboxClient::holding`): it holds that
+/// sender's task starts only.
+const HOLDING_SENDER: &str =
+    "1 mailbox object(s) wait for admission, holding the tasks of host:host-sender only";
+
+/// The mailbox read to its head with only `senders`' inbox rows waiting
+/// for admission: the gate's mailbox part open, those senders' task starts
+/// held (final readings item 6's proviso, #120 comment 7028723996).
+fn holds_only(mailbox: &Value, senders: &[&str]) -> bool {
+    mailbox["open"] == true && mailbox["undecided"] == json!(senders)
+}
 
 /// How the host reaches its Station.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,14 +153,21 @@ impl Rig {
             Hook::Senders,
             Some("[collab]\nsend = true"),
             true,
+            false,
         )
     }
 
-    fn build(via: Via, hook: Hook, admitting: Option<&str>) -> Rig {
-        Rig::build_with(via, hook, admitting, false)
+    /// [`Rig::admitting`], the other host ([`OTHER_HOST`]) a second sending
+    /// host: project [`PROJECT`] lists it too.
+    fn admitting_two() -> Rig {
+        Rig::build_with(Via::Local, Hook::Senders, Some(""), false, true)
     }
 
-    fn build_with(via: Via, hook: Hook, admitting: Option<&str>, sending: bool) -> Rig {
+    fn build(via: Via, hook: Hook, admitting: Option<&str>) -> Rig {
+        Rig::build_with(via, hook, admitting, false, false)
+    }
+
+    fn build_with(via: Via, hook: Hook, admitting: Option<&str>, sending: bool, two: bool) -> Rig {
         let sandbox = Sandbox::new();
         write_verified_pairing(&sandbox.config(), ACCOUNT, HOST, 1);
         let host_seed = secret("host mail host");
@@ -160,11 +179,16 @@ impl Rig {
         if admitting.is_some() {
             sender = sender.with_enc(&secret("host mail sender enc"));
             log.append(support::r9log::MAC, sender.enc_key_action());
+            let hosts: &[&str] = if two {
+                &[HOST, SENDER, OTHER_HOST]
+            } else {
+                &[HOST, SENDER]
+            };
             log.append(
                 support::r9log::MAC,
                 atem_client::membership::project_set(
                     PROJECT,
-                    [HOST, SENDER],
+                    hosts.iter().copied(),
                     [ProjectOp::Message, ProjectOp::Notify, ProjectOp::Prompt],
                     0,
                 )
@@ -1183,16 +1207,12 @@ fn reads_its_mailbox_to_the_head_on_relay_local_and_routed_links() {
         assert_eq!(rig.done_positions(&mailbox_id), [1, 2, 3, 4], "{via:?}");
         let afters: Vec<u64> = rig.syncs().into_iter().map(|(_, after)| after).collect();
         assert_eq!(afters, [0, 1, 2, 3], "{via:?}");
-        let mailbox = rig.until_mailbox("the inbox waits", |m| m["open"] == false);
-        assert_eq!(
-            mailbox["closed"], "1 mailbox object(s) wait for admission",
-            "{via:?}"
-        );
+        // The request waits for admission: its sender's task starts only.
+        let mailbox = rig.until_mailbox("the inbox waits", |m| holds_only(m, &[SENDER]));
+        assert_eq!(mailbox["holding"], HOLDING_SENDER, "{via:?}");
         assert_eq!(mailbox["faults"], 0, "{via:?}");
         if via == Via::Relay {
-            rig.status_feeds(
-                "host senders' mailbox not checked (1 mailbox object(s) wait for admission)",
-            );
+            rig.status_feeds(&format!("{READ_TO_HEAD}; {HOLDING_SENDER}"));
             // Done, its key is free: the same bytes put again are stored
             // anew (rule 3), and the host takes them as a duplicate: no
             // new row, marked done.
@@ -1617,12 +1637,12 @@ fn an_object_over_the_pending_limits_is_marked_done() {
 // ── The gate's mailbox part (design II.5) ──
 
 /// Design II.5, §11.5: host senders' gate's mailbox part is closed until the
-/// host has read its mailbox to the announced head and every inbox row is
-/// admitted: closed with no mailbox announced, while a page is out, while
-/// an opened request waits for admission; open once admission took it
-/// (admission is held in these tests: the test takes the row as admission
-/// does), a kept result holding none; closed again by a new object until
-/// it is read.
+/// host has read its mailbox to the announced head: closed with no mailbox
+/// announced, while a page is out. An opened request waiting for admission
+/// then holds its own sender's task starts only (final readings item 6's
+/// proviso), until admission takes it (admission is held in these tests:
+/// the test takes the row as admission does), a kept result holding none;
+/// a new object closes the part again until it is read.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
@@ -1650,12 +1670,11 @@ fn the_gates_mailbox_part_waits_for_the_head_and_the_inbox() {
     rig.serve_until("read to the head", |rig| {
         rig.owed().is_empty() && rig.cursor().is_some_and(|c| c.1 == 2)
     });
-    rig.until_mailbox("the inbox waits", |m| {
-        m["closed"] == "1 mailbox object(s) wait for admission"
-    });
-    // Admission takes the request: open (the kept result holds nothing).
+    rig.until_mailbox("the inbox waits", |m| holds_only(m, &[SENDER]));
+    // Admission takes the request: nobody held (the kept result holds
+    // nothing).
     rig.admit_all();
-    rig.until_mailbox("open", |m| m["open"] == true);
+    rig.until_mailbox("open", |m| holds_only(m, &[]));
     assert_eq!(rig.count("mailbox_results"), 1);
     rig.status_feeds(READ_TO_HEAD);
     // A new object: closed until it is read and admitted.
@@ -1669,11 +1688,9 @@ fn the_gates_mailbox_part_waits_for_the_head_and_the_inbox() {
     rig.serve_until("read", |rig| {
         rig.owed().is_empty() && rig.cursor().is_some_and(|c| c.1 == 3)
     });
-    rig.until_mailbox("waits again", |m| {
-        m["closed"] == "1 mailbox object(s) wait for admission"
-    });
+    rig.until_mailbox("waits again", |m| holds_only(m, &[SENDER]));
     rig.admit_all();
-    rig.until_mailbox("open again", |m| m["open"] == true);
+    rig.until_mailbox("open again", |m| holds_only(m, &[]));
 }
 
 /// Ruling R35: a flood of results over the sending host's results' share
@@ -1736,11 +1753,9 @@ fn a_results_flood_leaves_the_gate_open_and_a_skipped_request_closes_it() {
         rig.inbox().len() == 1 && rig.owed().is_empty()
     });
     assert_eq!(rig.station().mailbox_positions(), [65]);
-    rig.until_mailbox("waiting for admission", |m| {
-        m["closed"] == "1 mailbox object(s) wait for admission"
-    });
+    rig.until_mailbox("waiting for admission", |m| holds_only(m, &[SENDER]));
     rig.admit_all();
-    rig.until_mailbox("open again", |m| m["open"] == true);
+    rig.until_mailbox("open again", |m| holds_only(m, &[]));
     assert_eq!(rig.count("mailbox_results"), 64);
     rig.offline();
 }
@@ -1806,11 +1821,9 @@ fn a_request_left_again_on_a_reread_holds_the_gate_until_read_again() {
         rig.inbox().len() == 1 && rig.owed().is_empty()
     });
     assert!(rig.station().mailbox_positions().is_empty());
-    rig.until_mailbox("waiting for admission", |m| {
-        m["closed"] == "1 mailbox object(s) wait for admission"
-    });
+    rig.until_mailbox("waiting for admission", |m| holds_only(m, &[SENDER]));
     rig.admit_all();
-    rig.until_mailbox("open", |m| m["open"] == true);
+    rig.until_mailbox("open", |m| holds_only(m, &[]));
 }
 
 // ── An identity change on the live link (§11.4, rule 8) ──
@@ -2061,7 +2074,7 @@ fn with_the_hook_off_the_host_reads_no_mailbox() {
 /// A host sender's request reaches this host's agent (`atem:<this host>`
 /// matched against its own `host_id`): admitted into a task delegated as
 /// the sending host's, it starts once host senders' gate opens (the
-/// mailbox read to its head, the inbox drained), runs on the fake agent and
+/// mailbox read to its head, its request decided), runs on the fake agent and
 /// awaits its result; the statuses come back to the sending host's mailbox
 /// (opened with the shared core): the resolution first, then the task's
 /// later states. The sending host's `complete` then completes it with its
@@ -2173,6 +2186,59 @@ fn a_cancel_waiting_while_the_host_is_down_is_applied_before_its_task_starts() {
         .message(&to, &[&format!("atem:{HOST}")], 1, "HM_AFTER");
     rig.put(&rig.sender.request_of(&to, rig.log.log.head(), &later));
     support::delegated::in_turn(&rig, &task_of(&later, &sid), "HM_AFTER");
+}
+
+/// Final readings item 6's proviso (#120 comment 7028723996), two sending
+/// hosts: A's (the sending host's) and B's (the other host's) tasks are
+/// admitted and queued, A's first (host-work's scheduling held). A's
+/// `cancel` of its task is committed and waits in the inbox (admission
+/// held). It holds A's task starts only, across a restart too: started
+/// again, the host reads its mailbox to the head (every host sender waits
+/// until then) and B's task runs while A's waits, `revocations not yet
+/// checked`. Admitted, A's cancel cancels A's task, which never ran.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_senders_undecided_cancel_holds_only_its_own_tasks_across_a_restart() {
+    let mut rig = Rig::admitting_two();
+    rig.online();
+    let sid = rig.launch();
+    let to = rig.receiver(1);
+    let other = SenderHost::new(&rig.log, OTHER_HOST, 1, &secret("host mail other host"));
+    let head = rig.log.log.head();
+    rig.fault("hold_host_work");
+    let a = rig
+        .sender
+        .message(&to, &[&format!("atem:{HOST}")], 1, "HM_GATE_A");
+    rig.put(&rig.sender.request_of(&to, head, &a));
+    rig.within("A's admitted", || !rig.tasks_of(&a.message_id).is_empty());
+    let b = other.message(&to, &[&format!("atem:{HOST}")], 1, "HM_GATE_B");
+    other.put_stored(&mut rig.station(), &other.request_of(&to, head, &b));
+    rig.within("B's admitted", || !rig.tasks_of(&b.message_id).is_empty());
+    let (a_task, b_task) = (task_of(&a, &sid), task_of(&b, &sid));
+    // A's cancel committed, admission held.
+    rig.fault("hold_admission");
+    rig.put(&rig.sender.stop(&to, head, a_task.as_str().unwrap(), None));
+    rig.within("A's cancel committed", || rig.inbox().len() == 1);
+    rig.until_mailbox("A's row holds A only", |m| holds_only(m, &[SENDER]));
+    // Started again, the cancel still waiting.
+    rig.offline();
+    rig.kill();
+    rig.start_again();
+    rig.online();
+    rig.until_mailbox("read again", |m| holds_only(m, &[SENDER]));
+    std::fs::remove_file(rig.faults().join("hold_host_work")).unwrap();
+    support::delegated::in_turn(&rig, &b_task, "HM_GATE_B");
+    support::delegated::wait_stored(&rig, &a_task, "blocked", "revocations not yet checked");
+    support::delegated::never_ran(&rig, &a_task, "HM_GATE_A");
+    assert_eq!(rig.inbox().len(), 1);
+    // Admitted: A's task cancelled, never started.
+    std::fs::remove_file(rig.faults().join("hold_admission")).unwrap();
+    support::delegated::wait_stored(&rig, &a_task, "cancelled", "cancelled before submission");
+    support::delegated::never_ran(&rig, &a_task, "HM_GATE_A");
+    rig.until_mailbox("nobody held", |m| holds_only(m, &[]));
 }
 
 /// VII.B 31: the runtime is killed right after a request's admission

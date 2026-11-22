@@ -20,9 +20,13 @@
 //!
 //! - **A host sender** waits for the host's own Station's gate and, with
 //!   it, the gate's mailbox part (design II.5): the host's own mailbox read
-//!   and committed up to the announced head and its inbox drained
-//!   ([`super::mailbox::MailboxClient::open`], [`Gates::set_mailbox`]).
-//!   Natives and services never wait for it.
+//!   and committed up to the announced head, nothing left for want of room
+//!   ([`super::mailbox::MailboxClient::open`], [`Gates::set_mailbox`]), and
+//!   none of its own inbox rows waiting for admission
+//!   ([`Gates::set_mailbox_undecided`]): a committed row holds its own
+//!   sender's task starts only, never another sender's (final readings
+//!   item 6's proviso, #120 comment 7028723996). Natives and services never
+//!   wait for the mailbox.
 //!
 //! The feed part is the host's sync's ([`super::sync::FeedSync`]): it
 //! syncs only its own Station's feed (Decision 14), so only that Station's
@@ -53,9 +57,13 @@ pub struct Gates {
     /// The native members (`member:<id>`) holding a caught-up channel
     /// (`R9Host::native_caught_up`).
     caught_up: BTreeSet<String>,
-    /// The mailbox part, host senders' only (design II.5).
+    /// The mailbox part, host senders' only (design II.5): what holds every
+    /// host sender (the mailbox not read to its head, a reset, an object
+    /// left for want of room: nobody knows whose it is yet).
     mailbox: bool,
-    mailbox_held: BTreeSet<String>,
+    /// The host senders (`host_id`) with committed inbox rows not yet
+    /// decided: each holds its own sender's task starts only.
+    mailbox_undecided: BTreeSet<String>,
 }
 
 impl Gates {
@@ -78,10 +86,13 @@ impl Gates {
         self.mailbox = open;
     }
 
-    /// The host senders whose task starts a held inbox row holds (a
-    /// `cancel` or `complete` waiting for room, ruling R47).
-    pub fn set_mailbox_held(&mut self, held: BTreeSet<String>) {
-        self.mailbox_held = held;
+    /// The host senders whose task starts their own inbox rows hold, as
+    /// the store committed them (a request, `cancel` or `complete` waiting
+    /// for admission, one held for room among its sender's early stops
+    /// included, ruling R47): read from the same store as the mailbox part,
+    /// so a restart has them before the part opens.
+    pub fn set_mailbox_undecided(&mut self, undecided: BTreeSet<String>) {
+        self.mailbox_undecided = undecided;
     }
 
     /// Every Station's gate closed (design I.6.2 step 7, at a start's
@@ -147,10 +158,11 @@ impl GateView for Gates {
             // device list, which carry every stop of a host sender. No
             // channel opens it: a host sender has none, and a native's
             // caught-up channel speaks for that native only.
-            // And the mailbox part (design II.5).
+            // And the mailbox part (design II.5), with none of its own
+            // inbox rows undecided.
             DelegatedSender::Host { host_id, .. } => {
                 self.mailbox
-                    && !self.mailbox_held.contains(host_id)
+                    && !self.mailbox_undecided.contains(host_id)
                     && self
                         .own
                         .as_deref()
@@ -258,9 +270,9 @@ mod tests {
     }
 
     /// Design II.5: a host sender's gate also needs the mailbox part (the
-    /// host's own mailbox read and committed to the announced head, its
-    /// inbox drained); natives and services never wait for it. A start's
-    /// recovery closes it with the Stations' gates.
+    /// host's own mailbox read and committed to the announced head; its own
+    /// inbox rows, below); natives and services never wait for it. A
+    /// start's recovery closes it with the Stations' gates.
     #[test]
     fn only_host_senders_wait_for_the_mailbox() {
         let host = DelegatedSender::Host {
@@ -280,5 +292,30 @@ mod tests {
         gates.open_feed(ORIGIN);
         assert!(!gates.open_for(&host, fetched), "closed with the Stations");
         assert!(gates.open_for(&service(ORIGIN), fetched));
+    }
+
+    /// Final readings item 6's proviso (#120 comment 7028723996): a host
+    /// sender's committed inbox rows waiting for admission hold its own
+    /// task starts only; another host sender's, natives' and services'
+    /// pass. The mailbox part closed holds every host sender, rows or not.
+    #[test]
+    fn an_undecided_inbox_row_holds_only_its_own_sender() {
+        let host = |id: &str| DelegatedSender::Host {
+            host_id: id.into(),
+            generation: 1,
+            epoch: 1,
+        };
+        let mut gates = Gates::default();
+        gates.open_own_station(ORIGIN);
+        gates.set_mailbox_undecided(BTreeSet::from(["host-b".to_string()]));
+        assert!(!gates.open_for(&host("host-b"), None), "its own row");
+        assert!(gates.open_for(&host("host-c"), None), "not another's");
+        assert!(gates.open_for(&native("dev-tablet"), None));
+        assert!(gates.open_for(&service(ORIGIN), None));
+        gates.set_mailbox(false);
+        assert!(!gates.open_for(&host("host-c"), None), "the part closed");
+        gates.set_mailbox(true);
+        gates.set_mailbox_undecided(BTreeSet::new());
+        assert!(gates.open_for(&host("host-b"), None), "decided");
     }
 }

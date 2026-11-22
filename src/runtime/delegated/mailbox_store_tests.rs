@@ -111,6 +111,52 @@ fn a_reset_mark_is_durable() {
     assert_eq!(cursor(&store), Some((MAILBOX_2.into(), 0)));
 }
 
+/// Final readings item 6's proviso (#120 comment 7028723996): the senders
+/// whose task starts the inbox holds are read from the committed rows
+/// themselves, every row waiting for admission (one admission holds for
+/// room among its sender's early stops, ruling R47, included), and counted
+/// in `inbox`; a reopen (a restart) reads them again before anything else.
+#[test]
+fn the_inbox_names_its_senders_durably() {
+    let (dir, store) = store();
+    let row = |sender: &str, id: &str, held: bool| {
+        store
+            .db
+            .execute(
+                "INSERT INTO mailbox_inbox(sender_host, object_id, kind, plain, object_hash,
+                    at_ms, held) VALUES(?1, ?2, 'cancel', x'', ?2, 0, ?3)",
+                rusqlite::params![sender, id, held],
+            )
+            .unwrap();
+    };
+    let named = |store: &Store| {
+        let observed = read(store, &identity(1)).unwrap();
+        (
+            observed.inbox,
+            observed.undecided.into_iter().collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(named(&store), (0, vec![]));
+    row("host-b", "b-1", false);
+    row("host-b", "b-2", false);
+    row("host-c", "c-1", true);
+    assert_eq!(
+        named(&store),
+        (3, vec!["host-b".to_string(), "host-c".to_string()])
+    );
+    drop(store);
+    let store = Store::open(dir.path()).unwrap();
+    assert_eq!(
+        named(&store),
+        (3, vec!["host-b".to_string(), "host-c".to_string()])
+    );
+    store
+        .db
+        .execute("DELETE FROM mailbox_inbox WHERE sender_host='host-b'", [])
+        .unwrap();
+    assert_eq!(named(&store), (1, vec!["host-c".to_string()]));
+}
+
 // ------------------------------------------------- the objects' decisions
 
 use crate::session_protocol::membership::r9log::{TestLog, secret};

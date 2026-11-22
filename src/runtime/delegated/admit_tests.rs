@@ -370,7 +370,8 @@ fn ad_one_state(rig: &LocalRig, message: &Message) -> (WorkState, String) {
 /// one commit (read by another connection) with the inbox row gone; the
 /// status is a `resolved` receipt naming the selector task id (§11.5's
 /// derivation, checked against the shared vector) and put until stored.
-/// With the inbox drained and the head read, host senders' gate opens.
+/// Until it is admitted, its row holds B's task starts only; admitted, with
+/// the head read, B's gate opens too.
 #[test]
 fn a_request_is_admitted_with_its_status_in_one_commit() {
     local_test(async |root| {
@@ -381,7 +382,8 @@ fn a_request_is_admitted_with_its_status_in_one_commit() {
         let object = ad_request(&rig, &host, &message);
         ad_deliver(&mut rig, &mut host, &[object]);
         assert_eq!(ad_inbox_rows(&rig), 1, "opened, waiting for admission");
-        assert!(!mb_gate(&rig), "the inbox holds the gate");
+        assert!(!mb_gate(&rig), "B's row holds B's starts");
+        assert!(ad_gate_for(&rig, "host-c"), "only B's");
         // A status that can't be written undoes the whole admission: no
         // message, no task, the inbox row kept for the next pass.
         let db = &rig.bridge.work.store.as_ref().unwrap().db;
@@ -455,7 +457,7 @@ fn a_request_is_admitted_with_its_status_in_one_commit() {
         assert_eq!(resolved[0].task_id, expected);
         assert_eq!(resolved[0].state, WorkState::Queued);
         assert_eq!(ad_statuses(&rig)[0].0, "queued", "put until stored");
-        assert!(mb_gate(&rig), "the inbox drained, the head read");
+        assert!(mb_gate(&rig), "B's row decided, the head read");
     });
 }
 
@@ -1101,6 +1103,340 @@ fn a_stop_before_its_request_is_kept_and_applied_at_admission() {
     });
 }
 
+/// Host C added to the list (B's rig, `sp_host`), and to project `build`
+/// with this host and B, a task's ops: a second host sender.
+fn ad_with_host_c(rig: &mut LocalRig, host: &mut MbHost) {
+    use crate::session_protocol::membership::r9log::secret;
+    let entry = host.s.log.add_host("host-c", 1, &secret("host c"));
+    carry(rig, &host.s.log, entry);
+    sign_and_carry(
+        rig,
+        &mut host.s,
+        project_set("build", ["host", "host-b", "host-c"], task_ops(), 0).unwrap(),
+    );
+    mb_tick(rig, host, 0);
+}
+
+/// Host `host_id`'s task of `prompt` through route `rh` (as
+/// [`host_task`] makes B's), admitted on the host's committed list now: its
+/// id.
+fn ad_task_of(
+    rig: &mut LocalRig,
+    s: &HostSenders,
+    host_id: &str,
+    prompt: &str,
+    expires_at: u64,
+) -> String {
+    let id = phone_task(rig, &s.phone, prompt, expires_at);
+    let list = rig.bridge.membership.as_ref().unwrap().membership();
+    let route = rig.bridge.work.config.route("rh").unwrap().clone();
+    let sender = HostSender {
+        host_id,
+        admitted: None,
+    };
+    let permit = host_sender_permits(list, "host", &sender, &route, HostOp::Task).unwrap();
+    let admission = Admission::for_host(list, host_id, &permit, "rh", 1).unwrap();
+    let store = rig.bridge.work.store.as_ref().unwrap();
+    let mut r = store.work(&id).unwrap().unwrap();
+    r.principal = format!("host:{host_id}");
+    r.route_id = "rh".into();
+    r.delegated = Some(admission);
+    store.save_work(&r).unwrap();
+    id
+}
+
+/// A store fault on host B's inbox rows (their removal fails, so no
+/// decision of one commits) until [`ad_fault_ends`].
+fn ad_fault_on_b(rig: &LocalRig) {
+    rig.bridge
+        .work
+        .store
+        .as_ref()
+        .unwrap()
+        .db
+        .execute_batch(
+            "CREATE TRIGGER ad_fault BEFORE DELETE ON mailbox_inbox
+            WHEN OLD.sender_host = 'host-b' BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END;",
+        )
+        .unwrap();
+}
+
+fn ad_fault_ends(rig: &LocalRig) {
+    rig.bridge
+        .work
+        .store
+        .as_ref()
+        .unwrap()
+        .db
+        .execute_batch("DROP TRIGGER ad_fault")
+        .unwrap();
+}
+
+/// Final readings item 6's proviso (#120 comment 7028723996): host B's
+/// request waits in the inbox for admission, committed (host-work's pass,
+/// admission with it, held). When the turn before them ends, the session
+/// host's start check asks each attempt's own sender's gate: B's attempt,
+/// first, is withdrawn, never written; host C's, after it, starts. Once
+/// B's request is decided, B's task starts.
+#[test]
+fn an_undecided_inbox_row_holds_only_its_own_senders_starts() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut host = sp_host(&mut rig, root, &os);
+        // A link the passes keep (theirs: the rig's routed link).
+        r9_link_up(&mut rig);
+        ad_with_host_c(&mut rig, &mut host);
+        ad_deliver(&mut rig, &mut host, &[]);
+        host_running(&mut rig, &host.s, "AD_G_TURN", start).await;
+        let b_task = host_task(&mut rig, &host.s, "AD_G_B", start + HOUR);
+        let c_task = ad_task_of(&mut rig, &host.s, "host-c", "AD_G_C", start + HOUR);
+        for task in [&b_task, &c_task] {
+            blocked(&mut rig, task, BEHIND).await;
+        }
+        let b_attempt = attempt_behind_the_turn(&mut rig, &b_task, "AD_G_B");
+        attempt_behind_the_turn(&mut rig, &c_task, "AD_G_C");
+        hold_host_work(&mut rig);
+        let message = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
+        ad_inbox_request(&rig, &message);
+        mb_tick(&mut rig, &mut host, 0);
+        assert!(!ad_gate_for(&rig, "host-b"), "B's own row");
+        assert!(ad_gate_for(&rig, "host-c"), "not another sender's");
+        std::fs::write(rig.fake.join("complete"), "").unwrap();
+        rig.until_within(Duration::from_secs(20), |r| input(r).contains("AD_G_C"))
+            .await;
+        assert!(!input(&rig).contains("AD_G_B"));
+        assert_eq!(
+            rig.bridge.start_view().refused(&b_attempt),
+            Some(Event::GateClosed)
+        );
+        let receipt = rig
+            .bridge
+            .host
+            .attempt_receipt(&b_attempt, &b_task)
+            .unwrap();
+        assert_eq!(
+            (receipt.state, receipt.detail.as_deref()),
+            (
+                wire::ReceiptState::Rejected,
+                Some(details::WITHDRAWN_BY_THE_HOST)
+            )
+        );
+        // B's request decided: B's task starts once C's turn ends.
+        ad_admit(&mut rig);
+        assert_eq!(ad_inbox_rows(&rig), 0);
+        mb_tick(&mut rig, &mut host, 0);
+        assert!(ad_gate_for(&rig, "host-b"));
+        rig.bridge.work.scheduled = Instant::now();
+        complete(&mut rig, &c_task).await;
+        rig.until(|r| input(r).contains("AD_G_B")).await;
+    });
+}
+
+/// Final readings item 6's proviso, "including … storage failure": a store
+/// fault keeps host B's request undecided (each pass's admission of it
+/// fails and is tried again, never settled within the bounded tries). B's
+/// queued task waits behind it, `revocations not yet checked`, without
+/// holding the session; host C's, queued after it, runs. Once the fault
+/// ends, the request is admitted and B's task runs.
+#[test]
+fn a_row_a_store_fault_keeps_undecided_holds_only_its_own_senders_starts() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut host = sp_host(&mut rig, root, &os);
+        // A link the passes keep (theirs: the rig's routed link).
+        r9_link_up(&mut rig);
+        ad_with_host_c(&mut rig, &mut host);
+        ad_deliver(&mut rig, &mut host, &[]);
+        hold_host_work(&mut rig);
+        let b_task = host_task(&mut rig, &host.s, "AD_F_B", start + HOUR);
+        let c_task = ad_task_of(&mut rig, &host.s, "host-c", "AD_F_C", start + HOUR);
+        ad_fault_on_b(&rig);
+        let message = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
+        ad_inbox_request(&rig, &message);
+        mb_tick(&mut rig, &mut host, 0);
+        rig.bridge.work.scheduled = Instant::now();
+        rig.until_within(Duration::from_secs(20), |r| input(r).contains("AD_F_C"))
+            .await;
+        assert_eq!(ad_inbox_rows(&rig), 1, "undecided");
+        assert!(!rig.bridge.work.admit_failures.is_empty(), "tried, failed");
+        assert_eq!(
+            settled(&rig, &b_task),
+            (
+                WorkState::Blocked,
+                details::REVOCATIONS_NOT_YET_CHECKED.to_string()
+            )
+        );
+        complete(&mut rig, &c_task).await;
+        passes(&mut rig, 3);
+        assert_eq!(ad_inbox_rows(&rig), 1);
+        assert_eq!(settled(&rig, &b_task).0, WorkState::Blocked);
+        assert!(!input(&rig).contains("AD_F_B"));
+        ad_fault_ends(&rig);
+        rig.until(|r| input(r).contains("AD_F_B")).await;
+        assert_eq!(ad_inbox_rows(&rig), 0);
+    });
+}
+
+/// Final readings item 6's proviso, "including restart": host B's request
+/// committed, a store fault keeping it undecided, the runtime starts again.
+/// Until the mailbox is read to its head again nobody can say whose its
+/// objects are: every host sender's task waits. Read, B's row (the store's,
+/// read again) holds B's task only: C's runs. Once the fault ends, B's
+/// task runs.
+#[test]
+fn an_undecided_inbox_row_holds_its_sender_across_a_restart() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut host = sp_host(&mut rig, root, &os);
+        // A link the passes keep (theirs: the rig's routed link).
+        r9_link_up(&mut rig);
+        ad_with_host_c(&mut rig, &mut host);
+        ad_deliver(&mut rig, &mut host, &[]);
+        hold_host_work(&mut rig);
+        let b_task = host_task(&mut rig, &host.s, "AD_R_B", start + HOUR);
+        let c_task = ad_task_of(&mut rig, &host.s, "host-c", "AD_R_C", start + HOUR);
+        ad_fault_on_b(&rig);
+        let message = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
+        ad_inbox_request(&rig, &message);
+        let read = mb_store_cursor(&rig).expect("read").1;
+        restart(&mut rig, root, &os, false, false);
+        // The Station link again, its feed and device-list parts stood in:
+        // the mailbox not read yet, nobody's task starts.
+        r9_link_up(&mut rig);
+        rig.bridge.start_view().gates.open_own_station(ORIGIN);
+        mb_tick(&mut rig, &mut host, 0);
+        assert!(!ad_gate_for(&rig, "host-b") && !ad_gate_for(&rig, "host-c"));
+        passes(&mut rig, 3);
+        for task in [&b_task, &c_task] {
+            assert_eq!(settled(&rig, task).0, WorkState::Blocked, "{task}");
+        }
+        // Read to its head: B's row holds B's task only.
+        mb_heads(&mut rig, MB_MAILBOX, read);
+        assert_eq!(ad_inbox_rows(&rig), 1);
+        assert!(!ad_gate_for(&rig, "host-b"));
+        assert!(ad_gate_for(&rig, "host-c"));
+        rig.until_within(Duration::from_secs(20), |r| input(r).contains("AD_R_C"))
+            .await;
+        assert!(!input(&rig).contains("AD_R_B"));
+        assert_eq!(settled(&rig, &b_task).0, WorkState::Blocked);
+        ad_fault_ends(&rig);
+        complete(&mut rig, &c_task).await;
+        rig.until(|r| input(r).contains("AD_R_B")).await;
+    });
+}
+
+/// What nobody can say whose it is yet closes host senders' gate for
+/// every host sender, B's and C's alike, rows or not (design II.5): the
+/// mailbox not read to its head, a reset (another mailbox announced), and
+/// a request left on the Station for want of room (not committed).
+#[test]
+fn unread_objects_a_reset_and_a_skipped_request_hold_every_host_sender() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        // A link the passes keep (theirs: the rig's routed link).
+        r9_link_up(&mut rig);
+        ad_with_host_c(&mut rig, &mut host);
+        ad_deliver(&mut rig, &mut host, &[]);
+        let both = |rig: &LocalRig| (ad_gate_for(rig, "host-b"), ad_gate_for(rig, "host-c"));
+        assert_eq!(both(&rig), (true, true));
+        // A row of B's: B's only, as `atem status` says.
+        let message = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
+        ad_inbox_request(&rig, &message);
+        mb_tick(&mut rig, &mut host, 0);
+        assert_eq!(both(&rig), (false, true));
+        assert_eq!(
+            rig.bridge.mail_status().as_deref(),
+            Some(
+                "host senders' mailbox read to its head; 1 mailbox object(s) wait for \
+                admission, holding the tasks of host:host-b only"
+            )
+        );
+        // Unread objects.
+        let at = mb_store_cursor(&rig).unwrap().1;
+        mb_heads(&mut rig, MB_MAILBOX, at + 1);
+        assert_eq!(both(&rig), (false, false), "unread");
+        mb_heads(&mut rig, MB_MAILBOX, at);
+        assert_eq!(both(&rig), (false, true));
+        // A request left on the Station for want of room.
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute("UPDATE mailbox_cursor SET skip_inbox_now=?1", [at])
+            .unwrap();
+        mb_tick(&mut rig, &mut host, 0);
+        assert_eq!(both(&rig), (false, false), "skipped");
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute("UPDATE mailbox_cursor SET skip_inbox_now=NULL", [])
+            .unwrap();
+        mb_tick(&mut rig, &mut host, 0);
+        assert_eq!(both(&rig), (false, true));
+        // A reset: another mailbox announced, read again from 0.
+        mb_heads(&mut rig, MB_MAILBOX_2, 1);
+        assert_eq!(mb_store_cursor(&rig), Some((MB_MAILBOX_2.to_string(), 0)));
+        assert_eq!(both(&rig), (false, false), "reset");
+    });
+}
+
+/// Final readings item 6's proviso, "including … storage failure": a store
+/// whose inbox can't be read names nobody, so every host sender waits (fail
+/// closed, never the senders last read), and `atem status` says the state
+/// isn't loaded; readable again, B's row holds B's starts only.
+#[test]
+fn a_store_whose_inbox_cant_be_read_holds_every_host_sender() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        ad_with_host_c(&mut rig, &mut host);
+        ad_deliver(&mut rig, &mut host, &[]);
+        let both = |rig: &LocalRig| (ad_gate_for(rig, "host-b"), ad_gate_for(rig, "host-c"));
+        let message = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
+        ad_inbox_request(&rig, &message);
+        mb_tick(&mut rig, &mut host, 0);
+        assert_eq!(both(&rig), (false, true));
+        let db = |rig: &LocalRig, sql: &str| {
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .execute_batch(sql)
+                .unwrap()
+        };
+        db(&rig, "ALTER TABLE mailbox_inbox RENAME TO ad_unreadable");
+        mb_tick(&mut rig, &mut host, 0);
+        assert_eq!(both(&rig), (false, false), "nobody known: all wait");
+        assert!(
+            rig.bridge
+                .mail_status()
+                .unwrap()
+                .contains("the mailbox state isn't loaded"),
+            "{:?}",
+            rig.bridge.mail_status()
+        );
+        db(&rig, "ALTER TABLE ad_unreadable RENAME TO mailbox_inbox");
+        mb_tick(&mut rig, &mut host, 0);
+        assert_eq!(both(&rig), (false, true));
+    });
+}
+
 /// II.4.4: a status is owed at every change of a host sender's task's
 /// state, marked by the trigger in the statement that changes it (queued,
 /// blocked, submitted, awaiting its result, completed; failed by a
@@ -1192,10 +1528,11 @@ fn a_status_is_owed_at_each_change_and_supersedes_the_unstored_one() {
 }
 
 /// Entry criterion 1: admission takes every inbox row whatever host
-/// senders' gate says (it waits for the inbox, so admission that waited for
-/// it would wait for itself): with the mailbox not read to its head, a pass
-/// of the runtime (`work_pass`) admits a request; its task then waits for
-/// the gate, `blocked`, revocations not yet checked.
+/// senders' gate says (an inbox row holds its own sender's starts, so
+/// admission that waited for the gate would wait for itself): with the
+/// mailbox not read to its head, a pass of the runtime (`work_pass`)
+/// admits a request; its task then waits for the gate, `blocked`,
+/// revocations not yet checked.
 #[test]
 fn a_pass_admits_mail_while_the_gate_is_closed() {
     local_test(async |root| {
@@ -1447,7 +1784,7 @@ fn a_row_that_cant_be_decided_is_settled_after_bounded_tries() {
                 refused: "busy".into()
             }));
         mb_tick(&mut rig, &mut host, 0);
-        assert_eq!(mb_store(&rig).inbox, 0, "the gate's inbox part drained");
+        assert_eq!(mb_store(&rig).inbox, 0, "settled: no row holds B's starts");
         db(&rig, "DROP TRIGGER ad_block");
     });
 }

@@ -917,8 +917,12 @@ host-work-v1 §11.5). Each host is set up as above, plus:
    gate stays closed.
 5. **What to check.**
    - `atem status`'s `Control feeds:` line adds `host senders' mailbox
-     read to its head`, or `host senders' mailbox not checked (<why>)`,
-     with the mailbox's alerts since the start.
+     read to its head`; or, while opened objects wait for admission,
+     `host senders' mailbox read to its head; N mailbox object(s) wait for
+     admission, holding the tasks of host:<host_id> only` (only those
+     senders' tasks wait, every other host sender's start); or `host
+     senders' mailbox not checked (<why>)` (every host sender's tasks
+     wait); with the mailbox's alerts since the start.
    - On the sending host, `atem message status <message id>` (from the
      sending session, or the owner's terminal) shows a row per host:
      `ready` (`waiting for the Station to announce this host's mailbox`

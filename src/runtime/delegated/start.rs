@@ -473,9 +473,10 @@ pub fn may_start(view: &StartView, task: &StartTask, now_d_ms: Option<u64>) -> R
 /// 5. the deadline, then the waits: the journal halted, a control state
 ///    that doesn't read, `host.senders` off (its stops aren't read then, so
 ///    it waits as for a closed gate), a deferred entry, the host's own
-///    Station's gate (II.5: its feed and device-list parts; the mailbox's
-///    part comes with the mailbox), and last host-work's effects of the
-///    device list's entries not yet written up to its head
+///    Station's gate (II.5: its feed and device-list parts, and the
+///    mailbox's with none of its own inbox rows waiting for admission;
+///    another sender's rows don't hold it), and last host-work's effects
+///    of the device list's entries not yet written up to its head
 ///    ([`StartView::host_effects_at`]): `EffectsPending`, `device list
 ///    update pending` (an attempt withdrawn for it at `executing` isn't
 ///    counted), so no start crosses a stop an entry has and the head
