@@ -11,10 +11,10 @@ use crate::runtime::host_work::{
 };
 use crate::session_protocol::r9::{HostWorkError, ProjectScope};
 use atem_client::principal::{Authority, Need, Op};
+use atem_client::session::framing;
 use atem_client::session::host_work::{
     self as hw, HostTarget, LaunchState, LaunchStatus, ResultBody, WorkState, WorkStatus,
 };
-use atem_client::session::framing;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
@@ -1891,6 +1891,9 @@ impl HostBridge {
             | Request::ReplyQuery { task_id, .. }
             | Request::Cancel { task_id, .. }
             | Request::Complete { task_id, .. } => {
+                // A UUID v5 names a host sender's selector task, the
+                // owner's alone, or is a missing task (§11.2, §11.5).
+                self.selector_task_named(&a, task_id)?;
                 let mut r = store
                     .work(task_id)
                     .map_err(|_| "busy")?
@@ -3013,6 +3016,7 @@ mod local_tests {
         include!("delegated/mail_pass_tests.rs");
         include!("delegated/send_pass_tests.rs");
         include!("delegated/admit_tests.rs");
+        include!("delegated/owner_ops_tests.rs");
         include!("delegated/results_tests.rs");
         include!("delegated/remote_stops_tests.rs");
         include!("delegated/host_launch_tests.rs");

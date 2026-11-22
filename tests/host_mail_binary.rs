@@ -2332,6 +2332,126 @@ fn a_withheld_revoke_carried_by_a_native_cancels_and_refuses() {
     assert!(!rig.has_message(&late.message_id));
 }
 
+/// Host-work-v1 §11.2, §11.5 (Astation's ask, #120 comment 7028723996),
+/// over the Mac's native channel (the owner: a native member holding
+/// `control`): a host sender's request admitted into a selector task (its
+/// UUID v5) on this host's agent is the owner's to manage from Astation or
+/// a phone. `work_query` gives its status in the agent's turn,
+/// `work_interrupt` writes one Esc and answers that status, and once its
+/// agent exits mid-turn (`outcome_unknown`, `agent exited`) `work_resolve`
+/// marks it failed, `resolved` by the Mac, and the status the sending host
+/// gets shows it failed. The client core sends each request and takes each
+/// result (a UUID v5 task id). A UUID v5 that names no task, and a viewer
+/// (a native member without `control`) naming the task, are answered
+/// `forbidden`, exactly as a missing task.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn the_owner_manages_a_host_senders_selector_task_over_its_channel() {
+    use support::delegated::{Dev, HostIds, HostRig, escs, in_turn, wait_stored};
+    use support::r9::Router;
+    let mut rig = Rig::admitting("");
+    rig.online();
+    let sid = rig.launch();
+    let to = rig.receiver(1);
+    let message = rig
+        .sender
+        .message(&to, &[&format!("atem:{HOST}")], 1, "HM_OWNER");
+    rig.put(&rig.sender.request_of(&to, rig.log.log.head(), &message));
+    let task = task_of(&message, &sid);
+    in_turn(&rig, &task, "HM_OWNER");
+    let ids = HostIds {
+        account: ACCOUNT,
+        host: HOST,
+    };
+    let mut r = Router::on(&rig.astation, rig.link());
+    let viewer = rig.log.add_native("dev-viewer", &["view"]);
+    let mut mac = Dev::new_via(&mut r, "direct", ids, &rig.log, support::r9log::MAC, false);
+    mac.carry(&mut r, &[viewer]);
+    let ask = |dev: &mut Dev, r: &mut Router, op: &str, task: &Value| {
+        let mut data = json!({"op": op, "host": ids.json(), "task_id": task});
+        if op == "work_resolve" {
+            data["resolution"] = json!({"kind": "failed", "detail": "agent exited"});
+        }
+        dev.request(r, data)
+    };
+    let query = ask(&mut mac, &mut r, "work_query", &task);
+    let work = &query["result"]["work"];
+    assert_eq!(
+        (&work["task_id"], &work["state"]),
+        (&task, &json!("submitted")),
+        "{query}"
+    );
+    let nothing = json!(atem_client::session::select::selector_task_id(
+        &support::delegated::uuid(),
+        &support::delegated::uuid(),
+        &sid
+    ));
+    let missing = json!(support::delegated::uuid());
+    // The same answer as a missing task's: the code, and no field but the
+    // exchange's own ids differs.
+    let same = |refused: &Value, absent: &Value, what: &str| {
+        let strip = |v: &Value| {
+            let mut v = v.clone();
+            let o = v.as_object_mut().unwrap();
+            o.remove("id");
+            o.remove("re");
+            v
+        };
+        assert_eq!(refused["code"], "forbidden", "{what}: {refused}");
+        assert_eq!(strip(refused), strip(absent), "{what}: as a missing task");
+    };
+    for op in ["work_query", "work_interrupt", "work_resolve"] {
+        let refused = ask(&mut mac, &mut r, op, &nothing);
+        let absent = ask(&mut mac, &mut r, op, &missing);
+        same(&refused, &absent, op);
+    }
+    let mut viewer = Dev::new_via(&mut r, "direct", ids, &rig.log, "dev-viewer", false);
+    for op in ["work_query", "work_interrupt", "work_resolve"] {
+        let refused = ask(&mut viewer, &mut r, op, &task);
+        let absent = ask(&mut viewer, &mut r, op, &missing);
+        same(&refused, &absent, op);
+    }
+    assert_eq!(escs(&rig), 0);
+    let interrupt = ask(&mut mac, &mut r, "work_interrupt", &task);
+    assert_eq!(
+        (
+            &interrupt["result"]["work"]["task_id"],
+            &interrupt["result"]["work"]["state"]
+        ),
+        (&task, &json!("submitted")),
+        "{interrupt}"
+    );
+    within("the Esc", || escs(&rig) == 1);
+    // The fake agent ignores an Esc; it exits in its turn.
+    private(&rig.fake_dir().join("exit"), "");
+    wait_stored(&rig, &task, "outcome_unknown", "agent exited");
+    let resolved = ask(&mut mac, &mut r, "work_resolve", &task);
+    let work = &resolved["result"]["work"];
+    assert_eq!(
+        (
+            &work["task_id"],
+            &work["state"],
+            &work["detail"],
+            &work["resolved"]["by"]
+        ),
+        (
+            &task,
+            &json!("failed"),
+            &json!("agent exited"),
+            &json!(format!("member:{}", support::r9log::MAC))
+        ),
+        "{resolved}"
+    );
+    wait_stored(&rig, &task, "failed", "agent exited");
+    rig.until_status("its status shows it failed", |s| {
+        resolved_state(s, &message.message_id) == Some(WorkState::Failed)
+    });
+    std::fs::remove_file(rig.fake_dir().join("exit")).unwrap();
+}
+
 /// VII.B 35: the sending host puts the same request again after this host
 /// admitted it and marked it done (a lost acknowledgment): the Station
 /// stores it again, the host reads it and takes it as a duplicate, so it
