@@ -1,8 +1,8 @@
 // The shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json), the
 // host-work prompt-framing vectors (fixtures/host-work/prompt-framing-v1.json,
-// framing-size-v1.json) and the host-work request, result_id and answers
-// vectors (fixtures/host-work/requests-v1.json) run through the WASM binding under
-// Node. Usage:
+// framing-size-v1.json) and the host-work request, result_id, answers and reply
+// result vectors (fixtures/host-work/requests-v1.json) run through the WASM
+// binding under Node. Usage:
 //   node conformance.mjs <wasm-bindgen nodejs pkg dir> <fixtures dir>
 // The same checks run through Kotlin (bindings/kotlin/Conformance.kt) and
 // Swift (bindings/swift/Tests/…/ConformanceTests.swift).
@@ -1675,6 +1675,33 @@ check("host work: the owner's reply_query of a selector task (§11.2)", () => {
     eq(c.request.data.task_id, selector, name);
     eq(m.hostWorkResultAnswers(str(c.request), str(c.result)), false, name);
   }
+});
+
+// Every reply result of the vectors (results, host-work-v1 §4 "Reply")
+// through hostWorkResultAnswers, as the answer to the owner's reply_query of
+// the selector task (reply_query_selector_task, whose id and host every
+// result names): as written, a case answers exactly when it is valid and its
+// result_id is the selector task's (reply_submitted's and reply_dropped's
+// name no task, so they don't); moved to the selector task's result_id (each
+// case whose own is a lowercase UUID v5: not the two about the id's form),
+// exactly when it is valid.
+check("host work: reply results read as the core reads them (§4, §11.2)", () => {
+  const request = requests.cases.find((c) => c.name === "reply_query_selector_task").message;
+  const derived = m.hostWorkResultId(request.data.task_id);
+  const replies = requests.results.filter((c) => c.result.result.kind === "reply");
+  eq(replies.length, 15);
+  let moved = 0;
+  for (const c of replies) {
+    const id = c.result.result.reply.result_id;
+    eq(m.hostWorkResultAnswers(str(request), str(c.result)), c.valid && id === derived, c.name);
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id)) {
+      const result = JSON.parse(str(c.result));
+      result.result.reply.result_id = derived;
+      eq(m.hostWorkResultAnswers(str(request), str(result)), c.valid, `${c.name}: as the selector task's`);
+      moved++;
+    }
+  }
+  eq(moved, 13);
 });
 
 console.log(`wasm conformance: ${passed} passed, ${failures.length} failed`);

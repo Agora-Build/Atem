@@ -1,10 +1,10 @@
 // The shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json), the
 // host-work prompt-framing vectors (fixtures/host-work/prompt-framing-v1.json,
-// framing-size-v1.json) and the host-work result_id vectors
-// (fixtures/host-work/requests-v1.json) run through the Swift binding, the
-// same checks as the Kotlin (bindings/kotlin/Conformance.kt) and WASM
-// (bindings/js/conformance.mjs) runs. ATEM_FIXTURES names the fixtures
-// directory.
+// framing-size-v1.json) and the host-work request, result_id, answers and
+// reply result vectors (fixtures/host-work/requests-v1.json) run through the
+// Swift binding, the same checks as the Kotlin
+// (bindings/kotlin/Conformance.kt) and WASM (bindings/js/conformance.mjs)
+// runs. ATEM_FIXTURES names the fixtures directory.
 import CryptoKit
 import Foundation
 import XCTest
@@ -2412,9 +2412,47 @@ final class ConformanceTests: XCTestCase {
             }
         }
 
+        // Every reply result of the vectors (results, host-work-v1 §4
+        // "Reply") through hostWorkResultAnswers, as the answer to the
+        // owner's reply_query of the selector task (reply_query_selector_task,
+        // whose id and host every result names): as written, a case answers
+        // exactly when it is valid and its result_id is the selector task's
+        // (reply_submitted's and reply_dropped's name no task, so they
+        // don't); moved to the selector task's result_id (each case whose own
+        // is a lowercase UUID v5: not the two about the id's form), exactly
+        // when it is valid.
+        check("host work: reply results read as the core reads them (§4, §11.2)") {
+            guard let selectorCase = a(requests["cases"]).map(o).first(where: { s($0["name"]) == "reply_query_selector_task" }) else {
+                throw Failure(description: "reply_query_selector_task missing")
+            }
+            let request = js(o(selectorCase["message"]))
+            let derived = hostWorkResultId(taskId: s(o(o(selectorCase["message"])["data"])["task_id"]))
+            let replies = a(requests["results"]).map(o).filter { s(o(o($0["result"])["result"])["kind"]) == "reply" }
+            try eq(replies.count, 15)
+            let lowercaseV5 = try NSRegularExpression(pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+            var moved = 0
+            for c in replies {
+                let valid = c["valid"] as! Bool
+                let result = o(c["result"])
+                let id = s(o(o(result["result"])["reply"])["result_id"])
+                try eq(hostWorkResultAnswers(requestJson: request, resultJson: js(result)), valid && id == derived, s(c["name"]))
+                if lowercaseV5.firstMatch(in: id, range: NSRange(id.startIndex..., in: id)) != nil {
+                    var body = o(result["result"])
+                    var reply = o(body["reply"])
+                    reply["result_id"] = derived
+                    body["reply"] = reply
+                    var movedResult = result
+                    movedResult["result"] = body
+                    try eq(hostWorkResultAnswers(requestJson: request, resultJson: js(movedResult)), valid, "\(s(c["name"])): as the selector task's")
+                    moved += 1
+                }
+            }
+            try eq(moved, 13)
+        }
+
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 136)
+        XCTAssertEqual(passed, 137)
     }
 }

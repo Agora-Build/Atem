@@ -43,8 +43,9 @@ pub fn host_work_result_id(task_id: String) -> String {
 /// welcome's features and host aside). The owner's `work_query`,
 /// `reply_query`, `work_interrupt` and `work_resolve` may name a host
 /// sender's selector task (a lowercase UUID v5, §11.2, §11.5); every other
-/// op naming a task takes a UUID v4. Valid says nothing of who may name the task: the host
-/// answers a caller that may not exactly as it answers a missing task.
+/// op naming a task takes a UUID v4. Valid says nothing of who may name
+/// the task: the host answers a caller that may not exactly as it answers
+/// a missing task.
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 pub fn host_work_request_valid(message_json: String) -> bool {
     Request::decode(message_json.as_bytes()).is_ok()

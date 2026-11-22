@@ -39,8 +39,9 @@ exports give an app the core's checks for its own use:
 and the request correlation applied to every result, a duplicate key
 refused; not the channel binding of `attachment_gen` and `channel_id`,
 which only the connection has); the conformance suites run
-`requests-v1.json`'s `cases` and `answers` through them. Apps still inspect
-errors and each result state.
+`requests-v1.json`'s `cases`, `answers` and `reply` results (each as the
+answer to the owner's `reply_query` of the selector task) through them.
+Apps still inspect errors and each result state.
 
 | Feature | Operations | Contract |
 |---|---|---|

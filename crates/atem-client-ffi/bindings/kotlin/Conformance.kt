@@ -1,9 +1,9 @@
 // The shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json), the
 // host-work prompt-framing vectors (fixtures/host-work/prompt-framing-v1.json,
-// framing-size-v1.json) and the host-work result_id vectors
-// (fixtures/host-work/requests-v1.json) run through the Kotlin binding
-// (UniFFI + JNA), the same checks as the WASM (bindings/js/conformance.mjs)
-// and Swift runs. Usage:
+// framing-size-v1.json) and the host-work request, result_id, answers and
+// reply result vectors (fixtures/host-work/requests-v1.json) run through the
+// Kotlin binding (UniFFI + JNA), the same checks as the WASM
+// (bindings/js/conformance.mjs) and Swift runs. Usage:
 //   java -Djna.library.path=<dir of libatem_client_ffi.so> -cp … \
 //     atem.bindings.test.ConformanceKt <fixtures dir>
 package atem.bindings.test
@@ -1994,6 +1994,35 @@ fun main(args: Array<String>) {
             eq(c["request"]["data"]["task_id"], selector, name)
             eq(hostWorkResultAnswers(Json.write(c["request"]), Json.write(c["result"])), false, name)
         }
+    }
+
+    // Every reply result of the vectors (results, host-work-v1 §4 "Reply")
+    // through hostWorkResultAnswers, as the answer to the owner's reply_query
+    // of the selector task (reply_query_selector_task, whose id and host every
+    // result names): as written, a case answers exactly when it is valid and
+    // its result_id is the selector task's (reply_submitted's and
+    // reply_dropped's name no task, so they don't); moved to the selector
+    // task's result_id (each case whose own is a lowercase UUID v5: not the two
+    // about the id's form), exactly when it is valid.
+    check("host work: reply results read as the core reads them (§4, §11.2)") {
+        val request = requests["cases"].arr().first { it["name"] == "reply_query_selector_task" }["message"]
+        val derived = hostWorkResultId(request["data"]["task_id"].s())
+        val replies = requests["results"].arr().filter { it["result"]["result"]["kind"] == "reply" }
+        eq(replies.size, 15)
+        val lowercaseV5 = Regex("[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+        var moved = 0
+        for (c in replies) {
+            val valid = c["valid"] as Boolean
+            val id = c["result"]["result"]["reply"]["result_id"].s()
+            eq(hostWorkResultAnswers(Json.write(request), Json.write(c["result"])), valid && id == derived, c["name"].s())
+            if (lowercaseV5.matches(id)) {
+                val text = Json.write(c["result"]).replace("\"result_id\":\"$id\"", "\"result_id\":\"$derived\"")
+                eq(text.contains("\"result_id\":\"$derived\""), true, c["name"].s())
+                eq(hostWorkResultAnswers(Json.write(request), text), valid, "${c["name"].s()}: as the selector task's")
+                moved++
+            }
+        }
+        eq(moved, 13)
     }
 
     println("kotlin conformance: $passed passed, ${failures.size} failed")

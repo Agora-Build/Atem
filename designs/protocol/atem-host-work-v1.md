@@ -1825,7 +1825,10 @@ Astation or a phone: `work_query`, `reply_query`, `work_interrupt` and
   a `work_query` and a status to a `reply_query` answering nothing),
   checked by the independent checker and run by the Swift, Kotlin and JS
   suites through the bindings' `host_work_request_valid`,
-  `host_work_result_answers` and `host_work_result_id`.
+  `host_work_result_answers` and `host_work_result_id`: every request
+  case, every `answers` case, and every `reply` result, each read as the
+  answer to the owner's `reply_query` of the selector task, as written
+  and moved to that task's `result_id`.
 
 [c-7028723996]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-7028723996
 

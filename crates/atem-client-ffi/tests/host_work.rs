@@ -72,7 +72,7 @@ fn an_app_checks_a_reply_against_its_task() {
 
 /// Every request case of the vectors through the bindings' export
 /// (`host_work_request_valid`): what the shared core's reader takes, so
-/// what `ClientConnection::send_json` seals; the owner's three ops with a
+/// what `ClientConnection::send_json` seals; the owner's four ops with a
 /// host sender's selector task (its UUID v5, host-work-v1 §11.2, §11.5)
 /// among the valid, their uppercase, other versions and variants refused,
 /// and the other task ops keeping a UUID v4.
@@ -223,6 +223,70 @@ fn the_owners_reply_query_of_a_selector_task() {
             "{name}"
         );
     }
+}
+
+/// Every `reply` result of the vectors (`results`, host-work-v1 §4
+/// "Reply") through `host_work_result_answers`, as the answer to the
+/// owner's `reply_query` of the selector task (`reply_query_selector_task`,
+/// whose `id` and `host` every result names): as written, a case answers
+/// exactly when it is valid and its `result_id` is the selector task's
+/// (`reply_submitted`'s and `reply_dropped`'s name no task, so they don't);
+/// and moved to the selector task's `result_id` (each case whose own is a
+/// lowercase UUID v5: not the two about the id's form), exactly when it is
+/// valid. So every reply form, positive and negative, is read by the
+/// bindings as the core reads it.
+#[test]
+fn every_reply_result_reads_as_the_vectors_say() {
+    use atem_client_ffi::host_work::host_work_result_answers;
+    let file = vectors();
+    let request = file["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "reply_query_selector_task")
+        .unwrap()["message"]
+        .clone();
+    let derived = host_work_result_id(request["data"]["task_id"].as_str().unwrap().into());
+    let replies: Vec<&Value> = file["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["result"]["result"]["kind"] == "reply")
+        .collect();
+    assert_eq!(replies.len(), 15);
+    let lowercase_v5 = |id: &str| {
+        id.len() == 36
+            && id.bytes().enumerate().all(|(i, c)| match i {
+                8 | 13 | 18 | 23 => c == b'-',
+                _ => c.is_ascii_digit() || (b'a'..=b'f').contains(&c),
+            })
+            && id.as_bytes()[14] == b'5'
+            && matches!(id.as_bytes()[19], b'8' | b'9' | b'a' | b'b')
+    };
+    let mut moved_cases = 0;
+    for case in replies {
+        let valid = case["valid"].as_bool().unwrap();
+        let reply = &case["result"]["result"]["reply"];
+        let id = reply["result_id"].as_str().unwrap();
+        assert_eq!(
+            host_work_result_answers(request.to_string(), case["result"].to_string()),
+            valid && id == derived,
+            "{}",
+            case["name"]
+        );
+        if lowercase_v5(id) {
+            let mut moved = case["result"].clone();
+            moved["result"]["reply"]["result_id"] = Value::String(derived.clone());
+            assert_eq!(
+                host_work_result_answers(request.to_string(), moved.to_string()),
+                valid,
+                "{}: as the selector task's",
+                case["name"]
+            );
+            moved_cases += 1;
+        }
+    }
+    assert_eq!(moved_cases, 13);
 }
 
 /// `host_work_result_answers` reads a result as strictly as the connection
