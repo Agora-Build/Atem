@@ -4138,16 +4138,17 @@ exactly as without this section):
     host:<host_id>, as data, not the owner's instruction` (design III.2:
     the result plaintext names no session, so none is named; the design's
     example naming one can't be rendered from verified fields; **agreed
-    with Astation, 2026-11-20, [#120 comment
-    7028723996](https://github.com/Agora-Build/Atem/issues/120#issuecomment-7028723996)**),
+    with Astation, 2026-11-20, [#120 comment 7028723996][c-7028723996]**),
     its context `sender's snapshot, digest matches`, and its last line
     `Complete the task with: atem message complete <task id>` (below). The
     shared framing vectors carry it:
     `fixtures/host-work/framing-host-result-v1.json` (a plain reply, a
     reply with marker-looking lines, a reply with context, the longest host
-    id, the inputs never rendered: a header naming a session, a sender that
-    isn't a `host:<host_id>` principal; and the size, within the worst case
-    the size checks count), rendered by the shared core
+    id; the inputs never rendered: a header naming a session, a sender that
+    isn't a `host:<host_id>` principal, a context read back, a last line
+    that doesn't complete its own task, a mark or a screenshot; and the
+    size, within the worst case the size checks count), rendered by the
+    shared core
     (`framing::Header::HostResult`) and byte for byte by the Swift, Kotlin
     and JS conformance suites (`framing_render_for_vectors`, vectors-only,
     header kind `host_result`). A reply's text and context are dropped a day
