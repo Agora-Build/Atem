@@ -84,17 +84,30 @@ unit_enum! {
         /// Host-only signatures (`sig_h`, push hints, seens, a host's
         /// `enc_sig`): never asked of a phone or a desktop client.
         HostSigning,
+        /// A member's signed verifier report (`atem-verifier-report`,
+        /// session-v1 R9.2 "How a verifier reports itself"; agreed for
+        /// implementation on Astation #101): read-only reporting of the
+        /// verifier this app's core runs, for a minter's challenge. **Never
+        /// prompts**: sign only when the key can sign with no interaction
+        /// (R9.6 rule 3's live window included), else return
+        /// `ProviderError::Cancelled` and the slot stays unconfirmed. The
+        /// core never creates, rekeys or enrolls a key for it, and builds
+        /// the body itself (`body_json` shows it).
+        VerifierReport,
     }
 }
 
 impl SigningPurpose {
     /// Whether R9.6 rule 4 asks for a fresh confirmation (everything but the
-    /// channel signature, host signing and a service key's own control
-    /// records).
+    /// channel signature, host signing, a service key's own control records
+    /// and a verifier report, which never prompts).
     pub fn needs_fresh_confirmation(self) -> bool {
         !matches!(
             self,
-            SigningPurpose::Channel | SigningPurpose::HostSigning | SigningPurpose::ServiceControl
+            SigningPurpose::Channel
+                | SigningPurpose::HostSigning
+                | SigningPurpose::ServiceControl
+                | SigningPurpose::VerifierReport
         )
     }
 }
@@ -112,6 +125,9 @@ unit_enum! {
         /// `atem-host-work-control-v1`: control records (delegated host
         /// work I.5.3).
         HostWorkControl,
+        /// `atem-verifier-report-v1`: a member's verifier report
+        /// (`verify_verifier_report`).
+        VerifierReport,
     }
 }
 

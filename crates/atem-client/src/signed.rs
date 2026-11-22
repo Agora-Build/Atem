@@ -57,6 +57,8 @@ fn array_rule(label: SignLabel, path: &[&str]) -> Option<ArrayKind> {
         // A project grant's hosts and ops (delegated host-work II.2.2).
         (SignLabel::MembershipEntry, ["project", "hosts" | "ops"]) => Some(ArrayKind::Set),
         (SignLabel::BrowserGrant, ["ops"]) => Some(ArrayKind::Set),
+        // A verifier report's inventory (`member_report`, R9.2).
+        (SignLabel::VerifierReport, ["verifier", "actions"]) => Some(ArrayKind::Set),
         _ => None,
     }
 }
@@ -461,6 +463,43 @@ mod tests {
             SignedObject::parse(br#"{"body":{"type":"atem-seen","v":1},"sig":"AA","sig":"AA"}"#),
             Err(Error::Strict(_))
         ));
+    }
+
+    /// A verifier report's one array is its inventory's `actions`, a set
+    /// (R9.2 "How a verifier reports itself"); none may sit elsewhere.
+    #[test]
+    fn a_verifier_report_takes_only_its_actions_set() {
+        let report = |verifier: Value, extra: Value| {
+            let mut body = json!({"type": "atem-verifier-report", "v": 1, "verifier": verifier});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            json!({"body": body, "sig": "AA"})
+        };
+        let sorted = json!({"version": 2, "actions": ["add", "remove"]});
+        let object = parse(&report(sorted.clone(), json!({}))).unwrap();
+        assert_eq!(object.label(), SignLabel::VerifierReport);
+        for actions in [json!(["remove", "add"]), json!(["add", "add"])] {
+            assert_eq!(
+                parse(&report(
+                    json!({"version": 2, "actions": actions}),
+                    json!({})
+                )),
+                Err(Error::ArrayNotCanonical)
+            );
+        }
+        assert_eq!(
+            parse(&report(sorted.clone(), json!({"slot": ["a"]}))),
+            Err(Error::ArrayNotCanonical)
+        );
+        // No kit_sig and no sealed part beside a report.
+        let mut kit = report(sorted.clone(), json!({}));
+        kit["kit_sig"] = json!("AA");
+        assert_eq!(parse(&kit), Err(Error::KitSigUnexpected));
+        let mut sealed = report(sorted, json!({}));
+        sealed["enc"] = json!("AA");
+        sealed["ct"] = json!("AA");
+        assert!(matches!(parse(&sealed), Err(Error::Malformed(_))));
     }
 
     #[test]
