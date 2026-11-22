@@ -461,6 +461,7 @@ impl HostBridge {
             delegated: None,
             deadline_passed: false,
             cancel_id: None,
+            list_stop: None,
             principal: "local".into(),
             attachment_owner: Sender::Local.owner(),
             control_gen: origin.control_gen,

@@ -61,7 +61,9 @@ pub const CANCELLED_BEFORE_SUBMISSION: &str = "cancelled before submission";
 pub const WAITING_FOR_A_READY_AGENT: &str = "waiting for a ready agent";
 
 /// What stops a delegated task from starting now (design I.3.3, I.4.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Serialized (snake case) only in a task's `list_stop`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Event {
     /// A `revoke` record (I.5.5).
     Revoked,
@@ -79,6 +81,12 @@ pub enum Event {
     GateClosed,
     /// The host's last carriage stopped at a deferred entry.
     Deferred,
+    /// Host-work's effects of the device list's entries aren't written up
+    /// to its committed head yet (`StartView::host_effects_at`): a host
+    /// sender's task or launch waits, as for a deferred entry. A
+    /// withdrawal of an attempt for it isn't counted (design I.6.4, as a
+    /// hold's: host-work's own lag, not the sender's).
+    EffectsPending,
     /// A project scope can't be compared: a locked cred agent (R9.6).
     ScopePending,
     /// The session journal halted, the device list usable.
@@ -100,7 +108,9 @@ impl Event {
             Event::RouteChanged => (WorkState::Failed, details::ROUTE_CHANGED),
             Event::AuthorityChanged => (WorkState::Failed, details::AUTHORITY_CHANGED),
             Event::GateClosed => (WorkState::Blocked, details::REVOCATIONS_NOT_YET_CHECKED),
-            Event::Deferred => (WorkState::Blocked, details::DEVICE_LIST_UPDATE_PENDING),
+            Event::Deferred | Event::EffectsPending => {
+                (WorkState::Blocked, details::DEVICE_LIST_UPDATE_PENDING)
+            }
             Event::ScopePending => (WorkState::Blocked, details::WAITING_FOR_UNLOCK),
             Event::Halted => (WorkState::Blocked, details::JOURNAL_HALTED),
             Event::Expired => (WorkState::Expired, EXPIRED_BEFORE_SUBMISSION),
@@ -113,7 +123,17 @@ impl Event {
     /// pending` (§11.6, "Waiting doesn't hold the session"): later tasks of
     /// other senders, local ones included, may pass it.
     pub fn holds_session(&self) -> bool {
-        !matches!(self, Event::Held | Event::GateClosed | Event::Deferred)
+        !matches!(
+            self,
+            Event::Held | Event::GateClosed | Event::Deferred | Event::EffectsPending
+        )
+    }
+
+    /// A withdrawal of an attempt for it counts toward the attempt limit
+    /// (design I.6.4): every event's but a hold's and host-work's own wait
+    /// for its device-list effects.
+    pub fn counts_withdrawal(&self) -> bool {
+        !matches!(self, Event::Held | Event::EffectsPending)
     }
 }
 
@@ -131,6 +151,10 @@ pub struct StartTask {
     /// Its host sender's `cancel` reached it while its attempt waited
     /// (`WorkRecord::cancel_id`, review N1): it never starts.
     pub cancelled: bool,
+    /// A device-list entry stopped it while its attempt was live
+    /// (`WorkRecord::list_stop`, review H1): it never starts, and settles
+    /// with this event.
+    pub list_stop: Option<Event>,
 }
 
 impl StartTask {
@@ -143,6 +167,7 @@ impl StartTask {
             target: r.task.target.clone(),
             accepted: r.accepted(),
             cancelled: r.cancel_id.is_some(),
+            list_stop: r.list_stop.map(|stop| stop.event),
         })
     }
 }
@@ -300,6 +325,13 @@ impl StartView {
         self.live.contains_key(attempt_id)
     }
 
+    /// Tests: the task the session host's check would read for live attempt
+    /// `attempt_id`.
+    #[cfg(test)]
+    pub fn live_task(&self, attempt_id: &str) -> Option<&StartTask> {
+        self.live.get(attempt_id)
+    }
+
     /// The event a start refused `attempt_id` for, if one did.
     pub fn refused(&self, attempt_id: &str) -> Option<Event> {
         self.refused.get(attempt_id).copied()
@@ -311,6 +343,16 @@ impl StartView {
     pub fn cancel(&mut self, attempt_id: &str) {
         if let Some(task) = self.live.get_mut(attempt_id) {
             task.cancelled = true;
+        }
+    }
+
+    /// The task of the live attempt `attempt_id` was stopped by a
+    /// device-list entry (`WorkRecord::list_stop`, review H1), in the
+    /// transaction that just committed: the session host's check refuses it
+    /// with `event` from now on (the first stop kept).
+    pub fn list_stop(&mut self, attempt_id: &str, event: Event) {
+        if let Some(task) = self.live.get_mut(attempt_id) {
+            task.list_stop.get_or_insert(event);
         }
     }
 
@@ -379,6 +421,9 @@ pub fn may_start(view: &StartView, task: &StartTask, now_d_ms: Option<u64>) -> R
     if task.cancelled {
         return Err(Event::Cancelled);
     }
+    if let Some(event) = task.list_stop {
+        return Err(event);
+    }
     let adm = &task.admission;
     if matches!(adm.sender, DelegatedSender::Host { .. }) {
         return host_may_start(view, task, now_d_ms);
@@ -431,8 +476,9 @@ pub fn may_start(view: &StartView, task: &StartTask, now_d_ms: Option<u64>) -> R
 ///    Station's gate (II.5: its feed and device-list parts; the mailbox's
 ///    part comes with the mailbox), and last host-work's effects of the
 ///    device list's entries not yet written up to its head
-///    ([`StartView::host_effects_at`]): `Deferred`, `device list update
-///    pending`, so no start crosses a stop an entry has and the head
+///    ([`StartView::host_effects_at`]): `EffectsPending`, `device list
+///    update pending` (an attempt withdrawn for it at `executing` isn't
+///    counted), so no start crosses a stop an entry has and the head
 ///    doesn't show (a narrowing restored by a later entry, per entry).
 ///
 /// A record that names a host sender without its grant can't be checked:
@@ -485,7 +531,7 @@ fn host_may_start(view: &StartView, task: &StartTask, now_d_ms: Option<u64>) -> 
     // §11.1, `not_for_host_principal`).
     waits(view, list, &SenderStanding::default(), adm, false, false)?;
     if !view.host_effects_at(&list.membership) {
-        return Err(Event::Deferred);
+        return Err(Event::EffectsPending);
     }
     Ok(())
 }
@@ -820,7 +866,7 @@ fn host_launch_event(view: &StartView, launch: &StartLaunch, now_d_ms: u64) -> R
     // A spawn is a start (ruling R51): as a task, it waits for host-work's
     // effects of the device list's entries up to its head.
     if !view.host_effects_at(&list.membership) {
-        return Err(Event::Deferred);
+        return Err(Event::EffectsPending);
     }
     Ok(())
 }

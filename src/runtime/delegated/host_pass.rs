@@ -26,7 +26,9 @@
 //! start check fails or holds every delegated task then), with a
 //! receipt-database fault, or on a store bound to another identity.
 use super::*;
+use crate::runtime::delegated::effects::Followup;
 use crate::runtime::delegated::host_senders::{self, ListEffects, QueuedLaunch};
+use crate::runtime::delegated::start::Event;
 
 impl HostBridge {
     /// See the module doc. A store error is a receipt-database fault.
@@ -78,6 +80,19 @@ impl HostBridge {
         })();
         match done {
             Ok((applied, effects)) => {
+                // A live attempt's stop is on its record (review H1); the
+                // view's copy of it is told too (below), so the session
+                // host's check at `executing` refuses it.
+                let stopped: Vec<(String, Event)> = effects
+                    .followups
+                    .iter()
+                    .filter_map(|followup| match followup {
+                        Followup::Withdraw {
+                            attempt_id, then, ..
+                        } => Some((attempt_id.clone(), *then)),
+                        _ => None,
+                    })
+                    .collect();
                 self.work.followups.extend(effects.followups);
                 self.work.host_applied = Some(key);
                 // The launches an entry stopped leave the queue; one the
@@ -98,6 +113,9 @@ impl HostBridge {
                 let mut view = self.start_view();
                 for (request_id, detail) in held {
                     view.stop_launch(&request_id, detail);
+                }
+                for (attempt_id, event) in stopped {
+                    view.list_stop(&attempt_id, event);
                 }
                 // Host senders' tasks and launches start once it reaches
                 // the head the start view shows (`StartView::host_effects_at`).

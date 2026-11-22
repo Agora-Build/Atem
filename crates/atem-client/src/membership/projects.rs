@@ -184,12 +184,52 @@ impl Projects {
     }
 }
 
+impl Projects {
+    fn project(&self, name: &str) -> Option<&Project> {
+        self.by_name.get(name).map(|p| &p.project)
+    }
+
+    fn hosts_of(&self, name: &str) -> Vec<&str> {
+        self.by_name
+            .get(name)
+            .map(|p| p.members.iter().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+
+    fn of_host(&self, host_id: &str) -> Vec<&str> {
+        self.by_name
+            .iter()
+            .filter(|(_, p)| p.members.contains(host_id))
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+}
+
+impl super::ListAsOf {
+    /// The project `name` in effect then ([`Membership::project`]).
+    pub fn project(&self, name: &str) -> Option<&Project> {
+        self.derived.projects.project(name)
+    }
+
+    /// The hosts whose membership of the project `name` was in effect then
+    /// ([`Membership::project_hosts`]).
+    pub fn project_hosts(&self, name: &str) -> Vec<&str> {
+        self.derived.projects.hosts_of(name)
+    }
+
+    /// The projects `host_id`'s membership of was in effect then
+    /// ([`Membership::host_projects`]).
+    pub fn host_projects(&self, host_id: &str) -> Vec<&str> {
+        self.derived.projects.of_host(host_id)
+    }
+}
+
 impl Membership {
     /// The project `name` in effect, as its latest `project_set` signed it
     /// (its `hosts` may name hosts whose membership has since ended:
     /// [`Membership::project_hosts`]).
     pub fn project(&self, name: &str) -> Option<&Project> {
-        self.derived.projects.by_name.get(name).map(|p| &p.project)
+        self.derived.projects.project(name)
     }
 
     /// The projects in effect, by name, each as its latest `project_set`
@@ -205,23 +245,12 @@ impl Membership {
     /// The hosts whose membership of the project `name` is in effect, in
     /// order (empty for a project not in effect).
     pub fn project_hosts(&self, name: &str) -> Vec<&str> {
-        self.derived
-            .projects
-            .by_name
-            .get(name)
-            .map(|p| p.members.iter().map(String::as_str).collect())
-            .unwrap_or_default()
+        self.derived.projects.hosts_of(name)
     }
 
     /// The projects `host_id`'s membership of is in effect, by name.
     pub fn host_projects(&self, host_id: &str) -> Vec<&str> {
-        self.derived
-            .projects
-            .by_name
-            .iter()
-            .filter(|(_, p)| p.members.contains(host_id))
-            .map(|(name, _)| name.as_str())
-            .collect()
+        self.derived.projects.of_host(host_id)
     }
 
     /// What `a` and `b` may send each other: the union of the ops of every

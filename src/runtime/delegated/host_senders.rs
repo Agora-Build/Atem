@@ -42,10 +42,13 @@ use anyhow::{Result, bail};
 use atem_client::encoding::Hash32;
 use atem_client::host_principal::{host_principal, parse_host_principal};
 use atem_client::membership::entry::Action;
-use atem_client::membership::{HostSenderState, Membership, ProjectOp, project_name_ok};
+use atem_client::membership::{
+    HostRecord, HostSenderState, ListAsOf, Membership, Project, ProjectOp, project_name_ok,
+};
 use atem_client::session::host_work::{LaunchState, WorkState};
 use atem_client::session::wire::is_delegated_sender;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 /// Host-work's applied device-list `seq` (II.3.1, "Crash safety"): one row,
@@ -245,13 +248,74 @@ pub fn host_sender_permits(
     Err(Event::Narrowed)
 }
 
+/// What the host-sender checks read of a device list: the committed list
+/// ([`Membership`]) or the list as of one of its entries ([`ListAsOf`]: a
+/// project entry judged per entry, review L2's narrow view).
+pub trait Grants {
+    fn host(&self, host_id: &str) -> Option<&HostRecord>;
+    fn host_membership_epoch(&self, host_id: &str) -> Option<u64>;
+    fn host_sender_state(&self, host_id: &str) -> Option<HostSenderState>;
+    fn project(&self, name: &str) -> Option<&Project>;
+    fn project_hosts(&self, name: &str) -> Vec<&str>;
+    fn host_projects(&self, host_id: &str) -> Vec<&str>;
+}
+
+macro_rules! grants_of {
+    ($list:ty) => {
+        impl Grants for $list {
+            fn host(&self, host_id: &str) -> Option<&HostRecord> {
+                <$list>::host(self, host_id)
+            }
+            fn host_membership_epoch(&self, host_id: &str) -> Option<u64> {
+                <$list>::host_membership_epoch(self, host_id)
+            }
+            fn host_sender_state(&self, host_id: &str) -> Option<HostSenderState> {
+                <$list>::host_sender_state(self, host_id)
+            }
+            fn project(&self, name: &str) -> Option<&Project> {
+                <$list>::project(self, name)
+            }
+            fn project_hosts(&self, name: &str) -> Vec<&str> {
+                <$list>::project_hosts(self, name)
+            }
+            fn host_projects(&self, host_id: &str) -> Vec<&str> {
+                <$list>::host_projects(self, host_id)
+            }
+        }
+    };
+}
+grants_of!(Membership);
+grants_of!(ListAsOf);
+
+/// The committed list as the start view shares it.
+impl<L: Grants> Grants for std::sync::Arc<L> {
+    fn host(&self, host_id: &str) -> Option<&HostRecord> {
+        L::host(self, host_id)
+    }
+    fn host_membership_epoch(&self, host_id: &str) -> Option<u64> {
+        L::host_membership_epoch(self, host_id)
+    }
+    fn host_sender_state(&self, host_id: &str) -> Option<HostSenderState> {
+        L::host_sender_state(self, host_id)
+    }
+    fn project(&self, name: &str) -> Option<&Project> {
+        L::project(self, name)
+    }
+    fn project_hosts(&self, name: &str) -> Vec<&str> {
+        L::project_hosts(self, name)
+    }
+    fn host_projects(&self, host_id: &str) -> Vec<&str> {
+        L::host_projects(self, host_id)
+    }
+}
+
 /// Whether a task admitted with `admitted` from `host_id` is still covered
 /// for `op` on `list` (conditions 2 and 3, the device list's part): its
 /// standing, and its recorded consent's grant now. What the device list's
 /// own entries do to such a task (`list_effects`): `Removed` or `Revoked`
 /// (cancelled), `Narrowed` (failed); no route is read.
 pub fn host_task_covered(
-    list: &Membership,
+    list: &impl Grants,
     this_host: &str,
     host_id: &str,
     admitted: Admitted<'_>,
@@ -270,7 +334,7 @@ pub fn host_task_covered(
 /// while it may send (step 1 of [`host_sender_permits`]), checked against
 /// `admitted` (a task's recorded generation and epoch) when given.
 pub fn host_standing(
-    list: &Membership,
+    list: &impl Grants,
     host_id: &str,
     admitted: Option<(u64, u64)>,
 ) -> Result<(u64, u64), Event> {
@@ -297,7 +361,7 @@ pub fn host_standing(
 /// on and their ops; none when the entry doesn't name the sender, or names
 /// no project in effect listing both hosts.
 fn grant(
-    list: &Membership,
+    list: &impl Grants,
     this_host: &str,
     sender: &str,
     entry: &str,
@@ -371,6 +435,16 @@ pub fn set_applied_seq(tx: &Transaction, genesis: &Hash32, seq: u64) -> Result<(
     Ok(())
 }
 
+/// A device-list entry's stop of a host sender's task whose attempt was
+/// live when the entry reached it (`WorkRecord::list_stop`, review H1): the
+/// entry's `seq` and the event, written in [`list_effects`]' transaction,
+/// the first stopping entry's only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListStop {
+    pub seq: u64,
+    pub event: Event,
+}
+
 /// A host sender's launch on message this run reserved and hasn't spawned
 /// (its spawn check never let it go, `StartView::launch_gone`): what a
 /// project entry may stop (ruling R51). A launch of a run before a restart
@@ -423,7 +497,9 @@ pub struct ListEffects {
 ///   `seq` ([`Membership::prefixes`], [`host_task_covered`]): one no
 ///   longer covered stops with the event (`Narrowed`: `failed`, `sender's
 ///   authorization narrowed`), and stays stopped whatever a later entry
-///   restores. Tasks awaiting their result or of unknown outcome are kept.
+///   restores: a live attempt's task gets the stop on its record first
+///   ([`ListStop`], review H1), for revokes and removals too. Tasks
+///   awaiting their result or of unknown outcome are kept.
 ///   A queued launch on message (ruling R51: a spawn is a start), admitted
 ///   before `seq`, that the list as of `seq` no longer covers for a launch
 ///   on message (its consent's projects with `launch` and a task's ops,
@@ -453,10 +529,10 @@ pub fn list_effects(
 ) -> Result<ListEffects> {
     let mut out = Vec::new();
     let mut stopped = Vec::new();
-    // The list as of each project entry, read forward once; host senders'
-    // tasks a project entry may stop, read at the first one; the queued
-    // launches not stopped yet.
-    let mut prefixes = list.prefixes();
+    // The list as of each project entry (`ListAsOf`), read forward once
+    // from the first one; host senders' tasks a project entry may stop,
+    // read at the first one; the queued launches not stopped yet.
+    let mut prefixes = None;
     let mut reachable: Option<Vec<WorkRecord>> = None;
     let mut queued: Vec<&QueuedLaunch> = launches.iter().collect();
     for seq in after.saturating_add(1)..=list.head().seq {
@@ -471,7 +547,7 @@ pub fn list_effects(
                 let principal = host_principal(host_id);
                 let mut tasks =
                     admitted_before(store, &principal, |generation, _| generation < seq)?;
-                effects::stop(store, tx, &mut tasks, Event::Revoked, &mut out)?;
+                stop(store, tx, &mut tasks, Event::Revoked, seq, &mut out)?;
                 if *interrupt_running {
                     effects::interrupt(store, tx, &principal, &tasks, &seq.to_string(), &mut out)?;
                 }
@@ -479,10 +555,11 @@ pub fn list_effects(
             Action::RemoveHost { host_id } if host_id != this_host => {
                 let principal = host_principal(host_id);
                 let mut tasks = admitted_before(store, &principal, |_, epoch| epoch < seq)?;
-                effects::stop(store, tx, &mut tasks, Event::Removed, &mut out)?;
+                stop(store, tx, &mut tasks, Event::Removed, seq, &mut out)?;
             }
             Action::ProjectSet { .. } | Action::ProjectRemove { .. } => {
-                let Some(then) = prefixes.as_of(seq) else {
+                let walk = prefixes.get_or_insert_with(|| list.prefixes());
+                let Some(then) = walk.as_of(seq) else {
                     bail!("the device list has no position {seq}");
                 };
                 let tasks = match &mut reachable {
@@ -519,7 +596,7 @@ fn launches_narrowed(
     store: &Store,
     tx: &Transaction,
     queued: &mut Vec<&QueuedLaunch>,
-    then: &Membership,
+    then: &ListAsOf,
     seq: u64,
     this_host: &str,
 ) -> Result<Vec<(String, &'static str)>> {
@@ -624,7 +701,7 @@ fn narrowed(
     store: &Store,
     tx: &Transaction,
     tasks: &mut Vec<WorkRecord>,
-    then: &Membership,
+    then: &ListAsOf,
     seq: u64,
     this_host: &str,
     out: &mut Vec<Followup>,
@@ -655,7 +732,37 @@ fn narrowed(
             continue;
         }
         let mut one = [(r, live)];
-        effects::stop(store, tx, &mut one, event, out)?;
+        stop(store, tx, &mut one, event, seq, out)?;
+    }
+    Ok(())
+}
+
+/// `tasks` stop for the entry at `seq` with `event` (`effects::stop`: an
+/// unstarted task takes the event's state in `tx`; a live attempt's
+/// withdrawal is asked). A task whose attempt is live gets the stop on its
+/// record first, in `tx` (`WorkRecord::list_stop`, review H1), so it
+/// outlives what the withdrawal may not (a crash after the commit, a
+/// receipt-database fault, a halted journal); the first entry's stop is
+/// kept, and its withdrawal settles the task with that one's event.
+fn stop(
+    store: &Store,
+    tx: &Transaction,
+    tasks: &mut [effects::Task],
+    event: Event,
+    seq: u64,
+    out: &mut Vec<Followup>,
+) -> Result<()> {
+    for task in tasks.iter_mut() {
+        let then = match (&task.1, task.0.list_stop) {
+            (None, _) => event,
+            (Some(_), Some(first)) => first.event,
+            (Some(_), None) => {
+                task.0.list_stop = Some(ListStop { seq, event });
+                store.save_work(&task.0)?;
+                event
+            }
+        };
+        effects::stop(store, tx, std::slice::from_mut(task), then, out)?;
     }
     Ok(())
 }

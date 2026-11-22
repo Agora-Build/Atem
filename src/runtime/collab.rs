@@ -1184,6 +1184,7 @@ mod tests {
             delegated: None,
             deadline_passed: false,
             cancel_id: None,
+            list_stop: None,
             principal: principal.into(),
             attachment_owner: String::new(),
             control_gen: 1,

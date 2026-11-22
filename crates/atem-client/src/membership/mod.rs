@@ -846,6 +846,14 @@ impl Derived {
     fn current_hosts(&self) -> usize {
         self.hosts.values().filter(|h| !h.removed).count()
     }
+
+    /// A current host's newest record.
+    fn current_host(&self, host_id: &str) -> Option<&HostRecord> {
+        self.hosts
+            .get(host_id)
+            .filter(|h| !h.removed)
+            .map(|h| &h.record)
+    }
 }
 
 /// A verified membership log on one verifier.
@@ -863,7 +871,7 @@ pub struct Membership {
 
 /// A verified list as it stood after each of its entries, read forward
 /// ([`Membership::prefixes`]): [`Prefixes::as_of`] gives the list as of
-/// `seq`, its first `seq` entries and the standing they give with the
+/// `seq` ([`ListAsOf`]), the standing its first `seq` entries give with the
 /// decisions this verifier recorded up to that position. That is the
 /// standing [`Membership::verify_chain`] over those entries derives (with
 /// those decisions), without verifying anything again: each entry of a
@@ -871,18 +879,41 @@ pub struct Membership {
 /// however many positions are asked (each entry applied once), so a host
 /// can judge what an entry did on the list as it was then (delegated
 /// host-work design II.8: a project entry's effect on host senders' tasks,
-/// judged per entry). A verifier's own observations (evidence, a freeze)
-/// are none in the view: they aren't the entries'.
+/// judged per entry).
 pub struct Prefixes<'a> {
     list: &'a Membership,
-    view: Membership,
+    view: ListAsOf,
+}
+
+/// A verified list's standing as of one of its entries ([`Prefixes::as_of`]):
+/// its head there and the grants and standings the entries up to it give
+/// (hosts, host senders, projects). Read-only, and not a [`Membership`]: it
+/// can't be stored, carried onto, or read for serving or a freeze (the
+/// list's own freeze and evidence are the verifier's, not the entries'),
+/// and holds no member or recovery state.
+#[derive(Debug)]
+pub struct ListAsOf {
+    head: Head,
+    derived: Derived,
+}
+
+impl ListAsOf {
+    /// The entry it stands at.
+    pub fn head(&self) -> Head {
+        self.head
+    }
+
+    /// A current host's newest key then ([`Membership::host`]).
+    pub fn host(&self, host_id: &str) -> Option<&HostRecord> {
+        self.derived.current_host(host_id)
+    }
 }
 
 impl Prefixes<'_> {
     /// The list as of `seq` (1 to the head), moving forward from the last
     /// position asked; `None` beyond the head or behind that position.
-    pub fn as_of(&mut self, seq: u64) -> Option<&Membership> {
-        let at = self.view.head().seq;
+    pub fn as_of(&mut self, seq: u64) -> Option<&ListAsOf> {
+        let at = self.view.head.seq;
         if seq < at || seq > self.list.head().seq {
             return None;
         }
@@ -890,20 +921,11 @@ impl Prefixes<'_> {
             let entry = self.list.entry(next)?;
             self.view.derived.apply(entry);
             self.list.apply_decisions_at(&mut self.view.derived, next);
-            self.view.entries.push(entry.clone());
+            self.view.head = Head {
+                seq: next,
+                hash: entry.hash(),
+            };
         }
-        // The pending entries up to `seq`, decided only where they were by
-        // then.
-        self.view.records = self
-            .list
-            .records
-            .iter()
-            .filter(|r| r.seq <= seq)
-            .map(|r| RecoveryRecord {
-                decision: r.decision.clone().filter(|d| d.at_seq <= seq),
-                ..r.clone()
-            })
-            .collect();
         Some(&self.view)
     }
 }
@@ -1160,11 +1182,7 @@ impl Membership {
 
     /// A current host's newest key (`add_host`).
     pub fn host(&self, host_id: &str) -> Option<&HostRecord> {
-        self.derived
-            .hosts
-            .get(host_id)
-            .filter(|h| !h.removed)
-            .map(|h| &h.record)
+        self.derived.current_host(host_id)
     }
 
     /// Every current host's newest record (`add_host`), by host id.
@@ -1476,14 +1494,11 @@ impl Membership {
     /// [`Prefixes`]).
     pub fn prefixes(&self) -> Prefixes<'_> {
         let genesis = &self.entries[0];
-        let mut view = Membership {
-            account_id: self.account_id.clone(),
-            genesis_hash: self.genesis_hash,
-            entries: vec![genesis.clone()],
-            records: Vec::new(),
-            decision_order: self.decision_order,
-            evidence: Evidence::default(),
-            frozen: None,
+        let mut view = ListAsOf {
+            head: Head {
+                seq: genesis.seq,
+                hash: genesis.hash(),
+            },
             derived: Derived::new(genesis),
         };
         self.apply_decisions_at(&mut view.derived, genesis.seq);
@@ -2335,15 +2350,13 @@ mod tests {
             let len = usize::try_from(seq).unwrap();
             let view = prefixes.as_of(seq).unwrap();
             assert_eq!(view.derived, m.derived_at(len), "as of {seq}");
-            assert_eq!(view.entries, m.entries[..len]);
-            assert!(
-                view.records
-                    .iter()
-                    .all(|r| r.seq <= seq && r.decision.as_ref().is_none_or(|d| d.at_seq <= seq))
-            );
+            let entry = m.entry(seq).unwrap();
             assert_eq!(
-                view.records.len(),
-                m.records.iter().filter(|r| r.seq <= seq).count()
+                view.head(),
+                Head {
+                    seq,
+                    hash: entry.hash()
+                }
             );
         }
         assert_eq!(prefixes.as_of(m.head().seq).unwrap().derived, m.derived);

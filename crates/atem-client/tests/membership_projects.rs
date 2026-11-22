@@ -853,27 +853,31 @@ fn the_list_as_of_each_entry_is_the_verified_prefix() {
         .unwrap();
         assert_eq!(fresh.deferred, None);
         let view = prefixes.as_of(seq).unwrap();
-        assert_eq!(view, &fresh.membership, "as of {seq}");
-        assert_eq!(view.head(), fresh.membership.head());
-        let projects = |m: &Membership| m.projects().cloned().collect::<Vec<_>>();
-        assert_eq!(projects(view), projects(&fresh.membership), "as of {seq}");
-        for host in ["host-a", "host-b", "host-c"] {
-            assert_eq!(
-                view.host_projects(host),
-                fresh.membership.host_projects(host)
-            );
+        let then = &fresh.membership;
+        assert_eq!(view.head(), then.head());
+        let projects: Vec<&str> = then.projects().map(|p| p.name.as_str()).collect();
+        for name in ["p", "q", "r"] {
+            assert_eq!(view.project(name), then.project(name), "{name} as of {seq}");
+            assert_eq!(view.project_hosts(name), then.project_hosts(name));
+        }
+        assert!(projects.iter().all(|name| view.project(name).is_some()));
+        for host in ["host-a", "host-b", "host-c", "host-z"] {
+            assert_eq!(view.host(host), then.host(host), "{host} as of {seq}");
+            assert_eq!(view.host_projects(host), then.host_projects(host));
             assert_eq!(
                 view.host_sender_state(host),
-                fresh.membership.host_sender_state(host),
+                then.host_sender_state(host),
                 "{host} as of {seq}"
             );
             assert_eq!(
                 view.host_membership_epoch(host),
-                fresh.membership.host_membership_epoch(host)
+                then.host_membership_epoch(host)
             );
         }
     }
-    assert_eq!(prefixes.as_of(head).unwrap(), &log.m);
+    let last = prefixes.as_of(head).unwrap();
+    assert_eq!(last.head(), log.m.head());
+    assert_eq!(last.project("q"), log.m.project("q"));
     assert!(prefixes.as_of(head - 1).is_none(), "never backwards");
     assert!(prefixes.as_of(head + 1).is_none());
 }

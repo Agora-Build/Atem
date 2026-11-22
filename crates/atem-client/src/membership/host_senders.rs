@@ -114,6 +114,20 @@ impl HostSenders {
     }
 }
 
+impl super::ListAsOf {
+    /// `host_id`'s sending authorization then
+    /// ([`Membership::host_sender_state`]).
+    pub fn host_sender_state(&self, host_id: &str) -> Option<HostSenderState> {
+        self.derived.host_senders.state(host_id)
+    }
+
+    /// `host_id`'s membership epoch then
+    /// ([`Membership::host_membership_epoch`]).
+    pub fn host_membership_epoch(&self, host_id: &str) -> Option<u64> {
+        self.derived.host_senders.epoch(host_id)
+    }
+}
+
 impl Membership {
     /// `host_id`'s sending authorization; `None` for a host no `add_host`
     /// ever named. A removed host keeps its state (it can't send while it

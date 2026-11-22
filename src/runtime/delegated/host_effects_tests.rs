@@ -1003,11 +1003,12 @@ fn a_task_admitted_after_the_entries_is_not_judged_on_them() {
 
 /// No start crosses an entry whose effects aren't written (the owner's
 /// decision, 2026-11-22: no start may cross a missing stop): once a
-/// narrowing and its restore committed, the start check (the dispatch's,
-/// and the session host's at `executing`) holds B's task, `device list
-/// update pending`, until host-work's pass wrote their effects, which fail
-/// it; the committed head alone, which covers it again, never lets it
-/// start.
+/// narrowing and its restore committed, the start check (`may_start`,
+/// which the dispatch and the session host's check at `executing` both
+/// ask; the latter in `the_effects_gates_withdrawal_at_executing_is_not_counted`)
+/// holds B's task, `device list update pending`, until host-work's pass
+/// wrote their effects, which fail it; the committed head alone, which
+/// covers it again, never lets it start.
 #[test]
 fn no_start_crosses_an_entry_whose_effects_arent_written() {
     use crate::runtime::delegated::start::{StartTask, may_start};
@@ -1029,7 +1030,7 @@ fn no_start_crosses_an_entry_whose_effects_arent_written() {
         assert_eq!(check(&rig), Ok(()));
         sign_and_carry(&mut rig, &mut s, hs_narrowing());
         sign_and_carry(&mut rig, &mut s, hs_restoring());
-        assert_eq!(check(&rig), Err(Event::Deferred));
+        assert_eq!(check(&rig), Err(Event::EffectsPending));
         ticks(&mut rig, 1);
         assert_eq!(settled(&rig, &queued), outcome(Event::Narrowed));
         // Written: a task admitted now starts.
@@ -1637,5 +1638,192 @@ fn a_feed_delivery_of_a_carried_record_is_acknowledged() {
         let acks = acks_for_host_b(&rig);
         assert_eq!(acks.len(), 2, "{acks:?}");
         assert!(acks.iter().any(|a| a.contains("duplicate")), "{acks:?}");
+    });
+}
+
+// ── Fix round 1: a live attempt's stop is durable (review H1, L1) ──
+
+/// What comes between host-work's device-list effects' commit and their
+/// followup (the withdrawal of a live attempt), in review H1's cases.
+#[derive(Clone, Copy, Debug)]
+enum HsLoss {
+    /// The runtime is killed: the followup was in memory only.
+    Crash,
+    /// The session journal halts: the withdrawal waits for the restart.
+    HaltedJournal,
+    /// A receipt-database fault: the followups are dropped until the
+    /// restart.
+    StoreFault,
+}
+
+/// Review H1 (the reviewer's probe, made a test), in each way the
+/// withdrawal asked after the commit can be lost: a narrowing and its
+/// restore (or a narrowing and a revoke) reach B's task whose attempt waits
+/// `accepted` behind a turn; host-work's pass commits their effects, the
+/// applied `seq` at the head, and then the runtime is killed, its session
+/// journal halts, or its receipt database fails, before the withdrawal.
+/// The stop was written with the effects (`WorkRecord::list_stop`: the
+/// first stopping entry's event and `seq`), so after the restart the
+/// recovery settles the task with it, though the head covers it again (or
+/// shows the later revoke), and its prompt never reaches the agent.
+#[test]
+fn a_live_attempts_stop_survives_what_comes_after_the_commit() {
+    let cases: [(HsLoss, bool, Event); 4] = [
+        (HsLoss::Crash, false, Event::Narrowed),
+        (HsLoss::HaltedJournal, false, Event::Narrowed),
+        (HsLoss::StoreFault, false, Event::Narrowed),
+        (HsLoss::Crash, true, Event::Narrowed),
+    ];
+    for (loss, revoke, event) in cases {
+        local_test(async |root| {
+            let what = format!("{loss:?}, revoke after: {revoke}");
+            let mut rig = LocalRig::new(root).await;
+            let start = host_now().wall_ms;
+            let os = ManualOs::at(start);
+            let mut s = host_senders_host(&mut rig, root, &os);
+            let running = host_running(&mut rig, &s, "HS_H1_RUNNING", start).await;
+            let accepted = host_task(&mut rig, &s, "HS_H1_ACCEPTED", start + HOUR);
+            blocked(&mut rig, &accepted, BEHIND).await;
+            attempt_behind_the_turn(&mut rig, &accepted, "HS_H1_ACCEPTED");
+            hold_host_work(&mut rig);
+            sign_and_carry(&mut rig, &mut s, hs_narrowing());
+            if revoke {
+                sign_and_carry(
+                    &mut rig,
+                    &mut s,
+                    host_sender_revoke("host-b", false, 0).unwrap(),
+                );
+            } else {
+                sign_and_carry(&mut rig, &mut s, hs_restoring());
+            }
+            match loss {
+                HsLoss::Crash => {}
+                HsLoss::HaltedJournal => {
+                    rig.bridge.host.journal_mut().fail_append_of(1, false);
+                    let effects = rig.bridge.host.fence_principal("service:other", 0);
+                    rig.bridge.exec(
+                        effects,
+                        &mut Cx {
+                            client: &rig.app.astation_client,
+                            sessions: &mut rig.sessions,
+                        },
+                    );
+                    assert!(rig.bridge.host.journal_halted(), "{what}");
+                }
+                HsLoss::StoreFault => {}
+            }
+            rig.bridge.host_senders_pass();
+            assert_eq!(applied(&rig), s.log.log.head().seq, "{what}");
+            assert!(
+                rig.bridge.work.followups.iter().any(|f| matches!(
+                    f,
+                    crate::runtime::delegated::effects::Followup::Withdraw {
+                        then: Event::Narrowed,
+                        ..
+                    }
+                )),
+                "{what}: {:?}",
+                rig.bridge.work.followups
+            );
+            match loss {
+                HsLoss::Crash => {}
+                HsLoss::HaltedJournal => ticks(&mut rig, 2),
+                HsLoss::StoreFault => {
+                    rig.bridge.work_fail();
+                    ticks(&mut rig, 2);
+                }
+            }
+            assert_ne!(settled(&rig, &accepted), outcome(event), "{what}: not yet");
+            restart(&mut rig, root, &os, false, true);
+            rig.bridge.start_view().gates.open_own_station(ORIGIN);
+            complete(&mut rig, &running).await;
+            passes(&mut rig, 5);
+            assert_eq!(settled(&rig, &accepted), outcome(event), "{what}");
+            assert!(!input(&rig).contains("HS_H1_ACCEPTED"), "{what}: never ran");
+        });
+    }
+}
+
+/// Review H1, the start check: once a stop is on the record, the start
+/// check refuses the task with it first, whatever the head says, here
+/// with host-work's effects written and the head covering the task again.
+#[test]
+fn the_start_check_refuses_a_task_its_list_stop_names() {
+    use crate::runtime::delegated::start::{StartTask, may_start};
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let running = host_running(&mut rig, &s, "HS_H1_TURN", start).await;
+        let accepted = host_task(&mut rig, &s, "HS_H1_CHECK", start + HOUR);
+        blocked(&mut rig, &accepted, BEHIND).await;
+        let attempt = attempt_behind_the_turn(&mut rig, &accepted, "HS_H1_CHECK");
+        hold_host_work(&mut rig);
+        sign_and_carry(&mut rig, &mut s, hs_narrowing());
+        sign_and_carry(&mut rig, &mut s, hs_restoring());
+        rig.bridge.host_senders_pass();
+        rig.bridge.refresh_start_view();
+        let task = StartTask::of(&stored_record(&rig, &accepted)).unwrap();
+        {
+            let view = rig.bridge.start_view();
+            assert_eq!(
+                may_start(&view, &task, view.now_d_ms),
+                Err(Event::Narrowed),
+                "the record's stop, first"
+            );
+            // The attempt registered before the stop: the view's copy says
+            // so too, so the session host's check at `executing` refuses it.
+            let live = view.live_task(&attempt).unwrap().clone();
+            assert_eq!(live.list_stop, Some(Event::Narrowed));
+            assert_eq!(may_start(&view, &live, view.now_d_ms), Err(Event::Narrowed));
+        }
+        // The withdrawal asked after the commit lost: the dispatch settles
+        // the task from the record's stop all the same.
+        rig.bridge.work.followups.clear();
+        rig.bridge.work.scheduled = Instant::now();
+        complete(&mut rig, &running).await;
+        passes(&mut rig, 3);
+        assert_eq!(settled(&rig, &accepted), outcome(Event::Narrowed));
+        assert_eq!(attempts(&rig, &accepted)[0].0, attempt);
+        assert!(!input(&rig).contains("HS_H1_CHECK"), "never ran");
+    });
+}
+
+/// Review L1: an entry committed earlier in the tick than host-work's pass
+/// (the start view's applied `seq` behind its head) makes the start check
+/// wait (`Event::EffectsPending`, `device list update pending`); an
+/// attempt that reaches `executing` meanwhile is withdrawn, and that
+/// withdrawal isn't counted toward the attempt limit (design I.6.4, as a
+/// hold's): the task waits, then runs once the effects are written.
+#[test]
+fn the_effects_gates_withdrawal_at_executing_is_not_counted() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = host_senders_host(&mut rig, root, &os);
+        let running = host_running(&mut rig, &s, "HS_L1_RUNNING", start).await;
+        let accepted = host_task(&mut rig, &s, "HS_L1_ACCEPTED", start + HOUR);
+        blocked(&mut rig, &accepted, BEHIND).await;
+        let attempt = attempt_behind_the_turn(&mut rig, &accepted, "HS_L1_ACCEPTED");
+        let (genesis, head) = (s.log.log.genesis_hash(), s.log.log.head().seq);
+        rig.bridge.start_view().host_applied = Some((genesis, head - 1));
+        complete(&mut rig, &running).await;
+        rig.until(|r| {
+            attempts(r, &accepted)
+                .first()
+                .is_some_and(|a| a.1.is_some())
+        })
+        .await;
+        assert_eq!(
+            attempts(&rig, &accepted)[0],
+            (attempt, Some("withdrawn".to_string()), false),
+            "withdrawn, not counted"
+        );
+        rig.until(|r| settled(r, &accepted) == outcome(Event::EffectsPending))
+            .await;
+        rig.bridge.start_view().host_applied = Some((genesis, head));
+        rig.until(|r| input(r).contains("HS_L1_ACCEPTED")).await;
     });
 }

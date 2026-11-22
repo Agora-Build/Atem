@@ -140,6 +140,7 @@ fn task(log: &TestLog, principal: &str, deadline: u64) -> StartTask {
             project: "local:project".into(),
         },
         cancelled: false,
+        list_stop: None,
     }
 }
 
@@ -1025,6 +1026,7 @@ fn host_task(log: &TestLog, principals: &[&str], deadline: u64) -> StartTask {
             project: "local:project".into(),
         },
         cancelled: false,
+        list_stop: None,
     }
 }
 
@@ -1260,9 +1262,14 @@ fn a_host_senders_task_waits_for_the_device_lists_effects() {
         Some((genesis, head - 1)),
         Some((atem_client::encoding::Hash32([7; 32]), head)),
     ] {
-        assert_eq!(with(behind), Err(Event::Deferred), "{behind:?}");
+        assert_eq!(with(behind), Err(Event::EffectsPending), "{behind:?}");
     }
-    assert!(!Event::Deferred.holds_session());
+    assert!(!Event::EffectsPending.holds_session());
+    // Host-work's own lag: a withdrawal for it isn't counted (review L1),
+    // nor a hold's; every other event's is (design I.6.4).
+    assert!(!Event::EffectsPending.counts_withdrawal());
+    assert!(!Event::Held.counts_withdrawal());
+    assert!(Event::Deferred.counts_withdrawal() && Event::GateClosed.counts_withdrawal());
     let mut revoked = host_log(|_| {});
     revoked.append(MAC, host_sender_revoke("host-b", false, 0).unwrap());
     let mut v = host_view(&revoked, &["project:build"]);

@@ -1381,6 +1381,7 @@ impl HostBridge {
             delegated: Some(admission),
             deadline_passed: false,
             cancel_id: None,
+            list_stop: None,
         })
     }
 
