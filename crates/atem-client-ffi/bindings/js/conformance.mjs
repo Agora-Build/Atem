@@ -1530,8 +1530,10 @@ check("framing: the host-result header's prompts byte for byte, its refusals and
     eq(rendered.split("\n")[0], `[atem ${framingHost.tag}] ${first}`, `${p.name}: first line`);
   }
   // What is never rendered: a host result naming a session, a sender that
-  // isn't a host principal.
-  eq(framingHost.refused.length, 8);
+  // isn't a host principal, and anything but another host's reply as the
+  // runtime delivers it (a context read back, another closing, a mark, a
+  // screenshot).
+  eq(framingHost.refused.length, 14);
   for (const r of framingHost.refused) throwsCode(() => m.framingRenderForVectors(str(r.input), bits), r.code);
   // The longest first and last lines are within the worst case the size
   // checks count, which is prompt-framing-v1.json's: the bound doesn't move.

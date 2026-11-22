@@ -2213,9 +2213,11 @@ final class ConformanceTests: XCTestCase {
                 try eq(outerLines(rendered).head, Array("[atem \(tag)] \(first)".utf8), "\(name): first line")
             }
             // What is never rendered: a host result naming a session, a
-            // sender that isn't a host principal.
+            // sender that isn't a host principal, and anything but another
+            // host's reply as the runtime delivers it (a context read back,
+            // another closing, a mark, a screenshot).
             let refused = a(framingHost["refused"]).map(o)
-            try eq(refused.count, 8)
+            try eq(refused.count, 14)
             for r in refused {
                 try throwsCode(s(r["code"])) { _ = try framingRenderForVectors(inputJson: js(r["input"]!), tagBits: bits) }
             }

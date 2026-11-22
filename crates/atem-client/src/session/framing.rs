@@ -362,8 +362,44 @@ pub enum FramingError {
     AtemLine,
     /// A context snapshot's text doesn't match its digest.
     Digest,
+    /// Not another host's result as Atem renders it ([`Header::HostResult`]).
+    HostResult(HostResultProblem),
     /// Not a prompt Atem rendered: the line or part that doesn't read.
     Malformed(&'static str),
+}
+
+/// Why a [`Header::HostResult`] prompt isn't one Atem renders. Another
+/// host's reply is delivered with its first line naming that host, its
+/// text and the snapshots its reply carries (the replying host's own:
+/// [`Snapshots::FromSender`]), and the line that completes its own task;
+/// nothing else (delegated host-work design II.4.4, III.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostResultProblem {
+    /// The sender isn't a `host:<host_id>` principal whose id the device
+    /// list's grammar allows ([`parse_host_principal`]).
+    Sender,
+    /// The context claims Atem read it back ([`Snapshots::ReadBack`]): it
+    /// is the replying host's own.
+    ReadBack,
+    /// The last line isn't `Complete the task with: atem message complete`
+    /// of its own task.
+    Closing,
+    /// A mark: another host's reply carries none.
+    Mark,
+    /// A screenshot line: another host's reply carries none.
+    Screenshot,
+}
+
+impl fmt::Display for HostResultProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Sender => "its sender isn't a host:<host_id> principal",
+            Self::ReadBack => "its context is the replying host's own, never read back",
+            Self::Closing => "its last line doesn't complete its own task",
+            Self::Mark => "it carries a mark",
+            Self::Screenshot => "it carries a screenshot",
+        })
+    }
 }
 
 impl fmt::Display for FramingError {
@@ -371,6 +407,9 @@ impl fmt::Display for FramingError {
         match self {
             Self::AtemLine => f.write_str("one of Atem's prompt lines is not a single line"),
             Self::Digest => f.write_str("a context snapshot doesn't match its digest"),
+            Self::HostResult(problem) => {
+                write!(f, "not another host's result as Atem renders it: {problem}")
+            }
             Self::Malformed(what) => write!(f, "not an Atem prompt: {what}"),
         }
     }
@@ -680,9 +719,12 @@ pub enum Header<'a> {
     /// there (delegated host-work design II.4.4; agreed with Astation on
     /// #120, comment 7028723996). `sender` is that host's principal,
     /// `host:<host_id>` with an id the device list's grammar allows
-    /// ([`parse_host_principal`]); anything else is never rendered. Its
-    /// result names no session, so none is named here (verified fields
-    /// only). Vectors: `fixtures/host-work/framing-host-result-v1.json`.
+    /// ([`parse_host_principal`]). Its result names no session, so none is
+    /// named here (verified fields only). Its prompt is the reply and the
+    /// snapshots the reply carries ([`Snapshots::FromSender`]), and its
+    /// last line completes its own task; anything else is refused
+    /// ([`HostResultProblem`]), never rendered. Vectors:
+    /// `fixtures/host-work/framing-host-result-v1.json`.
     HostResult { task_id: &'a str, sender: &'a str },
 }
 
@@ -887,9 +929,10 @@ impl TaskPrompt<'_> {
     /// (Atem's line and its block), each context snapshot, each verified
     /// screenshot, and the closing line. Refused when a snapshot's text
     /// doesn't match its digest: Atem never says it matches falsely
-    /// ([`FramingError::Digest`]); and when a sender is longer than the size
-    /// checks count, or a host result's isn't a host principal
-    /// ([`FramingError::AtemLine`]).
+    /// ([`FramingError::Digest`]); when a sender is longer than the size
+    /// checks count ([`FramingError::AtemLine`]); and when a host result
+    /// isn't another host's reply as Atem delivers it
+    /// ([`FramingError::HostResult`]).
     pub fn prompt(&self) -> Result<Prompt, FramingError> {
         if self
             .context
@@ -904,13 +947,14 @@ impl TaskPrompt<'_> {
         // `sender` (with the sending session for a local sender); a
         // result's first line names its principal and session (counted
         // whole), and only a mark line would name both as the sender. A
-        // host result's sender is a host principal only, which is shorter.
+        // host result's sender is a host principal (`host_result_problem`),
+        // which is shorter.
+        if let Some(problem) = self.host_result_problem() {
+            return Err(FramingError::HostResult(problem));
+        }
         let sender = self.header.sender();
         let fits = match self.header {
-            Header::Task { .. } => sender.len() <= MAX_SENDER_BYTES,
-            Header::HostResult { sender, .. } => {
-                parse_host_principal(sender).is_some() && sender.len() <= MAX_SENDER_BYTES
-            }
+            Header::Task { .. } | Header::HostResult { .. } => sender.len() <= MAX_SENDER_BYTES,
             Header::Result {
                 sender: principal, ..
             } => {
@@ -941,6 +985,29 @@ impl TaskPrompt<'_> {
             prompt.line(closing.line());
         }
         Ok(prompt)
+    }
+
+    /// Why a host result isn't another host's reply as Atem delivers it
+    /// (II.4.4): a sender that isn't a host principal, a context that
+    /// claims to be read back, a last line that doesn't complete its own
+    /// task, a mark or a screenshot. `None` for the other headers.
+    fn host_result_problem(&self) -> Option<HostResultProblem> {
+        let Header::HostResult { task_id, sender } = self.header else {
+            return None;
+        };
+        if parse_host_principal(sender).is_none() {
+            Some(HostResultProblem::Sender)
+        } else if self.snapshots != Snapshots::FromSender {
+            Some(HostResultProblem::ReadBack)
+        } else if self.closing != Some(Closing::Complete { task_id }) {
+            Some(HostResultProblem::Closing)
+        } else if self.mark.is_some() {
+            Some(HostResultProblem::Mark)
+        } else if !self.screenshots.is_empty() {
+            Some(HostResultProblem::Screenshot)
+        } else {
+            None
+        }
     }
 
     /// The prompt with a fresh tag.

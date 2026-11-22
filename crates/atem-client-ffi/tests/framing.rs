@@ -27,13 +27,6 @@ fn prompt_vectors() -> Value {
     .unwrap()
 }
 
-fn host_result_vectors() -> Value {
-    serde_json::from_str(include_str!(
-        "../../../designs/protocol/fixtures/host-work/framing-host-result-v1.json"
-    ))
-    .unwrap()
-}
-
 fn size_vectors() -> Value {
     serde_json::from_str(include_str!(
         "../../../designs/protocol/fixtures/host-work/framing-size-v1.json"
@@ -281,6 +274,14 @@ mod rendering {
     use super::*;
     use atem_client_ffi::framing::framing_render_for_vectors;
 
+    /// The host-result header's vectors (rendering only, so only here).
+    fn host_result_vectors() -> Value {
+        serde_json::from_str(include_str!(
+            "../../../designs/protocol/fixtures/host-work/framing-host-result-v1.json"
+        ))
+        .unwrap()
+    }
+
     /// The 60 bits of a tag as written (`XXXX-XXXX-XXXX`, Crockford base32).
     fn bits_of(tag: &str) -> u64 {
         const CROCKFORD: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -331,8 +332,10 @@ mod rendering {
 
     /// The host-result header (another host's reply): every prompt byte for
     /// byte, its first line the agreed one from the input's own fields (the
-    /// host, no session), every refusal `malformed`, and its longest lines
-    /// within the worst case the size checks count.
+    /// host, no session), every refusal `malformed` (a session, a sender
+    /// that isn't a host principal, and the shared core's refusal of
+    /// anything but another host's reply as the runtime delivers it), and
+    /// its longest lines within the worst case the size checks count.
     #[test]
     fn render_matches_host_result_vectors() {
         let file = host_result_vectors();
@@ -360,7 +363,7 @@ mod rendering {
             assert!(!first.contains(" session "));
         }
         let refused = file["refused"].as_array().unwrap();
-        assert_eq!(refused.len(), 8);
+        assert_eq!(refused.len(), 14);
         for case in refused {
             let e = framing_render_for_vectors(case["input"].to_string(), bits_of(tag))
                 .expect_err(str_of(case, "name"));

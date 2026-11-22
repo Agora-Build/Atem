@@ -1829,9 +1829,11 @@ fun main(args: Array<String>) {
             eq(rendered.split('\n').first(), "[atem $tag] $first", "$name: first line")
         }
         // What is never rendered: a host result naming a session, a sender
-        // that isn't a host principal.
+        // that isn't a host principal, and anything but another host's reply
+        // as the runtime delivers it (a context read back, another closing,
+        // a mark, a screenshot).
         val refused = framingHost["refused"].arr()
-        eq(refused.size, 8)
+        eq(refused.size, 14)
         for (r in refused) throwsCode(r["code"].s()) { framingRenderForVectors(Json.write(r["input"]), bits) }
         // The longest first and last lines are within the worst case the
         // size checks count, which is prompt-framing-v1.json's: the bound

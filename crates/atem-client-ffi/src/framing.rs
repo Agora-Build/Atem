@@ -156,9 +156,11 @@ mod vectors {
     /// The header's `kind` is `task`, `result` (a principal and its
     /// session) or `host_result` (another host's reply: `task_id` and
     /// `sender`, a `host:<host_id>` principal, and no `session`:
-    /// `framing-host-result-v1.json`). What it refuses (a host result
-    /// naming a session, a sender that isn't a host principal, anything
-    /// the core refuses) is `Invalid` `malformed`.
+    /// `framing-host-result-v1.json`). What it refuses is `Invalid`
+    /// `malformed`: a host result naming a session, and anything the core
+    /// refuses; for a host result, a sender that isn't a host principal, a
+    /// context read back, a last line that doesn't complete its own task, a
+    /// mark or a screenshot (`HostResultProblem`).
     #[cfg_attr(feature = "uniffi", uniffi::export)]
     pub fn framing_render_for_vectors(input_json: String, tag_bits: u64) -> Result<String> {
         let input = strict(&input_json)?;

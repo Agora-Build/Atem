@@ -634,7 +634,10 @@ fn a_result_and_a_mark_read_as_the_design_shows() {
         },
         ..result
     };
-    assert_eq!(too_long.prompt(), Err(FramingError::AtemLine));
+    assert_eq!(
+        too_long.prompt(),
+        Err(FramingError::HostResult(HostResultProblem::Sender))
+    );
     let shot = Attachment {
         attachment_id: ID.into(),
         digest: digest(b"png"),
@@ -1197,7 +1200,7 @@ fn a_host_result_names_a_host_and_no_session() {
     ] {
         assert_eq!(
             host_result(sender),
-            Err(FramingError::AtemLine),
+            Err(FramingError::HostResult(HostResultProblem::Sender)),
             "{sender:?}"
         );
     }
@@ -1234,4 +1237,109 @@ fn a_host_result_names_a_host_and_no_session() {
     assert_eq!(worst_case_lines(), 546);
     let task = work("done".into(), vec![]);
     assert!(prompt.len() < task.checked_len(None));
+}
+
+/// A host result is exactly what the runtime delivers for another host's
+/// reply (II.4.4): its context is the replying host's own snapshots as its
+/// reply carries them (`sender's snapshot, digest matches`, never `digest
+/// verified`), it carries no mark and no screenshot, and its last line
+/// completes its own task. Anything else is refused with its own error,
+/// never rendered.
+#[test]
+fn a_host_result_is_the_replying_hosts_reply_completed_here() {
+    let context = [snapshot("api-contract", "POST /v2/orders\n")];
+    let other = "5d6e7f80-1a2b-4c3d-9e4f-5a6b7c8d9e0f";
+    let shot = Attachment {
+        attachment_id: ID.into(),
+        digest: digest(b"png"),
+        size: 3,
+        media_type: "image/png".into(),
+    };
+    let mark = MarkTask {
+        mark_id: "mark_1".into(),
+        url: "http://localhost:3000/".into(),
+        title: "Settings".into(),
+        screenshot: shot.clone(),
+        annotations: vec![],
+    };
+    let screenshots = [Screenshot {
+        attachment: &shot,
+        path: "/private/x.png",
+    }];
+    let base = TaskPrompt {
+        header: Header::HostResult {
+            task_id: ID,
+            sender: "host:host-b",
+        },
+        text: "done",
+        mark: None,
+        context: &context,
+        snapshots: Snapshots::FromSender,
+        screenshots: &[],
+        closing: Some(Closing::Complete { task_id: ID }),
+    };
+    let rendered = base.prompt().unwrap().render(&tag()).unwrap();
+    assert!(rendered.contains("(16 bytes, sender's snapshot, digest matches)"));
+    let refused = |prompt: TaskPrompt, problem: HostResultProblem| {
+        assert_eq!(
+            prompt.prompt(),
+            Err(FramingError::HostResult(problem)),
+            "{problem:?}"
+        );
+    };
+    refused(
+        TaskPrompt {
+            snapshots: Snapshots::ReadBack,
+            ..base
+        },
+        HostResultProblem::ReadBack,
+    );
+    // Read back is refused with no context too: never claimed.
+    refused(
+        TaskPrompt {
+            snapshots: Snapshots::ReadBack,
+            context: &[],
+            ..base
+        },
+        HostResultProblem::ReadBack,
+    );
+    for closing in [
+        Some(Closing::Answer { task_id: ID }),
+        None,
+        Some(Closing::Complete { task_id: other }),
+    ] {
+        refused(TaskPrompt { closing, ..base }, HostResultProblem::Closing);
+    }
+    refused(
+        TaskPrompt {
+            mark: Some(&mark),
+            ..base
+        },
+        HostResultProblem::Mark,
+    );
+    refused(
+        TaskPrompt {
+            screenshots: &screenshots,
+            ..base
+        },
+        HostResultProblem::Screenshot,
+    );
+    // Its error says what it is (the bindings' `malformed` detail, and the
+    // runtime's "the prompt could not be rendered: …").
+    assert_eq!(
+        FramingError::HostResult(HostResultProblem::Sender).to_string(),
+        "not another host's result as Atem renders it: its sender isn't a host:<host_id> principal"
+    );
+    // The other headers keep their own rules: a local result's context is
+    // read back, a task answers.
+    let local = TaskPrompt {
+        header: Header::Result {
+            task_id: ID,
+            sender: "local",
+            session: "ses-abcdefghijkl",
+        },
+        snapshots: Snapshots::ReadBack,
+        ..base
+    };
+    assert!(local.prompt().is_ok());
 }
