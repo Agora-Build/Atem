@@ -5,13 +5,14 @@
 # Astation should after downloading it (designs/protocol/atem-client-bindings.md
 # §7): the SHA-256 sums, the source pin, the shared vectors listed in the sums
 # and unchanged (host-work requests, prompt framing, framing size; r9 control,
-# push-hint, delegated-wire and host-envelope vectors; the acknowledgment
-# fixtures), no test-only or host-role export in the shipped bindings (the
-# framing's vectors-only rendering and host mail included), and each package
-# used once: the Node build of the WASM package runs the packaged framing
-# vectors (escaping, Unicode version, the preflight size check) and, with the
-# JVM jar (through JNA), reads the r9 pairing vectors' verifyCommit messages
-# with the shared parser. The Android zip: each ABI's ELF class, machine,
+# push-hint, delegated-wire, host-envelope, Station-call and required-verifier
+# vectors; the acknowledgment fixtures), no test-only or host-role export in
+# the shipped bindings (the framing's vectors-only rendering and host mail
+# included), and each package used once: the Node build of the WASM package
+# runs the packaged framing vectors (escaping, Unicode version, the preflight
+# size check) and the packaged required-verifier vectors, and, with the JVM
+# jar (through JNA), reads the r9 pairing vectors' verifyCommit messages with
+# the shared parser. The Android zip: each ABI's ELF class, machine,
 # 16 KB LOAD alignment and exports (READELF, default readelf).
 #   EXPECT_COMMIT  the full SHA the packages must pin (with a clean tree)
 #   NODE  node (default: node on PATH)
@@ -116,17 +117,23 @@ if [ -f "$WASM" ]; then
     }
     console.log(`wasm (nodejs): ${framing.escape.length} framing escape and ${sizes.cases.length} size vectors`);
   ' "$WORK/atem-client-wasm/nodejs/atem_client_ffi.js" "$FRAMING_VECTORS" "$FRAMING_SIZE_VECTORS"
+  # The packaged signing-gate requirement export against the packaged
+  # required-verifier vectors: each case's requirement, or its refusal with
+  # the case's reason. The file is the source's (cmp above), so its own
+  # count is the count; it only has to be non-empty.
   "$NODE" -e '
     const ffi = require(process.argv[1]);
     const vectors = require(process.argv[2]);
-    if (vectors.cases.length !== 44) throw new Error("required-verifier case count");
+    if (vectors.cases.length < 1) throw new Error("no required-verifier cases");
     for (const c of vectors.cases) {
-      let actual, refused = false;
-      try { actual = ffi.membershipRequiredVersion(c.body_json); } catch { refused = true; }
+      let actual, error;
+      try { actual = ffi.membershipRequiredVersion(c.body_json); } catch (e) { error = e; }
       if (c.reject === true) {
-        if (!refused) throw new Error(`${c.label}: invalid body accepted`);
+        if (error === undefined) throw new Error(`${c.label}: invalid body accepted`);
+        if (error.kind !== "membership" || error.code !== "membership_invalid" || error.detail !== c.reason)
+          throw new Error(`${c.label}: ${error.kind}/${error.code}/${error.detail}, not ${c.reason}`);
       } else {
-        if (refused) throw new Error(`${c.label}: valid body refused`);
+        if (error !== undefined) throw new Error(`${c.label}: valid body refused (${error.detail})`);
         const expected = c.requirement;
         if (expected === null ? actual != null :
             actual?.action !== expected.action || actual?.minimumVersion !== expected.minimum_version)

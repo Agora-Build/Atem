@@ -30,7 +30,9 @@ Usage: python3 -I scripts/check-r9-vectors.py designs/protocol/fixtures
 
 Prints one line per case and exits non-zero on any mismatch. Each vectors
 file has its own checker in CHECKERS; a file without one isn't checked here
-yet (`crates/atem-client/tests/vectors.rs` runs every file).
+yet (`crates/atem-client/tests/vectors.rs` runs every file or names its
+runner: `r9-vectors-required-verifier`, which holds no cryptographic value,
+runs in `crates/atem-client/tests/required_verifier.rs`).
 """
 
 import hashlib

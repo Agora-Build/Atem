@@ -573,21 +573,6 @@ fun main(args: Array<String>) {
     // so String order), each once; every action the membership-log vectors
     // sign is one of them.
     val wireShapes = load("r9-vectors-delegated-wire")
-    for (value in load("r9-vectors-required-verifier")["cases"].arr()) {
-        check("required verifier: ${value["label"].s()}") {
-            if (value.obj()["reject"] == true) {
-                var refused = false
-                try { membershipRequiredVersion(value["body_json"].s()) }
-                catch (e: AtemException) { refused = true }
-                eq(refused, true, "invalid body must throw")
-            } else {
-                val actual = membershipRequiredVersion(value["body_json"].s())
-                val expected = value.obj()["requirement"]
-                eq(actual, if (expected == null) null else VerifierRequirement(
-                    expected["action"].s(), expected["minimum_version"].l().toUInt()))
-            }
-        }
-    }
     check("verifier inventory: version and known actions (R9.2)") {
         val ours = verifierInventory()
         eq(ours.version.toLong(), wireShapes["verifier"]["version"].l(), "version")
@@ -601,6 +586,31 @@ fun main(args: Array<String>) {
         }
         for (a in listOf("project_set", "project_remove", "host_sender_revoke", "host_sender_readmit", "host_enc_key")) {
             if (a !in ours.actions) throw AssertionError("$a isn't listed")
+        }
+    }
+    // The signing gate's requirement of each unsigned body (session-v1 R9.2
+    // "How the signing gate uses it"; Atem's proposal, for Astation's
+    // agreement): r9-vectors-required-verifier's requirement, or its refusal
+    // as Membership(membership_invalid, the case's reason).
+    val requirements = load("r9-vectors-required-verifier")["cases"].arr()
+    check("required verifier: the cases") { eq(requirements.size, 56) }
+    for (value in requirements) {
+        check("required verifier: ${value["label"].s()}") {
+            if (value.obj()["reject"] == true) {
+                try {
+                    membershipRequiredVersion(value["body_json"].s())
+                    throw AssertionError("invalid body accepted")
+                } catch (e: AtemException.Membership) {
+                    eq(e.code, "membership_invalid", "code")
+                    eq(e.detail, value["reason"].s(), "reason")
+                    eq(e.index, null, "index")
+                }
+            } else {
+                val actual = membershipRequiredVersion(value["body_json"].s())
+                val expected = value.obj()["requirement"]
+                eq(actual, if (expected == null) null else VerifierRequirement(
+                    expected["action"].s(), expected["minimum_version"].l().toUInt()))
+            }
         }
     }
     check("device-list actions: a manager signs each under a purpose that names it (R9.6 rule 4)") {
