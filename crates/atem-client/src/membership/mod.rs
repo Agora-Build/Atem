@@ -861,6 +861,53 @@ pub struct Membership {
     derived: Derived,
 }
 
+/// A verified list as it stood after each of its entries, read forward
+/// ([`Membership::prefixes`]): [`Prefixes::as_of`] gives the list as of
+/// `seq`, its first `seq` entries and the standing they give with the
+/// decisions this verifier recorded up to that position. That is the
+/// standing [`Membership::verify_chain`] over those entries derives (with
+/// those decisions), without verifying anything again: each entry of a
+/// `Membership` was verified when it was appended. One pass over the log
+/// however many positions are asked (each entry applied once), so a host
+/// can judge what an entry did on the list as it was then (delegated
+/// host-work design II.8: a project entry's effect on host senders' tasks,
+/// judged per entry). A verifier's own observations (evidence, a freeze)
+/// are none in the view: they aren't the entries'.
+pub struct Prefixes<'a> {
+    list: &'a Membership,
+    view: Membership,
+}
+
+impl Prefixes<'_> {
+    /// The list as of `seq` (1 to the head), moving forward from the last
+    /// position asked; `None` beyond the head or behind that position.
+    pub fn as_of(&mut self, seq: u64) -> Option<&Membership> {
+        let at = self.view.head().seq;
+        if seq < at || seq > self.list.head().seq {
+            return None;
+        }
+        for next in at + 1..=seq {
+            let entry = self.list.entry(next)?;
+            self.view.derived.apply(entry);
+            self.list.apply_decisions_at(&mut self.view.derived, next);
+            self.view.entries.push(entry.clone());
+        }
+        // The pending entries up to `seq`, decided only where they were by
+        // then.
+        self.view.records = self
+            .list
+            .records
+            .iter()
+            .filter(|r| r.seq <= seq)
+            .map(|r| RecoveryRecord {
+                decision: r.decision.clone().filter(|d| d.at_seq <= seq),
+                ..r.clone()
+            })
+            .collect();
+        Some(&self.view)
+    }
+}
+
 /// A chain that failed verification: the index of the first bad entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainError {
@@ -1423,6 +1470,24 @@ impl Membership {
             self.apply_decisions_at(&mut d, entry.seq);
         }
         d
+    }
+
+    /// The list as it stood after each of its entries, read forward (see
+    /// [`Prefixes`]).
+    pub fn prefixes(&self) -> Prefixes<'_> {
+        let genesis = &self.entries[0];
+        let mut view = Membership {
+            account_id: self.account_id.clone(),
+            genesis_hash: self.genesis_hash,
+            entries: vec![genesis.clone()],
+            records: Vec::new(),
+            decision_order: self.decision_order,
+            evidence: Evidence::default(),
+            frozen: None,
+            derived: Derived::new(genesis),
+        };
+        self.apply_decisions_at(&mut view.derived, genesis.seq);
+        Prefixes { list: self, view }
     }
 
     fn apply_decisions_at(&self, d: &mut Derived, seq: u64) {
@@ -2263,6 +2328,29 @@ mod tests {
     /// the one built incrementally (conflicts are judged on replays).
     fn assert_replay(m: &Membership) {
         assert_eq!(m.derived_at(m.entries.len()), m.derived);
+        // Read forward, every position is the replayed prefix, with its
+        // entries and its records as they stood then; never backwards.
+        let mut prefixes = m.prefixes();
+        for seq in 1..=m.head().seq {
+            let len = usize::try_from(seq).unwrap();
+            let view = prefixes.as_of(seq).unwrap();
+            assert_eq!(view.derived, m.derived_at(len), "as of {seq}");
+            assert_eq!(view.entries, m.entries[..len]);
+            assert!(
+                view.records
+                    .iter()
+                    .all(|r| r.seq <= seq && r.decision.as_ref().is_none_or(|d| d.at_seq <= seq))
+            );
+            assert_eq!(
+                view.records.len(),
+                m.records.iter().filter(|r| r.seq <= seq).count()
+            );
+        }
+        assert_eq!(prefixes.as_of(m.head().seq).unwrap().derived, m.derived);
+        assert!(prefixes.as_of(m.head().seq + 1).is_none());
+        if m.head().seq > 1 {
+            assert!(prefixes.as_of(1).is_none(), "never backwards");
+        }
         // The durable form reads back as the same state (§R9.3).
         let stored = m.to_stored();
         let back = Membership::from_stored(&m.account_id, &m.genesis_hash, &stored)

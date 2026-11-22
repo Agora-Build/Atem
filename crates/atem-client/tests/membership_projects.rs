@@ -8,7 +8,8 @@ use atem_client::encoding::{Hash32, b64u};
 use atem_client::membership::{
     Action, ChangeRefusal, Check, Effect, Entry, HostNow, HostRecord, Invalid, MAX_ENTRIES,
     MAX_HOSTS, Member, MemberKind, Membership, Project, ProjectOp, Role, RolesChange, check_body,
-    check_change, draft_on, project_remove, project_set, sign_entry,
+    check_change, draft_on, host_sender_readmit, host_sender_revoke, project_remove, project_set,
+    sign_entry,
 };
 use atem_client::{Alg, KeyId, PublicKey, SoftwareKeys};
 use serde_json::{Value, json};
@@ -815,4 +816,64 @@ fn check_change_counts_capacity_only() {
             "{action:?}"
         );
     }
+}
+
+/// The list as of each entry (`Membership::prefixes`, delegated host-work
+/// design II.8: a project entry judged on the list as it was then) is the
+/// list `verify_chain` derives from that prefix of the entries, with the
+/// same genesis pin and clock: its projects, the hosts they list, the hosts
+/// and their standing as senders, at every position, read forward once.
+#[test]
+fn the_list_as_of_each_entry_is_the_verified_prefix() {
+    let mut log = Log::new();
+    for host in ["host-a", "host-b", "host-c"] {
+        log.add_host(host, 1);
+    }
+    log.set("p", &["host-a", "host-b"], &EVERY_OP);
+    log.set("p", &["host-a", "host-b"], &[ProjectOp::Message]);
+    log.set("p", &["host-a", "host-b"], &EVERY_OP);
+    log.set("q", &["host-a", "host-c"], &[ProjectOp::Message]);
+    log.apply(project_remove("q", log.at).unwrap());
+    log.set("q", &["host-a", "host-c"], &[ProjectOp::Launch]);
+    log.apply(host_sender_revoke("host-b", true, log.at).unwrap());
+    log.apply(host_sender_readmit("host-b", log.at).unwrap());
+    log.remove_host("host-c");
+    log.add_host("host-c", 2);
+    log.set("q", &["host-a", "host-c"], &EVERY_OP);
+    let head = log.m.head().seq;
+    let mut prefixes = log.m.prefixes();
+    for seq in 1..=head {
+        let len = usize::try_from(seq).unwrap();
+        let fresh = Membership::verify_chain(
+            ACCOUNT,
+            &log.m.genesis_hash(),
+            &log.m.entries()[..len],
+            &now(log.at),
+        )
+        .unwrap();
+        assert_eq!(fresh.deferred, None);
+        let view = prefixes.as_of(seq).unwrap();
+        assert_eq!(view, &fresh.membership, "as of {seq}");
+        assert_eq!(view.head(), fresh.membership.head());
+        let projects = |m: &Membership| m.projects().cloned().collect::<Vec<_>>();
+        assert_eq!(projects(view), projects(&fresh.membership), "as of {seq}");
+        for host in ["host-a", "host-b", "host-c"] {
+            assert_eq!(
+                view.host_projects(host),
+                fresh.membership.host_projects(host)
+            );
+            assert_eq!(
+                view.host_sender_state(host),
+                fresh.membership.host_sender_state(host),
+                "{host} as of {seq}"
+            );
+            assert_eq!(
+                view.host_membership_epoch(host),
+                fresh.membership.host_membership_epoch(host)
+            );
+        }
+    }
+    assert_eq!(prefixes.as_of(head).unwrap(), &log.m);
+    assert!(prefixes.as_of(head - 1).is_none(), "never backwards");
+    assert!(prefixes.as_of(head + 1).is_none());
 }
