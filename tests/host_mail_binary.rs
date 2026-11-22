@@ -2074,7 +2074,7 @@ fn with_the_hook_off_the_host_reads_no_mailbox() {
 /// A host sender's request reaches this host's agent (`atem:<this host>`
 /// matched against its own `host_id`): admitted into a task delegated as
 /// the sending host's, it starts once host senders' gate opens (the
-/// mailbox read to its head, the inbox drained), runs on the fake agent and
+/// mailbox read to its head, its request decided), runs on the fake agent and
 /// awaits its result; the statuses come back to the sending host's mailbox
 /// (opened with the shared core): the resolution first, then the task's
 /// later states. The sending host's `complete` then completes it with its

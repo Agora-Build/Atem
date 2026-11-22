@@ -3485,10 +3485,11 @@ show of each test, behind the debug-only hook, against a fake Station speaking o
 below; where no binary covers a test, the unit tests or shared vectors that do. "Joint" is what only the check with a
 real Station and Astation can show.
 
-- **22.** `mail::a_cancel_waiting_while_the_host_is_down_is_applied_before_its_task_starts` and
-  `senders::a_kill_of_the_receiving_host_after_admission_applies_once`: the receiving host down while its mail waits.
-  Not shown: the sending host offline while its task runs (both hosts stay up). Joint: the real Station keeping mail
-  for a host away up to 24 h, and a result reaching a sending host that comes back.
+- **22.** `mail::a_cancel_waiting_while_the_host_is_down_is_applied_before_its_task_starts`,
+  `mail::a_senders_undecided_cancel_holds_only_its_own_tasks_across_a_restart` (another sender's task runs meanwhile)
+  and `senders::a_kill_of_the_receiving_host_after_admission_applies_once`: the receiving host down while its mail
+  waits. Not shown: the sending host offline while its task runs (both hosts stay up). Joint: the real Station keeping
+  mail for a host away up to 24 h, and a result reaching a sending host that comes back.
 - **23.** `mail::reads_its_mailbox_to_the_head_on_relay_local_and_routed_links` (a forged copy refused, one sealed to
   another host's key refused); a re-signed, a redirected and an older-generation copy in the host-envelope vectors;
   `mail::a_waiting_object_is_kept_not_done_and_decided_once_the_device_list_advances` (a newer generation waits, then

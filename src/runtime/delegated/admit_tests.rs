@@ -370,7 +370,8 @@ fn ad_one_state(rig: &LocalRig, message: &Message) -> (WorkState, String) {
 /// one commit (read by another connection) with the inbox row gone; the
 /// status is a `resolved` receipt naming the selector task id (§11.5's
 /// derivation, checked against the shared vector) and put until stored.
-/// With the inbox drained and the head read, host senders' gate opens.
+/// Until it is admitted, its row holds B's task starts only; admitted, with
+/// the head read, B's gate opens too.
 #[test]
 fn a_request_is_admitted_with_its_status_in_one_commit() {
     local_test(async |root| {
@@ -456,7 +457,7 @@ fn a_request_is_admitted_with_its_status_in_one_commit() {
         assert_eq!(resolved[0].task_id, expected);
         assert_eq!(resolved[0].state, WorkState::Queued);
         assert_eq!(ad_statuses(&rig)[0].0, "queued", "put until stored");
-        assert!(mb_gate(&rig), "the inbox drained, the head read");
+        assert!(mb_gate(&rig), "B's row decided, the head read");
     });
 }
 
@@ -1392,6 +1393,50 @@ fn unread_objects_a_reset_and_a_skipped_request_hold_every_host_sender() {
     });
 }
 
+/// Final readings item 6's proviso, "including … storage failure": a store
+/// whose inbox can't be read names nobody, so every host sender waits (fail
+/// closed, never the senders last read), and `atem status` says the state
+/// isn't loaded; readable again, B's row holds B's starts only.
+#[test]
+fn a_store_whose_inbox_cant_be_read_holds_every_host_sender() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = sp_host(&mut rig, root, &os);
+        ad_with_host_c(&mut rig, &mut host);
+        ad_deliver(&mut rig, &mut host, &[]);
+        let both = |rig: &LocalRig| (ad_gate_for(rig, "host-b"), ad_gate_for(rig, "host-c"));
+        let message = ad_message(&rig, vec![ad_select(&["atem:host"], 1)]);
+        ad_inbox_request(&rig, &message);
+        mb_tick(&mut rig, &mut host, 0);
+        assert_eq!(both(&rig), (false, true));
+        let db = |rig: &LocalRig, sql: &str| {
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .execute_batch(sql)
+                .unwrap()
+        };
+        db(&rig, "ALTER TABLE mailbox_inbox RENAME TO ad_unreadable");
+        mb_tick(&mut rig, &mut host, 0);
+        assert_eq!(both(&rig), (false, false), "nobody known: all wait");
+        assert!(
+            rig.bridge
+                .mail_status()
+                .unwrap()
+                .contains("the mailbox state isn't loaded"),
+            "{:?}",
+            rig.bridge.mail_status()
+        );
+        db(&rig, "ALTER TABLE ad_unreadable RENAME TO mailbox_inbox");
+        mb_tick(&mut rig, &mut host, 0);
+        assert_eq!(both(&rig), (false, true));
+    });
+}
+
 /// II.4.4: a status is owed at every change of a host sender's task's
 /// state, marked by the trigger in the statement that changes it (queued,
 /// blocked, submitted, awaiting its result, completed; failed by a
@@ -1483,10 +1528,11 @@ fn a_status_is_owed_at_each_change_and_supersedes_the_unstored_one() {
 }
 
 /// Entry criterion 1: admission takes every inbox row whatever host
-/// senders' gate says (it waits for the inbox, so admission that waited for
-/// it would wait for itself): with the mailbox not read to its head, a pass
-/// of the runtime (`work_pass`) admits a request; its task then waits for
-/// the gate, `blocked`, revocations not yet checked.
+/// senders' gate says (an inbox row holds its own sender's starts, so
+/// admission that waited for the gate would wait for itself): with the
+/// mailbox not read to its head, a pass of the runtime (`work_pass`)
+/// admits a request; its task then waits for the gate, `blocked`,
+/// revocations not yet checked.
 #[test]
 fn a_pass_admits_mail_while_the_gate_is_closed() {
     local_test(async |root| {
@@ -1738,7 +1784,7 @@ fn a_row_that_cant_be_decided_is_settled_after_bounded_tries() {
                 refused: "busy".into()
             }));
         mb_tick(&mut rig, &mut host, 0);
-        assert_eq!(mb_store(&rig).inbox, 0, "the gate's inbox part drained");
+        assert_eq!(mb_store(&rig).inbox, 0, "settled: no row holds B's starts");
         db(&rig, "DROP TRIGGER ad_block");
     });
 }

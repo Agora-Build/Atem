@@ -338,8 +338,8 @@ impl HostBridge {
     /// Each pass while hosting runs, with `host.senders` on (and the
     /// store this identity's, its tables made): the refusals to report,
     /// then every inbox row decided (the module docs). The senders whose
-    /// task starts the inbox holds follow it as it now stands. Debug builds: held while a
-    /// test says (`<pty faults>/hold_admission`).
+    /// task starts the inbox holds follow it as it now stands. Debug
+    /// builds: held while a test says (`<pty faults>/hold_admission`).
     pub(super) fn admit_mail(&mut self, cx: &mut Cx) {
         if !self.senders_on() || crate::runtime::test_hooks::admission_held() {
             return;
@@ -364,8 +364,7 @@ impl HostBridge {
         // `SETTLE_AFTER_MS` since its first failure on the monotonic clock
         // (review N2: a passing fault, a lock held a while, settles
         // nothing) is settled, so it never holds its sender's starts for
-        // good. A
-        // count goes once its row or report no longer fails.
+        // good. A count goes once its row or report no longer fails.
         let now = self.clock.now();
         let mut counts = std::mem::take(&mut self.work.admit_failures);
         for failure in failed {

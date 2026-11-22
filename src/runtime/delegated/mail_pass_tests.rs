@@ -253,7 +253,7 @@ fn a_mailbox_page_commits_before_its_done_goes() {
             (dones[0].mailbox_id.as_str(), dones[0].position),
             (MB_MAILBOX, 1)
         );
-        assert!(!mb_gate(&rig), "the inbox waits for admission");
+        assert!(!mb_gate(&rig), "B's row holds B's starts");
         let answer = atem_client::host_mail::mailbox::MailboxDoneResult {
             request_id: dones[0].request_id.clone(),
             mailbox_id: MB_MAILBOX.into(),

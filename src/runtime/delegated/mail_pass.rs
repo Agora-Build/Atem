@@ -451,9 +451,9 @@ impl HostBridge {
         self.outbox_tick(now_mono);
     }
 
-    /// The gate's mailbox part into the start view (host senders only,
-    /// design II.5).
-    /// The mailbox's alert lines go to runtime.log here.
+    /// The gate's mailbox part and the senders the inbox holds into the
+    /// start view (host senders only, design II.5), from one observation
+    /// of the store. The mailbox's alert lines go to runtime.log here.
     pub(crate) fn publish_mail_gate(&mut self) {
         let Some(station) = self.station.as_mut() else {
             self.start_view().gates.set_mailbox(false);

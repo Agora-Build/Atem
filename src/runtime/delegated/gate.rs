@@ -270,9 +270,9 @@ mod tests {
     }
 
     /// Design II.5: a host sender's gate also needs the mailbox part (the
-    /// host's own mailbox read and committed to the announced head, its
-    /// inbox drained); natives and services never wait for it. A start's
-    /// recovery closes it with the Stations' gates.
+    /// host's own mailbox read and committed to the announced head; its own
+    /// inbox rows, below); natives and services never wait for it. A
+    /// start's recovery closes it with the Stations' gates.
     #[test]
     fn only_host_senders_wait_for_the_mailbox() {
         let host = DelegatedSender::Host {
