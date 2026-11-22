@@ -28,7 +28,11 @@ The other files'
 (`crates/atem-client/tests/vectors.rs`) and the binding suites.
 It also recomputes every Station report id of the acknowledgment fixtures
 (`r9-control-ack-*`, host-work-v1 §11.4): the known answers of the
-reference ledger's `report_id`; and, from host-work-v1 §4 and §11.2, the
+reference ledger's `report_id`, and derives their `expect_counts` (the
+ledger's counts) from the steps; from host-work-v1 §11.1 ("Resets"), the
+snapshot checker's answers and the stops in force of
+`r9-vectors-host-work-control`'s `snapshots` (each record's verdict taken
+from its `checks`, as the bound and O1 take each step's result); and, from host-work-v1 §4 and §11.2, the
 verdicts of `host-work/requests-v1`'s requests that name a task (the
 owner's ops naming a host sender's selector task among them), of its `work`
 and `reply` results and of its `answers` correlation.
@@ -831,6 +835,11 @@ def check_host_work_control(file, data, report, context):
                     case.check(body["principal_key"] != r9_svc, "principal_key names another key (key_mismatch)")
                 else:
                     case.equal(body["principal_key"], r9_svc, "principal_key = r9_svc")
+            if "wrong_account" in reasons:
+                case.check(
+                    (body["account_id"], body["genesis_hash"]) != (data["account_id"], data["genesis_hash"]),
+                    "another account or genesis (wrong_account)",
+                )
             if "parse_error" in vector:
                 case.check(True, f"refused at parse ({vector['parse_error']}; not derived here)")
 
@@ -946,6 +955,219 @@ def check_host_work_control(file, data, report, context):
             ("colliding_id", "a hold under a counted id (evidence) refusing a release"),
         ]:
             case.check(kind in o1_seen, what)
+
+    answers = set()
+    for snap in data.get("snapshots", []):
+        with report.case(file, snap["label"]) as case:
+            answers.add(derive_snapshot(case, snap, by_label, entries))
+    with report.case(file, "snapshot codes") as case:
+        case.check(
+            answers == set(SNAPSHOT_CODES) | {"consistent"},
+            "the snapshot cases give every inconsistency code and a consistent answer",
+            f"got {sorted(answers)}",
+        )
+
+
+# check_snapshot_consistency's codes, in the order its checks run.
+SNAPSHOT_CODES = [
+    "invalid_retained", "invalid_record", "wrong_origin", "not_signed_anew", "not_candidate_feed",
+    "cover_not_first", "uncovered_cover", "not_above_mark", "stop_lost",
+    "stop_not_resigned",
+]
+
+
+def snapshot_stops(labels, verdict, by_label, entry_at):
+    """The stops in force after the records `labels`, applied in order at
+    the list's head with each record left pending applied again after the
+    rest (no state machine): a service is revoked by its first valid
+    `revoke`, and interrupted once revoked when any valid record of it
+    carries an interrupt (a `revoke` with `interrupt_running`, or an
+    `interrupt_running`); a host principal's valid interrupt is in force at
+    its `revoke_seq` (a valid one names a revoke at or below the head)
+    unless that device-list revoke carried `interrupt_running: true`
+    itself, which interrupted with the entry. As each standing writes it:
+    `{revoked?, interrupted}`, only principals with one."""
+    revoked, interrupting, hosts = {}, set(), {}
+    for label in labels:
+        if verdict(label)["verdict"] != "valid":
+            continue
+        body = by_label[label]["record"]["body"]
+        p, action = body["principal"], body["action"]
+        if p.startswith("host:"):
+            entry = entry_at(body["revoke_seq"])
+            if not entry.get("interrupt_running"):
+                hosts.setdefault(p, set()).add(str(body["revoke_seq"]))
+            continue
+        if action == "revoke":
+            revoked.setdefault(p, body["record_id"])
+        if (action == "revoke" and body["interrupt_running"]) or action == "interrupt_running":
+            interrupting.add(p)
+    out = {}
+    for p, by in revoked.items():
+        out[p] = {"interrupted": [by] if p in interrupting else [], "revoked": by}
+    for p, seqs in hosts.items():
+        out[p] = {"interrupted": sorted(seqs)}
+    return out
+
+
+def derive_snapshot(case, snap, by_label, entries):
+    """A snapshot case (Astation #114, items 2 and 6), derived from the file
+    alone: each record's verdict is its `checks` on the case's chain (the
+    Rust runner and the suites pin those). First the retained records:
+    invalid_retained for the first that isn't valid (reason: the
+    verdict's; index: its position in retained), a removed manager's stop
+    excepted. Then record by record in publication order: invalid_record (not valid; reason: the verdict's), wrong_origin
+    (a service's record naming another origin), not_signed_anew (a cover,
+    hold or release whose wire record, body and sig, is a retained one's),
+    not_candidate_feed (a record signed anew with the service's own key,
+    signer = principal, naming another feed than the candidate; a current
+    manager's stop may name any feed of the origin, and so may a retained
+    revoke or interrupt_running carried unchanged, whoever signed it),
+    cover_not_first (a covered principal's first record isn't its cover, or
+    a hold or release before its principal's cover), uncovered_cover,
+    not_above_mark (signed anew with the service's own key, issued at or
+    below its principal's mark or with no mark). Then, at index the
+    snapshot's length, cover_not_first for a covered principal with no
+    cover; then each effect of each retained revoke or interrupt_running
+    (valid, or a removed manager's), in the retained order (the revocation, then
+    the interrupt), not in force after the snapshot alone (snapshot_stops;
+    a service's interrupt is due once its principal is revoked by a
+    retained revoke or after the snapshot; one not yet due needs an
+    interrupt_running of its principal in the snapshot, which a new host
+    holds pending; a host principal's is in force too when its device-list
+    revoke carried interrupt_running): stop_lost
+    when that stop is valid at the head, stop_not_resigned (reason
+    removed_manager) when a removed manager signed it, record_id that
+    stop. The answer must be
+    `expect`, and `in_force` the stops derived after the retained records,
+    the snapshot alone and both in order; a host that read the old feed
+    keeps every stop. Returns the answer's code, or `consistent`."""
+    chain = snap["chain"]
+    replay_bodies = [entries[label] for label in LOG_L + list(chain)]
+
+    def entry_at(seq):
+        return replay_bodies[seq - 1] if 1 <= seq <= len(replay_bodies) else {}
+
+    def verdict(label):
+        found = [c for c in by_label[label].get("checks", []) if c["chain"] == chain]
+        if len(found) != 1:
+            case.fail(f"{label} has no verdict on L + {chain}")
+            return {"verdict": "unknown"}
+        return found[0]
+
+    covered, marks = set(snap["covered"]), snap["marks"]
+    case.equal(sorted(covered), snap["covered"], "covered: sorted, each once")
+
+    def answer():
+        def at(index, code, body=None, principal=None, reason=None, effect=None, revoke_seq=None):
+            out = {"consistent": False, "index": index, "code": code}
+            if body is not None:
+                out["record_id"] = body["record_id"]
+            if principal is not None:
+                out["principal"] = principal
+            if reason is not None:
+                out["reason"] = reason
+            if effect is not None:
+                out["effect"] = effect
+            if revoke_seq is not None:
+                out["revoke_seq"] = revoke_seq
+            return out
+
+        for i, label in enumerate(snap["retained"]):
+            v = verdict(label)
+            if v["verdict"] != "valid" and v.get("reason") != "removed_manager":
+                body = by_label[label]["record"]["body"]
+                return at(i, "invalid_retained", body, body["principal"], v.get("reason"))
+        seen, covers = set(), set()
+        for i, label in enumerate(snap["snapshot"]):
+            body = by_label[label]["record"]["body"]
+            p, action = body["principal"], body["action"]
+            v = verdict(label)
+            if v["verdict"] != "valid":
+                return at(i, "invalid_record", body, p, v.get("reason"))
+            # A retained record carried as it is: the same wire record, body
+            # and sig. A retained stop so carried is no record signed anew,
+            # whoever signed it; a cover, hold or release must be signed anew.
+            stop = action in ("revoke", "interrupt_running")
+            retained = any(by_label[r]["record"] == by_label[label]["record"] for r in snap["retained"])
+            anew = body["signer"] == p and not (stop and retained)
+            if "origin" in body:
+                if body["origin"] != snap["origin"]:
+                    return at(i, "wrong_origin", body, p)
+                if retained and not stop:
+                    return at(i, "not_signed_anew", body, p)
+                if anew and body["feed_id"] != snap["candidate_feed_id"]:
+                    return at(i, "not_candidate_feed", body, p)
+            first = p not in seen
+            seen.add(p)
+            if (first and action != "cover" and p in covered) or (action in ("hold", "release") and p not in covers):
+                return at(i, "cover_not_first", body, p)
+            if action == "cover" and p not in covered:
+                return at(i, "uncovered_cover", body, p)
+            if anew and (p not in marks or body["issued_at"] <= marks[p]):
+                return at(i, "not_above_mark", body, p)
+            if action == "cover":
+                covers.add(p)
+        end = len(snap["snapshot"])
+        for p in sorted(covered - covers):
+            return at(end, "cover_not_first", principal=p)
+        fresh = snapshot_stops(snap["snapshot"], verdict, by_label, entry_at)
+        revoked = {
+            by_label[r]["record"]["body"]["principal"]
+            for r in snap["retained"]
+            if by_label[r]["record"]["body"]["action"] == "revoke"
+        }
+        for label in snap["retained"]:
+            body = by_label[label]["record"]["body"]
+            p, action = body["principal"], body["action"]
+            if action not in ("revoke", "interrupt_running"):
+                continue
+            v = verdict(label)
+            valid = v["verdict"] == "valid"
+            code, reason = ("stop_lost", None) if valid else ("stop_not_resigned", "removed_manager")
+            has = fresh.get(p, {"interrupted": []})
+            if p.startswith("host:"):
+                seq = body["revoke_seq"]
+                entry = entry_at(seq)
+                by_entry = (
+                    entry.get("action") == "host_sender_revoke"
+                    and entry.get("host_id") == p[len("host:"):]
+                    and entry.get("interrupt_running") is True
+                )
+                if not by_entry and str(seq) not in has["interrupted"]:
+                    return at(end, code, body, p, reason, "interrupt", seq)
+                continue
+            revokes = action == "revoke"
+            interrupts = action == "interrupt_running" or (revokes and body["interrupt_running"])
+            if revokes and "revoked" not in has:
+                return at(end, code, body, p, reason, "revocation")
+            # Due once its principal is revoked: then in force. Not yet due,
+            # it waits pending on a host that read the old feed, so the
+            # snapshot must hold an interrupt_running of that principal.
+            due = revokes or p in revoked or "revoked" in has
+            if due:
+                kept = bool(has["interrupted"])
+            else:
+                kept = any(
+                    by_label[s]["record"]["body"]["principal"] == p
+                    and by_label[s]["record"]["body"]["action"] == "interrupt_running"
+                    for s in snap["snapshot"]
+                )
+            if interrupts and not kept:
+                return at(end, code, body, p, reason, "interrupt")
+        return {"consistent": True}
+
+    got = answer()
+    case.equal(got, snap["expect"], "the answer, derived from the verdicts, the feeds, the marks and the effects")
+    in_force = {
+        "retained": snapshot_stops(snap["retained"], verdict, by_label, entry_at),
+        "snapshot": snapshot_stops(snap["snapshot"], verdict, by_label, entry_at),
+        "snapshot_over_retained": snapshot_stops(snap["retained"] + snap["snapshot"], verdict, by_label, entry_at),
+    }
+    case.equal(in_force, snap["in_force"], "in_force: the stops after the retained records, the snapshot alone and both")
+    kept = all(in_force["snapshot_over_retained"].get(p) == s for p, s in in_force["retained"].items())
+    case.check(kept, "a host that read the old feed keeps every stop it had")
+    return got.get("code", "consistent")
 
 
 # Applied::why's codes (host-work-v1 §11.1), by what they explain.
@@ -1235,7 +1457,8 @@ def check_control_ack(file, data, report, context):
     claims its link's association at the Station's origin and names records
     of the vectors, and every report id it names is one of its reports',
     recomputed here: each expected report's id from its own kind,
-    integration and host. Which reports are made, and when, is the ledger's
+    integration and host; and each `expect_counts`, the ledger's counts
+    (derive_counts). Which reports are made, and when, is the ledger's
     (the Rust runner and the binding suites, R9.12)."""
     mlog = context["membership_log"]
     control = context["host_work_control"]
@@ -1323,6 +1546,73 @@ def check_control_ack(file, data, report, context):
             if not all(r.get("record_id", "") in ids for r in a["results"]):
                 bad.append(f"{step['link']}'s ack names a record outside the vectors")
         case.check(not bad, f"{len(acks)} acks: each claims its link's association (or is refused not_the_link), at the station's origin, naming records of the vectors", "; ".join(bad))
+
+    if any("expect_counts" in step for step in data["steps"]):
+        with report.case(file, "counts") as case:
+            derive_counts(case, data, records)
+
+
+# A count's effect, in the ledger's order: the revocation before the interrupt.
+COUNT_EFFECTS = {"revocation": 0, "interrupt": 1}
+
+
+def derive_counts(case, data, records):
+    """The ledger's counts (its state's `done`), derived from the steps
+    alone (no ledger): the Station tracks each `revoke` and
+    `interrupt_running` it records (once per record_id), and each ack it
+    takes (not refused, committed) counts, for the link's host, every
+    effect of a tracked record whose result is `applied` or `duplicate`,
+    once per principal, effect (an interrupt at a host principal's
+    revoke_seq) and host, through the first record that said so; a cover,
+    hold or release, a pending or refused result, the cursor and the feed
+    the ack names count nothing. A `replica` step counts once, a step with
+    `commit: false` not at all, a restart keeps what was committed. Each
+    `expect_counts` must be those counts, sorted by principal, effect
+    (revocation first), revoke_seq and host."""
+    hosts = {name: link["host_id"] for name, link in data["setup"]["links"].items()}
+    tracked, counts, wrong = {}, {}, []
+
+    def apply(step):
+        if step.get("commit") is False:
+            return
+        if "control_record" in step:
+            body = records[step["control_record"]]
+            effects = {"revoke": ["revocation", "interrupt"] if body.get("interrupt_running") else ["revocation"],
+                       "interrupt_running": ["interrupt"]}.get(body["action"])
+            if effects is not None:
+                tracked.setdefault(body["record_id"], (body["principal"], effects, body.get("revoke_seq")))
+        if "control_ack" in step and "refused" not in step:
+            host = hosts[step["link"]]
+            for result in step["control_ack"]["results"]:
+                if result.get("record_id") not in tracked:
+                    continue
+                principal, effects, revoke_seq = tracked[result["record_id"]]
+                for e in result["effects"]:
+                    if e["result"] in ("applied", "duplicate"):
+                        seq = revoke_seq if e["effect"] == "interrupt" else None
+                        counts.setdefault((principal, e["effect"], seq, host), result["record_id"])
+        if "replica" in step:
+            apply(step["replica"])
+
+    checked = 0
+    for i, step in enumerate(data["steps"], 1):
+        apply(step)
+        if "expect_counts" in step:
+            checked += 1
+            keys = sorted(counts, key=lambda k: (k[0], COUNT_EFFECTS[k[1]], -1 if k[2] is None else k[2], k[3]))
+            want = []
+            for principal, effect, seq, host in keys:
+                count = {"effect": effect, "host": host, "principal": principal, "record_id": counts[(principal, effect, seq, host)]}
+                if seq is not None:
+                    count["revoke_seq"] = seq
+                want.append(count)
+            if step["expect_counts"] != want:
+                wrong.append(i)
+    case.check(
+        not wrong,
+        f"{checked} expect_counts: each the counts derived from the records tracked and the acks taken, per principal, effect and host, through the first record that said so"
+        + (f" (not: steps {wrong})" if wrong else ""),
+    )
 
 
 # ------------------------------------------------- r9-vectors-push-hint

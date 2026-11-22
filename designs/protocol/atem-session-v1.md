@@ -4573,7 +4573,8 @@ input, every signature by the key its chain names for the signer, the
 digests a sequence's state keeps (each the body of a record of that
 principal with that `record_id`) and each step's position against the
 file's stations), every Station report id of the acknowledgment
-fixtures `r9-control-ack-*` (host-work-v1 §11.4),
+fixtures `r9-control-ack-*` (host-work-v1 §11.4) and their
+`expect_counts`, derived from the steps,
 and of `r9-vectors-host-envelope` (its entries' chain, hashes and
 signatures, each object's `jcs`, signing input, signature, seal `info`,
 `sealed_hash`, the open with the recipient key, the seal again from the
@@ -4602,8 +4603,11 @@ alone (the evicted ids, the floor, the final order and every possible
 replay) and checks that each step's `why` is a code of its result's kind,
 present exactly when due; the exact code among codes of one kind is pinned
 by the Rust runner and the suites. It also derives each release's O1
-verdict from the steps' signed times (the hold time kept per principal) and
-reads the acknowledgments' typed reasons (O5). (Amended for step 4: the
+verdict from the steps' signed times (the hold time kept per principal),
+reads the acknowledgments' typed reasons (O5), and derives each case of
+its `snapshots` (the snapshot checker, host-work-v1 §11.1; #114, items 2
+and 6) from the records' verdicts on its chain: the answer and the stops
+in force. (Amended for step 4: the
 Station-calls checker and the control vectors' bound and `why` checks are
 **agreed with Astation (2026-11-13, #120 comment 6848326392)**; the O1 and O5 checks
 are **signed off by Astation (2026-11-13, #156 comment 6858184397; reaffirmed 2026-11-15, #120 comment 6889906767)**.) Scenarios
@@ -4665,7 +4669,10 @@ Station's acknowledgments (delegated host work, host-work-v1 §11.4;
 `r9-control-ack-deadline`, `r9-control-ack-durable`,
 `r9-control-ack-portal-refusals`, and (**signed off by Astation (2026-11-13, #156 comment 6858184397; reaffirmed 2026-11-15, #120 comment 6889906767)**,
 amended for step 4: typed reasons, host-work-v1 §11.4 wire rule 10)
-`r9-control-ack-reasons`.
+`r9-control-ack-reasons`, and (**agreed with Astation (2026-11-22, #114
+comment 7082464868, items 2 and 6)**: a replacement feed after a
+Station's rollback, a current manager's original stop carried unchanged,
+a fresh ledger's counts) `r9-control-ack-replacement-feed`.
 
 ### R9.13 Open questions for Astation
 

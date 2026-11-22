@@ -872,7 +872,7 @@ const ACKS = readdirSync(fixturesDir)
   .sort();
 for (const name of ACKS) {
   check(`Station acks: ${name} through AckLedgerHandle`, () => {
-    eq(ACKS.length, 6, "the acknowledgment fixtures");
+    eq(ACKS.length, 7, "the acknowledgment fixtures");
     const f = load(name);
     const setup = f.setup;
     const st = setup.station;
@@ -938,6 +938,9 @@ for (const name of ACKS) {
         if (t !== undefined) commit(t);
       } else if ("expect_resign_alerts" in step) {
         eq(ledger.resignAlerts(), step.expect_resign_alerts.map((l) => ctlByLabel[l].record.body.record_id).sort(), `${name} resign alerts`);
+      } else if ("expect_counts" in step) {
+        // The ledger's counts, as its state writes them (`done`).
+        eq(canon(JSON.parse(ledger.toJson()).done), canon(step.expect_counts), `${name} counts`);
       } else if ("expect_dropped" in step) {
         eq(ledger.droppedReports(), step.expect_dropped, `${name} dropped`);
       } else if ("expect_refused" in step) {
@@ -958,6 +961,43 @@ for (const name of ACKS) {
     }
   });
 }
+// The snapshot checker (Astation #114, items 2 and 6): every case of the
+// control vectors' `snapshots` through checkControlSnapshotConsistency, and
+// its input refused outside its grammar.
+const snapshotOut = (a) => {
+  if (a.type === "consistent") return { consistent: true };
+  const v = { consistent: false, index: a.index, code: a.code, principal: a.principal };
+  if (a.recordId !== null) v.record_id = a.recordId;
+  if (a.reason !== null) v.reason = a.reason;
+  if (a.effect !== null) v.effect = a.effect;
+  if (a.revokeSeq !== null) v.revoke_seq = a.revokeSeq;
+  return v;
+};
+check("control snapshots: every case through checkControlSnapshotConsistency", () => {
+  const run = (c, edit = {}) => {
+    const a = {
+      origin: c.origin,
+      candidate: c.candidate_feed_id,
+      retained: c.retained.map(ctlRecord),
+      snapshot: c.snapshot.map(ctlRecord),
+      marks: Object.entries(c.marks).map(([principal, markMs]) => ({ principal, markMs })),
+      covered: c.covered,
+      ...edit,
+    };
+    return m.checkControlSnapshotConsistency(logAfter(c.chain), a.origin, a.candidate, a.retained, a.snapshot, a.marks, a.covered);
+  };
+  if (ctl.snapshots.length < 8) throw new Error(`${ctl.snapshots.length} snapshot cases`);
+  for (const c of ctl.snapshots) same(snapshotOut(run(c)), c.expect, c.label);
+  const n1 = ctl.snapshots.find((c) => c.label === "N1_retained_native_revoke");
+  const mark = { principal: "service:svc-discord", markMs: n1.marks["service:svc-discord"] };
+  throwsCode(() => run(n1, { snapshot: [ctlRecord("A2_cover"), ctlRecord("P4_unknown_field")] }), "unknown_field");
+  throwsCode(() => run(n1, { origin: `${n1.origin}/` }), "malformed");
+  throwsCode(() => run(n1, { candidate: n1.candidate_feed_id.toUpperCase() }), "malformed");
+  throwsCode(() => run(n1, { marks: [mark, mark] }), "malformed");
+  throwsCode(() => run(n1, { marks: [{ principal: "member:dev-mac", markMs: 1 }] }), "malformed");
+  throwsCode(() => run(n1, { marks: [{ ...mark, mark_ms: 1 }] }), "malformed");
+  throwsCode(() => run(n1, { covered: ["service:svc-discord", "service:svc-discord"] }), "malformed");
+});
 check("Station acks: a call never changes its handle; the state loads only as written", () => {
   const f = load("r9-control-ack-per-effect");
   const st = f.setup.station;

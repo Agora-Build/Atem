@@ -25,6 +25,11 @@
 //!   persists in one transaction before any HTTP, and adopts only once
 //!   that committed; it sends that state's `pending_reports()`, never the
 //!   transition's `made`.
+//! - **A replacement feed's snapshot.** `check_control_snapshot_consistency`
+//!   checks the snapshot of a feed a Station publishes after a rollback
+//!   against the records it retained (host-work-v1 §11.1, "Resets";
+//!   Astation #114, items 2 and 6): consistency only, never that a
+//!   history, a clock or an author's stops are complete.
 //!
 //! Errors: input a reader, a builder or the ledger refuses is
 //! `Invalid{code}` (the relay's `too_large`, `not_strict`, `wrong_message`,
@@ -32,6 +37,7 @@
 //! `incomplete_link`, `not_the_link`, `other_account`, `other_station`,
 //! `not_the_record`, `record_id_reused`); a state that doesn't load is
 //! `Stored{code}`.
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use atem_client::canonical::{Numbers, parse_strict};
@@ -39,19 +45,20 @@ use atem_client::control::{
     AckLedger, AckResult, ApplicationResult, CallRefused, ControlAck, ControlRecord, ControlSync,
     ControlSyncResult, EffectKind, EffectResult, EffectWhy, EntryRef, FeedEntry, FeedHead, Heads,
     LedgerAlert, LedgerTransition, LinkAssociation, MembershipFetch, MembershipFetchResult,
-    RefusalCode, RefusedCall, Report, ReportAnswer, ReportIntent, SyncMismatch, ToHost, ToStation,
+    RefusalCode, RefusedCall, Report, ReportAnswer, ReportIntent, SnapshotConsistency,
+    SnapshotInput, SyncMismatch, ToHost, ToStation, check_snapshot_consistency,
 };
 use serde_json::Value;
 
 use crate::control::{effect_kind, result_kind};
 use crate::encoding::{canonical, canonical_lossy, hash_of};
 use crate::error::{AtemError, Result};
-use crate::log::{object_json, objects_of};
+use crate::log::{MembershipLog, object_json, objects_of};
 use crate::types::{
-    ControlAckInfo, ControlEffectKind, ControlEffectResult, ControlResultKind, LedgerAlertInfo,
-    LinkAssociationInfo, LogHead, RelayAckResult, RelayFeedHead, RelayFeedRecord, RelayRefusalCode,
-    RelaySyncVerdict, RelayToHost, RelayToStation, ReportAnswerKind, ReportIntentInfo,
-    StationReport,
+    ControlAckInfo, ControlEffectKind, ControlEffectResult, ControlResultKind,
+    ControlSnapshotConsistency, ControlSnapshotMark, LedgerAlertInfo, LinkAssociationInfo, LogHead,
+    RelayAckResult, RelayFeedHead, RelayFeedRecord, RelayRefusalCode, RelaySyncVerdict,
+    RelayToHost, RelayToStation, ReportAnswerKind, ReportIntentInfo, StationReport,
 };
 
 fn refusal_code(code: RefusalCode) -> RelayRefusalCode {
@@ -812,4 +819,113 @@ impl AckLedgerHandle {
     pub fn stopped_client_id(&self) -> Option<String> {
         self.ledger.stopped_client_id().map(str::to_owned)
     }
+}
+
+// ------------------------------------------- the replacement feed's snapshot
+
+/// Checks the snapshot of a replacement feed (a new `feed_id` a Station
+/// publishes after a rollback) for **consistency** with the records the
+/// restored Station retained (`atem_client::control::check_snapshot_consistency`;
+/// host-work-v1 §11.1, "Resets"; Astation #114, items 2 and 6). It never
+/// says that the retained records are the whole history, that a mark
+/// bounds every time the old deployment signed or reserved, or that every
+/// author's stops reached the Station: those stay the Station's and the
+/// owner's to establish.
+///
+/// `log` is the device list at the verifying head (never frozen);
+/// `origin` the Station's exact origin (`normalize_relay`'s form);
+/// `candidate_feed_id` the replacement feed's (a UUID v4);
+/// `retained_json` the retained records in their feed's order and
+/// `snapshot_json` the snapshot's in publication order (each record's
+/// JSON, as the control parser reads it); `marks` each service
+/// principal's mark, once each; `covered` the principals the snapshot
+/// covers (`service:<id>`), once each.
+///
+/// Checked first over the retained records: `invalid_retained` for one
+/// that isn't valid at the head, but a removed manager's stop (`reason` the
+/// verifier's code, `index` its position in `retained_json`): verify them
+/// at a head that includes them, or drop what doesn't verify from what you
+/// pass as retained; it is never a request to re-sign. Then record by
+/// record in publication order, then over the whole snapshot, the first
+/// failure answered: `invalid_record` (not valid at the head; a removed
+/// manager's original is `removed_manager`: a current manager signs it
+/// again), `wrong_origin`, `not_signed_anew` (a cover, hold or release
+/// whose signed object is a retained record's: those are always signed
+/// anew), `not_candidate_feed` (a record signed anew with the service's
+/// own key names the candidate feed), `cover_not_first` (a covered
+/// principal's cover comes first, a hold or release after it),
+/// `uncovered_cover`, `not_above_mark` (signed anew with the service's own
+/// key, issued at or below its principal's mark or with none); then a
+/// covered principal with no cover (`cover_not_first`), then each effect
+/// of each retained `revoke` or `interrupt_running` that the snapshot
+/// alone doesn't keep on a fresh state (a revocation, or an interrupt due
+/// because its principal is revoked, in force; an interrupt not yet due,
+/// of a principal nothing revokes, an `interrupt_running` of that
+/// principal in the snapshot, which a new host holds pending as a host
+/// that read the old feed does):
+/// `stop_lost` when that retained stop is valid at the head,
+/// `stop_not_resigned` (`reason` `removed_manager`) when a removed manager
+/// signed it, a genuine stop a current manager signs again (I.5.4).
+/// Holds and releases aren't compared: the Portal's current state
+/// decides them. A snapshot `revoke` or `interrupt_running` whose signed
+/// object (body and signature) is a retained record's is that stop
+/// carried as it is, whoever signed it (a current manager or the service's
+/// own key): it needs neither the candidate feed nor the mark, but is
+/// still valid at the head and of your origin.
+///
+/// Errors: a record its parse refuses is `Invalid{code}` (its parse code);
+/// any other input outside its grammar (an origin not in its exact form, a
+/// candidate feed that isn't a UUID v4, a mark or covered principal that
+/// isn't `service:<id>`, a principal marked or covered twice, a mark above
+/// 2^53 − 1, a frozen list) is `Invalid{malformed}`.
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub fn check_control_snapshot_consistency(
+    log: Arc<MembershipLog>,
+    origin: String,
+    candidate_feed_id: String,
+    retained_json: Vec<String>,
+    snapshot_json: Vec<String>,
+    marks: Vec<ControlSnapshotMark>,
+    covered: Vec<String>,
+) -> Result<ControlSnapshotConsistency> {
+    let records = |jsons: &[String]| -> Result<Vec<ControlRecord>> {
+        jsons
+            .iter()
+            .map(|json| Ok(ControlRecord::parse(json.as_bytes())?))
+            .collect()
+    };
+    let (retained, snapshot) = (records(&retained_json)?, records(&snapshot_json)?);
+    let mut by_principal = BTreeMap::new();
+    for mark in marks {
+        if by_principal.insert(mark.principal, mark.mark_ms).is_some() {
+            return Err(AtemError::malformed("a principal marked twice"));
+        }
+    }
+    let count = covered.len();
+    let covered: BTreeSet<String> = covered.into_iter().collect();
+    if covered.len() != count {
+        return Err(AtemError::malformed("a principal covered twice"));
+    }
+    let list = log.lock();
+    let answer = check_snapshot_consistency(&SnapshotInput {
+        list: &list,
+        origin: &origin,
+        candidate_feed_id: &candidate_feed_id,
+        retained: &retained,
+        snapshot: &snapshot,
+        marks: &by_principal,
+        covered: &covered,
+    })?;
+    Ok(match answer {
+        SnapshotConsistency::Consistent => ControlSnapshotConsistency::Consistent,
+        SnapshotConsistency::Inconsistent(i) => ControlSnapshotConsistency::Inconsistent {
+            index: i.index as u64,
+            code: i.code.code().into(),
+            principal: i.principal,
+            record_id: i.record_id,
+            reason: i.reason,
+            effect: i.effect.map(|e| e.code().into()),
+            revoke_seq: i.revoke_seq,
+        },
+    })
 }

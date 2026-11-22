@@ -1842,6 +1842,53 @@ impl AckTransition {
     }
 }
 
+/// A replacement feed's snapshot checked for **consistency** with the
+/// records the restored Station retained
+/// (`check_control_snapshot_consistency`): never a statement that a
+/// history, a clock or an author's stops are complete. `marks` is an array
+/// of `{principal, markMs}`; `covered` the principals the snapshot covers.
+/// Returns `{type: "consistent"}` or `{type: "inconsistent", index, code,
+/// principal, recordId, reason, effect, revokeSeq}` (`null` where none).
+#[wasm_bindgen(js_name = checkControlSnapshotConsistency)]
+pub fn check_control_snapshot_consistency(
+    log: &MembershipLog,
+    origin: String,
+    candidate_feed_id: String,
+    retained_json: Vec<String>,
+    snapshot_json: Vec<String>,
+    marks: JsValue,
+    covered: Vec<String>,
+) -> JsResult<JsValue> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct M {
+        principal: String,
+        mark_ms: f64,
+    }
+    let marks = items::<M>(
+        &marks,
+        &["principal", "markMs"],
+        "marks [{principal, markMs}]",
+    )?
+    .into_iter()
+    .map(|m| {
+        Ok(crate::types::ControlSnapshotMark {
+            principal: m.principal,
+            mark_ms: ms(m.mark_ms)?,
+        })
+    })
+    .collect::<JsResult<Vec<_>>>()?;
+    ok(crate::station::check_control_snapshot_consistency(
+        log.0.clone(),
+        origin,
+        candidate_feed_id,
+        retained_json,
+        snapshot_json,
+        marks,
+        covered,
+    ))
+}
+
 // ------------------------------------------------------- kit and backup
 
 #[wasm_bindgen]

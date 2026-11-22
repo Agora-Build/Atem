@@ -1256,6 +1256,58 @@ data_enum! {
     }
 }
 
+record! {
+    /// A service principal's mark for `check_control_snapshot_consistency`:
+    /// a record the service's own key signs anew in the snapshot is
+    /// issued strictly after `mark_ms` (`U_p`, or the mark the Station
+    /// signs above; ms since the epoch). A retained stop carried unchanged
+    /// needs no mark.
+    pub struct ControlSnapshotMark {
+        /// `service:<id>`.
+        pub principal: String,
+        pub mark_ms: u64,
+    }
+}
+
+data_enum! {
+    /// `check_control_snapshot_consistency`'s answer. **Consistency only:**
+    /// `Consistent` says that nothing handed in (the records the restored
+    /// Station retained, the marks, the covered set) contradicts the
+    /// snapshot, never that the retained records are the whole history,
+    /// that a mark bounds every time the old deployment signed or
+    /// reserved, or that every author's stops reached the Station.
+    pub enum ControlSnapshotConsistency {
+        /// Nothing handed in contradicts the snapshot.
+        Consistent,
+        /// The first check that failed. `code`, in the order the checks
+        /// run: `invalid_retained` (a retained record that isn't valid at
+        /// the head, but a removed manager's stop; `reason`: the
+        /// verifier's code; `index`: its position in the retained
+        /// records: verify them at a head that includes them, or drop what
+        /// doesn't verify, never re-sign it), `invalid_record` (`reason`:
+        /// the verifier's pending or refusal code), `wrong_origin`,
+        /// `not_signed_anew`, `not_candidate_feed`, `cover_not_first`,
+        /// `uncovered_cover`, `not_above_mark`, then `stop_lost` or
+        /// `stop_not_resigned` (a removed manager's retained stop, `reason`
+        /// `removed_manager`: a current manager signs it again; `effect`:
+        /// `revocation` or `interrupt`; `revoke_seq`: a host principal's
+        /// interrupt). `index` is otherwise the snapshot record's position
+        /// (from 0), or the snapshot's length for what only the whole
+        /// snapshot shows (a covered principal with no cover, a retained
+        /// stop's effect not kept). `record_id` is that snapshot
+        /// record's, or the retained record's.
+        Inconsistent {
+            index: u64,
+            code: String,
+            principal: String,
+            record_id: Option<String>,
+            reason: Option<String>,
+            effect: Option<String>,
+            revoke_seq: Option<u64>,
+        },
+    }
+}
+
 unit_enum! {
     /// What a Station does with the Portal's answer to a report
     /// (`report_answer`; the classes are Auth/Portal's).
