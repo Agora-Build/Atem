@@ -2063,8 +2063,8 @@ which entries:
   unconfirmed verifier keeps signing off, and a host whose welcome carries
   no `verifier` is unconfirmed.
 - *How the signing gate uses it* (**Atem's proposal, agreed with Astation (2026-11-13, #120 comment 6848326392); the shared
-  `required_version` helper its adoption waited on is built (below; its API Atem's proposal, for Astation's agreement), and
-  adoption stays Astation's, from a pinned SDK publication**). This says when a verifier is confirmed, and it extends the
+  `required_version` helper its adoption waited on is built (below; its API agreed with Astation on 2026-11-22, Atem #120
+  comment 7082465179, item 3), and adoption stays Astation's, from a pinned SDK publication**). This says when a verifier is confirmed, and it extends the
   gate to three scope ops (below). It removes none of the rules above.
   - Versions only widen. Version N lists every action of version N − 1,
     and it accepts every entry N − 1 accepts, with the same derived state.
@@ -2095,9 +2095,9 @@ which entries:
     verifiers that aren't hosts (native controllers, Station replicas,
     other SDK consumers, each of which can call `verifier_inventory()`) is
     Astation's.
-  - The shared helper (built; **Atem's proposal, for Astation's
-    agreement**: the API Astation asked for on #120, comments 7030456149
-    and 7040054791, proposed in Atem #190) gives a signer each entry's
+  - The shared helper (built; **agreed with Astation on 2026-11-22**, #120
+    comment 7082465179, item 3: the API Astation asked for on #120,
+    comments 7030456149 and 7040054791, built in Atem #190) gives a signer each entry's
     requirement, so no app keeps its own table of actions and ops:
     `atem_client::membership::required_version(body)`, in the bindings
     `membership_required_version(body_json)` (JS

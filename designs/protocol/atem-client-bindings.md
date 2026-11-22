@@ -656,8 +656,8 @@ carries this change; hosts from v0.8.0 to v0.8.5 send none. It is the
 host's claim about itself and never opens the gate alone.
 
 How a signer's gate uses it (**Atem's proposal, agreed with Astation (2026-11-13, #120 comment 6848326392); the shared
-`required_version` helper its adoption waited on is built (below; its API Atem's proposal, for Astation's agreement), and
-adoption stays Astation's, from a pinned SDK publication**; session-v1 R9.2 "How the signing gate uses it"). It says when
+`required_version` helper its adoption waited on is built (below; its API agreed with Astation on 2026-11-22, Atem #120
+comment 7082465179, item 3), and adoption stays Astation's, from a pinned SDK publication**; session-v1 R9.2 "How the signing gate uses it"). It says when
 a verifier is confirmed, and it extends the gate to three scope ops:
 
 - Versions only widen. A version lists every action of the one before it
