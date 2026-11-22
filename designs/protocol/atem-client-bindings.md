@@ -1882,15 +1882,22 @@ pruned in this version: keep it as long as the principal exists (design
 I.5.2's retention); `from_json` reads at most 64 MiB.
 
 **A replacement feed after a rollback** (host-work-v1 §11.1, "A
-replacement feed after a rollback" and "The snapshot checker"; **agreed
-with Astation (2026-11-22, #114 comment 7082464868, items 2 and 6)**).
-Start the replacement feed's ledger empty, with no carried settlement
-(`AckLedgerHandle::new`, never the restored state), and admit only acks
-naming the candidate feed, on sockets opened after the recovery: the
-ledger checks the origin, never the `feed_id`, so that rule is yours.
-Record the snapshot's records as any others; a retained stop is carried as
-it is (it names the old feed), and each host reports it
-again as it reads the snapshot (`r9-control-ack-replacement-feed`).
+replacement feed after a rollback" and "The snapshot checker"; Astation
+#114, items 2 and 6). Start the replacement feed's ledger empty, with no
+carried settlement (`AckLedgerHandle::new`, never the restored state;
+**agreed with Astation, item 6**), and admit only acks naming the
+candidate feed, on sockets opened after the recovery: the ledger checks
+the origin, never the `feed_id`, so that rule is yours. Record the
+snapshot's records as any others. A retained stop is carried as it is (it
+names the old feed; a current manager's, **agreed with Astation, #114
+comment 7082464868, item 2**; your own service key's, Atem's reading of
+§11.1 "Resets", for Astation's confirmation on #114), and each host
+reports it again as it reads the snapshot
+(`r9-control-ack-replacement-feed`). A retained stop that isn't valid at
+your head can't be carried: have a current manager sign it again (a
+removed manager's), or verify at a head where it is valid (one pending,
+its signer not yet in your list); until then the checker below answers
+`stop_not_resigned`, never `Consistent`.
 
 ### The snapshot checker
 
@@ -1912,32 +1919,34 @@ you: what a rollback lost, nothing here can see (#114, items 1, 3 and 4).
 | `covered` | the principals the snapshot covers (`service:<id>`), once each |
 
 It answers `ControlSnapshotConsistency::Consistent`, or `Inconsistent{index,
-code, principal, record_id, reason, revoke_seq}`, the first check that
-failed, record by record in publication order, then over the whole
-snapshot (`index` the snapshot's length then): `invalid_record` (not valid
-at the head; `reason` the verifier's code, a removed manager's original
-`removed_manager`: have a current manager sign it again),
-`wrong_origin`, `not_candidate_feed` (a record signed anew with the
-service's own key names the candidate feed; a cover, hold or release is
-always signed anew), `cover_not_first` (each covered principal's cover
-first, a hold or release after it; a covered principal with no cover),
-`not_above_mark` (signed anew with the service's own key, issued at or
-below the mark, or no mark), `uncovered_cover`, and `stop_lost` (a revocation, or its
-interrupt, in force from the retained records but not from the snapshot
-alone on a fresh host; `reason` `revocation` or `interrupt`, `record_id`
-the retained revoke that revoked a service, `revoke_seq` a host
-principal's interrupt). Holds and releases aren't compared: the Portal's
-current state decides them. A snapshot `revoke` or `interrupt_running`
-whose signed object (body and signature) is a retained record's is that
-stop carried as it is (ruling R52), whoever signed it, a current manager
-or the service's own key: it may name the old feed and needs no mark, but
-must still be valid at the head and of your origin. Errors: a record its parse refuses is
-`Invalid{code}`; any other input outside its grammar (an origin not in its
-exact form, a candidate that isn't a UUID v4, a principal that isn't
-`service:<id>`, marked or covered twice, a mark above 2^53 − 1, a frozen
-list) `Invalid{malformed}`. JS: `checkControlSnapshotConsistency(log,
-origin, candidateFeedId, retainedJson, snapshotJson, [{principal,
-markMs}], covered)` gives `{type: "consistent"}` or `{type:
-"inconsistent", index, code, principal, recordId, reason, revokeSeq}`
-(`null` where none). Its cases: `r9-vectors-host-work-control`'s
-`snapshots`.
+code, principal, record_id, reason, effect, revoke_seq}`, the first check
+that failed. Record by record in publication order: `invalid_record` (not
+valid at the head; `reason` the verifier's code, a removed manager's
+original `removed_manager`: have a current manager sign it again),
+`wrong_origin`, `not_signed_anew` (a cover, hold or release that is a
+retained record's: those are always signed anew), `not_candidate_feed`
+(a record signed anew with the service's own key names the candidate
+feed), `cover_not_first` (each covered principal's cover first, a hold or
+release after it), `uncovered_cover`, `not_above_mark` (signed anew with
+the service's own key, issued at or below the mark, or no mark). Then,
+with `index` the snapshot's length: `cover_not_first` for a covered
+principal with no cover, and each effect of each retained `revoke` or
+`interrupt_running`, valid at your head or not, that isn't in force after
+the snapshot alone on a fresh host: `stop_lost` when that retained stop is
+valid at the head, `stop_not_resigned` (`reason` the verifier's) when it
+isn't; `record_id` the retained stop, `effect` `revocation` or
+`interrupt`, `revoke_seq` a host principal's interrupt. Holds and
+releases aren't compared: the Portal's current state decides them. A
+snapshot `revoke` or `interrupt_running` whose signed object (body and
+signature) is a retained record's is that stop carried as it is, whoever
+signed it, a current manager or the service's own key: it may name the
+old feed and needs no mark, but must still be valid at the head and of
+your origin. Errors: a record its parse refuses is `Invalid{code}`; any
+other input outside its grammar (an origin not in its exact form, a
+candidate that isn't a UUID v4, a principal that isn't `service:<id>`,
+marked or covered twice, a mark above 2^53 − 1, a frozen list)
+`Invalid{malformed}`. JS: `checkControlSnapshotConsistency(log, origin,
+candidateFeedId, retainedJson, snapshotJson, [{principal, markMs}],
+covered)` gives `{type: "consistent"}` or `{type: "inconsistent", index,
+code, principal, recordId, reason, effect, revokeSeq}` (`null` where
+none). Its cases: `r9-vectors-host-work-control`'s `snapshots`.
