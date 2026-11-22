@@ -4955,9 +4955,15 @@ rules into each host sender's task, and the start check asks them again.
   `membership_applied`; Atem writes them in host-work's own pass instead,
   so they can lag the device list's commit by one pass, while the start
   check already refuses from the committed list; and until host-work's
-  applied `seq` reaches the committed head, a host sender's task waits,
-  `device list update pending` (not holding its session), so no start
-  crosses an entry whose effects aren't written.
+  applied `seq` reaches the committed head, a host sender's task (and its
+  launch at the spawn boundary) waits, `device list update pending` (not
+  holding its session), so no start crosses an entry whose effects aren't
+  written. An attempt already `accepted` that reaches `executing`
+  meanwhile is withdrawn there, and that withdrawal isn't counted toward
+  the attempt limit (design I.6.4: as a hold's, host-work's own lag; the
+  task waits, then gets a new attempt). A live attempt's stop is on its
+  task's record (below), so what follows the commit (a crash, a
+  receipt-database fault, a halted journal) never loses it.
 - **Project entries are judged per entry. Owner decision 2026-11-22;
   Astation's integration requirement** ([#120 comment
   7028723996][c-7028723996], final readings item 9: no start may cross a
@@ -4968,14 +4974,24 @@ rules into each host sender's task, and the start check asks them again.
   device list as of `seq`: the chain up to and including that entry, the
   standing `verify_chain` derives from that prefix with the same pin (the
   shared core's `Membership::prefixes`, read forward once a catch-up;
-  nothing is verified again). A task that list no longer covers fails,
-  `sender's authorization narrowed` (the revoke's or removal's event when
-  its standing as of `seq` is that), and stays failed: an entry that
-  restores the grant, in the same catch-up or later, revives nothing, and
-  a replay after a crash writes it once. Entries go in `seq` order, so a
-  task a narrowing and a revoke or removal both reach takes the first
-  one's outcome (`failed`, narrowed, or `cancelled`, `sender revoked`; of
-  a live attempt's withdrawals the first is kept). A task admitted on a
+  nothing is verified again; what it reads is a read-only view of grants
+  and standings, `ListAsOf`, never a stored or servable list). A task
+  that list no longer covers fails, `sender's authorization narrowed`
+  (the revoke's or removal's event when its standing as of `seq` is
+  that), and stays failed: an entry that restores the grant, in the same
+  catch-up or later, revives nothing, and a replay after a crash writes
+  it once. A task whose attempt is live is stopped the same way, durably:
+  its record gets the stop in that transaction (`list_stop`: the first
+  stopping entry's event and `seq`; a revoke's or a removal's too, the
+  first kept), its attempt's withdrawal is asked after the commit, and
+  the start check refuses a task with a stop first, whatever the head
+  shows, so the withdrawal, whoever makes it (that followup, the dispatch,
+  the session host's check at `executing`, the start's recovery), settles
+  it with that event, across a crash, a receipt-database fault or a
+  halted journal; an attempt found started already runs, and the stop is
+  cleared. Entries go in `seq` order, so a task a narrowing and a revoke
+  or removal both reach takes the first one's outcome (`failed`,
+  narrowed, or `cancelled`, `sender revoked`). A task admitted on a
   list that already had the entry was judged on it at admission. The start
   check holds a host sender's task until these effects are written up to
   the committed head ("Crash safety"), since the head alone may cover a
