@@ -1779,8 +1779,8 @@ results with its `host_channel_key` (§11.5).
 
 **Built:** `project_set` and `project_remove` in the shared core's verifier and `check_change` (step 3); behind the
 debug-only hook, the receiving host's use of them: a project's ops in admission and the start check, and a project
-entry's effects on unstarted tasks, judged once per catch-up against the head (Atem's reading, for Astation;
-host-work-v1 §11.6). **Not built:** signing them, which is Astation's, behind the signing gate, still closed.
+entry's effects on unstarted tasks, judged per entry on the device list as of that entry (owner decision 2026-11-22,
+Astation's integration requirement; host-work-v1 §11.6). **Not built:** signing them, which is Astation's, behind the signing gate, still closed.
 
 **Owner decision 2026-11-07 (choice 6); needs agreement.** A project is a device-list entry signed by a native
 manager, so grants share the device list's signing, carriage, durable head, deferred entries, fences and freeze rules
@@ -1809,8 +1809,10 @@ manager, so grants share the device list's signing, carriage, durable head, defe
   needs a new `project_set` that lists it. A newer `add_host` without a removal (re-verification) keeps the host in its
   projects. The membership vectors carry both cases (III.1).
 - **Effects on a receiving host.** A host principal has no attachments, so no §H fence is needed. When a project entry
-  is committed, host-work evaluates the unstarted tasks of the senders it affects: those no longer covered fail
-  `sender's authorization narrowed` (I.3.3); `awaiting_result` and `outcome_unknown` tasks are kept. A `remove_host`
+  is committed, host-work evaluates the unstarted tasks of the senders it affects, on the device list as of that entry:
+  those no longer covered fail `sender's authorization narrowed` (I.3.3), and a later entry that restores the grant
+  revives none (owner decision 2026-11-22, even when this host reads both in one catch-up); `awaiting_result` and
+  `outcome_unknown` tasks are kept. A `remove_host`
   of the sender cancels them, `sender revoked` (II.3). These effects are part of R9.3's step 4 and are replayed after a
   crash from host-work's applied device-list `seq` (II.3.1, "Crash safety").
 - **Membership epoch. Changed after review 4.** A host's membership epoch is the `seq` of its first `add_host` after
@@ -2485,7 +2487,7 @@ I.3.3 for host senders. Projects have no expiry (II.2.2), so the expiry and rene
 |---|---|---|---|---|---|
 | Sending host offline | n/a | Run | Continue | Kept | Kept; results wait in the mailbox and in resends (II.4.4) |
 | Project widened | Allowed | No effect | No effect | Kept | Kept |
-| Project narrowed (the sender or this host left out, fewer ops), `project_remove` | Per the new grant | Those no longer covered fail `sender's authorization narrowed` | Continue | Kept; completable within the new grant | Readable by the owner |
+| Project narrowed (the sender or this host left out, fewer ops), `project_remove` | Per the new grant | Those no longer covered fail `sender's authorization narrowed`, judged per entry on the list as of it (owner decision 2026-11-22): a later entry that restores the grant, even one this host reads in the same catch-up, doesn't revive them | Continue | Kept; completable within the new grant | Readable by the owner |
 | `host_sender_revoke` (owner decision 2026-11-07) | Refused until a readmit | `cancelled`, `sender revoked` | Continue, or interrupted if `interrupt_running` (or a later native `interrupt_running`) | Kept; only the owner completes or resolves them | Kept; readable by the owner |
 | `host_sender_readmit` | Allowed again, for envelopes signed after it | No effect: cancelled tasks stay cancelled | n/a | Kept | Kept |
 | `remove_host` of the sender | Refused: not a current host | `cancelled`, `sender revoked` | Continue | Kept; only the owner completes or resolves them | Kept; readable by the owner |
@@ -3325,7 +3327,8 @@ Nothing is merged or deployed before step 1.
     them; the bodies carry no kind, text, context or task id.
 25. **Project narrowing.** Removing host A from the project fails A's unstarted tasks on B (`sender's authorization
     narrowed`) and keeps its awaiting ones; reducing the ops to `message` does the same for task work; a widening
-    changes nothing.
+    changes nothing. A narrowing that a later entry restores before B catches up still fails them, and they stay failed
+    (per entry; owner decision 2026-11-22).
 26. **Removed and added again.** `remove_host` of A, then a new `add_host` of the same `host_id`: A sends nothing
     under its old projects until a new `project_set` lists it. A re-verified A (a newer `add_host` without a removal)
     keeps its projects (II.2.2).
@@ -3452,8 +3455,12 @@ real Station and Astation can show.
   opens once). Joint: the copies made against a real Station and device list.
 - **24.** The seals and `sealed_hash` in the host-envelope vectors; the fake Station keeps bodies and ciphertext only.
   Joint: what the real Station's store and logs hold.
-- **25.** No binary; host_effects_tests.rs (`a_narrowing_fails_unstarted_tasks_and_keeps_awaiting_ones`,
-  `project_entries_are_judged_once_per_catch_up_against_the_head`). Joint: Astation signing the project entries.
+- **25.** `mail::a_narrowing_and_its_restore_read_together_fail_the_queued_task` (per entry: a restore read in the
+  same catch-up revives nothing); host_effects_tests.rs (`a_narrowing_fails_unstarted_tasks_and_keeps_awaiting_ones`,
+  `a_narrowing_then_a_restore_in_one_catch_up_fails_the_task` and the per-entry tests after it: a removal and a re-set,
+  a widening, a task admitted after the entries, the start check held until the effects are written, a live attempt, a
+  narrowing and a revoke in both orders, a crash between the entries and their effects). Joint: Astation signing the
+  project entries.
 - **26.** No binary; host_effects_tests.rs (`a_remove_host_cancels_unstarted_tasks`,
   `a_replay_leaves_tasks_admitted_after_a_readmit_or_a_re_add`) and the membership vectors (`P9_remove_host_b`,
   `P10_readd_host_b`, `P11_set_again`, `P9_reverify_a`). Joint: a real removal and re-add, and `atem unpair`, then

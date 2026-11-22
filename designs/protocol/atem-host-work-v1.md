@@ -4780,7 +4780,6 @@ Not yet asked on #120 (earlier PRs):
 - The opened object commits with the cursor as an inbox row, its resolution in admission's later transaction (PR #185): [On the receiving host][mailbox-calls], "admission".
 - The sender's standing checked again at admission against the head it signed at (PR #185): [On the receiving host][mailbox-calls], "A request".
 - The device list's effects on host senders' tasks written in host-work's own pass (PR #171): [§11.6, "Host senders on the receiving host"](#host-senders-on-the-receiving-host), "Crash safety".
-- Project entries judged once per catch-up, against the head (PR #171): the same section.
 - A record only a channel carried is reported on that channel only, never acknowledged to the Station unless the Station's feed delivers it too (PR #171): [§11.1, "Carriage"](#carriage), "Channels, as built".
 - `host_enc_key_get` records the key's id on request and answers `busy` when that write fails (PR #169): session-v1 R9.14 item 8, "The record first".
 
@@ -4793,6 +4792,7 @@ verify` and at a start that finds none.
 [c-6938206284]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-6938206284
 [c-6945317466]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-6945317466
 [c-6951602509]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-6951602509
+[c-7028723996]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-7028723996
 [mailbox-calls]: #the-mailbox-calls-agreed-with-astation-2026-11-16
 [s-11-5]: #115-envelopes-and-results-atems-side-built-behind-a-debug-only-hook-not-advertised
 
@@ -4937,9 +4937,11 @@ rules into each host sender's task, and the start check asks them again.
   of those whose turn may run (reason `revoke`, the revocation the
   entry's `seq` in decimal). A `remove_host` of the sender at `seq`
   cancels its unstarted tasks admitted before it (epoch below `seq`). A
-  `project_set` or `project_remove` fails the unstarted tasks no longer
-  covered. A readmit and a newer `add_host` do nothing. Tasks awaiting
-  their result or of unknown outcome are kept.
+  `project_set` or `project_remove` at `seq` fails the unstarted tasks,
+  admitted before it, that the list as of `seq` no longer covers, a live
+  attempt withdrawn first (per entry, below). A readmit and a newer
+  `add_host` do nothing. Tasks awaiting their result or of unknown
+  outcome are kept.
 - **Crash safety** (design II.3.1). Host-work keeps its own applied
   device-list `seq` in `host-work.sqlite`, naming its list's genesis, and
   writes the effects of every entry after it with the new `seq` in one
@@ -4952,18 +4954,32 @@ rules into each host sender's task, and the start check asks them again.
   design places these effects inside R9.3's step 4, before
   `membership_applied`; Atem writes them in host-work's own pass instead,
   so they can lag the device list's commit by one pass, while the start
-  check already refuses from the committed list.
-- **Project entries are judged once per catch-up, against the head.
-  Atem's reading, for Astation** (design II.2.2 "Effects on a receiving
-  host", II.3.1 "Crash safety"): the revoke and removal effects follow
-  each entry (by its `seq`), but the project entries' narrowing is judged
-  once per pass, after them, on the committed head, as Part I judges every
-  narrowing at `executing` (design I.4.3). Two differences can be seen: a
-  narrowing undone before host-work's pass (a narrowing and a re-widening
-  arriving together, or replayed together after a crash) fails nothing;
-  and a narrowing and a revoke or removal of the same sender arriving
-  together give the revoke's `cancelled`, `sender revoked`, not `failed`,
-  narrowed. Neither lets work run that the committed head doesn't cover.
+  check already refuses from the committed list; and until host-work's
+  applied `seq` reaches the committed head, a host sender's task waits,
+  `device list update pending` (not holding its session), so no start
+  crosses an entry whose effects aren't written.
+- **Project entries are judged per entry. Owner decision 2026-11-22;
+  Astation's integration requirement** ([#120 comment
+  7028723996][c-7028723996], final readings item 9: no start may cross a
+  missing stop; design II.2.2 "Effects on a receiving host", II.8). Each
+  `project_set` or `project_remove` at `seq` in a catch-up judges the host
+  senders' tasks that wait, or whose attempt is live, admitted on a list
+  before it (their admission's `device_list_seq` below `seq`), on the
+  device list as of `seq`: the chain up to and including that entry, the
+  standing `verify_chain` derives from that prefix with the same pin (the
+  shared core's `Membership::prefixes`, read forward once a catch-up;
+  nothing is verified again). A task that list no longer covers fails,
+  `sender's authorization narrowed` (the revoke's or removal's event when
+  its standing as of `seq` is that), and stays failed: an entry that
+  restores the grant, in the same catch-up or later, revives nothing, and
+  a replay after a crash writes it once. Entries go in `seq` order, so a
+  task a narrowing and a revoke or removal both reach takes the first
+  one's outcome (`failed`, narrowed, or `cancelled`, `sender revoked`; of
+  a live attempt's withdrawals the first is kept). A task admitted on a
+  list that already had the entry was judged on it at admission. The start
+  check holds a host sender's task until these effects are written up to
+  the committed head ("Crash safety"), since the head alone may cover a
+  task an earlier entry stopped.
 - **A later interrupt** (design II.3.1, §11.1 rule 4). A native manager's
   `interrupt_running` about `host:<host_id>`, from a feed or a native's
   channel, writes intents only for the host's tasks admitted before the
