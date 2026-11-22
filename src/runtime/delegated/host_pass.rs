@@ -11,7 +11,12 @@
 //! revoke's effects sees them; at a start that is before the recovery of
 //! delegated tasks, so a crash between an entry's commit and its effects
 //! is replayed before anything is dispatched and ahead of the recovery's
-//! interrupt-intent step (design I.6.2).
+//! interrupt-intent step (design I.6.2). The applied `seq` goes into the
+//! start view once written or read: until it reaches the committed head, a
+//! host sender's task doesn't start (`StartView::host_effects_at`), since a
+//! project entry is judged on the list as of that entry, and the head alone
+//! may cover a task an entry before it stopped (the owner's decision,
+//! 2026-11-22).
 //!
 //! Nothing runs with the hook off (no table is made: hook off = main),
 //! while the device list doesn't serve (frozen, held, faulted, gone: the
@@ -68,6 +73,9 @@ impl HostBridge {
             Ok((applied, followups)) => {
                 self.work.followups.extend(followups);
                 self.work.host_applied = Some(key);
+                // Host senders' tasks start once it reaches the head the
+                // start view shows (`StartView::host_effects_at`).
+                self.start_view().host_applied = Some((genesis, applied));
                 // Kept in memory from its commit (or its read): the sync and
                 // the re-verification read it from here.
                 self.work.applied_seq = Some((identity, genesis, applied));

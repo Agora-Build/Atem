@@ -42,8 +42,9 @@ use crate::session_protocol::host::{StartCheck, StartRequest, StartVerdict};
 use crate::session_protocol::membership::ListState;
 use crate::session_protocol::wire::Target;
 use atem_client::channel::Principal;
+use atem_client::encoding::Hash32;
 use atem_client::membership::entry::MemberKind;
-use atem_client::membership::{MemberState, MemberStatus};
+use atem_client::membership::{MemberState, MemberStatus, Membership};
 use atem_client::principal::{Authority, Need, Op};
 use atem_client::session::host_work::WorkState;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -214,6 +215,12 @@ pub struct StartView {
     /// `host.senders` is on (the debug-only hook's): a host sender's tasks
     /// may start only then; off, they wait (their stops aren't read).
     pub senders: bool,
+    /// Host-work's applied device-list `seq` (design II.3.1) with the
+    /// genesis of the list it counts in, as host senders' pass last wrote
+    /// or read it (`host_senders_pass`): a host sender's task starts only
+    /// once its effects reach the committed head ([`Self::host_effects_at`]).
+    /// None until that pass ran.
+    pub host_applied: Option<(Hash32, u64)>,
     /// `D`, the delegated clock's reading of this pass (none: no clock, or
     /// a damaged one; deadlines aren't compared then, and the dispatch
     /// waits).
@@ -238,6 +245,7 @@ impl StartView {
             scopes: ScopeHashes::default(),
             host_id: host_id.to_string(),
             senders: false,
+            host_applied: None,
             now_d_ms: None,
             live: HashMap::new(),
             refused: HashMap::new(),
@@ -258,6 +266,16 @@ impl StartView {
             return None;
         }
         fetch.origin.as_deref()
+    }
+
+    /// Whether host-work wrote the device list's effects on host senders'
+    /// tasks up to `list`'s head ([`Self::host_applied`]). Until it did, an
+    /// entry may still have a stop for a task that the head alone doesn't
+    /// show: a narrowing a later entry restored, judged per entry (the
+    /// owner's decision, 2026-11-22: no start crosses a missing stop).
+    pub fn host_effects_at(&self, list: &Membership) -> bool {
+        self.host_applied
+            .is_some_and(|(genesis, seq)| genesis == list.genesis_hash() && seq >= list.head().seq)
     }
 
     /// `attempt_id` is about to be submitted for `task` (after its row
@@ -368,7 +386,11 @@ pub fn may_start(view: &StartView, task: &StartTask, now_d_ms: Option<u64>) -> R
 ///    that doesn't read, `host.senders` off (its stops aren't read then, so
 ///    it waits as for a closed gate), a deferred entry, the host's own
 ///    Station's gate (II.5: its feed and device-list parts; the mailbox's
-///    part comes with the mailbox).
+///    part comes with the mailbox), and last host-work's effects of the
+///    device list's entries not yet written up to its head
+///    ([`StartView::host_effects_at`]): `Deferred`, `device list update
+///    pending`, so no start crosses a stop an entry has and the head
+///    doesn't show (a narrowing restored by a later entry, per entry).
 ///
 /// A record that names a host sender without its grant can't be checked:
 /// `Narrowed` (fail closed).
@@ -418,7 +440,11 @@ fn host_may_start(view: &StartView, task: &StartTask, now_d_ms: Option<u64>) -> 
     // Its stops are the device list's and interrupts: never held, never
     // covered (no control record holds a host principal, host-work-v1
     // §11.1, `not_for_host_principal`).
-    waits(view, list, &SenderStanding::default(), adm, false, false)
+    waits(view, list, &SenderStanding::default(), adm, false, false)?;
+    if !view.host_effects_at(&list.membership) {
+        return Err(Event::Deferred);
+    }
+    Ok(())
 }
 
 /// Condition 2a: the device list as it committed, usable (not frozen,

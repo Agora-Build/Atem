@@ -2851,3 +2851,54 @@ fn a_reply_from_a_host_revoked_meanwhile_is_kept_as_data() {
     );
     assert!(!support::delegated::input(&rig).contains("HM_KEPT"));
 }
+
+/// VII.B 25, per entry (the owner's decision, 2026-11-22; host-work-v1
+/// §11.6, "Project entries are judged per entry"): the sending host's task
+/// is admitted and queued (host-work's scheduling held), then a narrowing
+/// of their project and its restore reach the host together from the
+/// Station. The task fails at the narrowing, `sender's authorization
+/// narrowed`, never runs once scheduling is back, and its status says
+/// `failed`; a request sent after the restore is admitted and runs.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_narrowing_and_its_restore_read_together_fail_the_queued_task() {
+    use atem_client::membership::project_set;
+    let mut rig = Rig::admitting("");
+    rig.online();
+    let sid = rig.launch();
+    let to = rig.receiver(1);
+    rig.fault("hold_host_work");
+    let message = rig
+        .sender
+        .message(&to, &[&format!("atem:{HOST}")], 1, "HM_NARROWED");
+    rig.put(&rig.sender.request_of(&to, rig.log.log.head(), &message));
+    let task = task_of(&message, &sid);
+    rig.within("admitted", || !rig.tasks_of(&message.message_id).is_empty());
+    let ops = |ops: &[ProjectOp]| project_set(PROJECT, [HOST, SENDER], ops.iter().copied(), 0);
+    rig.log
+        .append(support::r9log::MAC, ops(&[ProjectOp::Message]).unwrap());
+    rig.log.append(
+        support::r9log::MAC,
+        ops(&[ProjectOp::Message, ProjectOp::Notify, ProjectOp::Prompt]).unwrap(),
+    );
+    rig.station().set_log(&rig.log);
+    let head = rig.log.log.head().seq;
+    rig.within("the restore committed", || {
+        rig.dump()["membership"]["head"]["seq"].as_u64() == Some(head)
+    });
+    support::delegated::wait_stored(&rig, &task, "failed", "sender's authorization narrowed");
+    std::fs::remove_file(rig.faults().join("hold_host_work")).unwrap();
+    rig.until_status("failed", |s| {
+        resolved_state(s, &message.message_id) == Some(WorkState::Failed)
+    });
+    let later = rig
+        .sender
+        .message(&to, &[&format!("atem:{HOST}")], 1, "HM_RESTORED");
+    rig.put(&rig.sender.request_of(&to, rig.log.log.head(), &later));
+    support::delegated::in_turn(&rig, &task_of(&later, &sid), "HM_RESTORED");
+    support::delegated::never_ran(&rig, &task, "HM_NARROWED");
+}
+

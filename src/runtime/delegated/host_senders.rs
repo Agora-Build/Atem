@@ -26,8 +26,9 @@
 //!   sender cancels its unstarted tasks admitted before it (`sender
 //!   revoked`), a revoke with `interrupt_running` writes an interrupt intent
 //!   for each of them that started; a project entry fails the unstarted
-//!   tasks it no longer covers (`sender's authorization narrowed`); a
-//!   readmit and a newer `add_host` do nothing. They are written in one
+//!   tasks the list as of that entry no longer covers (`sender's
+//!   authorization narrowed`), per entry, so a later restore revives none;
+//!   a readmit and a newer `add_host` do nothing. They are written in one
 //!   transaction with host-work's own applied device-list `seq`
 //!   ([`applied_seq`], in `host-work.sqlite`), so a crash between an entry's
 //!   commit and its effects loses none: the next pass, and the start before
@@ -35,7 +36,7 @@
 use super::effects::{self, Followup};
 use super::start::Event;
 use super::{DelegatedSender, SenderClass};
-use crate::runtime::host_work::{Route, Store};
+use crate::runtime::host_work::{Route, Store, WorkRecord};
 use crate::runtime::test_hooks::HostFeatures;
 use anyhow::{Result, bail};
 use atem_client::encoding::Hash32;
@@ -388,17 +389,26 @@ pub fn set_applied_seq(tx: &Transaction, genesis: &Hash32, seq: u64) -> Result<(
 ///   (their epoch below `seq`) stop the same way (`Removed`: `cancelled`,
 ///   `sender revoked`). This host's own removal is the device list's
 ///   (every principal fenced, a new identity's store).
-/// - **`project_set`, `project_remove`**: once per call, after the other
-///   entries, each host sender's unstarted task is judged on `list` as it
-///   committed ([`host_task_covered`]): one no longer covered stops with
-///   the event (`Narrowed`: `failed`, `sender's authorization narrowed`).
-///   Tasks awaiting their result or of unknown outcome are kept.
+/// - **`project_set`, `project_remove`** at `seq`, per entry (the owner's
+///   decision, 2026-11-22; Astation's integration requirement, #120
+///   comment 7028723996, final readings item 9): each host sender's task
+///   that waits, or whose attempt is live, admitted on a list before `seq`
+///   (`Admission::device_list_seq` below it), is judged on the list as of
+///   `seq` ([`Membership::prefixes`], [`host_task_covered`]): one no
+///   longer covered stops with the event (`Narrowed`: `failed`, `sender's
+///   authorization narrowed`), and stays stopped whatever a later entry
+///   restores. Tasks awaiting their result or of unknown outcome are kept.
 /// - **`host_sender_readmit`, `add_host`**: nothing (cancelled tasks stay
 ///   cancelled; a new key changes no authorization).
 ///
+/// Entries go in `seq` order, so a task two entries reach (a narrowing
+/// and a revoke) takes the first one's outcome: an unstarted task is
+/// settled by it in `tx`, and of the withdrawals asked for one live
+/// attempt only the first is kept.
+///
 /// Idempotent, keyed by the entry's `seq`: a task already in the state
 /// the entry gives is left, an intent already written isn't written again,
-/// so entries applied again (a replay) add nothing.
+/// so entries applied again (a replay) add nothing, and revive nothing.
 pub fn list_effects(
     store: &Store,
     tx: &Transaction,
@@ -407,7 +417,10 @@ pub fn list_effects(
     after: u64,
 ) -> Result<Vec<Followup>> {
     let mut out = Vec::new();
-    let mut projects = false;
+    // The list as of each project entry, read forward once; host senders'
+    // tasks a project entry may stop, read at the first one.
+    let mut prefixes = list.prefixes();
+    let mut reachable: Option<Vec<WorkRecord>> = None;
     for seq in after.saturating_add(1)..=list.head().seq {
         let Some(entry) = list.entry(seq) else {
             continue;
@@ -430,14 +443,31 @@ pub fn list_effects(
                 let mut tasks = admitted_before(store, &principal, |_, epoch| epoch < seq)?;
                 effects::stop(store, tx, &mut tasks, Event::Removed, &mut out)?;
             }
-            Action::ProjectSet { .. } | Action::ProjectRemove { .. } => projects = true,
+            Action::ProjectSet { .. } | Action::ProjectRemove { .. } => {
+                let Some(then) = prefixes.as_of(seq) else {
+                    bail!("the device list has no position {seq}");
+                };
+                let tasks = match &mut reachable {
+                    Some(tasks) => tasks,
+                    None => reachable.insert(host_senders_tasks(store)?),
+                };
+                narrowed(store, tx, tasks, then, seq, this_host, &mut out)?;
+            }
             _ => {}
         }
     }
-    if projects {
-        narrowed(store, tx, list, this_host, &mut out)?;
-    }
+    first_withdrawals(&mut out);
     Ok(out)
+}
+
+/// Of the withdrawals `out` asks for one attempt, the first: a task's
+/// first stop, in `seq` order, is its outcome.
+fn first_withdrawals(out: &mut Vec<Followup>) {
+    let mut asked = BTreeSet::new();
+    out.retain(|followup| match followup {
+        Followup::Withdraw { attempt_id, .. } => asked.insert(attempt_id.clone()),
+        _ => true,
+    });
 }
 
 /// `principal`'s (a host sender's) tasks that wait or run, each with its
@@ -457,25 +487,59 @@ fn admitted_before(
     Ok(tasks)
 }
 
-/// A project entry's effect: every host sender's task that waits (or whose
-/// attempt is live) and that `list` no longer covers stops with the event
-/// [`host_task_covered`] gives (a narrowing; a revoke or removal applied
-/// above already settled theirs). One read of the active tasks.
+/// Host senders' tasks that wait or run (`queued`, `blocked`,
+/// `submitting`, `submitted`): what a project entry may stop. One read of
+/// the active tasks a catch-up.
+fn host_senders_tasks(store: &Store) -> Result<Vec<WorkRecord>> {
+    let mut tasks = store.active_tasks()?;
+    tasks.retain(|r| {
+        r.delegated
+            .as_ref()
+            .and_then(|a| a.host_admitted())
+            .is_some()
+    });
+    Ok(tasks)
+}
+
+/// The effect of the project entry at `seq`, `then` the list as of it, on
+/// `tasks` (those no entry of this catch-up reached yet): every one
+/// admitted on a list before `seq` that `then` no longer covers is reached,
+/// and leaves `tasks`. If it still waits, or its attempt is live, as `tx`
+/// has it now (an entry before this one, a revoke or removal, may have
+/// settled it), it stops with the event [`host_task_covered`] gives (a
+/// narrowing); a started one goes on. A task admitted at `seq` or after was
+/// judged on a list that had the entry.
 fn narrowed(
     store: &Store,
     tx: &Transaction,
-    list: &Membership,
+    tasks: &mut Vec<WorkRecord>,
+    then: &Membership,
+    seq: u64,
     this_host: &str,
     out: &mut Vec<Followup>,
 ) -> Result<()> {
-    for r in store.active_tasks()? {
-        let Some((host_id, admitted)) = r.delegated.as_ref().and_then(|a| a.host_admitted()) else {
+    let mut reached = Vec::new();
+    tasks.retain(|r| {
+        let event = r.delegated.as_ref().and_then(|admission| {
+            let (host_id, admitted) = admission.host_admitted()?;
+            if admission.device_list_seq >= seq {
+                return None;
+            }
+            host_task_covered(then, this_host, host_id, admitted, HostOp::Task).err()
+        });
+        match event {
+            Some(event) => {
+                reached.push((r.task.task_id.clone(), event));
+                false
+            }
+            None => true,
+        }
+    });
+    for (task_id, event) in reached {
+        let Some(r) = store.work(&task_id)? else {
             continue;
         };
-        let Err(event) = host_task_covered(list, this_host, host_id, admitted, HostOp::Task) else {
-            continue;
-        };
-        let live = store.live_attempt(&r.task.task_id)?;
+        let live = store.live_attempt(&task_id)?;
         if live.is_none() && !matches!(r.status.state, WorkState::Queued | WorkState::Blocked) {
             continue;
         }

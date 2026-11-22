@@ -1028,10 +1028,12 @@ fn host_task(log: &TestLog, principals: &[&str], deadline: u64) -> StartTask {
     }
 }
 
-/// [`view`], with `host.senders` on and route `rh` naming `principals`.
+/// [`view`], with `host.senders` on, host-work's device-list effects
+/// written up to `log`'s head, and route `rh` naming `principals`.
 fn host_view(log: &TestLog, principals: &[&str]) -> StartView {
     let mut v = view(log);
     v.senders = true;
+    v.host_applied = Some((log.log.genesis_hash(), log.log.head().seq));
     let mut route = v.config.routes[0].clone();
     route.id = "rh".into();
     route.principals = principals.iter().map(|p| p.to_string()).collect();
@@ -1228,6 +1230,44 @@ fn a_host_senders_task_follows_its_route_and_the_own_stations_gate() {
         launch_check(&v, &launch, 0),
         LaunchVerdict::Fail(details::AUTHORIZATION_NARROWED)
     );
+}
+
+/// No start crosses a missing stop (the owner's decision, 2026-11-22; design
+/// II.8): while host-work's device-list effects aren't written up to the
+/// committed head (none read yet, behind it, or another list's), a host
+/// sender's task waits, `device list update pending` (it doesn't hold its
+/// session), even with the head covering it, as after a narrowing a later
+/// entry restored; written up to the head (or beyond, never lower), it
+/// starts. What settles a task comes first: a revoke at the head cancels
+/// it however far the effects are.
+#[test]
+fn a_host_senders_task_waits_for_the_device_lists_effects() {
+    use crate::session_protocol::membership::r9log::MAC;
+    use atem_client::membership::host_sender_revoke;
+    let log = host_log(|_| {});
+    let task = host_task(&log, &["project:build"], LATER);
+    let head = log.log.head().seq;
+    let genesis = log.log.genesis_hash();
+    let with = |applied: Option<(atem_client::encoding::Hash32, u64)>| {
+        let mut v = host_view(&log, &["project:build"]);
+        v.host_applied = applied;
+        may_start(&v, &task, Some(0))
+    };
+    assert_eq!(with(Some((genesis, head))), Ok(()));
+    assert_eq!(with(Some((genesis, head + 1))), Ok(()));
+    for behind in [
+        None,
+        Some((genesis, head - 1)),
+        Some((atem_client::encoding::Hash32([7; 32]), head)),
+    ] {
+        assert_eq!(with(behind), Err(Event::Deferred), "{behind:?}");
+    }
+    assert!(!Event::Deferred.holds_session());
+    let mut revoked = host_log(|_| {});
+    revoked.append(MAC, host_sender_revoke("host-b", false, 0).unwrap());
+    let mut v = host_view(&revoked, &["project:build"]);
+    v.host_applied = Some((genesis, head));
+    assert_eq!(may_start(&v, &task, Some(0)), Err(Event::Revoked));
 }
 
 /// The admission record of a host sender's task (design I.4.1, "Changed for
