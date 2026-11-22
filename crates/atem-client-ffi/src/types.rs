@@ -312,6 +312,54 @@ impl From<&atem_client::membership::VerifierInventory> for VerifierInventory {
     }
 }
 
+unit_enum! {
+    /// Which kind of member signed a verifier report.
+    pub enum ReportSignerKind {
+        /// `member:<device_id>`: a native member, with its `auth_key`.
+        Native,
+        /// `service:<device_id>`: a service, with its own key.
+        Service,
+    }
+}
+
+record! {
+    /// A verifier report's challenge as the minter issues and stores it
+    /// (`verifier_report_challenge`, `parse_verifier_report_challenge`):
+    /// `signer` (`member:<id>` or `service:<id>`), `slot`, `origin` (the
+    /// Station, exact as `normalize_relay` writes it), `connection` (the
+    /// slot's generation, 1 to 2^53 − 1), `nonce` (32 bytes, base64url),
+    /// and the lease `0 < expires_at − issued_at ≤ 30000` ms.
+    pub struct VerifierReportChallenge {
+        pub signer: String,
+        pub slot: String,
+        pub origin: String,
+        pub connection: u64,
+        pub nonce: String,
+        pub issued_at: u64,
+        pub expires_at: u64,
+    }
+}
+
+record! {
+    /// A verified report (`verify_verifier_report`): who signed it and as
+    /// which kind, in which slot and process (base64url, 16 bytes), for
+    /// which `connection`, at which head of the reporter's list (`at_head`
+    /// when it is the verifier's own head, false at an ancestor: the
+    /// consumer decides whether that suffices), its verifier `inventory`
+    /// (read for its shape only) and the challenge's `expires_at`.
+    pub struct VerifiedReport {
+        pub signer: String,
+        pub kind: ReportSignerKind,
+        pub slot: String,
+        pub process: String,
+        pub connection: u64,
+        pub head: LogHead,
+        pub at_head: bool,
+        pub inventory: VerifierInventory,
+        pub expires_at: u64,
+    }
+}
+
 record! {
     /// The exact action and minimum reported verifier version required before
     /// signing this membership body. The caller authenticates and enumerates

@@ -66,6 +66,16 @@ pub enum AtemError {
     /// The object was used out of order (a step already taken, a state it
     /// isn't in).
     State { detail: String },
+    /// A member's verifier report, its challenge or its build refused
+    /// (`atem_client::member_report`; Astation #101): the verifier's codes
+    /// in their order (`malformed`, `frozen`, `wrong_account`,
+    /// `unknown_signer`, `signer_expired`, `bad_signature`, `stale_log`,
+    /// `fork`, `signer_mismatch`, `slot_mismatch`, `challenge_mismatch`,
+    /// `expired`), and the reporter's `origin_mismatch` (a challenge for
+    /// another Station) and `signing_failed` (the provider declined or
+    /// failed). A new variant: an app that switches over `AtemError`
+    /// exhaustively needs a source change.
+    Report { code: String, detail: String },
 }
 
 impl AtemError {
@@ -79,7 +89,8 @@ impl AtemError {
             | AtemError::Restore { code, .. }
             | AtemError::Publish { code, .. }
             | AtemError::Push { code, .. }
-            | AtemError::Stored { code, .. } => code.clone(),
+            | AtemError::Stored { code, .. }
+            | AtemError::Report { code, .. } => code.clone(),
             AtemError::BadWelcome { .. } => "bad_welcome".into(),
             AtemError::Request { .. } => "request".into(),
             AtemError::State { .. } => "state".into(),
@@ -129,7 +140,8 @@ impl std::fmt::Display for AtemError {
             | AtemError::Restore { code, detail }
             | AtemError::Publish { code, detail }
             | AtemError::Push { code, detail }
-            | AtemError::Stored { code, detail } => write!(f, "{code}: {detail}"),
+            | AtemError::Stored { code, detail }
+            | AtemError::Report { code, detail } => write!(f, "{code}: {detail}"),
             AtemError::Membership { detail, index, .. } => match index {
                 Some(i) => write!(f, "membership_invalid at {i}: {detail}"),
                 None => write!(f, "membership_invalid: {detail}"),
@@ -284,6 +296,17 @@ impl From<atem_client::control::RecordRefusal> for AtemError {
 impl From<FramingError> for AtemError {
     fn from(e: FramingError) -> Self {
         AtemError::malformed(&e.to_string())
+    }
+}
+
+impl From<atem_client::member_report::ReportRefusal> for AtemError {
+    /// A report, challenge or build refused: `Report{code}`, `detail` the
+    /// refusal as text (a `malformed` names the part).
+    fn from(r: atem_client::member_report::ReportRefusal) -> Self {
+        AtemError::Report {
+            code: r.code().into(),
+            detail: r.to_string(),
+        }
     }
 }
 
