@@ -39,7 +39,10 @@ while IFS= read -r line; do
             text=${text%"$esc[201~"*}
             t=$(json_escape "$text")
             # Now, in ms (as Claude Code writes it): a remote prompt pairs
-            # only with a transcript entry from after its paste.
+            # only with a transcript entry from after its paste. Taken when
+            # the prompt is submitted, before its UserPromptSubmit hook runs,
+            # and used for the whole turn: the worst case an agent may stamp
+            # (Atem never pairs an entry with its hook by their times).
             ts=$(python3 -I -c 'import time; t = time.time(); print(time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + ".%03dZ" % (int(t * 1000) % 1000))')
             fire "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$session\",\"prompt\":\"$t\",\"prompt_id\":\"p-$n\"}"
             log "{\"type\":\"user\",\"uuid\":\"u-$n\",\"promptId\":\"p-$n\",\"timestamp\":\"$ts\",\"message\":{\"role\":\"user\",\"content\":\"$t\"}}"
@@ -48,6 +51,10 @@ while IFS= read -r line; do
             fire "{\"hook_event_name\":\"PostToolUse\",\"session_id\":\"$session\",\"tool_name\":\"Bash\"}"
             log "{\"type\":\"user\",\"uuid\":\"r-$n\",\"promptId\":\"p-$n\",\"timestamp\":\"$ts\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tool-$n\",\"content\":\"hi\"}]}}"
             log "{\"type\":\"assistant\",\"uuid\":\"a-$n-2\",\"promptId\":\"p-$n\",\"timestamp\":\"$ts\",\"message\":{\"id\":\"msg-$n\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"reply $n\"}],\"stop_reason\":\"end_turn\"}}"
+            # The Stop hook runs after the transcript's end_turn, and Atem's
+            # 200 ms poll may read it a pass later (as on slower hosts):
+            # the transcript end alone must make the session ready.
+            sleep 0.3
             fire "{\"hook_event_name\":\"Stop\",\"session_id\":\"$session\"}"
             ;;
         exit) exit 0 ;;
