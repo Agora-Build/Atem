@@ -3021,13 +3021,16 @@ table of `host-work.sqlite`, made only with the hook on):
   crash after it sends the result at the next start, from the one row the
   book holds. A store whose control state doesn't load for its identity
   keeps the result in the book's table, for the start that reads it. With
-  `host.delegated` alone (no `host.senders`) host-work writes no
-  host-sender effects, so no entry is reported. Where the agreed text is
-  silent, **Atem's readings, for Astation's confirmation**:
+  `host.senders` off (`host.delegated` alone) host-work writes no
+  host-sender effects and no entry result goes, ones an earlier run wrote
+  included: they wait in the table as they are (never marked sent, never
+  removed) and go once `host.senders` is on again. Where the agreed text
+  is silent, **Atem's readings, for Astation's confirmation**:
   - **Applied, never pending.** Host-work writes an entry's effects in its
-    pass after the device list commits the entry (one pass later at most),
-    and while it can't write them (a receipt-database fault) it can't
-    write a result either, so the host reports an entry only with its
+    pass after the device list commits the entry (one pass later at most
+    while hosting runs), and while it can't write them (a receipt-database
+    fault) it can't write a result either, so the host reports an entry
+    only with its
     effects: the revocation `applied`, and the interrupt `applied` when
     the entry carries `interrupt_running: true`, with no reason. It never
     sends `pending` (`revoke_not_applied`, which rule 10 still defines for
@@ -3038,10 +3041,13 @@ table of `host-work.sqlite`, made only with the hook on):
     revocation's first; a native's `interrupt_running` for the same
     `revoke_seq` waits (`pending`) until host-work's applied `seq` reaches
     the entry, and is then `duplicate` (§11.1, rule 4).
-  - **Every revoke entry, whoever carried it.** The host reports each
-    `host_sender_revoke` of its device list, this host's own revocation as
-    a sender included (no host sends to itself, so that revocation is in
-    force on it at once); the Station picks the hosts it waits for. The
+  - **Every revoke entry of another host, whoever carried it.** The host
+    reports each `host_sender_revoke` of another host in its device list;
+    the Station picks the hosts it waits for. It doesn't report this
+    host's own revocation as a sender: nothing on this host applies it (no
+    host sends to itself, and this host's own sends stop by its committed
+    list, not by host-work's effects), so an `applied` would say nothing,
+    as a removal of this host has no host-work effect here either. The
     device list is its authority, not the carrier: an entry the host's own
     fetch, a carriage or a native's channel brought is reported alike (a
     carried control record's result, by contrast, goes on its channel
@@ -3050,13 +3056,19 @@ table of `host-work.sqlite`, made only with the hook on):
     it from a later resend.
   - **Resends.** In force and bounded by no deadline, an entry's result
     goes once per connection ("When a host acknowledges" above: "any other
-    in-force result") and stays in the book, as a native record's does; it
-    is never one of a principal's bounded results (those are entirely
-    `duplicate`).
+    in-force result"), unchanged (its `applied_seq` as written), and stays
+    in the book, as a native record's does; it is never one of a
+    principal's bounded results (those are entirely `duplicate`). Once
+    host-work has applied a later `host_sender_readmit` of the same host,
+    that revocation is no longer in force: its result stays in the book
+    (marked with the readmit's `seq`) but is no longer sent, across
+    restarts too; a revoke and its readmit applied in one catch-up write
+    it already marked.
   - **A new identity's store** applies the device list's entries from its
-    start (its applied `seq` begins at 0), so it reports every revoke entry
-    again, `applied`, under its own claim, as it does the stops it reads
-    from the feed ("Only this identity's store" above).
+    start (its applied `seq` begins at 0), so it reports again, `applied`,
+    under its own claim, each revoke entry still in force at its applied
+    `seq` (one a later readmit lifted is kept, never sent), as it does the
+    stops it reads from the feed ("Only this identity's store" above).
   - **The reference ledger** (`AckLedger::ack`) takes an ack with entry
     results, checking them as the reader does, and counts nothing from
     them: a host sender has no integration to report to the Portal, and an
@@ -5052,8 +5064,11 @@ debug-only hook.
   effects and sent as a record's result is. Where the agreed wire rules
   are silent, Atem's readings, for Astation's confirmation: never
   `pending` (reported only with the effects, `applied`), every revoke
-  entry whoever carried it (this host's own revocation included), once
-  per connection and kept, again under a new identity, and counted by
+  entry of another host whoever carried it (never this host's own
+  revocation as a sender), once per connection and unchanged until a
+  later readmit of the same host lifts it (then kept, never sent), none
+  while `host.senders` is off (rows an earlier run wrote wait), again
+  under a new identity for the revokes still in force, and counted by
   nothing in the reference ledger.
 
 [c-6903887341]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-6903887341
