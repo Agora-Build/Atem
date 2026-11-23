@@ -264,10 +264,10 @@ them as follows:
 |---|---|
 | `UserPromptSubmit`, `PreToolUse` | `working` |
 | `Notification` asking for permission | `waiting` (approve on the card or in the terminal) |
-| `Stop` | `ready` (and `complete`, below) |
+| `Stop` | `ready` (and `complete`, below), unless read late (below) |
 | `SessionStart` `startup`/`clear`, or a different transcript | `ready`; the draft mark is reset |
 | `SessionStart` `compact`/`resume` on the transcript being read (or any `SessionStart` on it while a turn is in progress) | unchanged: the turn, a prompt waiting for acceptance and the draft mark stay |
-| transcript: assistant entry with `stop_reason: "end_turn"`, or the interrupt marker after Esc | `ready` (and `complete`, outcome `interrupted` for an interrupt), even if `Stop` was missed |
+| transcript: assistant entry with `stop_reason: "end_turn"`, or the interrupt marker after Esc | `ready` (and `complete`, outcome `interrupted` for an interrupt), even if `Stop` was missed; not while the next prompt's hook waits for its entry (below) |
 | agent process exits | `unknown`; the generation is retired |
 | no `SessionStart`, or chat withdrawn | `unknown`, capability removed |
 
@@ -287,21 +287,137 @@ Atem reads the transcript to its end and sends what it found before
 
 A `Stop` can be read late. The transcript's `end_turn` makes the session ready
 before that turn's `Stop` hook is read, so the next prompt may go in first.
-A `Stop` recorded (by its event file's time) before the transcript entry that
-began the current, still open turn is an earlier turn's: it ends nothing of
-the current turn, neither `complete` nor `ready`. On a filesystem that keeps
+A `Stop` recorded before the current, still open turn began is an earlier
+turn's: it ends nothing of the current turn, neither `complete` nor `ready`. The
+`Stop` (by its event file's time) is weighed against two starts: the event file
+of the prompt hook the turn's entry answered (below), and the entry's own time.
+It is an earlier turn's when surely before either. A turn's own `Stop` comes
+after its prompt's hook ran and after its prompt was submitted, so it is before
+neither, however early the agent stamps the entry. Either start can be the
+later one. An entry stamped at its prompt's submission reads before its hook.
+The hook an entry answered may be an older equal prompt's whose own entry never
+came (Esc during the hook check, then the same text again), since entries
+answer the oldest waiting hook of their prompt. On a filesystem that keeps
 whole seconds (a time counts to the end of its second), a `Stop` in the same
-second as that entry is stale only while the previous turn's own `Stop` is
-still owed (its transcript end was read, its hook not); otherwise it is the
-current turn's own, which is never dropped. When the current turn's user entry
-is no longer retained or has no time, a `Stop` applies as before. Codex has no
-hook turn end (its rollout's end record ends the turn), so the rule is
-Claude's. Known limits: the owed mark isn't carried across a broker restart, so
-right after one, on a whole-second filesystem, a same-second `Stop` of the
-previous turn still counts as the current turn's; and a previous turn's `Stop`
-read after the new turn's prompt hook but before its transcript entry isn't
-recognized (no turn start is known yet): it makes the session `ready` while the
-new turn runs, though it completes no receipt.
+second as a start is stale only while the previous turn's own `Stop` is still
+owed (its transcript end was read, its hook not); otherwise it is the current
+turn's own, which is never dropped. When neither start is known (no hook, its
+entry no longer retained or with no time), a `Stop` applies as before. The owed
+mark and the hook's time go with the worker's chat snapshot (and a catch-up
+after dropped items), so a broker that adopts the worker after a restart
+decides as the worker does. This rule, like #126's hold, relies on a prompt's
+hook running when the prompt goes in, after the previous turn's `Stop`, or on
+its entry being stamped after that `Stop`. A hook run while the prompt is only
+queued during the previous turn, with its entry stamped then too, would defeat
+both.
+
+Claude runs the `UserPromptSubmit` hook before it writes the prompt's
+transcript entry, so a pass can read the next prompt's hook and not yet its
+entry: no turn start is known, but the prompt went in. Atem keeps such hooks in
+a queue, oldest first, until their entries are read. Claude writes entries in
+prompt order, so an entry answers the oldest waiting hook it pairs with: the
+hook naming its turn (only Codex's hooks name one), else the hook with the same
+prompt (compared as acceptance compares it, whitespace-blind). Every older
+waiting hook goes with it: their entries came, or never will. The times never
+decide a pairing: Claude may stamp an entry when its prompt was submitted,
+before the hook ran (the chat tests' fake agent does). So:
+
+- A queued prompt equal to the running turn's (`continue` twice) waits as a new
+  prompt's hook, since turn 1's entry already answered turn 1's hook.
+- An older entry with the same prompt, read late in the hook's pass, answers
+  the older hook, not the newer one.
+- A turn ends `ready` at its transcript end, without waiting for its `Stop`,
+  however its entries are stamped, and even when it ends within its hook's
+  second on a filesystem keeping whole seconds.
+
+An entry that pairs with no waiting hook ends every wait if it was recorded
+surely after the newest hook: its prompt was submitted after that hook ran, so
+every waiting hook's entry came or never will (its own text was recorded
+otherwise than the hook gave it). An entry stamped early can only miss this,
+leaving the hooks waiting. Else it is kept as possibly ahead of its own hook,
+which, read before the turn ends, then waits for nothing.
+
+While a hook waits, no turn end recorded before the newest one (or in its
+second, on a filesystem keeping whole seconds) makes the session `ready`. A
+`Stop` that finds no open turn is the previous turn's, read late: it ends
+nothing. One that ends the open turn, or a transcript end, is that turn's own:
+it still sends `complete` (its receipt completes as before), but the session
+stays `working` for the new turn. A turn end recorded surely after the newest
+hook applies as before.
+
+Where times are compared, and why an entry stamped at its prompt's submission,
+before its hook, can't fool them:
+
+- **A turn end against the newest waiting hook.** The end is a `Stop` (an event
+  file's time) or a transcript end (when the reply ended, after its hook). A
+  stamp only the user entry carries never takes part. An agent that stamps the
+  transcript end early too (the chat tests' fake stamps a whole turn at the
+  prompt's submission) only makes it held more, toward `working`, and only
+  while its own hook still waits. The turn's `Stop` then releases it; an
+  interrupted turn has no `Stop`, so it is released by the next entry.
+- **A `Stop` against the open turn's starts: the hook its entry answered (an
+  event file), and the entry's time.** It is stale only if surely before
+  either. A turn's own `Stop` comes after its prompt's hook ran and after its
+  prompt was submitted, so an entry stamped at submission still reads before
+  its own turn's `Stop`, and no genuine end is dropped. The entry's term guards
+  against a paired hook that is an older equal prompt's.
+- **An unpaired entry surely after the newest waiting hook.** Stamping it early
+  only fails toward waiting.
+- **A chat prompt's hook and entry against its paste** (acceptance). A prompt
+  is submitted, and stamped, after it was pasted.
+
+The waiting hooks, an entry ahead and the count of dropped hooks go with the
+worker's chat snapshot and a catch-up, like the owed mark, so an adopting
+broker decides as the worker does. Each prompt is carried as a digest, not as
+text: the SHA-256 of its text with whitespace runs squashed, which is what the
+matching compares. For a very long prompt (over 128 KiB, or one whose escaping
+takes its item over the worker's 192 KiB bound) the broker sees a cut copy,
+whose digest may not match its hook's. That hook then waits, failing toward
+`working`, until a later entry recorded surely after it, or the next prompt's
+entry, ends the wait.
+
+At most 8 hooks wait (a carried queue is bound the same way when a broker
+restores or catches up). Past that the oldest goes, counted; the newest, which
+decides what a turn end may do, always stays. While a dropped hook's entry may
+still come, an entry pairing the newest hook may be that one, so the newest
+keeps its wait (failing toward `working`, for that turn). This happens at most
+as many times as hooks were dropped (at most 8), and a turn's own end, surely
+after its own hook, is `ready` all the same (within the hook's second, on a
+filesystem keeping whole seconds, it waits for the next prompt's entry). In practice the queue holds one or two
+hooks (prompts queued in the terminal); a run of commands whose entries the
+reader skips (below) is what fills it.
+
+An entry lost on its way to the broker (its backlog's bound) leaves its hook
+waiting there. That holds only ends not surely after the hook, and lasts until
+the catch-up that the gap triggers (the worker's queue replaces the broker's),
+or until the next prompt's entry ends every older wait. The worker reads every
+entry.
+
+Codex has no hook turn end (its `Stop` only wakes the rollout reader), so the
+`Stop` rules are Claude's. The waiting hook holds a Codex rollout's turn end the
+same way, its entry told by the turn its hook names (Codex writes the new turn's
+`task_started` before the prompt's hook, so that pass ends `working` either
+way; it no longer shows `ready` within it).
+
+Known limits, each failing closed (`working`, so no prompt goes in):
+
+- A prompt whose entry never comes: a hook of the user's blocked it (a
+  `UserPromptSubmit` hook's exit 2, or a hook's `onFailure: "block"`), or Esc
+  was pressed while hooks still checked it. Its turn never runs, so the
+  `working` its hook set lasts until a later turn ends (typed in the
+  terminal), a `/clear` or the agent's exit. This was already so before #126,
+  except that the previous turn's `Stop` or transcript end, read in that
+  hook's own pass, made the session `ready` by accident; neither does now.
+- Typed skills and custom commands fire the prompt hook, but Atem's transcript
+  reader skips their entries (`<command-…>`, `isMeta`). The hook waits until the
+  next regular prompt's entry ends it. Only an end within the hook's second
+  (a filesystem keeping whole seconds) is held by it meanwhile.
+- A prompt whose entry Atem reads with another text (its words differ from the
+  hook's) pairs only by time, and an early stamp keeps it from pairing at all.
+  Its hook then waits until the next prompt's entry, holding only the ends not
+  surely after it: its own turn's end within the hook's second (a filesystem
+  keeping whole seconds), or, if the entry was stamped early, an end the agent
+  stamped with the prompt's own time.
 
 ### Sending a prompt from chat
 
@@ -636,7 +752,8 @@ and a failure is a session notice (Codex starts anyway).
   went there), or the person at the terminal says it was answered (the
   prefix, then `a`: "approval answered"); never a Stop, a plain
   `task_complete`, a reply or a tool result — `ready` at `task_complete` /
-  `turn_aborted` otherwise.
+  `turn_aborted` otherwise (not while the next prompt's hook waits for its
+  entry: "A `Stop` can be read late" above).
   Codex's waits outlast the turn: Codex (0.163, its exec cell) may end the
   turn while the approval still waits, or with its dialog still open, so a
   plain turn end neither closes an open approval nor makes the session

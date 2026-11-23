@@ -7,9 +7,14 @@
 //! (the log is in hand first). A hook `TurnEnded` that arrives alone is still
 //! authoritative: it emits `Complete { Done }` and marks the turn completed; a later
 //! log `TurnEnded` for that turn is ignored, so a turn never completes twice. A
-//! hook `TurnEnded` recorded before the transcript entry that began the current
-//! turn is an earlier turn's, read late (its log end made the session ready and
-//! the next prompt went in): it ends nothing (`ends_an_earlier_turn`).
+//! hook `TurnEnded` recorded surely before either the prompt hook the current
+//! turn's entry answered or that entry is an earlier turn's, read late (its log
+//! end made the session ready and the next prompt went in): it ends nothing
+//! (`ends_an_earlier_turn`). The
+//! agent runs a prompt hook just before it writes the prompt's entry, so a pass
+//! can read the hook and not yet the entry: no turn end recorded before that
+//! hook (a hook's or the log's) makes the session ready, and a hook `TurnEnded`
+//! that finds no open turn to end ends nothing (`prompted_since`).
 use crate::chat::adapter::{AgentEvent, ApprovalCard, LogItem, Outcome, Part};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -207,9 +212,10 @@ impl Pending {
 
 /// A chat session's state, for a broker that connects to a running agent's
 /// worker (the worker's session is the authoritative one): status, the
-/// input mark, the current and last completed turn, and the newest history.
-/// Prompt acceptance in flight is not carried (it belongs to the broker that
-/// submitted).
+/// input mark, the current and last completed turn, a turn end whose hook is
+/// owed, the prompts waiting to be paired (hooks and an entry, by digest),
+/// and the newest history. Prompt acceptance in flight is not carried (it
+/// belongs to the broker that submitted).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatSnapshot {
     pub started: bool,
@@ -237,6 +243,29 @@ pub struct ChatSnapshot {
     /// The turn ended while it held.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub held_past_turn: bool,
+    /// A turn the log ended whose turn-end hook isn't read yet (Claude's
+    /// `Stop`): a hook turn end in the same second as the current turn's
+    /// start (a filesystem keeping whole seconds) is that earlier turn's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_end_owed: Option<String>,
+    /// Prompt hooks whose transcript entries aren't read yet, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting_prompts: Vec<PromptMark>,
+    /// A transcript entry no waiting hook paired with: its hook may be read
+    /// a pass after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_ahead: Option<PromptMark>,
+    /// Waiting hooks the bound dropped whose entries may still come.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub prompts_dropped: usize,
+    /// When the hook of the current turn's prompt was recorded (unix ms),
+    /// when its entry paired with one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_hook_at: Option<i64>,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 pub struct ChatSession {
@@ -281,6 +310,100 @@ pub struct ChatSession {
     /// hook turn end from the same second as the current turn's start (a
     /// filesystem keeping whole seconds) is that turn's.
     hook_end_owed: Option<String>,
+    /// Prompt hooks whose transcript entries aren't read yet, oldest
+    /// first (at most `MAX_WAITING_PROMPTS`). The agent runs a prompt's
+    /// hook just before it writes its entry, so a pass can read the hook
+    /// and not yet the entry: no turn start is known, but the prompt went
+    /// in. A turn end not surely after the newest makes nothing ready.
+    waiting: VecDeque<PromptMark>,
+    /// The newest transcript entry no waiting hook paired with: its hook
+    /// may be read a pass after it (before its turn ends), and then waits
+    /// for nothing.
+    entry_ahead: Option<PromptMark>,
+    /// Waiting hooks the bound dropped whose entries may still come (at
+    /// most `MAX_WAITING_PROMPTS`): while any may, an entry never ends the
+    /// newest hook's wait (it may be a dropped hook's).
+    prompts_dropped: usize,
+    /// When the hook of the current turn's prompt was recorded (its event
+    /// file's time), when its entry paired with one: a turn ends after its
+    /// prompt's hook, whatever time its entry carries.
+    turn_hook_at: Option<i64>,
+}
+
+/// Prompt hooks kept waiting for their entries; the oldest go first. In
+/// practice one or two wait at a time (prompts queued in the terminal).
+const MAX_WAITING_PROMPTS: usize = 8;
+
+/// A prompt as the agent recorded it: by its hook, or by its transcript
+/// entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptMark {
+    /// When it was recorded (unix ms): a hook's event file time, an
+    /// entry's log time (0 when unknown).
+    pub at_ms: i64,
+    /// Its turn: an entry's, or the one a hook names (Codex's do).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    /// SHA-256 (hex) of the prompt, normalized as `same_prompt` compares.
+    pub prompt: String,
+}
+
+impl PromptMark {
+    fn new(text: &str, at_ms: i64, turn_id: Option<String>) -> Self {
+        use sha2::{Digest, Sha256};
+        Self {
+            at_ms,
+            turn_id,
+            prompt: format!("{:x}", Sha256::digest(squash(text).as_bytes())),
+        }
+    }
+
+    /// The hook `self` and the transcript `entry` are one prompt's: of the
+    /// turn the hook names (Codex), else (Claude's hooks name none) the
+    /// same prompt. Never the times: an agent may stamp an entry when its
+    /// prompt was submitted, before its hook ran.
+    fn pairs(&self, entry: &PromptMark) -> bool {
+        match (&self.turn_id, &entry.turn_id) {
+            (Some(hook), Some(turn)) => hook == turn,
+            _ => self.prompt == entry.prompt,
+        }
+    }
+}
+
+/// A recorded time (unix ms) as the span it may stand for: one with no
+/// sub-second part (a filesystem or a log keeping whole seconds) is
+/// anywhere in its second. The event reader counts an event file's whole
+/// second to its end (`…999`); a log's whole second reads `…000`.
+#[derive(Debug, Clone, Copy)]
+enum Recorded {
+    Event(i64),
+    Log(i64),
+}
+
+impl Recorded {
+    fn earliest(self) -> i64 {
+        match self {
+            Recorded::Event(t) if t % 1000 == 999 => t - 999,
+            Recorded::Event(t) | Recorded::Log(t) => t,
+        }
+    }
+
+    fn latest(self) -> i64 {
+        match self {
+            Recorded::Log(t) if t % 1000 == 0 => t + 999,
+            Recorded::Event(t) | Recorded::Log(t) => t,
+        }
+    }
+
+    /// Surely before `other`.
+    fn before(self, other: Recorded) -> bool {
+        self.latest() < other.earliest()
+    }
+
+    /// Surely after `other`.
+    fn after(self, other: Recorded) -> bool {
+        self.earliest() > other.latest()
+    }
 }
 
 /// Redact credential values (names are kept). See `memory::secrets::redact_secrets`.
@@ -315,8 +438,26 @@ pub fn clean_prompt(text: &str) -> Result<&str, &'static str> {
 /// store a pasted prompt as several text blocks, which the adapter joins
 /// with newlines).
 fn same_prompt(a: &str, b: &str) -> bool {
-    let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     a.trim() == b.trim() || squash(a) == squash(b)
+}
+
+/// Waiting prompt hooks as carried (a snapshot), with the count of those
+/// dropped, bound as when they wait live: the newest
+/// `MAX_WAITING_PROMPTS`, the oldest dropped first (and counted).
+fn bounded(prompts: Vec<PromptMark>, dropped: usize) -> (VecDeque<PromptMark>, usize) {
+    let mut waiting = VecDeque::from(prompts);
+    let mut dropped = dropped;
+    while waiting.len() > MAX_WAITING_PROMPTS {
+        waiting.pop_front();
+        dropped += 1;
+    }
+    (waiting, dropped.min(MAX_WAITING_PROMPTS))
+}
+
+/// `text`'s words, one space between them: what `same_prompt` compares
+/// (trimmed equality implies it).
+fn squash(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn truncate_at(text: &str, max: usize) -> &str {
@@ -429,6 +570,10 @@ impl ChatSession {
             wait_held: false,
             held_past_turn: false,
             hook_end_owed: None,
+            waiting: VecDeque::new(),
+            entry_ahead: None,
+            prompts_dropped: 0,
+            turn_hook_at: None,
         }
     }
 
@@ -509,6 +654,11 @@ impl ChatSession {
             last_evicted_turn: self.last_evicted_turn.clone(),
             wait_held: self.wait_held,
             held_past_turn: self.held_past_turn,
+            hook_end_owed: self.hook_end_owed.clone(),
+            waiting_prompts: self.waiting.iter().cloned().collect(),
+            entry_ahead: self.entry_ahead.clone(),
+            prompts_dropped: self.prompts_dropped,
+            turn_hook_at: self.turn_hook_at,
         }
     }
 
@@ -528,6 +678,11 @@ impl ChatSession {
         session.last_outcome = snapshot.last_outcome;
         session.wait_held = snapshot.wait_held;
         session.held_past_turn = snapshot.held_past_turn;
+        session.hook_end_owed = snapshot.hook_end_owed;
+        (session.waiting, session.prompts_dropped) =
+            bounded(snapshot.waiting_prompts, snapshot.prompts_dropped);
+        session.entry_ahead = snapshot.entry_ahead;
+        session.turn_hook_at = snapshot.turn_hook_at;
         for message in snapshot.history {
             session.push_message(message);
         }
@@ -727,7 +882,9 @@ impl ChatSession {
     /// Catches up with the worker's `snapshot` state (its history replaced
     /// this one's after items were dropped on the way): the turn the worker
     /// saw end completes here too (with its outcome), and status, the
-    /// current turn and the input mark follow the worker's.
+    /// current turn, the input mark, the owed turn end and the prompts
+    /// waiting to be paired follow the worker's (this session's own hooks
+    /// may wait for entries dropped on the way).
     pub fn catch_up(&mut self, snapshot: &ChatSnapshot) -> Vec<Out> {
         let mut out = Vec::new();
         if self.exited {
@@ -749,6 +906,11 @@ impl ChatSession {
         self.input_mark = snapshot.input_mark;
         self.wait_held = snapshot.wait_held;
         self.held_past_turn = snapshot.held_past_turn;
+        self.hook_end_owed = snapshot.hook_end_owed.clone();
+        (self.waiting, self.prompts_dropped) =
+            bounded(snapshot.waiting_prompts.clone(), snapshot.prompts_dropped);
+        self.entry_ahead = snapshot.entry_ahead.clone();
+        self.turn_hook_at = snapshot.turn_hook_at;
         self.set_status(
             snapshot.state,
             snapshot.detail.as_deref(),
@@ -901,6 +1063,7 @@ impl ChatSession {
             } => {
                 // A new turn: a held wait goes on into it.
                 self.held_past_turn = false;
+                let hook = at_ms.map(|at| PromptMark::new(&text, at, turn_id.clone()));
                 // The first hook from after the paste whose turn isn't
                 // known to be another decides.
                 if let Some(p) = &mut self.pending
@@ -917,6 +1080,9 @@ impl ChatSession {
                         p.hook_seen = true;
                         p.hook_turn = turn_id;
                     }
+                }
+                if let Some(hook) = hook {
+                    self.hook_read(hook);
                 }
                 if self.live() {
                     self.set_status(State::Working, None, now_ms, &mut out);
@@ -957,63 +1123,157 @@ impl ChatSession {
             AgentEvent::TurnEnded { .. } if !self.started => {}
             AgentEvent::TurnEnded { at_ms } => {
                 let earlier = at_ms.is_some_and(|at| self.ends_an_earlier_turn(at));
+                let prompted = at_ms.is_some_and(|at| self.prompted_since(Recorded::Event(at)));
                 // Whichever turn it ended, its hook is read now.
                 self.hook_end_owed = None;
-                if earlier {
+                let open = self.open_turn();
+                if earlier || (prompted && open.is_none()) {
                     // An earlier turn's end read only now (its log entry
                     // made the session ready, and the next prompt went in
-                    // meanwhile): it ends nothing of the current turn.
+                    // meanwhile, its entry read or not yet): it ends
+                    // nothing of the current turn, nor the link a timed-out
+                    // chat prompt's entry may still claim (`expired`), nor
+                    // an entry ahead of its hook.
                     return out;
                 }
+                // A late prompt hook is read before its turn ends.
+                self.entry_ahead = None;
                 self.expired = None;
-                let turn = self.current_turn.as_ref().map(|(t, _)| t.clone());
-                if let Some(turn) = turn
-                    && self.last_completed.as_deref() != Some(turn.as_str())
-                {
+                if let Some(turn) = open {
                     self.complete(turn, Outcome::Done, &mut out);
                 }
                 self.input_mark = input_count;
-                self.after_turn(now_ms, &mut out);
+                // Unless the next prompt went in after it (its entry not
+                // read yet): its turn runs.
+                if !prompted {
+                    self.after_turn(now_ms, &mut out);
+                }
             }
         }
         out
     }
 
+    /// The current turn, unless it ended.
+    fn open_turn(&self) -> Option<String> {
+        self.current_turn
+            .as_ref()
+            .map(|(t, _)| t)
+            .filter(|t| self.last_completed.as_ref() != Some(*t))
+            .cloned()
+    }
+
+    /// When the transcript entry that began `turn` was recorded (unix ms),
+    /// while it is retained and has a time.
+    fn turn_start(&self, turn: &str) -> Option<i64> {
+        self.history
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User && m.turn_id == turn)
+            .map(|m| m.created_at_ms)
+            .filter(|&t| t > 0)
+    }
+
+    /// A prompt hook read: it waits for its entry, unless that was read
+    /// already (the hook read a pass after it, or naming a turn already
+    /// begun). Past the bound the oldest waiting hook goes (counted); the
+    /// newest, which decides what a turn end may do, always stays.
+    fn hook_read(&mut self, hook: PromptMark) {
+        // A Codex hook naming the current turn starts none (one read late
+        // after its entry, or a prompt into the running turn).
+        if hook.turn_id.is_some() && hook.turn_id.as_deref() == self.current_turn_id() {
+            return;
+        }
+        if let Some(entry) = self.entry_ahead.take_if(|e| hook.pairs(e)) {
+            if entry.turn_id.as_deref() == self.current_turn_id() {
+                self.turn_hook_at = Some(hook.at_ms);
+            }
+            return;
+        }
+        while self.waiting.len() >= MAX_WAITING_PROMPTS {
+            self.waiting.pop_front();
+            self.prompts_dropped = (self.prompts_dropped + 1).min(MAX_WAITING_PROMPTS);
+        }
+        self.waiting.push_back(hook);
+    }
+
+    /// A transcript entry read; the time of the hook it answered, if one.
+    /// It answers the oldest waiting hook it pairs with (prompt order: an
+    /// older equal entry answers an older hook), and every older one goes
+    /// too (their entries came or never will). While hooks the bound
+    /// dropped may still get theirs, an entry pairing the newest may be a
+    /// dropped hook's: the newest keeps its wait (fail toward working, for
+    /// that turn). One that pairs with none ends every wait if recorded
+    /// surely after the newest hook: its prompt was submitted after that
+    /// hook ran, so every waiting hook's entry came or never will (an
+    /// entry stamped early only keeps them waiting). Else its own hook may
+    /// still be read.
+    fn entry_read(&mut self, entry: PromptMark) -> Option<i64> {
+        if let Some(i) = self.waiting.iter().position(|h| h.pairs(&entry)) {
+            self.entry_ahead = None;
+            if i + 1 == self.waiting.len() && self.prompts_dropped > 0 {
+                self.prompts_dropped -= 1;
+                self.waiting.drain(..i);
+                return None;
+            }
+            let at = self.waiting[i].at_ms;
+            self.waiting.drain(..=i);
+            return Some(at);
+        }
+        if entry.at_ms > 0
+            && self
+                .waiting
+                .back()
+                .is_some_and(|h| Recorded::Log(entry.at_ms).after(Recorded::Event(h.at_ms)))
+        {
+            self.waiting.clear();
+            self.prompts_dropped = 0;
+            self.entry_ahead = None;
+        } else {
+            self.entry_ahead = Some(entry);
+        }
+        None
+    }
+
+    /// A prompt went in after a turn end recorded at `end` (or, on a
+    /// filesystem keeping whole seconds, within its second) and its
+    /// transcript entry isn't read yet: that prompt's turn runs, so the end
+    /// makes nothing ready. A prompt's entry follows its hook at once and
+    /// the log is read after the hooks, so the end can't be that prompt's
+    /// turn's; one whose entry never comes (a hook blocked it) holds no end
+    /// recorded surely after it.
+    fn prompted_since(&self, end: Recorded) -> bool {
+        self.waiting
+            .back()
+            .is_some_and(|h| !end.after(Recorded::Event(h.at_ms)))
+    }
+
     /// A hook turn end recorded at `at` (unix ms, its event file's time;
     /// the reader counts a time with no sub-second part to the end of its
     /// second) belongs to an earlier turn than the current, still open one:
-    /// it was recorded before the transcript entry that began the current
-    /// turn. Within the same second (a filesystem or log keeping whole
-    /// seconds) it is an earlier turn's only while that turn's own hook is
-    /// still unread (its log ended it); otherwise it is the current turn's,
-    /// so a turn's own end is never dropped.
+    /// it was recorded surely before either the hook the turn's entry
+    /// answered (one event file's time against another's) or the turn's
+    /// entry. A turn's own Stop comes after its prompt's hook and after its
+    /// prompt was submitted, so it is before neither, however early the
+    /// agent stamps the entry. Either can be the later: an entry stamped at
+    /// its prompt's submission reads before the hook, and the hook an entry
+    /// answered may be an older equal prompt's whose own entry never came.
+    /// Within the same second (a filesystem keeping whole seconds) it is an
+    /// earlier turn's only while that turn's own hook is still unread (its
+    /// log ended it); otherwise it is the current turn's, so a turn's own
+    /// end is never dropped.
     fn ends_an_earlier_turn(&self, at: i64) -> bool {
-        let Some((turn, _)) = &self.current_turn else {
+        let Some(turn) = self.open_turn() else {
             return false;
         };
-        if self.last_completed.as_deref() == Some(turn.as_str()) {
-            return false;
-        }
-        let Some(start) = self
-            .history
-            .iter()
-            .rev()
-            .find(|m| m.role == Role::User && m.turn_id == *turn)
-            .map(|m| m.created_at_ms)
-            .filter(|&t| t > 0)
-        else {
-            return false;
-        };
-        if at < start {
-            return true;
-        }
-        let end_earliest = if at % 1000 == 999 { at - 999 } else { at };
-        let start_latest = if start % 1000 == 0 {
-            start + 999
-        } else {
-            start
-        };
-        end_earliest < start_latest && self.hook_end_owed.is_some()
+        let end = Recorded::Event(at);
+        let owed = self.hook_end_owed.is_some();
+        [
+            self.turn_hook_at.map(Recorded::Event),
+            self.turn_start(&turn).map(Recorded::Log),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|start| end.before(start) || (end.earliest() < start.latest() && owed))
     }
 
     /// The turn ended: ready, unless a permission wait that outlasts it
@@ -1122,6 +1382,8 @@ impl ChatSession {
                     self.user_messages
                         .insert(r.clone(), message.message_id.clone());
                 }
+                self.turn_hook_at =
+                    self.entry_read(PromptMark::new(&text, created_at_ms, Some(turn_id.clone())));
                 self.current_turn = Some((turn_id, request_id));
                 self.push_message(message.clone());
                 out.push(Out::Message(message));
@@ -1144,9 +1406,13 @@ impl ChatSession {
             }
             LogItem::TurnEnded { .. } if !self.started => {}
             LogItem::TurnEnded {
-                turn_id, outcome, ..
+                turn_id,
+                outcome,
+                at_ms,
             } => {
                 self.expired = None;
+                // A late prompt hook is read before its turn ends.
+                self.entry_ahead = None;
                 // Interrupted: nothing of the turn waits on (its tool call
                 // was cancelled, a dialog dismissed).
                 if outcome == Outcome::Interrupted {
@@ -1159,6 +1425,11 @@ impl ChatSession {
                     self.complete(turn_id, outcome, &mut out);
                 }
                 self.input_mark = input_count;
+                // The next prompt went in after this end (its hook read
+                // with it, its entry not yet): its turn runs.
+                if at_ms > 0 && self.prompted_since(Recorded::Log(at_ms)) {
+                    return out;
+                }
                 self.after_turn(now_ms, &mut out);
             }
             LogItem::Backfill(item) => self.on_backfill(*item),
@@ -2136,13 +2407,7 @@ mod tests {
     #[test]
     fn a_stop_read_after_the_next_prompt_began_ends_nothing_of_it() {
         for whole_seconds in [false, true] {
-            let file = |at: i64| {
-                if whole_seconds {
-                    at / 1000 * 1000 + 999
-                } else {
-                    at
-                }
-            };
+            let file = |at: i64| file_time(at, whole_seconds);
             let mut s = ready();
             submit_ok(&mut s, "r1", "first");
             s.mark_pasted("r1", Instant::now(), 1_000);
@@ -2233,6 +2498,1140 @@ mod tests {
         pass(&mut s, vec![], vec![user_at("u2", "t2", "next", 2_500)], 4);
         let o = pass(&mut s, vec![stop_at(2_600)], vec![], 5);
         assert_eq!(completes(&o).len(), 1, "{o:?}");
+    }
+
+    /// Some `Out::Status` in `outs` says ready.
+    fn says_ready(outs: &[Out]) -> bool {
+        outs.iter()
+            .any(|o| matches!(o, Out::Status(st) if st.state == State::Ready))
+    }
+
+    /// The time an event file shows for `at` (unix ms): on a filesystem
+    /// keeping whole seconds the reader counts it to the end of its second.
+    fn file_time(at: i64, whole_seconds: bool) -> i64 {
+        if whole_seconds {
+            at / 1000 * 1000 + 999
+        } else {
+            at
+        }
+    }
+
+    /// A session in turn 1 (`t1`), the remote prompt `r1`'s, accepted.
+    fn in_turn_one(whole_seconds: bool) -> ChatSession {
+        let mut s = ready();
+        submit_ok(&mut s, "r1", "first");
+        s.mark_pasted("r1", Instant::now(), 1_000);
+        let o = pass(
+            &mut s,
+            vec![prompt_hook_at("first", file_time(1_010, whole_seconds))],
+            vec![user_at("u1", "t1", "first", 1_020)],
+            1,
+        );
+        assert!(o.contains(&Out::Accepted {
+            request_id: "r1".into()
+        }));
+        s
+    }
+
+    /// Turn 2's entry (its prompt `text`), then its own end: it completes
+    /// once (with `r2` when it was a chat prompt), and only then is the
+    /// session ready.
+    fn turn_two_runs_to_its_end(
+        s: &mut ChatSession,
+        text: &str,
+        remote: bool,
+        whole_seconds: bool,
+        case: &str,
+    ) {
+        let o = pass(s, vec![], vec![user_at("u2", "t2", text, 2_700)], 10);
+        assert_eq!(
+            o.contains(&Out::Accepted {
+                request_id: "r2".into()
+            }),
+            remote,
+            "{case}: {o:?}"
+        );
+        assert!(!says_ready(&o), "{case}: {o:?}");
+        assert_eq!(s.status().state, State::Working, "{case}");
+        assert_eq!(s.current_turn_id(), Some("t2"), "{case}");
+        let o = pass(
+            s,
+            vec![stop_at(file_time(5_010, whole_seconds))],
+            vec![end_at("t2", 5_000)],
+            11,
+        );
+        assert_eq!(
+            completes(&o),
+            vec![&Out::Complete {
+                turn_id: "t2".into(),
+                request_id: remote.then(|| "r2".to_string()),
+                outcome: Outcome::Done
+            }],
+            "{case}"
+        );
+        assert_eq!(s.status().state, State::Ready, "{case}");
+    }
+
+    /// #126: turn 1's transcript end made the session ready before its
+    /// Stop hook was read; the next prompt went in. One pass reads turn 1's
+    /// Stop with turn 2's prompt hook, before turn 2's transcript entry
+    /// (Claude runs the hook before it writes the entry, so no turn start
+    /// is known yet); the next pass reads the entry. That Stop ends
+    /// nothing: the session stays working throughout, and a chat prompt in
+    /// between is refused. Turn 2 sent from chat or typed in the terminal
+    /// (then no chat prompt waits for acceptance, so only the status
+    /// refuses one); also on a filesystem keeping whole seconds, where turn
+    /// 1's Stop and turn 2's hook share a second.
+    #[test]
+    fn a_stop_read_with_the_next_prompts_hook_before_its_entry_keeps_it_working() {
+        for whole_seconds in [false, true] {
+            for remote in [true, false] {
+                let case = format!("whole seconds {whole_seconds}, remote {remote}");
+                let mut s = in_turn_one(whole_seconds);
+                // Turn 1's transcript end, its Stop not read yet.
+                let o = pass(&mut s, vec![], vec![end_at("t1", 1_500)], 2);
+                assert_eq!(completes(&o).len(), 1, "{case}: {o:?}");
+                assert_eq!(s.status().state, State::Ready, "{case}");
+                if remote {
+                    submit_ok(&mut s, "r2", "second");
+                    s.mark_pasted("r2", Instant::now(), 1_600);
+                }
+                // Turn 1's Stop and turn 2's prompt hook; no entry yet.
+                let o = pass(
+                    &mut s,
+                    vec![
+                        stop_at(file_time(1_550, whole_seconds)),
+                        prompt_hook_at("second", file_time(1_650, whole_seconds)),
+                    ],
+                    vec![],
+                    3,
+                );
+                assert!(completes(&o).is_empty(), "{case}: {o:?}");
+                assert!(!says_ready(&o), "{case}: {o:?}");
+                assert_eq!(s.status().state, State::Working, "{case}");
+                let r = s.submit("r3", "g1", "third", 0, false);
+                assert!(
+                    matches!(&r, Err(outs) if matches!(outs.as_slice(),
+                        [Out::Error { text, .. }] if text == "the agent is busy; wait for the current turn to finish")),
+                    "{case}: {r:?}"
+                );
+                turn_two_runs_to_its_end(&mut s, "second", remote, whole_seconds, &case);
+            }
+        }
+    }
+
+    /// The same race with turn 1's transcript end read in that pass too (a
+    /// prompt queued in the terminal goes in as the turn ends), with or
+    /// without turn 2's entry, or with turn 1 interrupted (no Stop): turn
+    /// 1's end completes it, but makes nothing ready while turn 2's prompt,
+    /// which went in after it, waits for its entry. Also when turn 2's
+    /// prompt is turn 1's again (`continue` twice): the hook is still a new
+    /// prompt's, not turn 1's own read late.
+    #[test]
+    fn a_turn_end_read_with_the_next_prompts_hook_keeps_it_working() {
+        for whole_seconds in [false, true] {
+            for second in ["second", "first"] {
+                for (outcome, entry_too) in [
+                    (Outcome::Done, false),
+                    (Outcome::Done, true),
+                    (Outcome::Interrupted, false),
+                ] {
+                    let case = format!(
+                        "whole seconds {whole_seconds}, prompt 2 {second:?}, {outcome:?}, entry {entry_too}"
+                    );
+                    let mut s = in_turn_one(whole_seconds);
+                    // Claude fires no Stop for an interrupted turn.
+                    let mut events = Vec::new();
+                    if outcome == Outcome::Done {
+                        events.push(stop_at(file_time(1_550, whole_seconds)));
+                    }
+                    events.push(prompt_hook_at(second, file_time(1_650, whole_seconds)));
+                    let mut log = vec![LogItem::TurnEnded {
+                        turn_id: "t1".into(),
+                        outcome,
+                        at_ms: 1_500,
+                    }];
+                    if entry_too {
+                        log.push(user_at("u2", "t2", second, 1_700));
+                    }
+                    let o = pass(&mut s, events, log, 2);
+                    assert_eq!(
+                        completes(&o),
+                        vec![&Out::Complete {
+                            turn_id: "t1".into(),
+                            request_id: Some("r1".into()),
+                            outcome
+                        }],
+                        "{case}"
+                    );
+                    assert!(!says_ready(&o), "{case}: {o:?}");
+                    assert_eq!(s.status().state, State::Working, "{case}");
+                    assert!(s.submit("r3", "g1", "third", 0, false).is_err(), "{case}");
+                    if entry_too {
+                        assert_eq!(s.current_turn_id(), Some("t2"), "{case}");
+                        let o = pass(
+                            &mut s,
+                            vec![stop_at(file_time(5_010, whole_seconds))],
+                            vec![end_at("t2", 5_000)],
+                            11,
+                        );
+                        assert_eq!(completes(&o).len(), 1, "{case}: {o:?}");
+                        assert_eq!(s.status().state, State::Ready, "{case}");
+                    } else {
+                        turn_two_runs_to_its_end(&mut s, second, false, whole_seconds, &case);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A genuine turn end is never dropped. Turn 1's own Stop read alone
+    /// ends it and completes its prompt's receipt, as before; read in one
+    /// pass with the next prompt's hook, before that prompt's entry, it
+    /// still ends turn 1 and completes its receipt, and only the status
+    /// stays with turn 2 (working). A prompt hook whose entry never comes
+    /// (a prompt blocked by a hook) holds no end recorded after it.
+    #[test]
+    fn a_turns_own_stop_still_ends_it_with_the_next_prompts_hook_pending() {
+        let r1_done = Out::Complete {
+            turn_id: "t1".into(),
+            request_id: Some("r1".into()),
+            outcome: Outcome::Done,
+        };
+        for whole_seconds in [false, true] {
+            let case = format!("whole seconds {whole_seconds}");
+            // Alone.
+            let mut s = in_turn_one(whole_seconds);
+            let o = pass(
+                &mut s,
+                vec![stop_at(file_time(1_500, whole_seconds))],
+                vec![],
+                2,
+            );
+            assert_eq!(completes(&o), vec![&r1_done], "{case}");
+            assert_eq!(s.status().state, State::Ready, "{case}");
+            // Its transcript end, read later, completes nothing more.
+            let o = pass(&mut s, vec![], vec![end_at("t1", 1_400)], 3);
+            assert!(completes(&o).is_empty(), "{case}: {o:?}");
+            assert_eq!(s.status().state, State::Ready, "{case}");
+
+            // With the next prompt's hook (its transcript end not read).
+            let mut s = in_turn_one(whole_seconds);
+            let o = pass(
+                &mut s,
+                vec![
+                    stop_at(file_time(1_500, whole_seconds)),
+                    prompt_hook_at("second", file_time(2_650, whole_seconds)),
+                ],
+                vec![],
+                2,
+            );
+            assert_eq!(completes(&o), vec![&r1_done], "{case}");
+            assert!(!says_ready(&o), "{case}: {o:?}");
+            assert_eq!(s.status().state, State::Working, "{case}");
+            // Its transcript end, read later, changes nothing.
+            let o = pass(&mut s, vec![], vec![end_at("t1", 1_400)], 3);
+            assert!(completes(&o).is_empty() && !says_ready(&o), "{case}: {o:?}");
+            turn_two_runs_to_its_end(&mut s, "second", false, whole_seconds, &case);
+
+            // A prompt hook with no entry, then turn 1's own end after it.
+            let mut s = in_turn_one(whole_seconds);
+            let o = pass(
+                &mut s,
+                vec![prompt_hook_at("blocked", file_time(1_300, whole_seconds))],
+                vec![],
+                2,
+            );
+            assert!(o.is_empty(), "{case}: {o:?}");
+            let o = pass(
+                &mut s,
+                vec![stop_at(file_time(2_510, whole_seconds))],
+                vec![end_at("t1", 2_500)],
+                3,
+            );
+            assert_eq!(completes(&o), vec![&r1_done], "{case}");
+            assert_eq!(s.status().state, State::Ready, "{case}");
+        }
+    }
+
+    type Pass = (Vec<AgentEvent>, Vec<LogItem>);
+
+    /// What a pass decides: the turns it completed (and how), and the
+    /// status after it.
+    fn decided(
+        s: &mut ChatSession,
+        (events, log): &Pass,
+        now: i64,
+    ) -> (Vec<(String, Outcome)>, State) {
+        let done = pass(s, events.clone(), log.clone(), now)
+            .into_iter()
+            .filter_map(|o| match o {
+                Out::Complete {
+                    turn_id, outcome, ..
+                } => Some((turn_id, outcome)),
+                _ => None,
+            })
+            .collect();
+        (done, s.status().state)
+    }
+
+    /// The worker's chat snapshot as it reaches a broker.
+    fn over_the_wire(worker: &ChatSession) -> ChatSnapshot {
+        let json = serde_json::to_string(&worker.snapshot(500, 1 << 20)).unwrap();
+        serde_json::from_str(&json).unwrap()
+    }
+
+    /// Checks that a broker adopting the worker after any of `passes`
+    /// (`restore`), or catching up after losing that pass (`catch_up`),
+    /// decides as the worker from then on; returns the worker's decisions.
+    fn brokers_decide_as_the_worker(
+        passes: &[Pass],
+        case: &str,
+    ) -> Vec<(Vec<(String, Outcome)>, State)> {
+        let mut worker = ready();
+        let all: Vec<_> = passes
+            .iter()
+            .enumerate()
+            .map(|(i, p)| decided(&mut worker, p, i as i64))
+            .collect();
+        for adopt in 1..passes.len() {
+            for caught_up in [false, true] {
+                let case = format!("{case}, adopted after pass {adopt}, caught up {caught_up}");
+                let mut worker = ready();
+                let mut broker = if caught_up {
+                    // Restored a pass earlier; that pass was lost on the
+                    // way, so the broker reloads the worker's history and
+                    // catches up with its state.
+                    for (i, p) in passes[..adopt - 1].iter().enumerate() {
+                        decided(&mut worker, p, i as i64);
+                    }
+                    let mut broker = ChatSession::restore("g2".into(), over_the_wire(&worker));
+                    decided(&mut worker, &passes[adopt - 1], adopt as i64 - 1);
+                    let snapshot = over_the_wire(&worker);
+                    broker.reload(snapshot.history.clone());
+                    broker.catch_up(&snapshot);
+                    broker
+                } else {
+                    for (i, p) in passes[..adopt].iter().enumerate() {
+                        decided(&mut worker, p, i as i64);
+                    }
+                    ChatSession::restore("g2".into(), over_the_wire(&worker))
+                };
+                assert_eq!(broker.status(), worker.status(), "{case}");
+                for (i, p) in passes.iter().enumerate().skip(adopt) {
+                    let w = decided(&mut worker, p, i as i64);
+                    let b = decided(&mut broker, p, i as i64);
+                    assert_eq!(b, w, "{case}, pass {i}");
+                    assert_eq!(w, all[i], "{case}, pass {i}");
+                }
+            }
+        }
+        all
+    }
+
+    /// A broker that adopts the worker mid-race decides as the worker does,
+    /// on a filesystem keeping whole seconds: the mark of a turn whose
+    /// transcript end was read and its Stop not yet goes with the snapshot
+    /// (`restore`), and with the catch-up after the broker lost a pass on
+    /// the way (`catch_up`). The races: turn 1's Stop read with turn 2's
+    /// prompt hook before turn 2's entry (#126), or with that entry too, in
+    /// its second (#125: only the mark tells that Stop is turn 1's). Turns
+    /// typed in the terminal (a worker's chat names no request).
+    #[test]
+    fn a_broker_adopting_the_worker_mid_race_decides_as_it_does() {
+        let at = |t: i64| file_time(t, true);
+        let start: Pass = (
+            vec![prompt_hook_at("first", at(1_010))],
+            vec![user_at("u1", "t1", "first", 1_020)],
+        );
+        let t1_ends: Pass = (vec![], vec![end_at("t1", 1_500)]);
+        let stop_and_hook = vec![stop_at(at(1_550)), prompt_hook_at("second", at(1_650))];
+        let t2_entry = user_at("u2", "t2", "second", 1_700);
+        let t2_ends: Pass = (vec![stop_at(at(5_010))], vec![end_at("t2", 5_000)]);
+        let races: [Vec<Pass>; 2] = [
+            vec![
+                start.clone(),
+                t1_ends.clone(),
+                (stop_and_hook.clone(), vec![]),
+                (vec![], vec![t2_entry.clone()]),
+                t2_ends.clone(),
+            ],
+            vec![start, t1_ends, (stop_and_hook, vec![t2_entry]), t2_ends],
+        ];
+        for (race, passes) in races.iter().enumerate() {
+            // The worker's own decisions: turn 2 runs until its end.
+            let mut worker = ready();
+            let all: Vec<_> = passes
+                .iter()
+                .enumerate()
+                .map(|(i, p)| decided(&mut worker, p, i as i64))
+                .collect();
+            let t2_done = all
+                .iter()
+                .position(|(done, _)| done.contains(&("t2".to_string(), Outcome::Done)));
+            assert_eq!(t2_done, Some(passes.len() - 1), "race {race}: {all:?}");
+            assert_eq!(all[1].1, State::Ready, "race {race}: {all:?}");
+            assert!(
+                all[2..passes.len() - 1]
+                    .iter()
+                    .all(|(_, state)| *state == State::Working),
+                "race {race}: {all:?}"
+            );
+            brokers_decide_as_the_worker(passes, &format!("race {race}"));
+        }
+    }
+
+    /// An older entry with the waiting hook's prompt, read in the hook's
+    /// pass, isn't that hook's entry (a stalled worker: turn 1, `continue`,
+    /// ran whole between two passes, and `continue` went in again): it
+    /// leaves the hook waiting, so turn 1's end makes nothing ready. On a
+    /// filesystem keeping whole seconds turn 2's own entry, in its hook's
+    /// second, can't be told from it either: the hook keeps waiting (fail
+    /// closed), and only an end after its second makes the session ready.
+    #[test]
+    fn an_older_entry_with_the_same_prompt_leaves_the_hook_waiting() {
+        for whole_seconds in [false, true] {
+            let case = format!("whole seconds {whole_seconds}");
+            let at = |t: i64| file_time(t, whole_seconds);
+            let mut s = ready();
+            // Turn 1's hook; its entry not read yet.
+            let o = pass(
+                &mut s,
+                vec![prompt_hook_at("continue", at(1_010))],
+                vec![],
+                1,
+            );
+            assert_eq!(s.status().state, State::Working, "{case}: {o:?}");
+            // Turn 1's entry, end and Stop with turn 2's hook, same prompt.
+            let o = pass(
+                &mut s,
+                vec![stop_at(at(1_550)), prompt_hook_at("continue", at(1_650))],
+                vec![user_at("u1", "t1", "continue", 1_020), end_at("t1", 1_500)],
+                2,
+            );
+            assert_eq!(completes(&o).len(), 1, "{case}: {o:?}");
+            assert!(!says_ready(&o), "{case}: {o:?}");
+            assert_eq!(s.status().state, State::Working, "{case}");
+            assert!(s.submit("r3", "g1", "third", 0, false).is_err(), "{case}");
+            turn_two_runs_to_its_end(&mut s, "continue", false, whole_seconds, &case);
+        }
+    }
+
+    /// On a filesystem keeping whole seconds a turn can end in its prompt
+    /// hook's second. Its entry answers its hook by the prompt (entries come
+    /// in prompt order), so the turn ends ready, in the worker and in a
+    /// broker that adopted it or caught up with it. So when two equal
+    /// prompts are queued within one second (`continue` twice): turn 1's
+    /// entry answers turn 1's hook, turn 2's waits for turn 2's entry, and
+    /// turn 1's end in that second makes nothing ready.
+    #[test]
+    fn a_turn_ending_in_its_hooks_second_ends_ready() {
+        let at = |t: i64| file_time(t, true);
+        let passes: Vec<Pass> = vec![
+            (
+                vec![prompt_hook_at("first", at(1_010))],
+                vec![user_at("u1", "t1", "first", 1_020)],
+            ),
+            (vec![stop_at(at(1_550))], vec![end_at("t1", 1_500)]),
+        ];
+        let all = brokers_decide_as_the_worker(&passes, "one turn");
+        assert_eq!(
+            all[1],
+            (vec![("t1".to_string(), Outcome::Done)], State::Ready)
+        );
+
+        // Two equal prompts within one second.
+        let mut s = ready();
+        pass(
+            &mut s,
+            vec![prompt_hook_at("continue", at(1_010))],
+            vec![user_at("u1", "t1", "continue", 1_100)],
+            1,
+        );
+        let o = pass(
+            &mut s,
+            vec![stop_at(at(1_550)), prompt_hook_at("continue", at(1_650))],
+            vec![end_at("t1", 1_500)],
+            2,
+        );
+        assert_eq!(completes(&o).len(), 1, "{o:?}");
+        assert!(!says_ready(&o), "{o:?}");
+        assert_eq!(s.status().state, State::Working);
+        assert!(s.submit("r3", "g1", "third", 0, false).is_err());
+        let o = pass(
+            &mut s,
+            vec![],
+            vec![user_at("u2", "t2", "continue", 1_700)],
+            3,
+        );
+        assert!(!says_ready(&o), "{o:?}");
+        assert_eq!(s.status().state, State::Working);
+        assert_eq!(s.current_turn_id(), Some("t2"));
+        let o = pass(
+            &mut s,
+            vec![stop_at(at(1_950))],
+            vec![end_at("t2", 1_900)],
+            4,
+        );
+        assert_eq!(
+            completes(&o),
+            vec![&Out::Complete {
+                turn_id: "t2".into(),
+                request_id: None,
+                outcome: Outcome::Done
+            }]
+        );
+        assert_eq!(s.status().state, State::Ready);
+    }
+
+    /// The waiting prompts go with the snapshot and the catch-up, so a
+    /// broker that adopts the worker, or catches up after losing a pass,
+    /// decides as the worker: a hook waiting for its entry when an older
+    /// turn end is read a pass later (as when Codex's capped rollout read
+    /// leaves it for the next pass), and an entry read a pass before its
+    /// hook (on a filesystem keeping whole seconds, its turn then ending in
+    /// the hook's second).
+    #[test]
+    fn an_adopting_broker_takes_the_workers_waiting_prompts() {
+        let at = |t: i64| file_time(t, true);
+        let hook_waits: Vec<Pass> = vec![
+            (
+                vec![prompt_hook_at("first", at(1_010))],
+                vec![user_at("u1", "t1", "first", 1_020)],
+            ),
+            (vec![prompt_hook_at("second", at(2_650))], vec![]),
+            (vec![], vec![end_at("t1", 1_500)]),
+            (vec![], vec![user_at("u2", "t2", "second", 2_700)]),
+            (vec![stop_at(at(5_010))], vec![end_at("t2", 5_000)]),
+        ];
+        let all = brokers_decide_as_the_worker(&hook_waits, "hook waits");
+        assert_eq!(
+            all[2],
+            (vec![("t1".to_string(), Outcome::Done)], State::Working)
+        );
+        assert_eq!(
+            all[4],
+            (vec![("t2".to_string(), Outcome::Done)], State::Ready)
+        );
+        let entry_first: Vec<Pass> = vec![
+            (vec![], vec![user_at("u1", "t1", "first", 1_020)]),
+            (vec![prompt_hook_at("first", at(1_010))], vec![]),
+            (vec![stop_at(at(1_550))], vec![end_at("t1", 1_500)]),
+        ];
+        let all = brokers_decide_as_the_worker(&entry_first, "entry first");
+        assert_eq!(
+            all[2],
+            (vec![("t1".to_string(), Outcome::Done)], State::Ready)
+        );
+    }
+
+    /// At most `MAX_WAITING_PROMPTS` hooks wait for their entries (commands
+    /// whose entries the reader skips, or blocked prompts, are the way
+    /// there; every regular prompt's entry ends the wait of all older
+    /// hooks). Past the bound the oldest goes, counted; the newest, which
+    /// decides what an end may do, always stays. While a dropped hook's
+    /// entry may still come, an entry pairing the newest may be that one:
+    /// the newest keeps its wait (fail toward working, for that turn), at
+    /// most as many times as hooks were dropped. A turn's own end, after
+    /// its own hook, is ready all the same.
+    #[test]
+    fn the_waiting_prompts_are_bounded() {
+        // Commands with no entries (three dropped), then regular prompts.
+        let mut s = ready();
+        for n in 1..=MAX_WAITING_PROMPTS as i64 + 3 {
+            pass(
+                &mut s,
+                vec![prompt_hook_at(&format!("c{n}"), n * 1_000)],
+                vec![],
+                n,
+            );
+        }
+        assert_eq!(s.waiting.len(), MAX_WAITING_PROMPTS);
+        for (n, p) in ["p", "q", "r", "s", "t"].into_iter().enumerate() {
+            let t = 20_000 + 1_000 * n as i64;
+            let turn = format!("t{p}");
+            pass(
+                &mut s,
+                vec![prompt_hook_at(p, t + 10)],
+                vec![user_at(&format!("u{p}"), &turn, p, t + 100)],
+                t,
+            );
+            // Four entries taken as maybe the dropped hooks' (three
+            // dropped before, one by p's own hook): each keeps only its
+            // own hook waiting; the fifth ends every wait.
+            assert_eq!(s.waiting.len(), if n < 4 { 1 } else { 0 }, "{p}");
+            let o = pass(
+                &mut s,
+                vec![stop_at(t + 550)],
+                vec![end_at(&turn, t + 500)],
+                t,
+            );
+            assert_eq!(completes(&o).len(), 1, "{p}: {o:?}");
+            assert_eq!(s.status().state, State::Ready, "{p}");
+        }
+
+        // Nine equal prompts queued, their entries read late: the first's
+        // hook was dropped, and no entry ends the newest hook's wait
+        // before its own does.
+        let mut s = ready();
+        for n in 1..=MAX_WAITING_PROMPTS as i64 + 1 {
+            pass(
+                &mut s,
+                vec![prompt_hook_at("continue", n * 1_000)],
+                vec![],
+                n,
+            );
+        }
+        let newest = s.waiting.back().cloned();
+        for n in 1..=MAX_WAITING_PROMPTS as i64 {
+            let turn = format!("t{n}");
+            let o = pass(
+                &mut s,
+                vec![],
+                vec![
+                    user_at(&format!("u{n}"), &turn, "continue", n * 1_000 + 100),
+                    end_at(&turn, n * 1_000 + 500),
+                ],
+                10 + n,
+            );
+            assert!(!says_ready(&o), "entry {n}: {o:?}");
+            assert_eq!(s.status().state, State::Working, "entry {n}");
+            assert_eq!(s.waiting.back().cloned(), newest, "entry {n}");
+        }
+        pass(
+            &mut s,
+            vec![],
+            vec![user_at("u9", "t9", "continue", 9_100)],
+            20,
+        );
+        assert!(s.waiting.is_empty());
+        let o = pass(&mut s, vec![], vec![end_at("t9", 9_500)], 21);
+        assert_eq!(completes(&o).len(), 1, "{o:?}");
+        assert_eq!(s.status().state, State::Ready);
+    }
+
+    /// A Codex-shaped prompt hook: it names its turn.
+    fn turn_hook_at(text: &str, turn: &str, at: i64) -> AgentEvent {
+        AgentEvent::PromptSubmitted {
+            text: text.into(),
+            turn_id: Some(turn.into()),
+            at_ms: Some(at),
+        }
+    }
+
+    /// The newest waiting hook decides what a turn end may do. A typed
+    /// skill's hook waits for good (the reader skips its entries); its turn
+    /// ends, and its end and Stop are read with the next prompt's hook: the
+    /// session stays working, though the skill's hook is older than that
+    /// end, and turn 3 then ends ready.
+    #[test]
+    fn the_newest_waiting_hook_decides() {
+        for whole_seconds in [false, true] {
+            let case = format!("whole seconds {whole_seconds}");
+            let at = |t: i64| file_time(t, whole_seconds);
+            let mut s = in_turn_one(whole_seconds);
+            pass(
+                &mut s,
+                vec![stop_at(at(1_550))],
+                vec![end_at("t1", 1_500)],
+                2,
+            );
+            assert_eq!(s.status().state, State::Ready, "{case}");
+            pass(
+                &mut s,
+                vec![prompt_hook_at("/review", at(3_010))],
+                vec![],
+                3,
+            );
+            let o = pass(
+                &mut s,
+                vec![stop_at(at(6_010)), prompt_hook_at("next", at(6_650))],
+                vec![end_at("t1", 6_000)],
+                4,
+            );
+            assert!(!says_ready(&o), "{case}: {o:?}");
+            assert_eq!(s.status().state, State::Working, "{case}");
+            pass(&mut s, vec![], vec![user_at("u3", "t3", "next", 6_700)], 5);
+            assert!(s.waiting.is_empty(), "{case}");
+            let o = pass(
+                &mut s,
+                vec![stop_at(at(9_010))],
+                vec![end_at("t3", 9_000)],
+                6,
+            );
+            assert_eq!(completes(&o).len(), 1, "{case}: {o:?}");
+            assert_eq!(s.status().state, State::Ready, "{case}");
+        }
+    }
+
+    /// A carried queue is bound as a live one: `restore` and `catch_up`
+    /// keep the newest `MAX_WAITING_PROMPTS` hooks, and one more read then
+    /// drops the oldest.
+    #[test]
+    fn a_carried_queue_is_bound_as_a_live_one() {
+        let mut worker = ready();
+        let mut snapshot = over_the_wire(&worker);
+        for n in 1..=2 * MAX_WAITING_PROMPTS as i64 {
+            snapshot
+                .waiting_prompts
+                .push(PromptMark::new(&format!("p{n}"), n * 1_000, None));
+        }
+        let newest: Vec<_> = snapshot.waiting_prompts[MAX_WAITING_PROMPTS..].to_vec();
+        let mut restored = ChatSession::restore("g2".into(), snapshot.clone());
+        worker.catch_up(&snapshot);
+        for s in [&mut restored, &mut worker] {
+            assert_eq!(s.waiting.iter().cloned().collect::<Vec<_>>(), newest);
+            assert_eq!(s.prompts_dropped, MAX_WAITING_PROMPTS);
+            s.on_event(prompt_hook_at("one more", 40_000), 1, 0);
+            assert_eq!(s.waiting.len(), MAX_WAITING_PROMPTS);
+            assert_eq!(s.waiting.front(), newest.get(1));
+        }
+    }
+
+    /// A Stop that ends nothing (the previous turn's, read with the next
+    /// prompt's hook) leaves the link a timed-out chat prompt's entry may
+    /// still claim: the entry read next is that prompt's, and its turn
+    /// completes its request.
+    #[test]
+    fn a_stale_stop_keeps_a_timed_out_prompts_link() {
+        let mut s = in_turn_one(false);
+        pass(&mut s, vec![], vec![end_at("t1", 1_500)], 2);
+        submit_ok(&mut s, "r2", "second");
+        let t = Instant::now();
+        s.tick(t);
+        let o = s.tick(t + Duration::from_secs(11));
+        assert!(matches!(&o[..], [Out::Error { .. }]), "{o:?}");
+        pass(
+            &mut s,
+            vec![stop_at(1_550), prompt_hook_at("second", 1_650)],
+            vec![],
+            3,
+        );
+        let o = pass(
+            &mut s,
+            vec![],
+            vec![user_at("u2", "t2", "second", 1_700)],
+            4,
+        );
+        assert!(
+            o.iter()
+                .any(|o| matches!(o, Out::Message(m) if m.request_id.as_deref() == Some("r2"))),
+            "{o:?}"
+        );
+        let o = pass(&mut s, vec![stop_at(5_010)], vec![end_at("t2", 5_000)], 5);
+        assert_eq!(
+            completes(&o),
+            vec![&Out::Complete {
+                turn_id: "t2".into(),
+                request_id: Some("r2".into()),
+                outcome: Outcome::Done
+            }]
+        );
+    }
+
+    /// An entry recorded surely after the newest waiting hook, with another
+    /// text (the prompt recorded otherwise than the hook gave it), ends the
+    /// wait: an older hook left waiting would take the next equal entry
+    /// and leave that entry's own hook waiting, holding its turn's end in
+    /// the hook's second on a filesystem keeping whole seconds.
+    #[test]
+    fn an_entry_with_another_text_after_its_hook_ends_the_wait() {
+        let at = |t: i64| file_time(t, true);
+        let mut s = ready();
+        pass(
+            &mut s,
+            vec![prompt_hook_at("continue", at(1_010))],
+            vec![user_at("u1", "t1", "continue [image]", 2_100)],
+            1,
+        );
+        assert!(s.waiting.is_empty());
+        pass(
+            &mut s,
+            vec![stop_at(at(2_550))],
+            vec![end_at("t1", 2_500)],
+            2,
+        );
+        assert_eq!(s.status().state, State::Ready);
+        pass(
+            &mut s,
+            vec![prompt_hook_at("continue", at(3_010))],
+            vec![user_at("u2", "t2", "continue", 3_100)],
+            3,
+        );
+        let o = pass(
+            &mut s,
+            vec![stop_at(at(3_550))],
+            vec![end_at("t2", 3_500)],
+            4,
+        );
+        assert_eq!(completes(&o).len(), 1, "{o:?}");
+        assert_eq!(s.status().state, State::Ready);
+    }
+
+    /// A Codex hook naming the current turn (a prompt into the running turn,
+    /// or one read after its entry) starts no turn and waits for nothing:
+    /// on a filesystem keeping whole seconds, that turn's end in the hook's
+    /// second makes the session ready.
+    #[test]
+    fn a_hook_naming_the_current_turn_waits_for_nothing() {
+        let at = |t: i64| file_time(t, true);
+        let mut s = ready();
+        pass(
+            &mut s,
+            vec![turn_hook_at("go", "t1", at(110))],
+            vec![user_at("u1", "t1", "go", 120)],
+            1,
+        );
+        pass(
+            &mut s,
+            vec![turn_hook_at("also this", "t1", at(1_010))],
+            vec![],
+            2,
+        );
+        assert!(s.waiting.is_empty());
+        let o = pass(&mut s, vec![], vec![end_at("t1", 1_500)], 3);
+        assert_eq!(completes(&o).len(), 1, "{o:?}");
+        assert_eq!(s.status().state, State::Ready);
+    }
+
+    /// An agent may stamp a prompt's transcript entry when the prompt was
+    /// submitted, before its prompt hook runs; and the fake agent stamps a
+    /// whole turn so. The entry still answers its hook (prompt order and
+    /// the prompt decide, never the times), so the turn's transcript end
+    /// makes the session ready without waiting for its Stop; the #126 race
+    /// stays working; and a prompt queued while the previous turn ran,
+    /// stamped before that turn's Stop, isn't ended by that Stop read with
+    /// it (#125's rule weighs the Stop against the turn's hook, not its
+    /// entry).
+    #[test]
+    fn an_entry_stamped_before_its_hook_still_answers_it() {
+        for whole_seconds in [false, true] {
+            let case = format!("whole seconds {whole_seconds}");
+            let at = |t: i64| file_time(t, whole_seconds);
+            // One turn stamped at submission (1 600), its hook at 1 650; its
+            // Stop read a pass after its transcript end.
+            let mut s = ready();
+            submit_ok(&mut s, "r1", "first");
+            s.mark_pasted("r1", Instant::now(), 1_000);
+            let o = pass(
+                &mut s,
+                vec![prompt_hook_at("first", at(1_650))],
+                vec![user_at("u1", "t1", "first", 1_600), end_at("t1", 1_600)],
+                1,
+            );
+            assert!(
+                o.contains(&Out::Accepted {
+                    request_id: "r1".into()
+                }),
+                "{case}: {o:?}"
+            );
+            assert_eq!(completes(&o).len(), 1, "{case}: {o:?}");
+            assert_eq!(s.status().state, State::Ready, "{case}");
+            // #126's race: turn 1's Stop with turn 2's hook; turn 2's entry,
+            // stamped at its submission, the next pass.
+            let o = pass(
+                &mut s,
+                vec![stop_at(at(1_700)), prompt_hook_at("second", at(3_650))],
+                vec![],
+                2,
+            );
+            assert!(!says_ready(&o), "{case}: {o:?}");
+            let o = pass(
+                &mut s,
+                vec![],
+                vec![user_at("u2", "t2", "second", 3_600)],
+                3,
+            );
+            assert!(!says_ready(&o), "{case}: {o:?}");
+            assert_eq!(s.status().state, State::Working, "{case}");
+            let o = pass(&mut s, vec![], vec![end_at("t2", 3_600)], 4);
+            assert_eq!(completes(&o).len(), 1, "{case}: {o:?}");
+            assert_eq!(s.status().state, State::Ready, "{case}");
+            // A prompt queued while turn 3 ran, stamped then (before turn
+            // 3's Stop), its hook after that Stop: turn 3's Stop, read
+            // with them, ends nothing of turn 4.
+            pass(
+                &mut s,
+                vec![prompt_hook_at("third", at(5_010))],
+                vec![user_at("u3", "t3", "third", 5_000)],
+                5,
+            );
+            pass(&mut s, vec![], vec![end_at("t3", 6_000)], 6);
+            let o = pass(
+                &mut s,
+                vec![stop_at(at(6_050)), prompt_hook_at("fourth", at(7_650))],
+                vec![user_at("u4", "t4", "fourth", 5_500)],
+                7,
+            );
+            assert!(completes(&o).is_empty(), "{case}: {o:?}");
+            assert!(!says_ready(&o), "{case}: {o:?}");
+            assert_eq!(s.status().state, State::Working, "{case}");
+            let o = pass(
+                &mut s,
+                vec![stop_at(at(9_010))],
+                vec![end_at("t4", 9_000)],
+                8,
+            );
+            assert_eq!(
+                completes(&o),
+                vec![&Out::Complete {
+                    turn_id: "t4".into(),
+                    request_id: None,
+                    outcome: Outcome::Done
+                }],
+                "{case}"
+            );
+            assert_eq!(s.status().state, State::Ready, "{case}");
+        }
+    }
+
+    /// #125's rule when an earlier equal prompt left a hook whose entry
+    /// never came (Esc during the hook check, then the same text typed
+    /// again): the entries pair one hook behind, so the hook a turn's entry
+    /// answered may be an older turn's. A Stop surely before either that
+    /// hook or the turn's entry is an earlier turn's, so the previous
+    /// turn's late Stop, read with a chat prompt's hook and entry, ends
+    /// nothing of that prompt's turn and completes no receipt early.
+    #[test]
+    fn a_stale_equal_hook_never_lets_a_late_stop_end_the_turn() {
+        for whole_seconds in [false, true] {
+            let case = format!("whole seconds {whole_seconds}");
+            let at = |t: i64| file_time(t, whole_seconds);
+            let mut s = ready();
+            pass(
+                &mut s,
+                vec![prompt_hook_at("go", at(1_010))],
+                vec![user_at("u0", "t0", "go", 1_020)],
+                1,
+            );
+            pass(
+                &mut s,
+                vec![stop_at(at(2_550))],
+                vec![end_at("t0", 2_500)],
+                2,
+            );
+            // `continue`'s hook alone (Esc during the hook check).
+            pass(
+                &mut s,
+                vec![prompt_hook_at("continue", at(4_010))],
+                vec![],
+                3,
+            );
+            // Typed again: turn 1, which ends (its Stop not read yet).
+            pass(
+                &mut s,
+                vec![prompt_hook_at("continue", at(5_010))],
+                vec![user_at("u1", "t1", "continue", 5_020)],
+                4,
+            );
+            pass(&mut s, vec![], vec![end_at("t1", 6_000)], 5);
+            assert_eq!(s.status().state, State::Ready, "{case}");
+            // A chat prompt `continue`: turn 1's Stop read with its hook and
+            // entry.
+            submit_ok(&mut s, "r2", "continue");
+            s.mark_pasted("r2", Instant::now(), 7_000);
+            let o = pass(
+                &mut s,
+                vec![stop_at(at(6_050)), prompt_hook_at("continue", at(7_300))],
+                vec![user_at("u2", "t2", "continue", 7_350)],
+                6,
+            );
+            assert!(
+                o.contains(&Out::Accepted {
+                    request_id: "r2".into()
+                }),
+                "{case}: {o:?}"
+            );
+            assert!(completes(&o).is_empty(), "{case}: {o:?}");
+            assert_eq!(s.status().state, State::Working, "{case}");
+            let o = pass(
+                &mut s,
+                vec![stop_at(at(9_010))],
+                vec![end_at("t2", 9_000)],
+                7,
+            );
+            assert_eq!(
+                completes(&o),
+                vec![&Out::Complete {
+                    turn_id: "t2".into(),
+                    request_id: Some("r2".into()),
+                    outcome: Outcome::Done
+                }],
+                "{case}"
+            );
+            assert_eq!(s.status().state, State::Ready, "{case}");
+        }
+    }
+
+    /// The same through the start of #126's own window: a pass reads turn
+    /// 1's end and turn 2's entry, but not its hook (published between the
+    /// pass's two reads), then turn 1's late Stop; the hook comes the next
+    /// pass. That Stop ends nothing, so it leaves turn 2's entry ahead of
+    /// its hook, which then waits for nothing; and turn 3, `continue`
+    /// again, sent from chat with turn 2's late Stop read with its hook and
+    /// entry, completes only at its own end.
+    #[test]
+    fn a_stale_stop_leaves_the_entry_ahead_of_its_hook() {
+        for whole_seconds in [false, true] {
+            let case = format!("whole seconds {whole_seconds}");
+            let at = |t: i64| file_time(t, whole_seconds);
+            let mut s = in_turn_one(whole_seconds);
+            pass(
+                &mut s,
+                vec![stop_at(at(1_550))],
+                vec![end_at("t1", 1_500), user_at("u2", "t2", "continue", 1_700)],
+                2,
+            );
+            assert!(s.entry_ahead.is_some(), "{case}");
+            pass(
+                &mut s,
+                vec![prompt_hook_at("continue", at(1_650))],
+                vec![],
+                3,
+            );
+            assert!(s.waiting.is_empty(), "{case}");
+            pass(&mut s, vec![], vec![end_at("t2", 3_000)], 4);
+            assert_eq!(s.status().state, State::Ready, "{case}");
+            submit_ok(&mut s, "r3", "continue");
+            s.mark_pasted("r3", Instant::now(), 3_500);
+            let o = pass(
+                &mut s,
+                vec![stop_at(at(3_050)), prompt_hook_at("continue", at(3_650))],
+                vec![user_at("u3", "t3", "continue", 3_700)],
+                5,
+            );
+            assert!(completes(&o).is_empty(), "{case}: {o:?}");
+            assert_eq!(s.status().state, State::Working, "{case}");
+            let o = pass(
+                &mut s,
+                vec![stop_at(at(6_010))],
+                vec![end_at("t3", 6_000)],
+                6,
+            );
+            assert_eq!(
+                completes(&o),
+                vec![&Out::Complete {
+                    turn_id: "t3".into(),
+                    request_id: Some("r3".into()),
+                    outcome: Outcome::Done
+                }],
+                "{case}"
+            );
+        }
+    }
+
+    /// An entry ahead of its hook lasts until its turn ends (by the
+    /// transcript or by a Stop): a later prompt with the same text then
+    /// gets a hook of its own, which waits, so #126's race stays working.
+    #[test]
+    fn an_entry_ahead_ends_with_its_turn() {
+        for by_stop in [false, true] {
+            let case = format!("ended by its Stop {by_stop}");
+            let mut s = ready();
+            // Turn 1's entry with no hook seen.
+            pass(
+                &mut s,
+                vec![],
+                vec![user_at("u1", "t1", "continue", 1_020)],
+                1,
+            );
+            assert!(s.entry_ahead.is_some(), "{case}");
+            if by_stop {
+                pass(&mut s, vec![stop_at(1_510)], vec![], 2);
+                // The next prompt's hook, then turn 1's transcript end read
+                // late: held.
+                let o = pass(
+                    &mut s,
+                    vec![prompt_hook_at("continue", 1_650)],
+                    vec![end_at("t1", 1_500)],
+                    3,
+                );
+                assert!(!says_ready(&o), "{case}: {o:?}");
+            } else {
+                pass(&mut s, vec![], vec![end_at("t1", 1_500)], 2);
+                let o = pass(
+                    &mut s,
+                    vec![stop_at(1_550), prompt_hook_at("continue", 1_650)],
+                    vec![],
+                    3,
+                );
+                assert!(!says_ready(&o), "{case}: {o:?}");
+            }
+            assert!(s.entry_ahead.is_none(), "{case}");
+            assert_eq!(s.waiting.len(), 1, "{case}");
+            assert_eq!(s.status().state, State::Working, "{case}");
+        }
+    }
+
+    /// A broker that adopts the worker decides as it does with an
+    /// early-stamped entry: the hook that began the turn (its time carried
+    /// in the snapshot) tells the previous turn's late Stop from the turn's
+    /// own, read a pass later; so does a hook that answered an entry read
+    /// ahead of it; and a carried count of dropped hooks keeps the newest
+    /// waiting as the worker does (a filesystem keeping whole seconds, the
+    /// turn ending within its hook's second).
+    #[test]
+    fn adopting_brokers_decide_as_the_worker_with_early_stamps_and_drops() {
+        let at = |t: i64| file_time(t, false);
+        // A prompt queued while turn 3 ran, stamped then; turn 3's Stop read
+        // a pass after turn 4's hook and entry.
+        let queued: Vec<Pass> = vec![
+            (
+                vec![prompt_hook_at("third", at(5_010))],
+                vec![user_at("u3", "t3", "third", 5_000)],
+            ),
+            (vec![], vec![end_at("t3", 6_000)]),
+            (
+                vec![prompt_hook_at("fourth", at(7_650))],
+                vec![user_at("u4", "t4", "fourth", 5_500)],
+            ),
+            (vec![stop_at(at(6_050))], vec![]),
+            (vec![stop_at(at(9_010))], vec![end_at("t4", 9_000)]),
+        ];
+        let all = brokers_decide_as_the_worker(&queued, "queued");
+        assert_eq!(all[3], (vec![], State::Working));
+        assert_eq!(
+            all[4],
+            (vec![("t4".to_string(), Outcome::Done)], State::Ready)
+        );
+        // Turn 2's entry, stamped early, read a pass before its hook.
+        let ahead: Vec<Pass> = vec![
+            (
+                vec![prompt_hook_at("first", at(1_010))],
+                vec![user_at("u1", "t1", "first", 1_020)],
+            ),
+            (
+                vec![],
+                vec![end_at("t1", 1_500), user_at("u2", "t2", "second", 1_520)],
+            ),
+            (
+                vec![stop_at(at(1_550)), prompt_hook_at("second", at(1_650))],
+                vec![],
+            ),
+            (vec![stop_at(at(4_010))], vec![end_at("t2", 4_000)]),
+        ];
+        let all = brokers_decide_as_the_worker(&ahead, "ahead");
+        assert_eq!(all[2], (vec![], State::Working));
+        assert_eq!(
+            all[3],
+            (vec![("t2".to_string(), Outcome::Done)], State::Ready)
+        );
+        // Nine prompt hooks (one dropped), then the newest's entry and its
+        // end within its second.
+        let whole = |t: i64| file_time(t, true);
+        let hooks: Vec<AgentEvent> = (1..=MAX_WAITING_PROMPTS as i64 + 1)
+            .map(|n| prompt_hook_at(&format!("c{n}"), whole(n * 1_000)))
+            .collect();
+        let dropped: Vec<Pass> = vec![
+            (hooks, vec![]),
+            (vec![], vec![user_at("u9", "t9", "c9", 9_100)]),
+            (vec![], vec![end_at("t9", 9_500)]),
+        ];
+        let all = brokers_decide_as_the_worker(&dropped, "dropped");
+        assert_eq!(
+            all[2],
+            (vec![("t9".to_string(), Outcome::Done)], State::Working)
+        );
     }
 
     #[test]

@@ -1814,3 +1814,62 @@ fn a_nested_codexs_prompt_of_another_session_never_re_pins() {
     assert_eq!(a.session_id(), Some("<session-A>"));
     assert_eq!(chat.status().state, State::Ready);
 }
+
+/// #126's race in Codex's order, through the real hook script: turn 1's
+/// `task_complete` and Stop hook, turn 2's prompt hook and `task_started`
+/// (Codex writes it before the hook) read in one pass, turn 2's user record
+/// in the next. Codex has no hook turn end (its Stop only wakes the
+/// reader), so the stale-Stop path isn't Codex's; its log's turn end is,
+/// and read with the next prompt's hook it completes turn 1 but never
+/// shows ready, not even for that pass: the status stays working and a
+/// chat prompt is refused. Also when turn 2's prompt is turn 1's again:
+/// the hook names turn 2, so it is a new prompt's, not turn 1's own.
+#[test]
+fn turn_ones_end_read_with_turn_twos_hook_never_shows_ready() {
+    let says_ready = |outs: &[Out]| {
+        outs.iter()
+            .any(|o| matches!(o, Out::Status(s) if s.state == State::Ready))
+    };
+    for same_prompt in [false, true] {
+        let f = fx();
+        let mut a = f.adapter();
+        let mut chat = ChatSession::new(GEN.into(), 0);
+        // Turn 1, typed in the terminal.
+        f.fire(&a, "01-SessionStart-startup.json");
+        f.fire(&a, "02-UserPromptSubmit.json");
+        rollout_upto(&f.a, A, 9);
+        tick(&mut a, &mut chat);
+        assert_eq!(chat.status().state, State::Working);
+        // One pass: turn 1's end and Stop, turn 2's hook and start.
+        rollout_upto(&f.a, A, 17);
+        f.fire(&a, "03-Stop.json");
+        let name = "04-UserPromptSubmit-approval-turn.json";
+        let mut hook: Value = serde_json::from_str(&f.hook(name)).unwrap();
+        if same_prompt {
+            hook["prompt"] = Value::from("Reply with exactly the word: pong");
+        }
+        f.fire_body(&a, &hook.to_string(), name);
+        let t = tick(&mut a, &mut chat);
+        assert_eq!(
+            completes(&t.outs),
+            [("<turn-1>".into(), None, Outcome::Done)]
+        );
+        assert!(
+            !says_ready(&t.outs),
+            "same prompt {same_prompt}: {:?}",
+            t.outs
+        );
+        assert_eq!(chat.status().state, State::Working);
+        assert!(chat.submit("r-1", GEN, "go on", 0, false).is_err());
+        // The next: turn 2's user record.
+        rollout_upto(&f.a, A, 19);
+        let t = tick(&mut a, &mut chat);
+        assert!(
+            !says_ready(&t.outs),
+            "same prompt {same_prompt}: {:?}",
+            t.outs
+        );
+        assert_eq!(chat.status().state, State::Working);
+        assert_eq!(chat.current_turn_id(), Some("<turn-2>"));
+    }
+}
