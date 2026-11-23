@@ -169,7 +169,8 @@ release build, none of it runs, and a `runtime.toml` that names a host-sender pr
 section opens with what of it is built; in short:
 - the host encryption key and `host_enc_key_get` (II.4.1);
 - on the receiving host: who `host:<host_id>` is, the route consents and both locks (II.2), the device list's effects
-  on its tasks and a native's later `interrupt_running` (II.3.1, II.8), the mailbox client and host senders' gate
+  on its tasks, a host sender's revoke reported to the host's own Station as applied (the entry form, 2026-11-23) and
+  a native's later `interrupt_running` (II.3.1, II.8), the mailbox client and host senders' gate
   (II.4.3, II.5), and the admission of requests, with `select` expanded and launch on message, `cancel` and `complete`
   (II.4.2, II.6, II.7), with the statuses and results back (II.4.4);
 - on the sending host: planning from the device list, sealing and the puts (II.6, II.4.3), the statuses and results
@@ -181,9 +182,8 @@ section opens with what of it is built; in short:
 Two real hosts run it end to end against a fake Station (`tests/host_senders_binary.rs`); VII.B, "Covered by Atem's
 tests (fake Station)", maps the joint tests onto Atem's. **Not built:** a Station's side of the mailbox and the native
 app's part (Astation's, the five device-list actions signed only behind the signing gate, still closed); the host
-encryption key in the ceremony (Atem's side is draft PR #176, held for Astation's, II.4.1); a host sender's revoke
-reported to the Station as applied, and a later answer on its channel for a carried record left `pending`
-(II.3.1); the directory (II.6). Astation agreed the wire on 2026-11-16 (#120
+encryption key in the ceremony (Atem's side is draft PR #176, held for Astation's, II.4.1); a later answer on its
+channel for a carried record left `pending` (II.3.1); the directory (II.6). Astation agreed the wire on 2026-11-16 (#120
 comment 6903887341), the receiving host's mailbox readings on 2026-11-17 (#120 comment 6938206284) and the rest of
 Atem's host-sender readings on 2026-11-20 (#120 comment 7028723996), each marked where it is written; project
 narrowing is judged per entry, as Astation asked, by the owner's decision of 2026-11-22. What is still open is listed
@@ -1906,10 +1906,10 @@ and replayed after a crash (in host-work's own pass, a pass after the device lis
 already refuses from the committed list: Atem's reading, agreed with Astation, 2026-11-20, #120 comment 7028723996), the
 start check's standing (a revoke, a removal
 or a readmit since admission), and a native's later `interrupt_running` about a host principal, from a feed or a
-native's channel (`control_records`) (host-work-v1 §11.6, §11.1). **Not built:** the host's report of a host sender's
-revoke as applied to its Station (the entry form, with the applied `seq`, "Reporting a revoke as applied" below), and
-a later answer on its channel for a carried record left `pending`; signing the actions, which is Astation's, behind the
-signing gate.
+native's channel (`control_records`) (host-work-v1 §11.6, §11.1), and (2026-11-23) the host's report of a host
+sender's revoke as applied to its Station (the entry form, with the applied `seq`, "Reporting a revoke as applied"
+below; host-work-v1 §11.4, "A host sender's revoke entry"). **Not built:** a later answer on its channel for a carried
+record left `pending`; signing the actions, which is Astation's, behind the signing gate.
 
 **Owner decision 2026-11-07. Atem's recommendation; needs agreement.**
 
@@ -1950,12 +1950,14 @@ interrupt-intent step, host-work replays the effects of every entry after its ap
 the entry's `seq` (R9.3's crash recovery, step 3, replays fences the same way). A crash between the entry and its
 effects therefore loses no cancellation and no interrupt intent.
 
-**Reporting a revoke as applied. Changed after Astation's review.** The host reports a host sender's revoke as applied
-(I.5.8, "Delivery progress is not application") only once host-work's applied device-list `seq` has reached the
-entry's `seq`, naming the entry (`seq`, `entry_hash`) and that applied `seq`: a downloaded or committed device-list
-head proves only that the entry arrived, not that its cancellations and interrupt intents are durable. A later native
-`interrupt_running` record is reported per `record_id` with its `control_records_result` value, over a channel or to
-the Station alike.
+**Reporting a revoke as applied. Changed after Astation's review.** (**Built** behind the debug-only hook, 2026-11-23:
+host-work writes the result in the transaction of the entry's effects; Atem's readings where the wire rules are silent,
+for Astation's confirmation, are host-work-v1 §11.4, "A host sender's revoke entry".) The host reports a host sender's
+revoke as applied (I.5.8, "Delivery progress is not application") only once host-work's applied device-list `seq` has
+reached the entry's `seq`, naming the entry (`seq`, `entry_hash`) and that applied `seq`: a downloaded or committed
+device-list head proves only that the entry arrived, not that its cancellations and interrupt intents are durable. A
+later native `interrupt_running` record is reported per `record_id` with its `control_records_result` value, over a
+channel or to the Station alike.
 
 **What a revoke does** on a receiving host, as an effect of the device-list commit (R9.3, "Applying a carriage", step
 4), in the same host-work transaction as the cancellations:
@@ -3153,8 +3155,8 @@ Nothing is merged or deployed before step 1.
    Atem's side, behind the debug-only hook (2026-11-17):** both hosts' sides of every item, run end to end by two real
    hosts against a fake Station (the status block, "Part II built on Atem's side"; VII.B, "Covered by Atem's tests").
    **Not built:** Astation's side (the Station's mailbox, the signing of the five actions behind the gate, the native
-   app's parts), the host encryption key in the ceremony on both sides (Atem's is draft PR #176, held), and Atem's
-   report of a host sender's revoke as applied. The joint check (VII.B) follows VII.A's.
+   app's parts), and the host encryption key in the ceremony on both sides (Atem's is draft PR #176, held); Atem's
+   report of a host sender's revoke as applied is built too (2026-11-23). The joint check (VII.B) follows VII.A's.
 10. **Disabled-account enforcement:** Auth/Portal and Astation define III.5 jointly; it is built only once that design
     is agreed, then checked (VII.D). **Changed after Astation's review:** first Astation builds the service-owner
     lookup and the ownership lifecycle and migrates existing rooms (VII.E, tests 46 and 47); only then does

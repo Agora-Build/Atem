@@ -21,14 +21,37 @@
 //! queue (the launcher's spawn check refuses one it holds,
 //! `StartView::stop_launch`).
 //!
+//! Each `host_sender_revoke` of another host applied gets its result owed
+//! the host's own Station in the same transaction (host-work-v1 §11.4,
+//! wire rule 4's entry form, `acks::Acked::entry`; design II.3.1,
+//! "Reporting a revoke as applied"), and each `host_sender_readmit` of
+//! another host lifts the results of that host's earlier revokes (kept,
+//! never sent again): through the acknowledgments' book in a feed
+//! transaction (`FeedStore::readmitted`, `FeedStore::acknowledge`) when the
+//! feeds are loaded for this identity and list, else into the book's table
+//! (`AckBook::owe`), for the book that loads it. It goes with the next acknowledgments, after the commit; a
+//! crash before the commit loses it with the effects, and the replay writes
+//! both once. Nothing is reported before the effects are written (never
+//! `pending`: Atem's reading, for Astation's confirmation).
+//!
 //! Nothing runs with the hook off (no table is made: hook off = main),
 //! while the device list doesn't serve (frozen, held, faulted, gone: the
 //! start check fails or holds every delegated task then), with a
 //! receipt-database fault, or on a store bound to another identity.
+use super::delegated_feed_pass::loaded;
 use super::*;
+use crate::runtime::delegated::acks::{AckBook, Acked};
 use crate::runtime::delegated::effects::Followup;
+use crate::runtime::delegated::feeds::Feeds;
 use crate::runtime::delegated::host_senders::{self, ListEffects, QueuedLaunch};
 use crate::runtime::delegated::start::Event;
+use atem_client::host_principal::host_principal;
+use rusqlite::Transaction;
+
+/// What the entries' transaction wrote: their effects (what they ask after
+/// the commit), the revokes' results owed the host's own Station, and the
+/// readmits that lift earlier ones (`(host:<host_id>, seq)`).
+type Written = (ListEffects, Vec<Acked>, Vec<(String, u64)>);
 
 impl HostBridge {
     /// See the module doc. A store error is a receipt-database fault.
@@ -60,22 +83,76 @@ impl HostBridge {
         // after the head moved: no spawn check has let one go since, as
         // it waits for these effects.
         let launches = self.queued_host_launches();
+        // The revokes' results owed the host's own Station go in the
+        // effects' transaction (host-work-v1 §11.4): through the
+        // acknowledgments' book when the feeds are loaded for this identity
+        // and list, else into its table, for the book that loads it.
+        let book = loaded(&self.work, Some(&list), &identity).is_some();
+        let State {
+            feeds,
+            store: Some(store),
+            ..
+        } = &mut self.work
+        else {
+            return;
+        };
         let done = (|| -> anyhow::Result<(u64, ListEffects)> {
             let after = host_senders::applied_seq(&store.db, &genesis)?;
             if after >= head.seq {
                 return Ok((after, ListEffects::default()));
             }
-            let tx = store.immediate()?;
-            let effects = host_senders::list_effects(
-                store,
-                &tx,
-                &list.membership,
-                &identity.atem_device_id,
-                after,
-                &launches,
-            )?;
-            host_senders::set_applied_seq(&tx, &genesis, head.seq)?;
-            tx.commit()?;
+            // The entries' effects, host-work's applied `seq` and the
+            // revokes' results (those a later readmit in this catch-up lifts
+            // written lifted), in `tx`; the readmits lift the results of
+            // their hosts' earlier revokes.
+            let write = |tx: &Transaction| -> anyhow::Result<Written> {
+                let effects = host_senders::list_effects(
+                    store,
+                    tx,
+                    &list.membership,
+                    &identity.atem_device_id,
+                    after,
+                    &launches,
+                )?;
+                host_senders::set_applied_seq(tx, &genesis, head.seq)?;
+                let owed = effects
+                    .revokes
+                    .iter()
+                    .map(|r| {
+                        let mut acked =
+                            Acked::entry(&r.host_id, r.entry, r.interrupt_running, head.seq);
+                        acked.superseded = effects
+                            .readmits
+                            .iter()
+                            .find(|m| m.host_id == r.host_id && m.seq > r.entry.seq)
+                            .map(|m| m.seq);
+                        acked
+                    })
+                    .collect();
+                let readmits = effects
+                    .readmits
+                    .iter()
+                    .map(|m| (host_principal(&m.host_id), m.seq))
+                    .collect();
+                Ok((effects, owed, readmits))
+            };
+            let effects = match feeds {
+                Feeds::Loaded(feeds) if book => {
+                    let tx = feeds.begin(store)?;
+                    let (effects, owed, readmits) = write(&tx)?;
+                    feeds.readmitted(&tx, &readmits)?;
+                    feeds.acknowledge(&tx, &owed)?;
+                    feeds.commit(tx)?;
+                    effects
+                }
+                _ => {
+                    let tx = store.immediate()?;
+                    let (effects, owed, readmits) = write(&tx)?;
+                    AckBook::owe(&tx, &owed, &readmits)?;
+                    tx.commit()?;
+                    effects
+                }
+            };
             Ok((head.seq, effects))
         })();
         match done {

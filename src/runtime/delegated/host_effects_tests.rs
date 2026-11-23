@@ -749,10 +749,11 @@ fn a_host_sender_is_refused_without_an_open_list() {
     });
 }
 
-/// Host B's results owed the Station (`control_acks`): none may be, by
-/// host-work-v1 §11.4's acknowledgments (what the host's own Station's feed
-/// delivered) and this rule: a record carried on a channel is answered on
-/// its channel only.
+/// Host B's records' results owed the Station (`control_acks`): none may
+/// be, by host-work-v1 §11.4's acknowledgments (what the host's own
+/// Station's feed delivered) and this rule: a record carried on a channel
+/// is answered on its channel only. (The revoke entry's own result is owed:
+/// it is the device list's, wire rule 4's entry form.)
 fn acks_owed_for_host_b(rig: &LocalRig) -> i64 {
     rig.bridge
         .work
@@ -761,7 +762,7 @@ fn acks_owed_for_host_b(rig: &LocalRig) -> i64 {
         .unwrap()
         .db
         .query_row(
-            "SELECT count(*) FROM control_acks WHERE principal=?1",
+            "SELECT count(*) FROM control_acks WHERE principal=?1 AND applied_seq IS NULL",
             [HOST_B],
             |r| r.get(0),
         )
@@ -1562,12 +1563,13 @@ fn a_carried_record_sent_during_the_pause_is_answered() {
     });
 }
 
-/// Host B's results owed the host's own Station: each row's `effects` as
-/// the book keeps them.
+/// Host B's records' results owed the host's own Station: each row's
+/// `effects` as the book keeps them (its revoke entry's own result left
+/// out: wire rule 4's entry form, `a_host_sender_revoke_is_acknowledged_once_its_effects_are_written`).
 fn acks_for_host_b(rig: &LocalRig) -> Vec<String> {
     let db = &rig.bridge.work.store.as_ref().unwrap().db;
     let mut q = db
-        .prepare("SELECT effects FROM control_acks WHERE principal=?1")
+        .prepare("SELECT effects FROM control_acks WHERE principal=?1 AND applied_seq IS NULL")
         .unwrap();
     q.query_map([HOST_B], |r| r.get(0))
         .unwrap()
@@ -1825,5 +1827,671 @@ fn the_effects_gates_withdrawal_at_executing_is_not_counted() {
             .await;
         rig.bridge.start_view().host_applied = Some((genesis, head));
         rig.until(|r| input(r).contains("HS_L1_ACCEPTED")).await;
+    });
+}
+
+// ── The acknowledgment of a host sender's revoke entry (§11.4 rule 4) ──
+
+/// The host's own Station's feed read (empty, to its head 0) on the link
+/// `n`: the cursor every ack names (wire rule 9). The link's sends kept.
+fn feed_read(rig: &mut LocalRig, s: &HostSenders, n: u64) -> crate::websocket_client::SentForTest {
+    let sent = station_up(rig, n);
+    station_pass(
+        rig,
+        0,
+        vec![heads_text(&[(ORIGIN, OWN_FEED, 0)], s.log.log.head())],
+    );
+    let page = page_text(rig, 0, &[]);
+    station_pass(rig, 100, vec![page]);
+    assert_eq!(
+        rig.bridge.station.as_ref().unwrap().feed.dump()["synced"]["cursor"],
+        0,
+        "the feed read"
+    );
+    sent
+}
+
+/// The entry results among `texts`' acks, in order.
+fn entry_results(texts: &[String]) -> Vec<atem_client::control::AckResult> {
+    acks_in(texts)
+        .into_iter()
+        .flat_map(|ack| ack.results)
+        .filter(|r| matches!(r, atem_client::control::AckResult::Entry { .. }))
+        .collect()
+}
+
+/// The entries' rows in `control_acks`: (principal, key, applied_seq).
+fn entry_rows(rig: &LocalRig) -> Vec<(String, String, i64)> {
+    let db = &rig.bridge.work.store.as_ref().unwrap().db;
+    let made: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='control_acks')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    if !made {
+        return Vec::new();
+    }
+    db.prepare(
+        "SELECT principal, key, applied_seq FROM control_acks
+        WHERE applied_seq IS NOT NULL ORDER BY rowid",
+    )
+    .unwrap()
+    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+/// The entry form's result for the entry of `log` at `seq` (wire rule 4):
+/// each of `effects` `applied`, host-work's applied `seq` `applied_seq`.
+fn entry_result(
+    log: &TestLog,
+    seq: u64,
+    applied_seq: u64,
+    effects: &[atem_client::control::EffectKind],
+) -> atem_client::control::AckResult {
+    use atem_client::control::{AckResult, ApplicationResult, EffectResult, EntryRef};
+    AckResult::Entry {
+        entry: EntryRef {
+            seq,
+            entry_hash: log.log.entry(seq).unwrap().hash(),
+        },
+        applied_seq,
+        effects: effects
+            .iter()
+            .map(|effect| EffectResult {
+                effect: *effect,
+                result: ApplicationResult::Applied,
+                why: None,
+            })
+            .collect(),
+    }
+}
+
+/// Host-work-v1 §11.4 wire rules 3 to 6 and 9, design II.3.1 ("Reporting a
+/// revoke as applied"): a `host_sender_revoke` of B committed in the device
+/// list is acknowledged to the host's own Station only once host-work wrote
+/// its effects: nothing goes before (never `pending`: Atem's reading), then
+/// its result is written in the transaction that moves host-work's applied
+/// `seq` to the entry, and the next Station step sends it in the entry
+/// form, `{entry: {seq, entry_hash}, applied_seq, effects}`, under the
+/// host's claim, naming the host's own Station's feed and cursor. The
+/// revocation `applied`; after a readmit, a revoke with
+/// `interrupt_running` is a new revocation: `revocation` and `interrupt`
+/// `applied` (a readmit gets no result, and lifts the first revoke's: no
+/// longer sent). Each goes once per connection, and the shared reference
+/// ledger takes the ack (an entry counts nothing there: no Portal report,
+/// no re-sign alert).
+#[test]
+fn a_host_sender_revoke_is_acknowledged_once_its_effects_are_written() {
+    use atem_client::control::{AckLedger, EffectKind, LinkAssociation};
+    use atem_client::membership::host_sender_readmit;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let queued = host_task(&mut rig, &s, "HS_EACK_QUEUED", start + HOUR);
+        hold_host_work(&mut rig);
+        let mut sent = feed_read(&mut rig, &s, 1);
+        assert_eq!(acks_in(&sent.texts()).len(), 1, "the cursor's ack");
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", false, 0).unwrap(),
+        );
+        let revoke = s.log.log.head().seq;
+        // Committed in the list, its effects not written: nothing owed, and
+        // nothing goes.
+        station_pass(&mut rig, 200, vec![]);
+        assert!(entry_results(&sent.texts()).is_empty());
+        assert!(entry_rows(&rig).is_empty());
+        // Host-work's pass: the effects, the applied `seq` and the result,
+        // in one transaction.
+        ticks(&mut rig, 1);
+        assert_eq!(applied(&rig), revoke);
+        assert_eq!(settled(&rig, &queued), outcome(Event::Revoked));
+        assert_eq!(
+            entry_rows(&rig),
+            [(HOST_B.to_owned(), format!("entry:{revoke}"), revoke as i64)]
+        );
+        let mut sent = station_up(&mut rig, 2);
+        station_pass(&mut rig, 300, vec![]);
+        let acks = acks_in(&sent.texts());
+        assert_eq!(acks.len(), 1, "{acks:?}");
+        let ack = &acks[0];
+        assert_eq!(
+            (
+                ack.account_id.as_str(),
+                ack.genesis_hash,
+                ack.host_id.as_str(),
+                ack.host_trust_gen
+            ),
+            ("acct", s.log.genesis_hash(), "host", 1)
+        );
+        assert_eq!(
+            (ack.origin.as_str(), ack.feed_id.as_str(), ack.cursor),
+            (ORIGIN, OWN_FEED, 0)
+        );
+        assert_eq!(
+            ack.results,
+            [entry_result(
+                &s.log,
+                revoke,
+                revoke,
+                &[EffectKind::Revocation]
+            )]
+        );
+        // The reference ledger (the Station's) takes it, counting nothing.
+        let ledger = AckLedger::new(ORIGIN, "acct", s.log.genesis_hash()).unwrap();
+        let link = LinkAssociation {
+            account_id: "acct".into(),
+            genesis_hash: s.log.genesis_hash(),
+            host_id: "host".into(),
+            host_trust_gen: 1,
+            connection_id: "link-2".into(),
+        };
+        let taken = ledger.ack(&link, ack, start).unwrap();
+        assert!(taken.made.is_empty() && taken.alerts.is_empty());
+        // Once on a connection.
+        station_pass(&mut rig, 400, vec![]);
+        assert!(acks_in(&sent.texts()).is_empty());
+        // A readmit (no result, and the first revoke's no longer sent),
+        // then a revoke that interrupts: a new revocation, both its effects
+        // `applied`, alone on the new connection.
+        sign_and_carry(&mut rig, &mut s, host_sender_readmit("host-b", 0).unwrap());
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", true, 0).unwrap(),
+        );
+        let again = s.log.log.head().seq;
+        ticks(&mut rig, 1);
+        assert_eq!(applied(&rig), again);
+        let mut sent = station_up(&mut rig, 3);
+        station_pass(&mut rig, 500, vec![]);
+        let texts = sent.texts();
+        assert_eq!(
+            entry_results(&texts),
+            [entry_result(
+                &s.log,
+                again,
+                again,
+                &[EffectKind::Revocation, EffectKind::Interrupt]
+            )]
+        );
+        let ack = acks_in(&texts).pop().unwrap();
+        let link = LinkAssociation {
+            connection_id: "link-3".into(),
+            ..link
+        };
+        assert!(ledger.ack(&link, &ack, start).unwrap().made.is_empty());
+    });
+}
+
+/// §11.4 "Durable before acknowledged", design II.3.1 "Crash safety": a
+/// revoke's result is written with its effects or not at all. Its
+/// transaction failing (here at the result's row) writes neither the
+/// effects nor host-work's applied `seq` nor the result; the runtime
+/// started again replays the entry from that `seq` and writes them once.
+/// Committed, then the runtime killed before the Station step: the result
+/// goes on the next start's first connection, once, from the one row the
+/// table holds (the replay writes nothing again).
+#[test]
+fn a_revokes_result_is_written_once_across_crashes() {
+    use atem_client::control::EffectKind;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let queued = host_task(&mut rig, &s, "HS_EACK_CRASH", start + HOUR);
+        hold_host_work(&mut rig);
+        let _ = feed_read(&mut rig, &s, 1);
+        let before = applied(&rig);
+        let db = |rig: &LocalRig, sql: &str| {
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .execute_batch(sql)
+                .unwrap()
+        };
+        db(
+            &rig,
+            "CREATE TRIGGER no_entry_ack BEFORE INSERT ON control_acks
+             WHEN NEW.applied_seq IS NOT NULL BEGIN SELECT RAISE(ABORT, 'no ack'); END;",
+        );
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", false, 0).unwrap(),
+        );
+        let revoke = s.log.log.head().seq;
+        ticks(&mut rig, 1);
+        assert!(rig.bridge.work.error, "a receipt-database fault");
+        assert_eq!(applied(&rig), before, "nothing of it committed");
+        assert_ne!(settled(&rig, &queued), outcome(Event::Revoked));
+        assert!(entry_rows(&rig).is_empty());
+        db(&rig, "DROP TRIGGER no_entry_ack;");
+        // Started again: the replay writes the effects and the result once.
+        restart(&mut rig, root, &os, false, true);
+        assert_eq!(applied(&rig), revoke);
+        assert_eq!(settled(&rig, &queued), outcome(Event::Revoked));
+        assert_eq!(entry_rows(&rig).len(), 1);
+        // Killed before any Station step; started again: the next pass
+        // writes nothing more, and the first connection sends it once.
+        restart(&mut rig, root, &os, false, true);
+        ticks(&mut rig, 1);
+        assert_eq!(entry_rows(&rig).len(), 1);
+        let mut sent = station_up(&mut rig, 2);
+        station_pass(&mut rig, 0, vec![]);
+        station_pass(&mut rig, 100, vec![]);
+        assert_eq!(
+            entry_results(&sent.texts()),
+            [entry_result(
+                &s.log,
+                revoke,
+                revoke,
+                &[EffectKind::Revocation]
+            )]
+        );
+    });
+}
+
+/// A store whose control state doesn't load for this identity (here it
+/// doesn't read) still gets host senders' device-list effects, and the
+/// revoke's result is owed in the table with them, never sent from there:
+/// the start that reads the control state sends it.
+#[test]
+fn a_revokes_result_is_owed_while_the_control_state_doesnt_read() {
+    use crate::runtime::delegated::feeds::Feeds;
+    use atem_client::control::EffectKind;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let queued = host_task(&mut rig, &s, "HS_EACK_DAMAGED", start + HOUR);
+        hold_host_work(&mut rig);
+        let _ = feed_read(&mut rig, &s, 1);
+        rig.bridge.work.feeds = Feeds::Damaged;
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", false, 0).unwrap(),
+        );
+        let revoke = s.log.log.head().seq;
+        ticks(&mut rig, 1);
+        assert_eq!(applied(&rig), revoke);
+        assert_eq!(settled(&rig, &queued), outcome(Event::Revoked));
+        assert_eq!(entry_rows(&rig).len(), 1);
+        let mut sent = station_up(&mut rig, 2);
+        station_pass(&mut rig, 0, vec![]);
+        assert!(acks_in(&sent.texts()).is_empty(), "no ack while damaged");
+        restart(&mut rig, root, &os, false, true);
+        let mut sent = station_up(&mut rig, 3);
+        station_pass(&mut rig, 100, vec![]);
+        assert_eq!(
+            entry_results(&sent.texts()),
+            [entry_result(
+                &s.log,
+                revoke,
+                revoke,
+                &[EffectKind::Revocation]
+            )]
+        );
+    });
+}
+
+/// Hook off = main: with `host.delegated` alone (no `host.senders`) host
+/// senders' effects aren't written, so no revoke entry's result is owed or
+/// sent; once `host.senders` is on, the entry's effects and result are.
+#[test]
+fn without_host_senders_no_revoke_result_is_owed() {
+    use atem_client::control::EffectKind;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let _ = feed_read(&mut rig, &s, 1);
+        rig.bridge.features = HostFeatures::parse("host.delegated").unwrap();
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", false, 0).unwrap(),
+        );
+        let revoke = s.log.log.head().seq;
+        passes(&mut rig, 2);
+        let mut sent = station_up(&mut rig, 2);
+        station_pass(&mut rig, 0, vec![]);
+        assert!(entry_rows(&rig).is_empty());
+        assert!(entry_results(&sent.texts()).is_empty());
+        rig.bridge.features = HostFeatures::parse("host.delegated,host.senders").unwrap();
+        passes(&mut rig, 1);
+        let mut sent = station_up(&mut rig, 3);
+        station_pass(&mut rig, 100, vec![]);
+        assert_eq!(
+            entry_results(&sent.texts()),
+            [entry_result(
+                &s.log,
+                revoke,
+                revoke,
+                &[EffectKind::Revocation]
+            )]
+        );
+    });
+}
+
+/// Ruling R57, L3 (host-work-v1 §11.4, "A host sender's revoke entry"):
+/// this host's own revocation as a sender is no result it owes: nothing on
+/// this host applies it (no host sends to itself; its own sends stop by
+/// the committed list), so it reports every revoke entry of another host
+/// only, as its removals skip this host.
+#[test]
+fn this_hosts_own_revocation_as_a_sender_is_not_acknowledged() {
+    use atem_client::control::EffectKind;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let _ = feed_read(&mut rig, &s, 1);
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host", false, 0).unwrap(),
+        );
+        let own = s.log.log.head().seq;
+        ticks(&mut rig, 1);
+        assert_eq!(applied(&rig), own);
+        assert!(entry_rows(&rig).is_empty());
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", false, 0).unwrap(),
+        );
+        let other = s.log.log.head().seq;
+        ticks(&mut rig, 1);
+        assert_eq!(
+            entry_rows(&rig),
+            [(HOST_B.to_owned(), format!("entry:{other}"), other as i64)]
+        );
+        let mut sent = station_up(&mut rig, 2);
+        station_pass(&mut rig, 0, vec![]);
+        assert_eq!(
+            entry_results(&sent.texts()),
+            [entry_result(
+                &s.log,
+                other,
+                other,
+                &[EffectKind::Revocation]
+            )]
+        );
+    });
+}
+
+/// The entries' `superseded_by`, by key.
+fn lifted_rows(rig: &LocalRig) -> Vec<(String, Option<i64>)> {
+    let db = &rig.bridge.work.store.as_ref().unwrap().db;
+    db.prepare(
+        "SELECT key, superseded_by FROM control_acks WHERE applied_seq IS NOT NULL ORDER BY rowid",
+    )
+    .unwrap()
+    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+/// Ruling R57, L2 and L4 (host-work-v1 §11.4, "A host sender's revoke
+/// entry", "Resends"): once host-work applied a later
+/// `host_sender_readmit` of the same host, a revoke's result is kept (its
+/// row, `superseded_by` the readmit's `seq`) but no longer sent, across a
+/// restart too; a revoke and its readmit applied in one catch-up write the
+/// row already lifted; a readmit applied while the control state doesn't
+/// read lifts the rows in the table alike.
+#[test]
+fn a_readmit_stops_its_revokes_result_from_being_resent() {
+    use crate::runtime::delegated::feeds::Feeds;
+    use atem_client::control::EffectKind;
+    use atem_client::membership::host_sender_readmit;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let _ = feed_read(&mut rig, &s, 1);
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", false, 0).unwrap(),
+        );
+        let first = s.log.log.head().seq;
+        ticks(&mut rig, 1);
+        let mut sent = station_up(&mut rig, 2);
+        station_pass(&mut rig, 0, vec![]);
+        assert_eq!(
+            entry_results(&sent.texts()),
+            [entry_result(
+                &s.log,
+                first,
+                first,
+                &[EffectKind::Revocation]
+            )]
+        );
+        sign_and_carry(&mut rig, &mut s, host_sender_readmit("host-b", 0).unwrap());
+        let readmit = s.log.log.head().seq;
+        ticks(&mut rig, 1);
+        assert_eq!(applied(&rig), readmit);
+        let mut sent = station_up(&mut rig, 3);
+        station_pass(&mut rig, 100, vec![]);
+        assert!(entry_results(&sent.texts()).is_empty(), "no longer sent");
+        assert_eq!(
+            lifted_rows(&rig),
+            [(format!("entry:{first}"), Some(readmit as i64))]
+        );
+        restart(&mut rig, root, &os, false, true);
+        let mut sent = station_up(&mut rig, 4);
+        station_pass(&mut rig, 200, vec![]);
+        assert!(
+            entry_results(&sent.texts()).is_empty(),
+            "after a restart too"
+        );
+        // A revoke and its readmit in one catch-up: written already lifted.
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", true, 0).unwrap(),
+        );
+        let second = s.log.log.head().seq;
+        sign_and_carry(&mut rig, &mut s, host_sender_readmit("host-b", 0).unwrap());
+        let readmit2 = s.log.log.head().seq;
+        ticks(&mut rig, 1);
+        assert_eq!(applied(&rig), readmit2);
+        // The table-only path: a revoke applied, then its readmit while the
+        // control state doesn't read.
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", false, 0).unwrap(),
+        );
+        let third = s.log.log.head().seq;
+        ticks(&mut rig, 1);
+        rig.bridge.work.feeds = Feeds::Damaged;
+        sign_and_carry(&mut rig, &mut s, host_sender_readmit("host-b", 0).unwrap());
+        let readmit3 = s.log.log.head().seq;
+        ticks(&mut rig, 1);
+        assert_eq!(applied(&rig), readmit3);
+        assert_eq!(
+            lifted_rows(&rig),
+            [
+                (format!("entry:{first}"), Some(readmit as i64)),
+                (format!("entry:{second}"), Some(readmit2 as i64)),
+                (format!("entry:{third}"), Some(readmit3 as i64)),
+            ]
+        );
+        restart(&mut rig, root, &os, false, true);
+        let mut sent = station_up(&mut rig, 5);
+        station_pass(&mut rig, 300, vec![]);
+        station_pass(&mut rig, 400, vec![]);
+        assert!(entry_results(&sent.texts()).is_empty());
+    });
+}
+
+/// The host verified again (trust generation 2): the device list grows by
+/// its new `add_host`, and the session host takes the new identity.
+fn host_senders_reverify(rig: &mut LocalRig, root: &Path, s: &mut HostSenders) {
+    use crate::session_protocol::membership::r9log::secret;
+    use crate::session_protocol::membership::{HostPin, MembershipHost};
+    s.log.add_host("host", 2, &secret("delegated host"));
+    let pairing = crate::profile::Sources::in_dir(&root.join("profile"))
+        .paths
+        .pairing;
+    MembershipHost::pin(
+        &pairing,
+        &rig.bridge.dir,
+        &HostPin {
+            host_id: "host".into(),
+            host_trust_gen: 2,
+        },
+        &s.log.log,
+        &secret("delegated host"),
+    )
+    .unwrap();
+    let identity = crate::runtime::host_bridge::Identity {
+        account_id: "acct".into(),
+        atem_device_id: "host".into(),
+        host_trust_gen: 2,
+    };
+    let mut cx = Cx {
+        client: &rig.app.astation_client,
+        sessions: &mut rig.sessions,
+    };
+    rig.bridge.pairing = Some(pairing);
+    rig.bridge.reopen_list_if_changed(&mut cx);
+    rig.bridge.pairing = None;
+    assert!(rig.bridge.adopt_identity(&identity, &mut cx));
+}
+
+/// Ruling R57, L2 and L4 (host-work-v1 §11.4, "A host sender's revoke
+/// entry", "A new identity's store"): verified again, the host's new store
+/// applies the device list from its start and reports, under its own
+/// claim, only the revokes still in force at its applied `seq`: one a
+/// later readmit lifted is kept, never sent. The old store's results went
+/// aside with it (the result names the new store's applied `seq`).
+#[test]
+fn a_new_identitys_store_reports_the_revokes_still_in_force() {
+    use atem_client::control::EffectKind;
+    use atem_client::membership::host_sender_readmit;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let _ = feed_read(&mut rig, &s, 1);
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", false, 0).unwrap(),
+        );
+        let lifted = s.log.log.head().seq;
+        sign_and_carry(&mut rig, &mut s, host_sender_readmit("host-b", 0).unwrap());
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", true, 0).unwrap(),
+        );
+        let in_force = s.log.log.head().seq;
+        ticks(&mut rig, 1);
+        assert_eq!(applied(&rig), in_force);
+        host_senders_reverify(&mut rig, root, &mut s);
+        passes(&mut rig, 2);
+        let head = s.log.log.head().seq;
+        assert_eq!(applied(&rig), head, "the new store applied the list");
+        assert_eq!(
+            lifted_rows(&rig),
+            [
+                (format!("entry:{lifted}"), Some(lifted as i64 + 1)),
+                (format!("entry:{in_force}"), None),
+            ]
+        );
+        let mut sent = feed_read(&mut rig, &s, 2);
+        let texts = sent.texts();
+        assert_eq!(
+            entry_results(&texts),
+            [entry_result(
+                &s.log,
+                in_force,
+                head,
+                &[EffectKind::Revocation, EffectKind::Interrupt]
+            )]
+        );
+        let acks = acks_in(&texts);
+        assert!(!acks.is_empty());
+        assert!(acks.iter().all(|ack| ack.host_trust_gen == 2), "{acks:?}");
+    });
+}
+
+/// Ruling R57, L1: results an earlier run wrote with `host.senders` on wait
+/// while it is off (a runtime started with `host.delegated` alone): no
+/// entry result goes, the rows stay as they are, and records' acks (the
+/// cursor's here) go as before; with `host.senders` on again they go.
+#[test]
+fn stored_entry_results_wait_while_host_senders_is_off() {
+    use atem_client::control::EffectKind;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let _ = feed_read(&mut rig, &s, 1);
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", false, 0).unwrap(),
+        );
+        let revoke = s.log.log.head().seq;
+        ticks(&mut rig, 1);
+        assert_eq!(entry_rows(&rig).len(), 1);
+        rig.bridge.features = HostFeatures::parse("host.delegated").unwrap();
+        restart(&mut rig, root, &os, false, true);
+        let mut sent = station_up(&mut rig, 2);
+        station_pass(&mut rig, 0, vec![]);
+        station_pass(&mut rig, 100, vec![]);
+        let texts = sent.texts();
+        assert!(!acks_in(&texts).is_empty(), "the cursor's ack goes");
+        assert!(entry_results(&texts).is_empty());
+        let sent_gen: Option<i64> = rig
+            .bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .query_row(
+                "SELECT sent_gen FROM control_acks WHERE applied_seq IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sent_gen, None, "untouched");
+        rig.bridge.features = HostFeatures::parse("host.delegated,host.senders").unwrap();
+        let mut sent = station_up(&mut rig, 3);
+        station_pass(&mut rig, 200, vec![]);
+        assert_eq!(
+            entry_results(&sent.texts()),
+            [entry_result(
+                &s.log,
+                revoke,
+                revoke,
+                &[EffectKind::Revocation]
+            )]
+        );
     });
 }

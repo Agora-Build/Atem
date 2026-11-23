@@ -603,12 +603,30 @@ impl FeedStore {
         self.stage(mem, out)
     }
 
+    /// `readmits`, host senders' readmits applied in `tx` (the transaction
+    /// of their effects), lift the entry results written before them
+    /// ([`AckBook::on_readmitted`]): in `tx`, held once it committed;
+    /// before [`FeedStore::acknowledge`] of the same transaction's results.
+    pub fn readmitted(&mut self, tx: &FeedTx, readmits: &[(String, u64)]) -> Result<()> {
+        self.ours(tx)?;
+        if self.mem.acks.is_none() || readmits.is_empty() {
+            return Ok(());
+        }
+        let mut mem = self.staged.take().unwrap_or_else(|| self.mem.clone());
+        let out = match mem.acks.as_mut() {
+            Some(book) => book.on_readmitted(tx, readmits),
+            None => Ok(()),
+        };
+        self.stage(mem, out)
+    }
+
     /// The acks due on `link` at `D` = `now_d` ([`AckBook::due`]), as
     /// committed: under the claim of the identity the store is bound to and
     /// its device list's root, naming the link's Station's feed as this
-    /// store reads it and its cursor. None without acknowledgments, an
+    /// store reads it and its cursor; host senders' entry results only with
+    /// `entries` (`host.senders` on). None without acknowledgments, an
     /// identity or a feed read.
-    pub fn acks_due(&self, link: &StationLink, now_d: Option<u64>) -> Vec<DueAck> {
+    pub fn acks_due(&self, link: &StationLink, now_d: Option<u64>, entries: bool) -> Vec<DueAck> {
         let (Some(book), Some(identity), Some(origin)) = (
             self.mem.acks.as_ref(),
             self.identity.as_ref(),
@@ -632,6 +650,7 @@ impl FeedStore {
                 .map(|(feed_id, cursor)| (feed_id.as_str(), *cursor)),
             &claim,
             now_d,
+            entries,
         )
     }
 

@@ -162,7 +162,7 @@ fn send_at(
     cursor: u64,
     now: Option<u64>,
 ) -> Vec<Vec<AckResult>> {
-    let due = book.due(link, Some((FEED, cursor)), &claim(), now);
+    let due = book.due(link, Some((FEED, cursor)), &claim(), now, true);
     let tx = db.unchecked_transaction().unwrap();
     book.sent(&tx, link, now, &due).unwrap();
     tx.commit().unwrap();
@@ -256,7 +256,7 @@ fn results_carry_exactly_the_records_effects() {
             effects: applied.effects.clone(),
         })
         .collect();
-    let due = book.due(&link(1), Some((FEED, 4)), &claim(), Some(ISSUED));
+    let due = book.due(&link(1), Some((FEED, 4)), &claim(), Some(ISSUED), true);
     assert_eq!(due.len(), 1);
     let ack = &due[0].ack;
     assert_eq!(ack.results, expected);
@@ -280,7 +280,7 @@ fn results_carry_exactly_the_records_effects() {
     // Durable: a book loaded again owes the same.
     let again = AckBook::load(&db).unwrap();
     assert_eq!(
-        again.due(&link(1), Some((FEED, 4)), &claim(), Some(ISSUED)),
+        again.due(&link(1), Some((FEED, 4)), &claim(), Some(ISSUED), true),
         due
     );
     // Sent; then the revoke served again: owed with this result.
@@ -294,7 +294,7 @@ fn results_carry_exactly_the_records_effects() {
         &mut book,
         &[Acked::of(&revoke, &duplicate, Some(&at(5)))],
     );
-    let due = book.due(&link(1), Some((FEED, 5)), &claim(), Some(ISSUED));
+    let due = book.due(&link(1), Some((FEED, 5)), &claim(), Some(ISSUED), true);
     assert_eq!(
         due.into_iter().map(|d| d.ack.results).collect::<Vec<_>>(),
         [vec![AckResult::Record {
@@ -582,7 +582,7 @@ fn the_cursor_goes_on_and_feedless_results_name_the_own_feed() {
             Acked::of(&carried, &in_force(EffectKind::Interrupt), None),
         ],
     );
-    let due = book.due(&link(1), Some((FEED, 4)), &claim(), Some(ISSUED));
+    let due = book.due(&link(1), Some((FEED, 4)), &claim(), Some(ISSUED), true);
     assert_eq!(due.len(), 1);
     assert_eq!(
         (due[0].ack.origin.as_str(), due[0].ack.feed_id.as_str()),
@@ -805,7 +805,13 @@ fn a_second_body_never_replaces_the_first_bodys_result() {
     // No result due for it on this connection (the cursor alone goes);
     // the next has the first body's result, with the other's.
     assert!(ids(&send(&db, &mut book, &link(1), 4, ISSUED + MIN)).is_empty());
-    let due = book.due(&link(2), Some((FEED, 4)), &claim(), Some(ISSUED + MIN));
+    let due = book.due(
+        &link(2),
+        Some((FEED, 4)),
+        &claim(),
+        Some(ISSUED + MIN),
+        true,
+    );
     let results: Vec<AckResult> = due.into_iter().flat_map(|d| d.ack.results).collect();
     assert_eq!(
         results,
@@ -838,7 +844,13 @@ fn a_second_body_never_replaces_the_first_bodys_result() {
         &mut book,
         &[Acked::of(&late, &in_force(EffectKind::Hold), None)],
     );
-    let due = book.due(&link(1), Some((FEED, 5)), &claim(), Some(ISSUED + MIN));
+    let due = book.due(
+        &link(1),
+        Some((FEED, 5)),
+        &claim(),
+        Some(ISSUED + MIN),
+        true,
+    );
     assert_eq!(
         due.into_iter()
             .flat_map(|d| d.ack.results)
@@ -869,7 +881,7 @@ fn a_batch_splits_at_64_results_and_at_a_shared_record_id() {
         })
         .collect();
     commit(&db, &mut book, &covers);
-    let due = book.due(&link(1), Some((FEED, 65)), &claim(), Some(ISSUED));
+    let due = book.due(&link(1), Some((FEED, 65)), &claim(), Some(ISSUED), true);
     let sizes: Vec<usize> = due.iter().map(|d| d.ack.results.len()).collect();
     assert_eq!(sizes, [MAX_ACK_RESULTS, 1]);
     assert!(
@@ -893,7 +905,7 @@ fn a_batch_splits_at_64_results_and_at_a_shared_record_id() {
         })
         .collect();
     commit(&db, &mut book, &shared);
-    let due = book.due(&link(1), Some((FEED, 66)), &claim(), Some(ISSUED));
+    let due = book.due(&link(1), Some((FEED, 66)), &claim(), Some(ISSUED), true);
     let sizes: Vec<usize> = due.iter().map(|d| d.ack.results.len()).collect();
     assert_eq!(sizes, [1, 1], "a record_id once an ack");
     assert!(due.iter().all(|d| d.ack.to_json().is_ok()));
@@ -1138,7 +1150,7 @@ fn the_states_collision_verdict_decides_the_first_body() {
         ],
     );
     assert!(book.take_lines().is_empty(), "no collision");
-    let due = book.due(&link(2), Some((FEED, 3)), &claim(), Some(ISSUED));
+    let due = book.due(&link(2), Some((FEED, 3)), &claim(), Some(ISSUED), true);
     let acks: Vec<Vec<AckResult>> = due.into_iter().map(|d| d.ack.results).collect();
     assert_eq!(
         acks,
@@ -1168,7 +1180,7 @@ fn the_states_collision_verdict_decides_the_first_body() {
         Hash32::of(second.object().jcs().as_bytes()).to_hex()
     );
     let mut loaded = AckBook::load(&db).unwrap();
-    let due = loaded.due(&link(1), Some((FEED, 3)), &claim(), Some(ISSUED));
+    let due = loaded.due(&link(1), Some((FEED, 3)), &claim(), Some(ISSUED), true);
     assert_eq!(
         due.iter().map(|d| d.ack.results.len()).collect::<Vec<_>>(),
         [1, 1]
@@ -1269,7 +1281,7 @@ fn two_refused_connections_in_a_row_lose_no_send_once_result() {
         })
         .collect();
     commit(&db, &mut book, &holds);
-    let due = book.due(&link(2), Some((FEED, 3)), &claim(), Some(ISSUED));
+    let due = book.due(&link(2), Some((FEED, 3)), &claim(), Some(ISSUED), true);
     assert_eq!(due.len(), 2, "{due:?}");
     assert!(ids(&[due[0].ack.results.clone()]).contains(&cover.record_id().to_owned()));
     // The first isn't taken (the queue is full); the second is.
@@ -1279,4 +1291,358 @@ fn two_refused_connections_in_a_row_lose_no_send_once_result() {
     book.on_refused();
     let resent = ids(&send(&db, &mut book, &link(3), 3, ISSUED + MIN));
     assert!(resent.contains(&cover.record_id().to_owned()), "{resent:?}");
+}
+
+// ------------------------------------------- host senders' revoke entries
+
+/// A host sender's revoke entry at `seq`, its hash made up (the book never
+/// checks one against a list).
+fn entry_ref(seq: u64) -> EntryRef {
+    EntryRef {
+        seq,
+        entry_hash: Hash32([seq as u8; 32]),
+    }
+}
+
+/// The keys of the results the acks carry, in order: a record's id, or
+/// `entry:<seq>`.
+fn keys(acks: &[Vec<AckResult>]) -> Vec<String> {
+    acks.iter()
+        .flatten()
+        .map(|r| match r {
+            AckResult::Record { record_id, .. } => record_id.clone(),
+            AckResult::Entry { entry, .. } => format!("entry:{}", entry.seq),
+        })
+        .collect()
+}
+
+fn in_force_effect(effect: EffectKind) -> EffectResult {
+    EffectResult {
+        effect,
+        result: ApplicationResult::Applied,
+        why: None,
+    }
+}
+
+/// Host-work-v1 §11.4 wire rules 3 to 6 and 9 (rule 4's entry form): a host
+/// sender's revoke entry's result, written with its effects, names the
+/// entry (`seq`, `entry_hash`) and host-work's applied device-list `seq`
+/// they were written with: the revocation `applied`, and the interrupt too
+/// when the entry asked for one, each with no reason. It is feedless and
+/// goes in an ack that names the host's own Station's feed and cursor
+/// (rule 9), beside records' results, one result per `record_id` and per
+/// entry `seq` (rule 6); the shared writer takes it and its reader reads
+/// it back. Durable: a book loaded again owes the same.
+#[test]
+fn a_host_sender_revoke_entry_is_acknowledged_in_the_entry_form() {
+    use atem_client::control::ControlAck;
+    let (db, mut book) = fresh();
+    let cover = record(BOT, ControlSigner::Principal, ControlAction::Cover, ISSUED);
+    let plain = Acked::entry("host-b", entry_ref(7), false, 9);
+    let interrupting = Acked::entry("host-c", entry_ref(9), true, 9);
+    assert_eq!(
+        (
+            plain.origin.as_str(),
+            plain.feed_id.as_str(),
+            plain.principal.as_str(),
+            plain.resend,
+            plain.collision
+        ),
+        ("", "", "host:host-b", Resend::PerConnection, false)
+    );
+    commit(
+        &db,
+        &mut book,
+        &[
+            Acked::of(&cover, &in_force(EffectKind::Cover), Some(&at(1))),
+            plain,
+            interrupting,
+        ],
+    );
+    let due = book.due(&link(1), Some((FEED, 1)), &claim(), Some(ISSUED), true);
+    assert_eq!(due.len(), 1, "{due:?}");
+    let ack = &due[0].ack;
+    assert_eq!(
+        (ack.origin.as_str(), ack.feed_id.as_str(), ack.cursor),
+        (ORIGIN, FEED, 1)
+    );
+    assert_eq!(
+        ack.results,
+        [
+            AckResult::Record {
+                record_id: cover.record_id().to_owned(),
+                effects: vec![in_force_effect(EffectKind::Cover)],
+            },
+            AckResult::Entry {
+                entry: entry_ref(7),
+                applied_seq: 9,
+                effects: vec![in_force_effect(EffectKind::Revocation)],
+            },
+            AckResult::Entry {
+                entry: entry_ref(9),
+                applied_seq: 9,
+                effects: vec![
+                    in_force_effect(EffectKind::Revocation),
+                    in_force_effect(EffectKind::Interrupt)
+                ],
+            },
+        ]
+    );
+    let wire = ack.to_json().unwrap().to_string();
+    assert_eq!(&ControlAck::decode(wire.as_bytes()).unwrap(), ack);
+    assert!(wire.contains(r#""applied_seq":9"#), "{wire}");
+    // The table: the entry's key, its hash and the applied `seq`.
+    let rows: Vec<(String, String, String, Option<i64>)> = db
+        .prepare("SELECT principal, key, digest, applied_seq FROM control_acks ORDER BY rowid")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rows[0].3, None, "a record's row has none");
+    assert_eq!(
+        rows[1..],
+        [
+            (
+                "host:host-b".to_owned(),
+                "entry:7".to_owned(),
+                Hash32([7; 32]).to_hex(),
+                Some(9)
+            ),
+            (
+                "host:host-c".to_owned(),
+                "entry:9".to_owned(),
+                Hash32([9; 32]).to_hex(),
+                Some(9)
+            ),
+        ]
+    );
+    // Durable: a book loaded again owes the same.
+    let again = AckBook::load(&db).unwrap();
+    assert_eq!(
+        again.due(&link(1), Some((FEED, 1)), &claim(), Some(ISSUED), true),
+        due
+    );
+}
+
+/// §11.4 "When a host acknowledges": a host sender's revoke entry's result,
+/// in force and bounded by no deadline, goes once per connection (a
+/// restart's first included), whatever the time, and never leaves the
+/// book. It puts its effects in force, so a principal's bound on results
+/// that are entirely `duplicate` never takes it.
+#[test]
+fn an_entry_result_goes_once_per_connection() {
+    let (db, mut book) = fresh();
+    let entry = Acked::entry("host-b", entry_ref(7), true, 7);
+    assert!(!Row::bounded(entry.resend, &entry.effects));
+    commit(&db, &mut book, &[entry]);
+    let key = ["entry:7"];
+    assert_eq!(keys(&send(&db, &mut book, &link(1), 1, ISSUED)), key);
+    assert!(send(&db, &mut book, &link(1), 1, ISSUED + 11 * MIN).is_empty());
+    assert!(send(&db, &mut book, &link(1), 1, ISSUED + 30 * HOUR).is_empty());
+    assert_eq!(keys(&send(&db, &mut book, &link(2), 1, ISSUED)), key);
+    let mut again = AckBook::load(&db).unwrap();
+    assert_eq!(keys(&send(&db, &mut again, &link(2), 1, ISSUED)), key);
+    assert!(send(&db, &mut again, &link(2), 1, ISSUED).is_empty());
+    assert_eq!(table(&db).len(), 1, "kept: {:?}", table(&db));
+}
+
+/// A table of a build before entry results (no `applied_seq`) gets the
+/// column at load, its rows kept and owed as before. A row naming an entry
+/// whose key isn't `entry:<seq>` doesn't read: kept as it is, never sent,
+/// logged once (as any row the writer wouldn't take).
+#[test]
+fn an_older_table_gets_the_entry_column() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "CREATE TABLE control_acks (
+            origin TEXT NOT NULL, feed_id TEXT NOT NULL, key TEXT NOT NULL, principal TEXT NOT NULL,
+            digest TEXT NOT NULL, effects TEXT NOT NULL, resend_until_ms INTEGER, sent_gen INTEGER,
+            sent_ms INTEGER, alone INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(principal, key))",
+    )
+    .unwrap();
+    let cover = record(BOT, ControlSigner::Principal, ControlAction::Cover, ISSUED);
+    db.execute(
+        "INSERT INTO control_acks(origin,feed_id,key,principal,digest,effects,resend_until_ms)
+        VALUES(?1,?2,?3,?4,?5,?6,0)",
+        params![
+            ORIGIN,
+            FEED,
+            cover.record_id(),
+            format!("service:{BOT}"),
+            Hash32::of(cover.object().jcs().as_bytes()).to_hex(),
+            r#"[{"effect":"cover","result":"applied"}]"#,
+        ],
+    )
+    .unwrap();
+    let mut book = AckBook::load(&db).unwrap();
+    let columns: Vec<String> = db
+        .prepare("SELECT name FROM pragma_table_info('control_acks')")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        columns.ends_with(&["applied_seq".to_owned(), "superseded_by".to_owned()]),
+        "{columns:?}"
+    );
+    commit(
+        &db,
+        &mut book,
+        &[Acked::entry("host-b", entry_ref(4), false, 5)],
+    );
+    let again = AckBook::load(&db).unwrap();
+    let due = again.due(&link(1), Some((FEED, 1)), &claim(), Some(ISSUED), true);
+    assert_eq!(
+        keys(&due.into_iter().map(|d| d.ack.results).collect::<Vec<_>>()),
+        [cover.record_id(), "entry:4"]
+    );
+    for key in ["entry:x", "entry:04", "entry:0", "entry:+7", "entry:", "7"] {
+        db.execute(
+            "INSERT INTO control_acks(origin,feed_id,key,principal,digest,effects,resend_until_ms,applied_seq)
+            VALUES('','',?1,'host:host-z',?2,'[{\"effect\":\"revocation\",\"result\":\"applied\"}]',NULL,9)",
+            params![key, Hash32([1; 32]).to_hex()],
+        )
+        .unwrap();
+    }
+    let mut odd = AckBook::load(&db).unwrap();
+    assert_eq!(odd.dump()["unreadable"], 6);
+    assert_eq!(odd.take_lines().len(), 1);
+    let due = odd.due(&link(1), Some((FEED, 1)), &claim(), Some(ISSUED), true);
+    assert_eq!(
+        keys(&due.into_iter().map(|d| d.ack.results).collect::<Vec<_>>()),
+        [cover.record_id(), "entry:4"]
+    );
+}
+
+/// The rows' `superseded_by`, by key.
+fn superseded(db: &Connection) -> Vec<(String, Option<i64>)> {
+    db.prepare("SELECT key, superseded_by FROM control_acks ORDER BY rowid")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// Host-work-v1 §11.4 "A host sender's revoke entry", "Resends" (ruling
+/// R57, L2): once host-work applied a later `host_sender_readmit` of the
+/// same host, the revoke's result is kept (its row and `superseded_by`,
+/// the readmit's `seq`) but no longer due, durably; a revoke of the host
+/// after the readmit, or of another host, is due as before. A result
+/// written already lifted (the readmit in the same catch-up) is never due,
+/// and the table-only path (`AckBook::owe`) marks the rows it holds alike.
+#[test]
+fn an_entry_result_lifted_by_a_readmit_is_kept_not_resent() {
+    let (db, mut book) = fresh();
+    commit(
+        &db,
+        &mut book,
+        &[
+            Acked::entry("host-b", entry_ref(7), false, 7),
+            Acked::entry("host-c", entry_ref(8), false, 8),
+        ],
+    );
+    assert_eq!(
+        keys(&send(&db, &mut book, &link(1), 1, ISSUED)),
+        ["entry:7", "entry:8"]
+    );
+    let tx = db.unchecked_transaction().unwrap();
+    let mut next = book.clone();
+    next.on_readmitted(&tx, &[("host:host-b".to_owned(), 9)])
+        .unwrap();
+    tx.commit().unwrap();
+    book = next;
+    assert_eq!(
+        keys(&send(&db, &mut book, &link(2), 1, ISSUED)),
+        ["entry:8"],
+        "entry 7 lifted, entry 8 another host's"
+    );
+    assert_eq!(
+        superseded(&db),
+        [
+            ("entry:7".to_owned(), Some(9)),
+            ("entry:8".to_owned(), None)
+        ]
+    );
+    // Durable: a book loaded again doesn't send it either.
+    let mut again = AckBook::load(&db).unwrap();
+    assert_eq!(
+        keys(&send(&db, &mut again, &link(3), 1, ISSUED)),
+        ["entry:8"]
+    );
+    // A revoke after the readmit is due; one written already lifted isn't.
+    let mut lifted = Acked::entry("host-b", entry_ref(12), false, 13);
+    lifted.superseded = Some(13);
+    commit(
+        &db,
+        &mut again,
+        &[Acked::entry("host-b", entry_ref(10), true, 13), lifted],
+    );
+    assert_eq!(
+        keys(&send(&db, &mut again, &link(4), 1, ISSUED)),
+        ["entry:8", "entry:10"]
+    );
+    // The table-only path marks the rows it holds.
+    let tx = db.unchecked_transaction().unwrap();
+    AckBook::owe(&tx, &[], &[("host:host-b".to_owned(), 11)]).unwrap();
+    tx.commit().unwrap();
+    let rows = superseded(&db);
+    assert_eq!(
+        rows,
+        [
+            ("entry:7".to_owned(), Some(9)),
+            ("entry:8".to_owned(), None),
+            ("entry:10".to_owned(), Some(11)),
+            ("entry:12".to_owned(), Some(13)),
+        ]
+    );
+    let mut loaded = AckBook::load(&db).unwrap();
+    assert_eq!(
+        keys(&send(&db, &mut loaded, &link(5), 1, ISSUED)),
+        ["entry:8"]
+    );
+    assert_eq!(table(&db).len(), 4, "every row kept");
+}
+
+/// Ruling R57, L1: with `host.senders` off no entry result is due, rows an
+/// earlier run wrote included: they stay as they are (never marked sent,
+/// never removed) and go once it is on again. Records' results go as
+/// before.
+#[test]
+fn entry_results_wait_while_host_senders_is_off() {
+    let (db, mut book) = fresh();
+    let cover = record(BOT, ControlSigner::Principal, ControlAction::Cover, ISSUED);
+    commit(
+        &db,
+        &mut book,
+        &[
+            Acked::of(&cover, &in_force(EffectKind::Cover), Some(&at(1))),
+            Acked::entry("host-b", entry_ref(7), false, 7),
+        ],
+    );
+    let off = |book: &mut AckBook, n: u64| -> Vec<Vec<AckResult>> {
+        let due = book.due(&link(n), Some((FEED, 1)), &claim(), Some(ISSUED), false);
+        let tx = db.unchecked_transaction().unwrap();
+        book.sent(&tx, &link(n), Some(ISSUED), &due).unwrap();
+        tx.commit().unwrap();
+        due.into_iter().map(|d| d.ack.results).collect()
+    };
+    assert_eq!(keys(&off(&mut book, 1)), [cover.record_id()]);
+    assert!(off(&mut book, 2).is_empty());
+    let entry_row = |db: &Connection| -> (Option<i64>, i64) {
+        db.query_row(
+            "SELECT sent_gen, count(*) FROM control_acks WHERE key='entry:7'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    assert_eq!(entry_row(&db), (None, 1), "kept, never marked sent");
+    let mut again = AckBook::load(&db).unwrap();
+    assert_eq!(
+        keys(&send(&db, &mut again, &link(3), 1, ISSUED)),
+        ["entry:7"]
+    );
 }
