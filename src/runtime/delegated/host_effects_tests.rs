@@ -2189,3 +2189,46 @@ fn without_host_senders_no_revoke_result_is_owed() {
         );
     });
 }
+
+/// Atem's reading, for Astation's confirmation (host-work-v1 §11.4, "A
+/// host sender's revoke entry"): every `host_sender_revoke` of the device
+/// list is acknowledged, this host's own revocation as a sender included
+/// (no host sends to itself: that revocation is in force on it at once);
+/// the Station picks the hosts it waits for.
+#[test]
+fn this_hosts_own_revocation_as_a_sender_is_acknowledged_too() {
+    use atem_client::control::EffectKind;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let _ = feed_read(&mut rig, &s, 1);
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host", false, 0).unwrap(),
+        );
+        let revoke = s.log.log.head().seq;
+        ticks(&mut rig, 1);
+        assert_eq!(
+            entry_rows(&rig),
+            [(
+                "host:host".to_owned(),
+                format!("entry:{revoke}"),
+                revoke as i64
+            )]
+        );
+        let mut sent = station_up(&mut rig, 2);
+        station_pass(&mut rig, 0, vec![]);
+        assert_eq!(
+            entry_results(&sent.texts()),
+            [entry_result(
+                &s.log,
+                revoke,
+                revoke,
+                &[EffectKind::Revocation]
+            )]
+        );
+    });
+}
