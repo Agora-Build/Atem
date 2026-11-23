@@ -1817,17 +1817,22 @@ Planned:
   terminal and the Astation operations (`atem pair`, `atem pair verify`,
   `atem cred …`) are unaffected.
 - **`atem pair verify` pins one.** *Built.* On a verified pairing with no
-  device-list file at all it says why (`This device was verified before
-  device lists were pinned; verifying again pins one.`) and runs the
-  ceremony again: the next host trust generation, commit-then-reveal, the
-  same Astation's pin updated over the device's sealed keys (the cred agent
-  unlocked first, checked before anything moves), and the list the
-  certificate carries pinned (R9.2 "Pairing"). From then on the host refuses
-  r8 as every host with a list does. A list in any state (frozen, held,
-  damaged) is never verified over, and a failed rerun keeps the earlier
-  verification with no list. `atem status` says `Run atem pair verify to
-  pin a device list (needed for remote sessions over r9).` on such a
-  pairing. `atem unpair`, then `atem pair`, also works.
+  device-list file at all it says why and what starting does, then asks
+  `Continue? [y/N]` before anything moves: starting moves the host to its
+  next trust generation even if cancelled, so the paired Astation's r8
+  sessions on it end (leases revoked, queued work not started rejected,
+  session rules dropped) when the list is pinned or, after a cancel, at the
+  link's next connection. Then the ceremony: commit-then-reveal, the same
+  Astation's pin updated over the device's sealed keys (the cred agent
+  unlocked, checked before anything moves; never fresh keys), and the list
+  the certificate carries pinned (R9.2 "Pairing"). From then on the host
+  refuses r8 as every host with a list does. A list in any state (frozen,
+  held, damaged) is never verified over, a host that froze on a list before
+  is refused offline, a `verifyCommit` unanswered within 15 s fails, and a
+  failed rerun keeps the earlier verification with no list. `atem status`
+  says what such a pairing needs first (`atem pair verify`, or `atem cred
+  unlock` then `atem pair verify`, or the reset). `atem unpair`, then `atem
+  pair`, also works.
 - **Atem says why.** `atem status` shows `Authorization: not authorized (no
   device list pinned; Atem serves remote sessions only over r9: run atem pair
   verify)`, and runtime.log gets one line when the runtime starts (it already
