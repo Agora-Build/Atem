@@ -219,6 +219,9 @@ impl Sandbox {
         if let Some(pid) = self.runtime_pid() {
             add(pid);
         }
+        if let Some(pid) = self.cred_agent_pid() {
+            add(pid);
+        }
         for record in self.records() {
             for key in ["worker_pid", "agent_pid"] {
                 if let Some(pid) = record[key].as_u64() {
@@ -235,6 +238,17 @@ impl Sandbox {
         let args = cmdline(pid);
         (args.first().is_some_and(|exe| exe.ends_with("atem"))
             && args.get(1).map(String::as_str) == Some("runtime"))
+        .then_some(pid)
+    }
+
+    /// The pid in `cred/agent.lock` when it names this sandbox's `atem
+    /// cred-agent` (one its runtime started for an operation).
+    pub fn cred_agent_pid(&self) -> Option<u32> {
+        let text = std::fs::read_to_string(self.config().join("cred").join("agent.lock")).ok()?;
+        let pid: u32 = text.trim().parse().ok()?;
+        let args = cmdline(pid);
+        (args.first().is_some_and(|exe| exe.ends_with("atem"))
+            && args.get(1).map(String::as_str) == Some("cred-agent"))
         .then_some(pid)
     }
 
