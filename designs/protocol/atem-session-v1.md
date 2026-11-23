@@ -2147,8 +2147,7 @@ which entries:
     `origin` the Station, exact as `normalize_relay` writes it;
     `connection` the slot's generation, 1 to 2^53 − 1; `nonce` 32 random
     bytes, base64url; `0 < expires_at − issued_at ≤ 30000` ms. A challenge
-    is read strictly, in at most 4,096 bytes (that bound is **Atem's
-    reading, for Astation's confirmation on #101**).
+    is read strictly, in at most 4,096 bytes (that bound is **agreed with Astation, Astation #101 comment 7089434853**).
   - The reporter answers with a signed object in R9.1's form: type
     `atem-verifier-report`, `v` 1, label `atem-verifier-report-v1`, the
     body `{account_id, genesis_hash, head{seq, hash}, signer, slot,
@@ -2168,8 +2167,7 @@ which entries:
   - The builder takes nothing that matters from its caller. The head,
     account and genesis are the reporter's own verified log's (a frozen log
     refuses; a client's log has no held state, held being a host's
-    recorded device-list fault (R9.3), so only frozen refuses: **Atem's
-    reading, for Astation's confirmation on #101**); `verifier` is the
+    recorded device-list fault (R9.3), so only frozen refuses: **agreed with Astation, Astation #101 comment 7089434853**); `verifier` is the
     loaded core's `VerifierInventory::ours()`; `process` is 16 CSPRNG
     bytes drawn once per loaded core (per process image, per WASM
     instance), readable for logs. A process image means what it says: a
@@ -2178,7 +2176,7 @@ which entries:
     the core must not count them as separate reporters. It refuses a
     challenge whose `origin` isn't its configured Station normalized
     (`origin_mismatch`, a refusal of the reporter's own that the verifier
-    never gives: **Atem's reading, for Astation's confirmation on #101**),
+    never gives: **agreed with Astation, Astation #101 comment 7089434853**),
     whose `signer` isn't itself or whose `slot` isn't its configured slot,
     whose lease is out of range, or that has expired. The signing purpose
     `VerifierReport` never prompts: the provider signs only with a key
@@ -4734,9 +4732,9 @@ sets versus sequences (R9.2). Still open:
    trust generation (II.4.1), its answer to `enc_key_reused`, and its
    compromise remedy (`retire_previous`) need a way to ask the host for a
    new key: a flag on the op, or a local command. Proposed on 2026-11-22
-   (#120 comment 7086542274: a separate op, `host_enc_key_new`), for
-   Astation's agreement; asked for on 2026-11-20 (#120 comment 7028723996;
-   R9.14 item 8).
+   (#120 comment 7086542274: a separate op, `host_enc_key_new`) and agreed
+   with Astation on 2026-11-23 (#120 comment 7089435308), being built;
+   asked for on 2026-11-20 (#120 comment 7028723996; R9.14 item 8).
 
 ### R9.14 Delegated host work (items 1-7 and item 8's `host_enc_key_get` built behind a debug-only hook; not advertised by release builds)
 
@@ -5175,8 +5173,9 @@ below. Item 8's request stays open.
          `bad_enc_sig`).
        - A relay or a channel can't offer a key the host didn't vouch for
          in this generation.
-     - **Open, proposed on 2026-11-22 (#120 comment 7086542274, a separate
-       op `host_enc_key_new`), for Astation's agreement:** how a manager asks a
+     - **Agreed with Astation on 2026-11-23 (#120 comment 7089435308),
+       being built: a separate op `host_enc_key_new`** (proposed in #120
+       comment 7086542274), how a manager asks a
        host for a *new* key. Astation (2026-11-20, #120 comment 7028723996):
        routine rotation stays a separate, unresolved operation; this op is
        no rotation, and in-place re-verification is no way to one; the
