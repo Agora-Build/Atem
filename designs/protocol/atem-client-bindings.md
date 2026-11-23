@@ -870,7 +870,8 @@ exceed 2^53.
 Tests: `r9-vectors-signer-report` (the challenges; valid reports at the
 head and at an ancestor, with drafts, with zero records, a host sender's
 interrupt with a service's stops, a reinstalled journal, a demoted
-manager, an Ed25519 manager; refused ones with every code, each challenge
+manager, an Ed25519 manager, a manager added by the Recovery Kit once its
+recovery took effect; refused ones with every code, each challenge
 and recovery field mismatched, `records_mismatch` in each form, a high S,
 substitution; the builder's cases and the request's finishes) runs in the
 core's `tests/signer_report.rs` (with `tests/member_report_signer.rs`), the
