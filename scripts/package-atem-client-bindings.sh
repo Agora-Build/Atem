@@ -240,6 +240,10 @@ FILES+=("$REQUIRED_VECTOR")
 REPORT_VECTOR="atem-client-${VERSION}-r9-vectors-verifier-report.json"
 cp designs/protocol/fixtures/r9-vectors-verifier-report.json "$OUT/$REPORT_VECTOR"
 FILES+=("$REPORT_VECTOR")
+# A native manager's signer report (host-work-v1 §11.1, Astation #114).
+SIGNER_VECTOR="atem-client-${VERSION}-r9-vectors-signer-report.json"
+cp designs/protocol/fixtures/r9-vectors-signer-report.json "$OUT/$SIGNER_VECTOR"
+FILES+=("$SIGNER_VECTOR")
 # The Station's acknowledgment fixtures (test 48), for Station builders.
 for fixture in designs/protocol/fixtures/r9-control-ack-*.json; do
   ACK_FIXTURE="atem-client-${VERSION}-$(basename "$fixture")"

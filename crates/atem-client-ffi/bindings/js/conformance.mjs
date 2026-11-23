@@ -642,6 +642,138 @@ check("verifier report: a bot signs with its own key", () => {
   reportError(() => sign("dev-phone/auth"), "bad_signature");
 });
 
+// ------------------------------------------- a manager's signer report
+// r9-vectors-signer-report (host-work-v1 §11.1 "The signer report"; Astation
+// #114 item 4): each challenge read or refused; each report verified with
+// its exported records, or refused with kind report and its code; each
+// builder case as a SignerReportRequest (its body but the process, which is
+// this instance's); the immutable request's finishes, signed here with
+// Node's crypto (another body, another member: refused); and the
+// synchronous signer with a software key.
+const srep = load("r9-vectors-signer-report");
+const srepLog = (c) => {
+  const now = { wallMs: c.now_ms, monoMs: 1000, bootId: "boot-1" };
+  const chain = c.chain.map((label) => str(srep.entries.find((e) => e.label === label).entry));
+  const log = m.MembershipLog.verify(ACCOUNT, GENESIS, [...L, ...chain], now);
+  if (c.freeze !== undefined) log.extend([entry(c.freeze)], now);
+  return log;
+};
+const recoveryOut = (r) => ({
+  generation: r.generation,
+  plan_id: r.planId,
+  candidate_feed_id: r.candidateFeedId,
+  source_hash: r.sourceHash,
+  evidence_hash: r.evidenceHash,
+});
+const recoveryIn = (r) => ({
+  generation: r.generation,
+  planId: r.plan_id,
+  candidateFeedId: r.candidate_feed_id,
+  sourceHash: r.source_hash,
+  evidenceHash: r.evidence_hash,
+});
+const srepOut = (v) => ({
+  signer: v.signer,
+  slot: v.slot,
+  process: v.process,
+  connection: v.connection,
+  head: head(v.head),
+  at_head: v.atHead,
+  recovery: recoveryOut(v.recovery),
+  journal: {
+    id: v.journal.id,
+    since: v.journal.since,
+    revision: v.journal.revision,
+    records: v.journal.records,
+    records_hash: v.journal.recordsHash,
+    drafts: v.journal.drafts,
+    drafts_hash: v.journal.draftsHash,
+  },
+  records: v.records,
+});
+check("signer report: challenges", () => {
+  for (const c of srep.challenges) {
+    if (c.fields === undefined) {
+      reportError(() => m.parseSignerReportChallenge(c.text), c.code);
+      continue;
+    }
+    const r = m.parseSignerReportChallenge(c.text);
+    same(
+      { signer: r.signer, slot: r.slot, origin: r.origin, connection: r.connection, nonce: r.nonce, issued_at: r.issuedAt, expires_at: r.expiresAt, recovery: recoveryOut(r.recovery) },
+      c.fields,
+      c.label,
+    );
+  }
+  const recovery = recoveryIn(srep.challenges[0].fields.recovery);
+  const fresh = (origin) => m.parseSignerReportChallenge(m.signerReportChallenge("member:dev-phone", "astation-ios", origin, 3, 1793264000000, 1793264030000, recovery));
+  const [one, two] = [fresh("https://Station-Dev.agora.build/"), fresh("https://station-dev.agora.build")];
+  eq(one.origin, "https://station-dev.agora.build", "the Station normalized");
+  same(recoveryOut(one.recovery), srep.challenges[0].fields.recovery, "the recovery echoed");
+  if (one.nonce === two.nonce) throw new Error("a fresh nonce each time");
+  reportError(() => m.signerReportChallenge("member:dev-phone", "astation-ios", "https://station-dev.agora.build", 3, 1793264000000, 1793264030000, { ...recovery, generation: "07" }), "malformed");
+  reportError(() => m.signerReportChallenge("service:svc-discord", "astation-ios", "https://station-dev.agora.build", 3, 1793264000000, 1793264030000, recovery), "malformed");
+});
+check("signer report: reports", () => {
+  for (const c of [...srep.valid, ...srep.invalid]) {
+    const verify = () => m.verifySignerReport(srepLog(c), c.report, str(c.challenge), c.exported, c.now_ms);
+    if (c.expect !== undefined) same(srepOut(verify()), c.expect, c.label);
+    else reportError(verify, c.code);
+  }
+  // Among them: a body in signing with no saved signature, a high S.
+  const byCase = Object.fromEntries([...srep.valid, ...srep.invalid].map((c) => [c.label, c]));
+  eq(byCase.records_possibly_signed.code, "records_mismatch", "records_possibly_signed");
+  eq(byCase.not_a_manager.code, "not_a_manager", "not_a_manager");
+  eq(byCase.high_s_signature.code, "bad_signature", "high_s_signature");
+});
+check("signer report: the builder", () => {
+  for (const c of [...srep.builder, ...srep.request]) {
+    const build = () => new m.SignerReportRequest(srepLog(c), str(c.challenge), c.signer, c.slot, c.station, c.journal, "key", c.now_ms);
+    if (c.body_but_process === undefined) {
+      reportError(build, c.code);
+      continue;
+    }
+    const body = JSON.parse(build().bodyJson());
+    eq(body.process, m.verifierReportProcess(), `${c.label}: this instance's process`);
+    delete body.process;
+    same(body, c.body_but_process, c.label);
+  }
+});
+check("signer report: the immutable request", () => {
+  for (const c of srep.request) {
+    const log = srepLog(c);
+    const request = (challenge, slot) => new m.SignerReportRequest(log, str(challenge), c.signer, slot, c.station, c.journal, c.key, c.now_ms);
+    const held = request(c.challenge, c.slot);
+    const body = held.bodyJson();
+    const sr = held.signRequest();
+    eq(sr.purpose, c.sign_request.purpose, "purpose");
+    eq(sr.freshConfirmation, true, "a fresh confirmation");
+    eq(sr.label, c.sign_request.label, "label");
+    eq(sr.keyId, c.key, "key");
+    eq(sr.bodyJson, body, "the held body shown");
+    eq(hex(sr.input), hex(m.encodeFields([utf8(sr.label), utf8(body)])), "input");
+    for (const f of c.finishes) {
+      const input = f.over === "held" ? sr.input : request({ ...c.challenge, slot: f.over.slot }, f.over.slot).signRequest().input;
+      const sig = signWith(f.signed_with, input);
+      if (f.code === undefined) eq(held.finish(sig), `{"body":${body},"sig":"${Buffer.from(sig).toString("base64url")}"}`, `${c.label} ${f.label}`);
+      else reportError(() => held.finish(sig), f.code);
+    }
+    eq(held.bodyJson(), body, "the held body never changes");
+  }
+});
+check("signer report: the synchronous signer, with a software key", () => {
+  const c = srep.request.find((r) => r.signer === "member:dev-phone");
+  const store = new m.SoftwareKeyStore();
+  store.insertP256("dev-phone/auth", unhex(keys["dev-phone"].auth.secret_hex));
+  store.insertP256("dev-mac/auth", unhex(keys["dev-mac"].auth.secret_hex));
+  const log = srepLog(c);
+  const sign = (key) => m.signSignerReport(store, log, str(c.challenge), c.signer, c.slot, c.station, c.journal, key, c.now_ms);
+  const records = ["phone_revoke", "phone_interrupt", "phone_host_interrupt"].map((l) => m.canonicalJson(str(srep.records.find((r) => r.label === l).record)));
+  const v = m.verifySignerReport(log, sign(c.key), str(c.challenge), records, c.now_ms);
+  eq(v.process, m.verifierReportProcess(), "process");
+  eq(v.journal.records, 3, "records");
+  reportError(() => sign("dev-mac/auth"), "bad_signature");
+});
+
 // ---------------------------------- delegated host work: control records
 // r9-vectors-host-work-control: every record parses and verifies on each of
 // its chains as `checks` says (or its parse refuses it, `parse_error`); the

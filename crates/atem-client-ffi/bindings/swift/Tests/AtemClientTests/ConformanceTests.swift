@@ -974,6 +974,179 @@ final class ConformanceTests: XCTestCase {
             try reportError("bad_signature") { _ = try sign("dev-mac/auth") }
             #endif
         }
+        // A manager's signer report (host-work-v1 §11.1 "The signer
+        // report"; Astation #114 item 4): each challenge read or refused;
+        // each report verified with its exported records, or refused as
+        // Report(code); each builder case as a SignerReportRequest (its body
+        // but the process, which is this core's); the immutable request's
+        // finishes, signed here with CryptoKit (another body, another member:
+        // refused); and the synchronous signer through the app's provider.
+        let srep = try load("r9-vectors-signer-report")
+        func srepLog(_ c: [String: Any]) throws -> MembershipLog {
+            let at = HostClock(wallMs: u(c["now_ms"]), monoMs: 1000, bootId: "boot-1")
+            let entries = a(srep["entries"]).map(o)
+            let chain = a(c["chain"]).map { label in js(entries.first { s($0["label"]) == s(label) }!["entry"]!) }
+            let log = try MembershipLog.verify(accountId: account, genesisHash: genesis, entries: l + chain, now: at)
+            if let freeze = c["freeze"] { _ = try log.extend(entries: [entry(s(freeze))], now: at) }
+            return log
+        }
+        func recoveryOut(_ r: SignerReportRecovery) -> [String: Any] {
+            ["generation": r.generation, "plan_id": r.planId, "candidate_feed_id": r.candidateFeedId,
+             "source_hash": r.sourceHash, "evidence_hash": r.evidenceHash]
+        }
+        func recoveryIn(_ r: [String: Any]) -> SignerReportRecovery {
+            SignerReportRecovery(generation: s(r["generation"]), planId: s(r["plan_id"]), candidateFeedId: s(r["candidate_feed_id"]),
+                sourceHash: s(r["source_hash"]), evidenceHash: s(r["evidence_hash"]))
+        }
+        func journalIn(_ j: [String: Any]) -> SignerJournalView {
+            SignerJournalView(id: s(j["id"]), since: u(j["since"]), revision: u(j["revision"]),
+                records: a(j["records"]).map(s), drafts: a(j["drafts"]).map(s))
+        }
+        func srepOut(_ v: VerifiedSignerReport) -> [String: Any] {
+            [
+                "signer": v.signer, "slot": v.slot, "process": v.process, "connection": v.connection,
+                "head": ["seq": v.head.seq, "hash": v.head.hash] as [String: Any],
+                "at_head": v.atHead,
+                "recovery": recoveryOut(v.recovery),
+                "journal": ["id": v.journal.id, "since": v.journal.since, "revision": v.journal.revision,
+                            "records": v.journal.records, "records_hash": v.journal.recordsHash,
+                            "drafts": v.journal.drafts, "drafts_hash": v.journal.draftsHash] as [String: Any],
+                "records": v.records,
+            ]
+        }
+        func srepRequest(_ log: MembershipLog, _ c: [String: Any], _ challenge: [String: Any], _ slot: String, _ key: String) throws -> SignerReportRequest {
+            try SignerReportRequest(log: log, challengeJson: js(challenge), signer: s(c["signer"]), slot: slot,
+                origin: s(c["station"]), journal: journalIn(o(c["journal"])), keyId: key, nowMs: u(c["now_ms"]))
+        }
+        check("signer report: challenges") {
+            for c in a(srep["challenges"]).map(o) {
+                guard let fields = c["fields"] as? [String: Any] else {
+                    try reportError(s(c["code"])) { _ = try parseSignerReportChallenge(challengeJson: s(c["text"])) }
+                    continue
+                }
+                let r = try parseSignerReportChallenge(challengeJson: s(c["text"]))
+                let got: [String: Any] = ["signer": r.signer, "slot": r.slot, "origin": r.origin, "connection": r.connection,
+                    "nonce": r.nonce, "issued_at": r.issuedAt, "expires_at": r.expiresAt, "recovery": recoveryOut(r.recovery)]
+                try eq(canon(got), canon(fields), s(c["label"]))
+            }
+            let recovery = recoveryIn(o(o(o(a(srep["challenges"])[0])["fields"])["recovery"]))
+            func fresh(_ origin: String) throws -> SignerReportChallenge {
+                try parseSignerReportChallenge(challengeJson: try signerReportChallenge(signer: "member:dev-phone",
+                    slot: "astation-ios", origin: origin, connection: 3, issuedAt: 1_793_264_000_000, expiresAt: 1_793_264_030_000,
+                    recovery: recovery))
+            }
+            let one = try fresh("https://Station-Dev.agora.build/")
+            let two = try fresh("https://station-dev.agora.build")
+            try eq(one.origin, "https://station-dev.agora.build", "the Station normalized")
+            try eq(one.recovery == recovery, true, "the recovery echoed")
+            try eq(one.nonce == two.nonce, false, "a fresh nonce each time")
+            var leadingZero = recovery
+            leadingZero.generation = "07"
+            try reportError("malformed") {
+                _ = try signerReportChallenge(signer: "member:dev-phone", slot: "astation-ios", origin: "https://station-dev.agora.build",
+                    connection: 3, issuedAt: 1_793_264_000_000, expiresAt: 1_793_264_030_000, recovery: leadingZero)
+            }
+            try reportError("malformed") {
+                _ = try signerReportChallenge(signer: "service:svc-discord", slot: "astation-ios", origin: "https://station-dev.agora.build",
+                    connection: 3, issuedAt: 1_793_264_000_000, expiresAt: 1_793_264_030_000, recovery: recovery)
+            }
+        }
+        check("signer report: reports") {
+            for c in a(srep["valid"]).map(o) + a(srep["invalid"]).map(o) {
+                let verify = { try verifySignerReport(log: try srepLog(c), reportJson: s(c["report"]),
+                    expectedChallengeJson: js(o(c["challenge"])), exportedRecordsJson: a(c["exported"]).map(s), nowMs: u(c["now_ms"])) }
+                if let expect = c["expect"] as? [String: Any] {
+                    try eq(canon(srepOut(try verify())), canon(expect), s(c["label"]))
+                } else {
+                    try reportError(s(c["code"])) { _ = try verify() }
+                }
+            }
+            // Among them: a body in signing with no saved signature, a
+            // native that never held manage, and a high-S P-256 signature.
+            var byCase: [String: [String: Any]] = [:]
+            for c in a(srep["valid"]).map(o) + a(srep["invalid"]).map(o) { byCase[s(c["label"])] = c }
+            try eq(s(byCase["records_possibly_signed"]!["code"]), "records_mismatch", "records_possibly_signed")
+            try eq(s(byCase["not_a_manager"]!["code"]), "not_a_manager", "not_a_manager")
+            try eq(s(byCase["high_s_signature"]!["code"]), "bad_signature", "high_s_signature")
+        }
+        check("signer report: the builder") {
+            for c in a(srep["builder"]).map(o) + a(srep["request"]).map(o) {
+                let build = { try srepRequest(try srepLog(c), c, o(c["challenge"]), s(c["slot"]), "key") }
+                guard let want = c["body_but_process"] as? [String: Any] else {
+                    try reportError(s(c["code"])) { _ = try build() }
+                    continue
+                }
+                let text = try build().bodyJson()
+                var body = o(try JSONSerialization.jsonObject(with: Data(text.utf8)))
+                try eq(body.removeValue(forKey: "process") as? String, verifierReportProcess(), "\(s(c["label"])): this core's process")
+                try eq(canon(body), canon(want), s(c["label"]))
+            }
+        }
+        check("signer report: the immutable request") {
+            #if canImport(CryptoKit)
+            let reporters = CryptoKitKeys()
+            for name in ["dev-phone", "dev-mac", "dev-desk"] {
+                let k = key(name, "auth")
+                if s(k["alg"]) == "p256" { try reporters.addP256("\(name)/auth", secret: unhex(s(k["secret_hex"]))) }
+                else { try reporters.addEd25519("\(name)/auth", seed: unhex(s(k["secret_hex"]))) }
+            }
+            for c in a(srep["request"]).map(o) {
+                let log = try srepLog(c)
+                let keyId = s(c["key"])
+                let held = try srepRequest(log, c, o(c["challenge"]), s(c["slot"]), keyId)
+                let body = held.bodyJson()
+                let sr = held.signRequest()
+                try eq(sr.purpose, .signerReport, "purpose")
+                try eq(sr.freshConfirmation, true, "a fresh confirmation")
+                try eq(sr.label, s(o(c["sign_request"])["label"]), "label")
+                try eq(sr.keyId, keyId, "key")
+                try eq(sr.bodyJson, body, "the held body shown")
+                try eq(hex(sr.input), hex(encodeFields(fields: [utf8(sr.label), utf8(body)])), "input")
+                for f in a(c["finishes"]).map(o) {
+                    var input = sr.input
+                    if let over = f["over"] as? [String: Any] {
+                        var other = o(c["challenge"])
+                        other["slot"] = s(over["slot"])
+                        input = try srepRequest(log, c, other, s(over["slot"]), keyId).signRequest().input
+                    }
+                    let signer = s(f["signed_with"])
+                    let raw = try reporters.sign(request: SignRequest(keyId: signer, purpose: .signerReport,
+                        freshConfirmation: true, label: sr.label, input: input, bodyJson: nil))
+                    let sig = try reporters.publicKey(keyId: signer).alg == .p256 ? lowS(raw) : raw
+                    if let code = f["code"] {
+                        try reportError(s(code)) { _ = try held.finish(signature: sig) }
+                    } else {
+                        try eq(try held.finish(signature: sig), "{\"body\":\(body),\"sig\":\"\(b64uString(sig))\"}", "\(s(c["label"])) \(s(f["label"]))")
+                    }
+                }
+                try eq(held.bodyJson(), body, "the held body never changes")
+            }
+            #endif
+        }
+        check("signer report: the synchronous signer, through the app's provider") {
+            #if canImport(CryptoKit)
+            let c = o(a(srep["request"])[0])
+            let log = try srepLog(c)
+            let phone = CryptoKitKeys()
+            try phone.addP256("dev-phone/auth", secret: unhex(s(key("dev-phone", "auth")["secret_hex"])))
+            try phone.addP256("dev-mac/auth", secret: unhex(s(key("dev-mac", "auth")["secret_hex"])))
+            func sign(_ keyId: String) throws -> String {
+                try signSignerReport(provider: phone, log: log, challengeJson: js(o(c["challenge"])), signer: s(c["signer"]),
+                    slot: s(c["slot"]), origin: s(c["station"]), journal: journalIn(o(c["journal"])), keyId: keyId, nowMs: u(c["now_ms"]))
+            }
+            let records = try ["phone_revoke", "phone_interrupt", "phone_host_interrupt"].map { label in
+                try canonicalJson(json: js(o(a(srep["records"]).map(o).first { s($0["label"]) == label }!["record"])))
+            }
+            let v = try verifySignerReport(log: log, reportJson: try sign("dev-phone/auth"),
+                expectedChallengeJson: js(o(c["challenge"])), exportedRecordsJson: records, nowMs: u(c["now_ms"]))
+            try eq(v.process, verifierReportProcess(), "process")
+            try eq(v.journal.records, 3, "records")
+            try eq(phone.requests.count, 1, "one request")
+            try eq(phone.requests[0].purpose, .signerReport, "purpose")
+            try eq(phone.requests[0].freshConfirmation, true, "a fresh confirmation")
+            try reportError("bad_signature") { _ = try sign("dev-mac/auth") }
+            #endif
+        }
         check("device-list actions: a manager signs each under a purpose that names it (R9.6 rule 4)") {
             #if canImport(CryptoKit)
             let mac = CryptoKitKeys()
@@ -2677,6 +2850,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 144)
+        XCTAssertEqual(passed, 149)
     }
 }

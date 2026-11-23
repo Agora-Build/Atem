@@ -760,6 +760,160 @@ fun main(args: Array<String>) {
             signVerifierReport(reporters, log, Json.write(c["challenge"]), c["signer"].s(), c["slot"].s(), c["station"].s(), "dev-mac/auth", c["now_ms"].l().toULong())
         }
     }
+    // A manager's signer report (host-work-v1 §11.1 "The signer report";
+    // Astation #114 item 4): each challenge read or refused; each report
+    // verified with its exported records, or refused as Report(code); each
+    // builder case as a SignerReportRequest (its body but the process,
+    // which is this core's); the immutable request's finishes, signed here
+    // with the JDK (another body, another member: refused); and the
+    // synchronous signer through the app's provider.
+    val srep = load("r9-vectors-signer-report")
+    fun srepLog(c: Any?): MembershipLog {
+        val at = HostClock(c["now_ms"].l().toULong(), 1000uL, "boot-1")
+        val chain = c["chain"].arr().map { label -> Json.write(srep["entries"].arr().first { it["label"] == label }["entry"]) }
+        val log = MembershipLog.verify(account, genesis, l + chain, at)
+        c.obj()["freeze"]?.let { log.extend(listOf(entry(it.s())), at) }
+        return log
+    }
+    fun recoveryOut(r: SignerReportRecovery): Map<String, Any?> = mapOf(
+        "generation" to r.generation,
+        "plan_id" to r.planId,
+        "candidate_feed_id" to r.candidateFeedId,
+        "source_hash" to r.sourceHash,
+        "evidence_hash" to r.evidenceHash,
+    )
+    fun recoveryIn(r: Any?) = SignerReportRecovery(
+        r["generation"].s(), r["plan_id"].s(), r["candidate_feed_id"].s(), r["source_hash"].s(), r["evidence_hash"].s(),
+    )
+    fun journalIn(j: Any?) = SignerJournalView(
+        j["id"].s(), j["since"].l().toULong(), j["revision"].l().toULong(),
+        j["records"].arr().map { it.s() }, j["drafts"].arr().map { it.s() },
+    )
+    fun srepOut(v: VerifiedSignerReport): Map<String, Any?> = mapOf(
+        "signer" to v.signer,
+        "slot" to v.slot,
+        "process" to v.process,
+        "connection" to v.connection.toLong(),
+        "head" to mapOf("seq" to v.head.seq.toLong(), "hash" to v.head.hash),
+        "at_head" to v.atHead,
+        "recovery" to recoveryOut(v.recovery),
+        "journal" to mapOf(
+            "id" to v.journal.id, "since" to v.journal.since.toLong(), "revision" to v.journal.revision.toLong(),
+            "records" to v.journal.records.toLong(), "records_hash" to v.journal.recordsHash,
+            "drafts" to v.journal.drafts.toLong(), "drafts_hash" to v.journal.draftsHash,
+        ),
+        "records" to v.records,
+    )
+    fun srepRequest(log: MembershipLog, c: Any?, challenge: Any?, slot: String, key: String) =
+        SignerReportRequest(log, Json.write(challenge), c["signer"].s(), slot, c["station"].s(), journalIn(c["journal"]), key, c["now_ms"].l().toULong())
+    check("signer report: challenges") {
+        for (c in srep["challenges"].arr()) {
+            val fields = c.obj()["fields"]
+            if (fields == null) {
+                reportError(c["code"].s()) { parseSignerReportChallenge(c["text"].s()) }
+                continue
+            }
+            val r = parseSignerReportChallenge(c["text"].s())
+            eq(mapOf("signer" to r.signer, "slot" to r.slot, "origin" to r.origin, "connection" to r.connection.toLong(),
+                "nonce" to r.nonce, "issued_at" to r.issuedAt.toLong(), "expires_at" to r.expiresAt.toLong(),
+                "recovery" to recoveryOut(r.recovery)), fields, c["label"].s())
+        }
+        val recovery = recoveryIn(srep["challenges"][0]["fields"]["recovery"])
+        fun fresh(origin: String) = parseSignerReportChallenge(
+            signerReportChallenge("member:dev-phone", "astation-ios", origin, 3uL, 1793264000000uL, 1793264030000uL, recovery))
+        val one = fresh("https://Station-Dev.agora.build/")
+        eq(one.origin, "https://station-dev.agora.build", "the Station normalized")
+        eq(one.recovery, recovery, "the recovery echoed")
+        if (one.nonce == fresh("https://station-dev.agora.build").nonce) throw AssertionError("a fresh nonce each time")
+        reportError("malformed") {
+            signerReportChallenge("member:dev-phone", "astation-ios", "https://station-dev.agora.build", 3uL, 1793264000000uL, 1793264030000uL,
+                recovery.copy(generation = "07"))
+        }
+        reportError("malformed") {
+            signerReportChallenge("service:svc-discord", "astation-ios", "https://station-dev.agora.build", 3uL, 1793264000000uL, 1793264030000uL, recovery)
+        }
+    }
+    check("signer report: reports") {
+        for (c in srep["valid"].arr() + srep["invalid"].arr()) {
+            val verify = {
+                verifySignerReport(srepLog(c), c["report"].s(), Json.write(c["challenge"]), c["exported"].arr().map { it.s() }, c["now_ms"].l().toULong())
+            }
+            val expect = c.obj()["expect"]
+            if (expect != null) eq(srepOut(verify()), expect, c["label"].s())
+            else reportError(c["code"].s()) { verify() }
+        }
+        // Among them: a body in signing with no saved signature, a native
+        // that never held manage, and a high-S P-256 signature.
+        val byCase = (srep["valid"].arr() + srep["invalid"].arr()).associateBy { it["label"].s() }
+        eq(byCase.getValue("records_possibly_signed")["code"], "records_mismatch", "records_possibly_signed")
+        eq(byCase.getValue("not_a_manager")["code"], "not_a_manager", "not_a_manager")
+        eq(byCase.getValue("high_s_signature")["code"], "bad_signature", "high_s_signature")
+    }
+    check("signer report: the builder") {
+        for (c in srep["builder"].arr() + srep["request"].arr()) {
+            val build = { srepRequest(srepLog(c), c, c["challenge"], c["slot"].s(), "key") }
+            val want = c.obj()["body_but_process"]
+            if (want == null) {
+                reportError(c["code"].s()) { build() }
+                continue
+            }
+            val body = LinkedHashMap(Json.parse(build().bodyJson()).obj())
+            eq(body.remove("process"), verifierReportProcess(), "${c["label"].s()}: this core's process")
+            eq(body, want, c["label"].s())
+        }
+    }
+    check("signer report: the immutable request") {
+        for (c in srep["request"].arr()) {
+            val log = srepLog(c)
+            val key = c["key"].s()
+            val held = srepRequest(log, c, c["challenge"], c["slot"].s(), key)
+            val body = held.bodyJson()
+            val sr = held.signRequest()
+            eq(sr.purpose, SigningPurpose.SIGNER_REPORT, "purpose")
+            eq(sr.freshConfirmation, true, "a fresh confirmation")
+            eq(sr.label, c["sign_request"]["label"].s(), "label")
+            eq(sr.keyId, key, "key")
+            eq(sr.bodyJson, body, "the held body shown")
+            eq(hex(sr.input), hex(encodeFields(listOf(utf8(sr.label), utf8(body)))), "input")
+            for (f in c["finishes"].arr()) {
+                val input = if (f["over"] == "held") sr.input else {
+                    val slot = f["over"]["slot"].s()
+                    val other = LinkedHashMap(c["challenge"].obj()).also { it["slot"] = slot }
+                    srepRequest(log, c, other, slot, key).signRequest().input
+                }
+                val signer = f["signed_with"].s()
+                val raw = reporters.sign(SignRequest(signer, SigningPurpose.SIGNER_REPORT, true, sr.label, input, null))
+                val sig = if (reporters.publicKey(signer).alg == KeyAlg.P256) lowS(raw) else raw
+                val code = f.obj()["code"]
+                if (code == null) {
+                    val b64 = Base64.getUrlEncoder().withoutPadding().encodeToString(sig)
+                    eq(held.finish(sig), "{\"body\":$body,\"sig\":\"$b64\"}", "${c["label"].s()} ${f["label"].s()}")
+                } else reportError(code.s()) { held.finish(sig) }
+            }
+            eq(held.bodyJson(), body, "the held body never changes")
+        }
+    }
+    check("signer report: the synchronous signer, through the app's provider") {
+        val c = srep["request"][0]
+        val log = srepLog(c)
+        val keysUsed = JdkKeys()
+        val k = keys["dev-phone"]["auth"]
+        keysUsed.addP256("dev-phone/auth", unhex(k["secret_hex"].s()), unhex(k["pub_hex"].s()))
+        val report = signSignerReport(keysUsed, log, Json.write(c["challenge"]), c["signer"].s(), c["slot"].s(), c["station"].s(),
+            journalIn(c["journal"]), "dev-phone/auth", c["now_ms"].l().toULong())
+        val records = listOf("phone_revoke", "phone_interrupt", "phone_host_interrupt").map { label ->
+            canonicalJson(Json.write(srep["records"].arr().first { it["label"] == label }["record"]))
+        }
+        val v = verifySignerReport(log, report, Json.write(c["challenge"]), records, c["now_ms"].l().toULong())
+        eq(v.process, verifierReportProcess(), "process")
+        eq(v.journal.records, 3uL, "records")
+        eq(keysUsed.requests.single().purpose, SigningPurpose.SIGNER_REPORT, "purpose")
+        eq(keysUsed.requests.single().freshConfirmation, true, "a fresh confirmation")
+        reportError("bad_signature") {
+            signSignerReport(reporters, log, Json.write(c["challenge"]), c["signer"].s(), c["slot"].s(), c["station"].s(),
+                journalIn(c["journal"]), "dev-mac/auth", c["now_ms"].l().toULong())
+        }
+    }
     check("device-list actions: a manager signs each under a purpose that names it (R9.6 rule 4)") {
         val mac = JdkKeys()
         mac.addP256("dev-mac/auth", unhex(keys["dev-mac"]["auth"]["secret_hex"].s()), unhex(keys["dev-mac"]["auth"]["pub_hex"].s()))
