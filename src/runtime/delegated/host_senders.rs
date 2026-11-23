@@ -39,6 +39,7 @@ use super::{DelegatedSender, SenderClass};
 use crate::runtime::host_work::{Route, Store, WorkRecord};
 use crate::runtime::test_hooks::HostFeatures;
 use anyhow::{Result, bail};
+use atem_client::control::EntryRef;
 use atem_client::encoding::Hash32;
 use atem_client::host_principal::{host_principal, parse_host_principal};
 use atem_client::membership::entry::Action;
@@ -458,8 +459,18 @@ pub struct QueuedLaunch {
     pub admission: super::Admission,
 }
 
+/// A `host_sender_revoke` entry [`list_effects`] applied: what its result
+/// to the host's own Station names (host-work-v1 §11.4 wire rule 4's entry
+/// form, [`super::acks::Acked::entry`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevokeApplied {
+    pub host_id: String,
+    pub entry: EntryRef,
+    pub interrupt_running: bool,
+}
+
 /// What [`list_effects`] asks of the bridge once its transaction
-/// committed.
+/// committed, and the revokes it applied.
 #[derive(Debug, Default)]
 pub struct ListEffects {
     /// A live attempt's withdrawal, the intents carried out.
@@ -469,13 +480,18 @@ pub struct ListEffects {
     /// bridge drops them from its queue, and its spawn check refuses one the
     /// launcher holds.
     pub launches: Vec<(String, &'static str)>,
+    /// Every `host_sender_revoke` applied, in `seq` order: their results
+    /// are written in the same transaction (`host_senders_pass`).
+    pub revokes: Vec<RevokeApplied>,
 }
 
 /// The effects on host senders' tasks of `list`'s entries after `after`
 /// (host-work's applied `seq`) up to its head, in `tx`, entry by entry
 /// (design II.2.2, II.3.1, II.8), and on `launches` (this run's queued
-/// launches on message); what must wait for the commit is returned. The
-/// caller writes the new applied `seq` in the same transaction.
+/// launches on message); what must wait for the commit is returned, with
+/// the revokes applied. The caller writes the new applied `seq` in the
+/// same transaction, and the revokes' results owed the host's own Station
+/// (host-work-v1 §11.4 wire rule 4's entry form).
 ///
 /// - **`host_sender_revoke`** at `seq` (II.3.1): the sender's tasks
 ///   admitted before it (their generation below `seq`) stop as a revoke
@@ -529,6 +545,7 @@ pub fn list_effects(
 ) -> Result<ListEffects> {
     let mut out = Vec::new();
     let mut stopped = Vec::new();
+    let mut revokes = Vec::new();
     // The list as of each project entry (`ListAsOf`), read forward once
     // from the first one; host senders' tasks a project entry may stop,
     // read at the first one; the queued launches not stopped yet.
@@ -551,6 +568,14 @@ pub fn list_effects(
                 if *interrupt_running {
                     effects::interrupt(store, tx, &principal, &tasks, &seq.to_string(), &mut out)?;
                 }
+                revokes.push(RevokeApplied {
+                    host_id: host_id.clone(),
+                    entry: EntryRef {
+                        seq,
+                        entry_hash: entry.hash(),
+                    },
+                    interrupt_running: *interrupt_running,
+                });
             }
             Action::RemoveHost { host_id } if host_id != this_host => {
                 let principal = host_principal(host_id);
@@ -583,6 +608,7 @@ pub fn list_effects(
     Ok(ListEffects {
         followups: out,
         launches: stopped,
+        revokes,
     })
 }
 

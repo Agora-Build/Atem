@@ -76,12 +76,19 @@
 //!   with whatever results are due (none, for a page with no record).
 //! - **A host sender's revoke entry** (wire rules 3 to 6, 9 and 10: rule
 //!   4's entry form, [`Acked::entry`]; design II.3.1, "Reporting a revoke
-//!   as applied"): its result names the entry (`seq`, `entry_hash`) and
-//!   host-work's applied device-list `seq` its effects were written with;
-//!   its revocation, and its interrupt when it asked for one, `applied`.
-//!   Feedless (rule 9: the ack names the host's own Station's feed and
-//!   cursor), in force and bounded by no deadline: once per connection, as
-//!   §11.4 says, and kept.
+//!   as applied"), with `host.senders` on: written in the transaction that
+//!   writes the entry's effects on host senders' tasks with host-work's
+//!   applied device-list `seq` (`host_senders_pass`), naming the entry
+//!   (`seq`, `entry_hash`) and that applied `seq`; its revocation, and its
+//!   interrupt when it asked for one, `applied`. Feedless (rule 9: the ack
+//!   names the host's own Station's feed and cursor), in force and bounded
+//!   by no deadline: once per connection, as §11.4 says, and kept. Never
+//!   `pending` (**Atem's reading, for Astation's confirmation**: host-work
+//!   writes an entry's effects in the pass after the device list commits
+//!   it, and while it can't write them it can't write a result either). A
+//!   store whose feeds aren't loaded for its identity (its control state
+//!   doesn't read) owes it in the table ([`AckBook::owe`]), for the book
+//!   that loads it.
 //! - **A new host identity's store** reads its feed from 0 and acknowledges
 //!   what it applied itself (**Atem's reading, for Astation and
 //!   Auth/Portal**): a stop applied under the previous identity is
@@ -702,6 +709,35 @@ impl AckBook {
                 Some(i) => self.rows[i] = row,
                 None => self.rows.push(row),
             }
+        }
+        Ok(())
+    }
+
+    /// `results`, host senders' revoke entries' ([`Acked::entry`]), written
+    /// in `tx` (the transaction of their effects) where no book is loaded
+    /// for the store's identity (its control state doesn't read): owed to
+    /// the book that loads the table, its table made if missing. Each
+    /// entry's is written once (host-work applies an entry once: its
+    /// applied `seq` moves past it in the same transaction), so no bound
+    /// or collision applies; one the shared writer wouldn't take isn't
+    /// written.
+    pub fn owe(tx: &Connection, results: &[Acked]) -> Result<()> {
+        if results.is_empty() {
+            return Ok(());
+        }
+        prepare(tx)?;
+        for acked in results.iter().filter(|a| writable(&a.result())) {
+            Row {
+                origin: acked.origin.clone(),
+                feed_id: acked.feed_id.clone(),
+                principal: acked.principal.clone(),
+                subject: acked.subject.clone(),
+                effects: acked.effects.clone(),
+                resend: acked.resend,
+                sent: Sent::Never,
+                alone: false,
+            }
+            .write(tx)?;
         }
         Ok(())
     }
