@@ -7,9 +7,10 @@
 //! (the log is in hand first). A hook `TurnEnded` that arrives alone is still
 //! authoritative: it emits `Complete { Done }` and marks the turn completed; a later
 //! log `TurnEnded` for that turn is ignored, so a turn never completes twice. A
-//! hook `TurnEnded` recorded before the transcript entry that began the current
-//! turn is an earlier turn's, read late (its log end made the session ready and
-//! the next prompt went in): it ends nothing (`ends_an_earlier_turn`). The
+//! hook `TurnEnded` recorded surely before either the prompt hook the current
+//! turn's entry answered or that entry is an earlier turn's, read late (its log
+//! end made the session ready and the next prompt went in): it ends nothing
+//! (`ends_an_earlier_turn`). The
 //! agent runs a prompt hook just before it writes the prompt's entry, so a pass
 //! can read the hook and not yet the entry: no turn end recorded before that
 //! hook (a hook's or the log's) makes the session ready, and a hook `TurnEnded`

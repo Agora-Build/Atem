@@ -288,20 +288,28 @@ Atem reads the transcript to its end and sends what it found before
 A `Stop` can be read late. The transcript's `end_turn` makes the session ready
 before that turn's `Stop` hook is read, so the next prompt may go in first.
 A `Stop` recorded before the current, still open turn began is an earlier
-turn's: it ends nothing of the current turn, neither `complete` nor `ready`. A
-turn begins after its prompt's hook ran, so the `Stop` (by its event file's
-time) is weighed against the event file of the hook that began the turn (the
-hook its entry answered, below), whatever time the turn's entry carries. Only
-when no hook answered the entry is it weighed against the entry's time, which
-holds while an agent stamps an entry no earlier than the previous turn's end.
-On a filesystem that keeps whole seconds (a time counts to the end of its
-second), a `Stop` in the same second as that start is stale only while the
-previous turn's own `Stop` is still owed (its transcript end was read, its hook
-not); otherwise it is the current turn's own, which is never dropped. When the
-current turn's start isn't known (no hook, its entry no longer retained or with
-no time), a `Stop` applies as before. The owed mark and the hook's time go with
-the worker's chat snapshot (and a catch-up after dropped items), so a broker
-that adopts the worker after a restart decides as the worker does.
+turn's: it ends nothing of the current turn, neither `complete` nor `ready`. The
+`Stop` (by its event file's time) is weighed against two starts: the event file
+of the prompt hook the turn's entry answered (below), and the entry's own time.
+It is an earlier turn's when surely before either. A turn's own `Stop` comes
+after its prompt's hook ran and after its prompt was submitted, so it is before
+neither, however early the agent stamps the entry. Either start can be the
+later one. An entry stamped at its prompt's submission reads before its hook.
+The hook an entry answered may be an older equal prompt's whose own entry never
+came (Esc during the hook check, then the same text again), since entries
+answer the oldest waiting hook of their prompt. On a filesystem that keeps
+whole seconds (a time counts to the end of its second), a `Stop` in the same
+second as a start is stale only while the previous turn's own `Stop` is still
+owed (its transcript end was read, its hook not); otherwise it is the current
+turn's own, which is never dropped. When neither start is known (no hook, its
+entry no longer retained or with no time), a `Stop` applies as before. The owed
+mark and the hook's time go with the worker's chat snapshot (and a catch-up
+after dropped items), so a broker that adopts the worker after a restart
+decides as the worker does. This rule, like #126's hold, relies on a prompt's
+hook running when the prompt goes in, after the previous turn's `Stop`, or on
+its entry being stamped after that `Stop`. A hook run while the prompt is only
+queued during the previous turn, with its entry stamped then too, would defeat
+both.
 
 Claude runs the `UserPromptSubmit` hook before it writes the prompt's
 transcript entry, so a pass can read the next prompt's hook and not yet its
@@ -342,10 +350,17 @@ before its hook, can't fool them:
 
 - **A turn end against the newest waiting hook.** The end is a `Stop` (an event
   file's time) or a transcript end (when the reply ended, after its hook). A
-  stamp only the user entry carries never takes part.
-- **A `Stop` against the hook that began the open turn.** Both are event files.
-  The fallback to the entry's time applies only to an entry no hook answered,
-  as stated above.
+  stamp only the user entry carries never takes part. An agent that stamps the
+  transcript end early too (the chat tests' fake stamps a whole turn at the
+  prompt's submission) only makes it held more, toward `working`, and only
+  while its own hook still waits. The turn's `Stop` then releases it; an
+  interrupted turn has no `Stop`, so it is released by the next entry.
+- **A `Stop` against the open turn's starts: the hook its entry answered (an
+  event file), and the entry's time.** It is stale only if surely before
+  either. A turn's own `Stop` comes after its prompt's hook ran and after its
+  prompt was submitted, so an entry stamped at submission still reads before
+  its own turn's `Stop`, and no genuine end is dropped. The entry's term guards
+  against a paired hook that is an older equal prompt's.
 - **An unpaired entry surely after the newest waiting hook.** Stamping it early
   only fails toward waiting.
 - **A chat prompt's hook and entry against its paste** (acceptance). A prompt
@@ -366,8 +381,9 @@ restores or catches up). Past that the oldest goes, counted; the newest, which
 decides what a turn end may do, always stays. While a dropped hook's entry may
 still come, an entry pairing the newest hook may be that one, so the newest
 keeps its wait (failing toward `working`, for that turn). This happens at most
-as many times as hooks were dropped (at most 8), and a turn's own end, after
-its own hook, is `ready` all the same. In practice the queue holds one or two
+as many times as hooks were dropped (at most 8), and a turn's own end, surely
+after its own hook, is `ready` all the same (within the hook's second, on a
+filesystem keeping whole seconds, it waits for the next prompt's entry). In practice the queue holds one or two
 hooks (prompts queued in the terminal); a run of commands whose entries the
 reader skips (below) is what fills it.
 
