@@ -1658,7 +1658,135 @@ applied once more after the rest. **It checks consistency only:** never
 that the retained records are the whole history, that a mark bounds every
 time the old deployment signed or reserved, or that every author's stops
 reached the Station (#114, items 1, 3 and 4 stay the Station's and the
-owner's).
+owner's; item 4's signer report below proves what one author's journal
+holds, no more).
+
+**The signer report** (Astation #114 item 4; the author barrier and the
+typed primitive **agreed with Astation, Astation #114 comment
+7089435073**). Before a Station publishes a replacement feed, every
+native manager that could have signed one of the plan's stops reports its
+signing journal, so the snapshot includes every stop that author can have
+signed. The author's own device holds a durable barrier from its report
+until the plan ends, so it can't sign a stop the snapshot misses. The
+barrier and the journal are the app's adapter's (Astation's); the shared
+core builds only the primitive.
+
+- **The plan's records** (B2): a control record a native member signs
+  (`signer` `member:<device_id>`), of this account and genesis, that is a
+  service's `revoke` or `interrupt_running` naming the recovering
+  Station's origin, or any `host:` principal's `interrupt_running` (which
+  names no origin, so any Station of the account may carry it). A
+  service's records at another origin aren't held.
+- **The barrier, B1 to B6, as the adapter keeps it:**
+  - B1: the barrier `{account_id, genesis_hash, origin, generation,
+    plan_id, candidate_feed_id, revision}` and the journal state at that
+    `revision` are committed durably in one transaction before the report
+    body is built from that state; a failed commit means no report.
+  - B2: while it is held for `(account_id, genesis_hash, origin)`, the
+    adapter refuses to create, draft or sign any of the plan's records,
+    with a typed refusal (`recovery_barrier`, naming the plan and
+    generation) before any prompt, checked again at the key-signing
+    boundary. Barriers of concurrent origins are independent, and any one
+    of them holds new `host:` interrupts.
+  - B3: write-ahead signing, always: the exact body is appended durably as
+    `signing` before the key is asked, then the signature is recorded. A
+    `signing` body with no saved signature stays possibly signed: it is in
+    the report's `records`, never an unsigned draft or an absent record.
+  - B4: only the plan's end releases it, as the author's own Station at
+    that origin reports it, authenticated and durable: the candidate feed
+    published under that generation, or evidence that the plan can never
+    publish. No timeout, owner click, local override, unknown answer,
+    dead Station, cancelled prompt, sleep or restart releases it. A
+    report is marked exposed durably before it crosses the adapter's
+    boundary (an uncertain write counts as exposed); only a provably
+    unexposed report may be discarded, and exposure never releases the
+    barrier.
+  - B5: one barrier per `(account_id, genesis_hash, origin)`: a new report
+    for the same plan keeps the hold in the same commit; another plan or
+    generation supersedes it only after authenticated evidence from that
+    exact origin that the older plan can't publish. The Station counts
+    only an author's newest report for the plan.
+  - B6: one lock across every process that signs with the member key; no
+    clock; every write before its effect; a failed release write keeps the
+    barrier. An old or unaccounted-for process, a missing journal range, a
+    changed journal identity or a rolled-back protected store stays an
+    unresolved author obligation, which a signed report never waives. The
+    barrier's lifetime is independent of the report's 30 s acceptance
+    lease: an expired report needs a fresh one, never a cleared barrier.
+- **The challenge** the Station mints and stores: the verifier report's
+  `{signer, slot, origin, connection, nonce, issued_at, expires_at}`
+  (session-v1 R9.2, its `signer` a `member:<device_id>`) and
+  `recovery{generation, plan_id, candidate_feed_id, source_hash,
+  evidence_hash}` (`generation` a canonical decimal string, 1 to 2^63 − 1;
+  UUID v4 ids; lowercase hex SHA-256), read strictly within 4,096 bytes,
+  the lease `0 < expires_at − issued_at ≤ 30000` ms.
+- **The body**, type `atem-signer-report`, `v` 1, signed by the member's
+  own `auth_key` over `enc(["atem-signer-report-v1", jcs(body)])`, with a
+  fresh confirmation (purpose `SignerReport`: the plan, the origin, the
+  counts, and that the barrier holds this device's stops until the plan
+  ends; never in the background):
+
+  ```json
+  {"body":{"type":"atem-signer-report","v":1,
+    "account_id":"…","genesis_hash":"<hex>","head":{"seq":9,"hash":"<hex>"},
+    "signer":"member:dev-phone","slot":"astation-ios","process":"<b64u 16>",
+    "challenge":{"origin":"https://station-dev.agora.build","connection":3,
+                 "nonce":"<b64u 32>","issued_at":1795000000000,"expires_at":1795000030000},
+    "recovery":{"generation":"7","plan_id":"<UUID v4>","candidate_feed_id":"<UUID v4>",
+                "source_hash":"<hex>","evidence_hash":"<hex>"},
+    "journal":{"id":"<b64u 16>","since":4,"revision":118,
+               "records":3,"records_hash":"<hex>","drafts":0,"drafts_hash":"<hex>"}},
+   "sig":"<b64u>"}
+  ```
+
+  `journal.id` is 16 random bytes made with the journal (a reinstalled or
+  wiped journal has another), `since` the device-list `seq` at its
+  creation (at least 1), `revision` the count of every append ever made
+  (0 to 2^53 − 1). `records` and `records_hash` are over the plan's
+  records the member put into `signing` or `signed`: `records_hash =
+  SHA-256(enc(["atem-signer-report-records-v1", d1…dn]))`, each `d` the 32
+  bytes of `SHA-256(jcs(body))`, sorted by bytes; `drafts` and
+  `drafts_hash` the same over its unsigned drafts of the plan's records,
+  with `atem-signer-report-drafts-v1`. The rest is the verifier report's:
+  strict I-JSON, exact fields at every level, no `null`, no array, the
+  body's `jcs` at most 4,096 bytes and the object at most 16 KiB.
+- **The builder** (`member_report::signer_report_body`; the bindings'
+  immutable `SignerReportRequest`) takes the log, the challenge, the
+  reporter's `member:<id>`, its slot, its configured Station and the
+  journal's view `{id, since, revision, records: [body_json], drafts:
+  [body_json]}`, under the adapter's lock. It reads each body strictly as
+  one of the plan's records by this member (anything else, or a body
+  twice in one set, is `malformed`), computes the counts and the set
+  hashes itself (the caller supplies no hash), and refuses a challenge for
+  another Station (`origin_mismatch`), signer or slot, a signer that isn't
+  a current native member (`unknown_signer`) or never held `manage`
+  (`not_a_manager`), and an expired challenge, as the verifier report's
+  builder does.
+- **The verifier**, `verify_signer_report(log, report, expected_challenge,
+  exported_records[], now_ms)`, reads membership at the verifier's head;
+  the first failure is the code, in this order: `malformed`, `frozen`,
+  `wrong_account`, `unknown_signer` (services, hosts, `recovery` and
+  grants included), `not_a_manager` (a current native that never held
+  `manage` at any `seq`; one demoted since still reports), `bad_signature`,
+  `stale_log`, `fork`, `signer_mismatch`, `slot_mismatch`,
+  `challenge_mismatch`, `recovery_mismatch` (any recovery field),
+  `records_mismatch` (an exported record that isn't a signed control
+  record of the plan by this member, one whose signature doesn't verify
+  under its `auth_key`, a duplicate, or another count or `records_hash`
+  than the report's), `expired`. It returns `{signer, slot, process,
+  connection, head, at_head, recovery, journal, records}`, `records` the
+  verified exported records.
+- **What it proves:** the report's signature, for this challenge and
+  plan, and that the export matches it. **It is consistency only, never
+  completeness of anything outside the journal.** A `signing` body with
+  no saved signature is in `records` and can't be exported as signed, so
+  the report stays `records_mismatch` and reconciliation stays fenced until
+  the exact evidence is recovered (Astation's conservative rule; there is
+  no permissive path). A report and a publication use the same recovery
+  tuple, head and commitments: reports of different evidence revisions
+  are never mixed. Comparing an author's reports (another `journal.id`, a
+  later `since`) is the Station's.
+- Vectors: `r9-vectors-signer-report` (below).
 
 **Stations: the trust model** (**Atem's proposal, agreed with Astation
 (2026-11-11, #120 comment 6810116314) and Auth/Portal (2026-11-12, #147 comment 6813332550)**). The principal's own key may sign every action,
@@ -1830,6 +1958,26 @@ after the retained records, after the snapshot alone and after both.
 machine, and checks every code is exercised.
 It derives no other verdict.
 Every SDK package's checksum manifest lists the file.
+
+**`r9-vectors-signer-report`** (the signer report above; agreed with
+Astation, #114 comment 7089435073): log L of `r9-vectors-membership-log`
+and its own `entries` (dev-desk, an Ed25519 native without `manage`, then
+made a manager; dev-phone demoted; R7 byte for byte); `records`, the
+control records the cases use; the challenges read or refused; valid
+reports (at the head and at an ancestor, with drafts, with zero records, a
+host sender's interrupt with a service's stops, a reinstalled journal, a
+demoted manager, an Ed25519 manager, records exported in another order);
+refused ones (every malformed form, the recovery and journal grammars
+included; each code in its order; `not_a_manager`; each challenge and
+recovery field mismatched; `records_mismatch` in each form: one missing,
+one extra, one signed after the report, a possibly signed body without a
+signature, a wrong signer, another origin, a duplicate, another key, a
+high S; a high-S report; substitution by another member and another slot;
+expiry); the builder's bodies and refusals; and the immutable request's
+finishes. Its runners are `crates/atem-client/tests/signer_report.rs`, the
+FFI's, the binding conformance suites and `scripts/check-r9-vectors.py`,
+which derives every verdict with a control-record reader of its own. Every
+SDK package's checksum manifest lists the file.
 
 ### 11.2 `work_interrupt` and `work_resolve`
 

@@ -4511,7 +4511,11 @@ subject of a recovery still waiting and a high-S signature included; the builder
 bodies and refusals; and the immutable request's finishes; its runners
 are `crates/atem-client/tests/verifier_report.rs`, the FFI's, the binding
 conformance suites and `scripts/check-r9-vectors.py`, which derives every
-verdict). The membership
+verdict) and `r9-vectors-signer-report` (host-work-v1 §11.1 "The signer
+report", a native manager's signed report of its control-record signing
+journal on the same core, agreed with Astation, #114 comment 7089435073;
+its runners are `crates/atem-client/tests/signer_report.rs`, the FFI's, the
+binding conformance suites and `scripts/check-r9-vectors.py`). The membership
 log also carries the planned actions of R9.2 "Host senders and projects"
 (signed only behind the signing gate): projects (`P7_add_host_b`,
 `P8_set`, the replacing `P9_narrow`, `P10_remove`; a host removed and added again,
