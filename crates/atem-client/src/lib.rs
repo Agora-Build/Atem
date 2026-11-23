@@ -63,7 +63,10 @@
 //!
 //! - [`member_report`]: a native member's or a service's signed report of
 //!   the device-list verifier its loaded core runs, for a minter's
-//!   single-use challenge, and the minter's verifier against its log.
+//!   single-use challenge, and the minter's verifier against its log; and
+//!   on the same core a native manager's signed report of its
+//!   control-record signing journal, for a Station recovering from a
+//!   rollback (host-work-v1 §11.1 "The signer report", Astation #114).
 //!
 //! Delegated host work (`designs/delegated-host-work.md`):
 //!
