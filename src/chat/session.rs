@@ -424,6 +424,16 @@ fn same_prompt(a: &str, b: &str) -> bool {
     a.trim() == b.trim() || squash(a) == squash(b)
 }
 
+/// Waiting prompt hooks as carried (a snapshot), bound as when they wait
+/// live: the newest `MAX_WAITING_PROMPTS`, the oldest dropped first.
+fn bounded(prompts: Vec<PromptMark>) -> VecDeque<PromptMark> {
+    let mut waiting = VecDeque::from(prompts);
+    while waiting.len() > MAX_WAITING_PROMPTS {
+        waiting.pop_front();
+    }
+    waiting
+}
+
 /// `text`'s words, one space between them: what `same_prompt` compares
 /// (trimmed equality implies it).
 fn squash(text: &str) -> String {
@@ -645,7 +655,7 @@ impl ChatSession {
         session.wait_held = snapshot.wait_held;
         session.held_past_turn = snapshot.held_past_turn;
         session.hook_end_owed = snapshot.hook_end_owed;
-        session.waiting = snapshot.waiting_prompts.into();
+        session.waiting = bounded(snapshot.waiting_prompts);
         session.entry_ahead = snapshot.entry_ahead;
         for message in snapshot.history {
             session.push_message(message);
@@ -871,7 +881,7 @@ impl ChatSession {
         self.wait_held = snapshot.wait_held;
         self.held_past_turn = snapshot.held_past_turn;
         self.hook_end_owed = snapshot.hook_end_owed.clone();
-        self.waiting = snapshot.waiting_prompts.iter().cloned().collect();
+        self.waiting = bounded(snapshot.waiting_prompts.clone());
         self.entry_ahead = snapshot.entry_ahead.clone();
         self.set_status(
             snapshot.state,
@@ -1093,7 +1103,8 @@ impl ChatSession {
                     // An earlier turn's end read only now (its log entry
                     // made the session ready, and the next prompt went in
                     // meanwhile, its entry read or not yet): it ends
-                    // nothing of the current turn.
+                    // nothing of the current turn, nor the link a timed-out
+                    // chat prompt's entry may still claim (`expired`).
                     return out;
                 }
                 self.expired = None;
@@ -1136,6 +1147,8 @@ impl ChatSession {
     /// begun). Past the bound the oldest waiting hook goes; the newest,
     /// which decides what a turn end may do, always stays.
     fn hook_read(&mut self, hook: PromptMark) {
+        // A Codex hook naming the current turn starts none (one read late
+        // after its entry, or a prompt into the running turn).
         if hook.turn_id.is_some() && hook.turn_id.as_deref() == self.current_turn_id() {
             return;
         }
@@ -1143,7 +1156,7 @@ impl ChatSession {
             self.entry_ahead = None;
             return;
         }
-        if self.waiting.len() == MAX_WAITING_PROMPTS {
+        while self.waiting.len() >= MAX_WAITING_PROMPTS {
             self.waiting.pop_front();
         }
         self.waiting.push_back(hook);
@@ -3011,6 +3024,189 @@ mod tests {
             12,
         );
         assert_eq!(s.waiting.len(), MAX_WAITING_PROMPTS - 1);
+    }
+
+    /// A Codex-shaped prompt hook: it names its turn.
+    fn turn_hook_at(text: &str, turn: &str, at: i64) -> AgentEvent {
+        AgentEvent::PromptSubmitted {
+            text: text.into(),
+            turn_id: Some(turn.into()),
+            at_ms: Some(at),
+        }
+    }
+
+    /// The newest waiting hook decides what a turn end may do. A typed
+    /// skill's hook waits for good (the reader skips its entries); its turn
+    /// ends, and its end and Stop are read with the next prompt's hook: the
+    /// session stays working, though the skill's hook is older than that
+    /// end, and turn 3 then ends ready.
+    #[test]
+    fn the_newest_waiting_hook_decides() {
+        for whole_seconds in [false, true] {
+            let case = format!("whole seconds {whole_seconds}");
+            let at = |t: i64| file_time(t, whole_seconds);
+            let mut s = in_turn_one(whole_seconds);
+            pass(
+                &mut s,
+                vec![stop_at(at(1_550))],
+                vec![end_at("t1", 1_500)],
+                2,
+            );
+            assert_eq!(s.status().state, State::Ready, "{case}");
+            pass(
+                &mut s,
+                vec![prompt_hook_at("/review", at(3_010))],
+                vec![],
+                3,
+            );
+            let o = pass(
+                &mut s,
+                vec![stop_at(at(6_010)), prompt_hook_at("next", at(6_650))],
+                vec![end_at("t1", 6_000)],
+                4,
+            );
+            assert!(!says_ready(&o), "{case}: {o:?}");
+            assert_eq!(s.status().state, State::Working, "{case}");
+            pass(&mut s, vec![], vec![user_at("u3", "t3", "next", 6_700)], 5);
+            assert!(s.waiting.is_empty(), "{case}");
+            let o = pass(
+                &mut s,
+                vec![stop_at(at(9_010))],
+                vec![end_at("t3", 9_000)],
+                6,
+            );
+            assert_eq!(completes(&o).len(), 1, "{case}: {o:?}");
+            assert_eq!(s.status().state, State::Ready, "{case}");
+        }
+    }
+
+    /// A carried queue is bound as a live one: `restore` and `catch_up`
+    /// keep the newest `MAX_WAITING_PROMPTS` hooks, and one more read then
+    /// drops the oldest.
+    #[test]
+    fn a_carried_queue_is_bound_as_a_live_one() {
+        let mut worker = ready();
+        let mut snapshot = over_the_wire(&worker);
+        for n in 1..=2 * MAX_WAITING_PROMPTS as i64 {
+            snapshot
+                .waiting_prompts
+                .push(PromptMark::new(&format!("p{n}"), n * 1_000, None));
+        }
+        let newest: Vec<_> = snapshot.waiting_prompts[MAX_WAITING_PROMPTS..].to_vec();
+        let mut restored = ChatSession::restore("g2".into(), snapshot.clone());
+        worker.catch_up(&snapshot);
+        for s in [&mut restored, &mut worker] {
+            assert_eq!(s.waiting.iter().cloned().collect::<Vec<_>>(), newest);
+            s.on_event(prompt_hook_at("one more", 40_000), 1, 0);
+            assert_eq!(s.waiting.len(), MAX_WAITING_PROMPTS);
+            assert_eq!(s.waiting.front(), newest.get(1));
+        }
+    }
+
+    /// A Stop that ends nothing (the previous turn's, read with the next
+    /// prompt's hook) leaves the link a timed-out chat prompt's entry may
+    /// still claim: the entry read next is that prompt's, and its turn
+    /// completes its request.
+    #[test]
+    fn a_stale_stop_keeps_a_timed_out_prompts_link() {
+        let mut s = in_turn_one(false);
+        pass(&mut s, vec![], vec![end_at("t1", 1_500)], 2);
+        submit_ok(&mut s, "r2", "second");
+        let t = Instant::now();
+        s.tick(t);
+        let o = s.tick(t + Duration::from_secs(11));
+        assert!(matches!(&o[..], [Out::Error { .. }]), "{o:?}");
+        pass(
+            &mut s,
+            vec![stop_at(1_550), prompt_hook_at("second", 1_650)],
+            vec![],
+            3,
+        );
+        let o = pass(
+            &mut s,
+            vec![],
+            vec![user_at("u2", "t2", "second", 1_700)],
+            4,
+        );
+        assert!(
+            o.iter()
+                .any(|o| matches!(o, Out::Message(m) if m.request_id.as_deref() == Some("r2"))),
+            "{o:?}"
+        );
+        let o = pass(&mut s, vec![stop_at(5_010)], vec![end_at("t2", 5_000)], 5);
+        assert_eq!(
+            completes(&o),
+            vec![&Out::Complete {
+                turn_id: "t2".into(),
+                request_id: Some("r2".into()),
+                outcome: Outcome::Done
+            }]
+        );
+    }
+
+    /// An entry recorded surely after the newest waiting hook, with another
+    /// text (the prompt recorded otherwise than the hook gave it), ends the
+    /// wait: an older hook left waiting would take the next equal entry
+    /// and leave that entry's own hook waiting, holding its turn's end in
+    /// the hook's second on a filesystem keeping whole seconds.
+    #[test]
+    fn an_entry_with_another_text_after_its_hook_ends_the_wait() {
+        let at = |t: i64| file_time(t, true);
+        let mut s = ready();
+        pass(
+            &mut s,
+            vec![prompt_hook_at("continue", at(1_010))],
+            vec![user_at("u1", "t1", "continue [image]", 2_100)],
+            1,
+        );
+        assert!(s.waiting.is_empty());
+        pass(
+            &mut s,
+            vec![stop_at(at(2_550))],
+            vec![end_at("t1", 2_500)],
+            2,
+        );
+        assert_eq!(s.status().state, State::Ready);
+        pass(
+            &mut s,
+            vec![prompt_hook_at("continue", at(3_010))],
+            vec![user_at("u2", "t2", "continue", 3_100)],
+            3,
+        );
+        let o = pass(
+            &mut s,
+            vec![stop_at(at(3_550))],
+            vec![end_at("t2", 3_500)],
+            4,
+        );
+        assert_eq!(completes(&o).len(), 1, "{o:?}");
+        assert_eq!(s.status().state, State::Ready);
+    }
+
+    /// A Codex hook naming the current turn (a prompt into the running turn,
+    /// or one read after its entry) starts no turn and waits for nothing:
+    /// on a filesystem keeping whole seconds, that turn's end in the hook's
+    /// second makes the session ready.
+    #[test]
+    fn a_hook_naming_the_current_turn_waits_for_nothing() {
+        let at = |t: i64| file_time(t, true);
+        let mut s = ready();
+        pass(
+            &mut s,
+            vec![turn_hook_at("go", "t1", at(110))],
+            vec![user_at("u1", "t1", "go", 120)],
+            1,
+        );
+        pass(
+            &mut s,
+            vec![turn_hook_at("also this", "t1", at(1_010))],
+            vec![],
+            2,
+        );
+        assert!(s.waiting.is_empty());
+        let o = pass(&mut s, vec![], vec![end_at("t1", 1_500)], 3);
+        assert_eq!(completes(&o).len(), 1, "{o:?}");
+        assert_eq!(s.status().state, State::Ready);
     }
 
     #[test]
