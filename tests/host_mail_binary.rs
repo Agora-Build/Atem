@@ -2398,6 +2398,139 @@ fn a_withheld_revoke_carried_by_a_native_cancels_and_refuses() {
     assert!(!rig.has_message(&late.message_id));
 }
 
+/// Host-work-v1 §11.4 wire rules 3 to 6 and 9 (design II.3.1, "Reporting
+/// a revoke as applied"): a `host_sender_revoke` of the sending host, with
+/// `interrupt_running`, that the Station's device list carries to this
+/// host reaches the fake Station, once host-work wrote its effects (the
+/// sender's queued task `cancelled`, `sender revoked`), as an entry-form
+/// result: the entry's `seq` and `entry_hash`, host-work's applied
+/// device-list `seq` (at least the entry's), the revocation and the
+/// interrupt `applied`, in a `control_ack` under the host's claim naming
+/// the host's own Station's feed and its cursor there. The reference
+/// ledger takes it (no refusal; an entry counts nothing there: no Portal
+/// report, no re-sign alert).
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_host_sender_revoke_reaches_the_station_as_an_entry_result() {
+    use atem_client::control::{AckResult, ApplicationResult, EffectKind};
+    use atem_client::membership::host_sender_revoke;
+    let mut rig = Rig::admitting("");
+    rig.online();
+    let sid = rig.launch();
+    let to = rig.receiver(1);
+    rig.fault("hold_host_work");
+    let before = rig.log.log.head();
+    let message = rig
+        .sender
+        .message(&to, &[&format!("atem:{HOST}")], 1, "HM_EACK");
+    rig.put(&rig.sender.request_of(&to, before, &message));
+    let task = task_of(&message, &sid);
+    rig.within("admitted", || !rig.tasks_of(&message.message_id).is_empty());
+    rig.log.append(
+        support::r9log::MAC,
+        host_sender_revoke(SENDER, true, 0).unwrap(),
+    );
+    rig.station().set_log(&rig.log);
+    let seq = rig.log.log.head().seq;
+    support::delegated::wait_stored(&rig, &task, "cancelled", "sender revoked");
+    let mut found = None;
+    rig.within("the entry's result at the Station", || {
+        found = rig.station().acks_sent().into_iter().find_map(|ack| {
+            let result = ack
+                .results
+                .iter()
+                .find(|r| matches!(r, AckResult::Entry { entry, .. } if entry.seq == seq))
+                .cloned()?;
+            Some((ack, result))
+        });
+        found.is_some()
+    });
+    let (ack, result) = found.unwrap();
+    let station = rig.station();
+    assert_eq!(
+        (
+            ack.account_id.as_str(),
+            ack.genesis_hash,
+            ack.host_id.as_str(),
+            ack.host_trust_gen
+        ),
+        (ACCOUNT, rig.log.genesis_hash(), HOST, 1)
+    );
+    assert_eq!(
+        (ack.origin.as_str(), ack.feed_id.as_str(), ack.cursor),
+        (station.origin(), station.feed_id(), 0),
+        "the host's own Station's feed and cursor"
+    );
+    let AckResult::Entry {
+        entry,
+        applied_seq,
+        effects,
+    } = result
+    else {
+        unreachable!()
+    };
+    assert_eq!(entry.entry_hash, rig.log.log.entry(seq).unwrap().hash());
+    assert!(applied_seq >= seq, "applied_seq {applied_seq}, entry {seq}");
+    assert_eq!(
+        effects
+            .iter()
+            .map(|e| (e.effect, e.result, e.why.is_some()))
+            .collect::<Vec<_>>(),
+        [
+            (EffectKind::Revocation, ApplicationResult::Applied, false),
+            (EffectKind::Interrupt, ApplicationResult::Applied, false),
+        ]
+    );
+    assert!(
+        station.ack_refusals().is_empty(),
+        "{:?}",
+        station.ack_refusals()
+    );
+    assert!(station.acks().pending_reports().is_empty());
+}
+
+/// Hook off = main for host senders: with `host.delegated` alone, a
+/// `host_sender_revoke` the device list carries is no result the host
+/// owes: its acks (the cursor's) carry no entry form, and nothing was
+/// refused.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn without_host_senders_a_revoke_entry_is_no_acknowledgment() {
+    use atem_client::control::AckResult;
+    use atem_client::membership::host_sender_revoke;
+    let mut rig = Rig::start(Via::Local, Hook::Delegated);
+    rig.online();
+    rig.within("the feed's cursor acknowledged", || {
+        !rig.station().acks_sent().is_empty()
+    });
+    rig.log.append(
+        support::r9log::MAC,
+        host_sender_revoke(SENDER, true, 0).unwrap(),
+    );
+    rig.station().set_log(&rig.log);
+    let seq = rig.log.log.head().seq;
+    rig.within("the revoke in the host's list", || {
+        rig.dump()["membership"]["head"]["seq"].as_u64() == Some(seq)
+    });
+    rig.two_passes();
+    rig.two_passes();
+    let station = rig.station();
+    assert!(
+        station
+            .acks_sent()
+            .iter()
+            .flat_map(|ack| ack.results.iter())
+            .all(|r| !matches!(r, AckResult::Entry { .. }))
+    );
+    assert!(station.ack_refusals().is_empty());
+}
+
 /// Host-work-v1 §11.2, §11.5 (Astation's ask, #120 comment 7028723996),
 /// over the Mac's native channel (the owner: a native member holding
 /// `control`): a host sender's request admitted into a selector task (its
