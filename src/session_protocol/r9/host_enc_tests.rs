@@ -507,7 +507,7 @@ fn the_recipient_is_the_pairings_with_the_generations_key_and_record() {
     let kid: [u8; 8] = atem_client::encoding::hex_decode_array(&kid_of(&public)).unwrap();
     let now = Some(host_enc::DNow {
         d_ms: crate::session_protocol::membership::r9log::host_now().wall_ms,
-        clock_change: None,
+        clock: 0,
     });
     let got = host_enc::recipient(&src, &log.log, now).unwrap();
     assert!(got.recipient.keys.is_empty(), "no entry set it yet");

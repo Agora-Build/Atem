@@ -91,7 +91,7 @@ impl HostBridge {
     }
 }
 
-/// `D` now and the delegated clock's latest repair or lowering: none
+/// `D` now and the delegated clock's mark (`host_clock::mark_of`): none
 /// without this pass's reading (the start view's: nothing is decided on
 /// the key's window then, and a commit gets no stamp), else the later of
 /// that reading and one taken now from the clock as the start view last
@@ -108,15 +108,15 @@ pub(crate) fn view_now(view: &StartView) -> Option<host_enc::DNow> {
         .max(clock.and_then(|c| c.d_ms()).unwrap_or(0));
     Some(host_enc::DNow {
         d_ms,
-        clock_change: clock.and_then(|c| c.change()),
+        // No snapshot: a mark no clock has, so no window opens on it.
+        clock: clock.map_or(0, |c| c.mark()),
     })
 }
 
 /// The device list's commit watch (`MembershipHost::set_commit_watch`), with
 /// `host.senders` on: a commit that turns a key this host holds into the
 /// list's previous key stamps it, just before the list is written, with
-/// `D` as `view_now` reads it then and the clock's latest repair or
-/// lowering.
+/// `D` and the clock's mark as `view_now` reads them then.
 pub(crate) fn commit_watch(
     view: &Arc<std::sync::Mutex<StartView>>,
 ) -> crate::session_protocol::membership::CommitWatch {
@@ -138,7 +138,7 @@ pub(crate) fn commit_watch(
 pub(crate) fn start_watch(state: PathBuf) -> crate::session_protocol::membership::CommitWatch {
     watch(Box::new(move || {
         crate::runtime::host_clock::start_reading(&state)
-            .map(|(d_ms, clock_change)| host_enc::DNow { d_ms, clock_change })
+            .map(|(d_ms, clock)| host_enc::DNow { d_ms, clock })
     }))
 }
 

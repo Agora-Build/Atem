@@ -341,12 +341,82 @@ fn a_clock_repair_after_the_stamp_retires_the_previous_key_at_once() {
         hk_tick(&mut rig);
         let change = rig.bridge.start_view().clock.as_ref().unwrap().change();
         assert!(change.is_some(), "a repair recorded");
-        rig.bridge.work.host_key_checked = None;
-        rig.bridge.host_key_pass();
-        assert!(hk_file(&rig).get("previous").is_none(), "retired at once");
+        // Refused at the next open, with no key pass forced (re-review I4:
+        // a clock change isn't one of the pass's triggers; every open judges
+        // the window), and the secret erased by that open.
         assert_eq!(
             hk_deliver(&mut rig, &mut host, &old, &mut position),
             Err("enc_key_not_accepted".into())
         );
+        assert!(hk_file(&rig).get("previous").is_none(), "retired at once");
+    });
+}
+
+/// Fix round 2 (re-review N1) on the real delegated clock: `D` ahead at the
+/// stamp (an unsynchronized jump of 5 h, its anchor pending); 6 h on, the
+/// clock's record is found damaged at a restart and starts afresh at a
+/// synchronized reading, `D` dropping back by the jump with no repair or
+/// lowering recorded (never below the stamp). The previous key is retired
+/// at once, at the next open, with no key pass forced: its window would
+/// otherwise run to 29 h of real time.
+#[test]
+fn a_clock_started_afresh_after_the_stamp_retires_the_previous_key_at_once() {
+    local_test(async |root| {
+        use crate::runtime::host_clock::os::Synced;
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = mb_host(&mut rig, root, &os);
+        hk_tick(&mut rig);
+        let old = host.enc_pub.clone();
+        // An unsynchronized jump of 5 h: `D` runs ahead.
+        {
+            let mut r = os.0.lock().unwrap();
+            r.wall_ms += 5 * HOUR + 1_000;
+            r.boot_ns += 1_000_000_000;
+            r.synced = Synced::No;
+        }
+        hk_tick(&mut rig);
+        assert!(rig.bridge.work.clock.as_ref().unwrap().anchored());
+        let ahead = rig.bridge.start_view().now_d_ms.unwrap();
+        let new = hk_new_key(&rig);
+        hk_rotate(&mut rig, &mut host, &new, false);
+        rig.bridge.host_key_pass();
+        assert_eq!(hk_file(&rig)["previous"]["applied_d_ms"], ahead);
+        let mut position = 0;
+        assert_eq!(hk_deliver(&mut rig, &mut host, &old, &mut position), Ok(()));
+        // 6 h on, still unsynchronized; then the record is found damaged at
+        // a restart of the clock.
+        os.pass(6 * HOUR);
+        hk_tick(&mut rig);
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute("UPDATE clock SET state='{' WHERE id=1", [])
+            .unwrap();
+        manual_clock(&mut rig, &os);
+        assert!(rig.bridge.work.clock.as_ref().unwrap().damaged());
+        // A synchronized reading at the truth: the clock starts afresh.
+        {
+            let mut r = os.0.lock().unwrap();
+            r.wall_ms -= 5 * HOUR;
+            r.boot_ns += 1_000_000_000;
+            r.synced = Synced::Yes;
+        }
+        hk_tick(&mut rig);
+        assert!(!rig.bridge.work.clock.as_ref().unwrap().damaged());
+        let d = rig.bridge.start_view().now_d_ms.unwrap();
+        assert!(
+            d >= ahead && d < ahead + 2 * HOUR,
+            "lowered by the jump, not below the stamp: {d} against {ahead}"
+        );
+        assert_eq!(
+            hk_deliver(&mut rig, &mut host, &old, &mut position),
+            Err("enc_key_not_accepted".into())
+        );
+        assert!(hk_file(&rig).get("previous").is_none(), "retired at once");
+        assert_eq!(hk_deliver(&mut rig, &mut host, &new, &mut position), Ok(()));
     });
 }

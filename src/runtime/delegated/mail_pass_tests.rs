@@ -42,7 +42,7 @@ fn mb_host(rig: &mut LocalRig, root: &Path, os: &ManualOs) -> MbHost {
         rig.bridge.membership.as_ref().unwrap().membership(),
         Some(crate::session_protocol::r9::host_enc::DNow {
             d_ms: host_now().wall_ms,
-            clock_change: None,
+            clock: 0,
         }),
     )
     .unwrap();

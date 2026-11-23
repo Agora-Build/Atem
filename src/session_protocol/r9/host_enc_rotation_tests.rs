@@ -171,11 +171,15 @@ fn commit_rotation(r: &mut Rot, pending: &[u8; 32], retire_previous: bool, d: Op
     }
 }
 
-/// `D` = `d`, no repair or lowering of the delegated clock recorded.
+/// The delegated clock's mark these tests run under (no repair, lowering
+/// or fresh start since a stamp).
+const MARK: u64 = 7;
+
+/// `D` = `d`, the clock's mark unchanged.
 fn at(d: u64) -> host_enc::DNow {
     host_enc::DNow {
         d_ms: d,
-        clock_change: None,
+        clock: MARK,
     }
 }
 
@@ -495,6 +499,7 @@ fn without_its_application_time_the_previous_key_is_retired_at_once() {
                 "seq": r.log.log.head().seq,
                 "hash": "00".repeat(32),
                 "d_ms": D0,
+                "clock": MARK,
             });
             std::fs::write(&r.pairing.host_enc_key, f.to_string()).unwrap();
         }
@@ -926,10 +931,10 @@ fn a_retry_never_gets_a_key_the_host_lost() {
     assert_eq!(pub_of(&r, "pending"), got);
 }
 
-/// R63 (review M2): a repair or lowering of the delegated clock recorded
-/// after a previous key's stamp retires that key at once (its window could
-/// otherwise run longer than 24 h of real time); one recorded before the
-/// stamp, and unchanged since, keeps it.
+/// R63 (review M2) and re-review N1: the delegated clock's mark changed
+/// after a previous key's stamp (a repair, a lowering, or a fresh start)
+/// retires that key at once (its window could otherwise run longer than
+/// 24 h of real time); the mark unchanged since the stamp keeps it.
 #[test]
 fn a_clock_repair_after_the_stamp_retires_the_previous_key() {
     let mut r = rot();
@@ -940,14 +945,11 @@ fn a_clock_repair_after_the_stamp_retires_the_previous_key() {
     let mut store = dl_store(&r);
     let before = Some(host_enc::DNow {
         d_ms: D0,
-        clock_change: Some(D0 - HOUR),
+        clock: 11,
     });
     host_enc::stamp_application_locked(&mut store, &prev, &r.log.log, HOST, 1, before);
-    let view_at = |r: &Rot, d: u64, change: Option<u64>| {
-        let now = host_enc::DNow {
-            d_ms: d,
-            clock_change: change,
-        };
+    let view_at = |r: &Rot, d: u64, clock: u64| {
+        let now = host_enc::DNow { d_ms: d, clock };
         let got =
             host_enc::recipient_at(&r.pairing, HOST.into(), 1, &r.log.log, Some(now)).unwrap();
         got.recipient
@@ -957,7 +959,7 @@ fn a_clock_repair_after_the_stamp_retires_the_previous_key() {
             .collect::<Vec<_>>()
     };
     assert_eq!(
-        view_at(&r, D0 + HOUR, Some(D0 - HOUR)),
+        view_at(&r, D0 + HOUR, 11),
         [kid(&new), kid(&old)],
         "the change before the stamp, unchanged"
     );
@@ -968,15 +970,17 @@ fn a_clock_repair_after_the_stamp_retires_the_previous_key() {
         &r.log.log,
         Some(host_enc::DNow {
             d_ms: D0 + 2 * HOUR,
-            clock_change: Some(D0 + 2 * HOUR),
+            clock: 12,
         }),
     )
     .unwrap();
     assert!(
-        done.lines.iter().any(|l| l.contains("repaired or lowered")),
+        done.lines
+            .iter()
+            .any(|l| l.contains("repaired, lowered or started afresh")),
         "{:?}",
         done.lines
     );
     assert_eq!(retired(&r), [kid(&old)]);
-    assert_eq!(view_at(&r, D0 + 2 * HOUR, Some(D0 + 2 * HOUR)), [kid(&new)]);
+    assert_eq!(view_at(&r, D0 + 2 * HOUR, 12), [kid(&new)]);
 }

@@ -1191,22 +1191,108 @@ fn a_station_time_that_raises_nothing_writes_no_row() {
     assert_eq!(stored(&store), clock.state);
 }
 
-/// Review L1: `start_reading` reads `D` and the latest repair or lowering
-/// from the record a store at `state` keeps, read only, before the
-/// runtime opens the store (a carriage record replayed at the start); none
-/// without a store or a record.
+/// Review L1: `start_reading` reads `D` and the clock's mark from the
+/// record a store at `state` keeps, read only, before the runtime opens
+/// the store (a carriage record replayed at the start); none without a
+/// store or a record. Re-review I1: it observes the reading as the clock
+/// does, so after a long downtime in the same boot with the wall clock set
+/// back (below `wall_hw`: its follow-down) its `D` and mark are the ones
+/// the restarted clock reads at its first reading, not above them.
 #[test]
 fn the_start_reading_takes_the_records_clock() {
     let (dir, store) = open_store();
     let os = Os::new(T, 100 * SEC, "boot-a", Synced::Yes);
     let mut clock = HostClock::with_reader(&store, os.reader());
     assert_eq!(super::start_reading(&store.state), None, "no record yet");
+    assert_eq!(super::start_reading_at(&store.state, &os.now()), None);
     clock.tick(&store);
-    let (d, change) = super::start_reading(&store.state).expect("a record");
-    // The OS's own reading (no hook here): `D` is at least the record's.
-    assert!(d >= T, "{d}");
-    assert_eq!(change, None);
+    os.pass(MIN);
+    clock.tick(&store);
+    let at = |os: &Os| super::start_reading_at(&store.state, &os.now()).expect("a record");
+    let snapshot = clock.snapshot().unwrap();
+    assert_eq!(at(&os), (snapshot.d_ms().unwrap(), snapshot.mark()));
+    // Down for an hour of the same boot, the wall clock set back 10 minutes.
+    os.pass(HOUR);
+    os.set_wall(os.wall() - 10 * MIN, Synced::Yes);
+    let (d, mark) = at(&os);
+    let mut clock = HostClock::with_reader(&store, os.reader());
+    clock.tick(&store);
+    let first = clock.snapshot().unwrap();
+    assert_eq!((d, mark), (first.d_ms().unwrap(), first.mark()));
+    // The OS's own reading (no hook here) reads the record too.
+    assert!(super::start_reading(&store.state).is_some());
     let empty = tempfile::tempdir().unwrap();
     assert_eq!(super::start_reading(empty.path()), None);
     drop(dir);
+}
+
+/// Fix round 2 (re-review N1): a fresh start lowers `D` with no repair or
+/// lowering recorded, so the clock's mark (its record's epoch and its
+/// latest repair or lowering) changes with it. The reviewer's scenario:
+/// `D` 5 h ahead (its anchor pending) when a key is stamped; 6 h on the
+/// record is found damaged at a restart and starts afresh at a synchronized
+/// reading, `D` dropping by the jump, never below the stamp, no change
+/// recorded: the mark differs. So do a record read as none and a damaged
+/// one started afresh at a Station time. A restart that reads the record
+/// keeps the mark.
+#[test]
+fn a_fresh_start_changes_the_clocks_mark() {
+    let (_dir, store) = open_store();
+    let os = Os::new(T, 100 * SEC, "boot-a", Synced::Yes);
+    let mut clock = HostClock::with_reader(&store, os.reader());
+    clock.tick(&store);
+    os.pass(SEC);
+    clock.tick(&store);
+    os.set_wall(os.wall() + 5 * HOUR, Synced::No);
+    os.pass(SEC);
+    clock.tick(&store);
+    assert!(clock.anchored());
+    let at_stamp = clock.snapshot().unwrap();
+    let (d_stamp, mark) = (at_stamp.d_ms().unwrap(), at_stamp.mark());
+    os.pass(6 * HOUR);
+    clock.tick(&store);
+    // A restart that reads the record: the same mark.
+    let mut clock = HostClock::with_reader(&store, os.reader());
+    clock.tick(&store);
+    let d_before = clock.snapshot().unwrap().d_ms().unwrap();
+    assert_eq!(clock.snapshot().unwrap().mark(), mark, "the same record");
+    // Damaged at a restart, then afresh at the truth.
+    store
+        .db
+        .execute("UPDATE clock SET state='{' WHERE id=1", [])
+        .unwrap();
+    let mut clock = HostClock::with_reader(&store, os.reader());
+    assert!(clock.damaged());
+    os.set_wall(os.wall() - 5 * HOUR, Synced::Yes);
+    clock.tick(&store);
+    assert!(!clock.damaged());
+    let afresh = clock.snapshot().unwrap();
+    let d_after = afresh.d_ms().unwrap();
+    assert!(d_after + 4 * HOUR < d_before, "{d_after} {d_before}");
+    assert!(d_after >= d_stamp, "not below the stamp");
+    assert_eq!(afresh.change(), None, "no repair or lowering recorded");
+    assert_ne!(afresh.mark(), mark, "a fresh start, a new mark");
+    let afresh_mark = afresh.mark();
+    let mut clock = HostClock::with_reader(&store, os.reader());
+    clock.tick(&store);
+    assert_eq!(clock.snapshot().unwrap().mark(), afresh_mark);
+    // A record read as none (its row gone): another fresh start.
+    store.db.execute("DELETE FROM clock", []).unwrap();
+    let mut clock = HostClock::with_reader(&store, os.reader());
+    clock.tick(&store);
+    let none_mark = clock.snapshot().unwrap().mark();
+    assert!(none_mark != afresh_mark && none_mark != mark);
+    // Damaged again, afresh at a Station time within the cap.
+    store
+        .db
+        .execute("UPDATE clock SET state='{' WHERE id=1", [])
+        .unwrap();
+    let mut clock = HostClock::with_reader(&store, os.reader());
+    assert!(clock.damaged());
+    os.pass(SEC);
+    assert!(clock.station(ORIGIN, os.wall(), &store));
+    assert!(!clock.damaged());
+    let station_mark = clock.snapshot().unwrap().mark();
+    assert!(![mark, afresh_mark, none_mark].contains(&station_mark));
+    logged();
 }

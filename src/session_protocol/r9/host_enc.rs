@@ -14,15 +14,16 @@
 //!                                         "current":{"secret":"<b64u>","pub":"<b64u>"},
 //!                                         "pending":{"secret":…,"pub":…},
 //!                                         "previous":{"secret":…,"pub":…,"replaced_at_seq":S,
-//!                                                     "applied_d_ms":D,"clock_change":C},
+//!                                                     "applied_d_ms":D,"clock":C},
 //!                                         "applied":{"seq":S,"hash":"<64 hex>","d_ms":D,
-//!                                                    "clock_change":C}}
+//!                                                    "clock":C}}
 //! <profile>/pairing/host_enc_generated  {"v":2,"host_trust_gen":N,"kids":["<16 hex>",…],
 //!                                         "retired":["<16 hex>",…],
 //!                                         "requests":[{"request_id","kid","pub"},…]}
 //! ```
 //!
-//! Each slot of the key file is optional (`clock_change` too); a v1 file
+//! Each slot of the key file is optional (`C`, the delegated clock's mark,
+//! `host_clock::mark_of`, is a number); a v1 file
 //! (`{"v":1, "host_trust_gen", "secret", "pub"}`, a current key only) and a
 //! v1 record (no `retired`, no `requests`) are read as such and written as
 //! v2 at their next change.
@@ -86,7 +87,8 @@
 //!   watch): just before the list writes a commit whose newest
 //!   `host_enc_key` entry for this host turns a key the host holds into the
 //!   list's previous key (not retired), the delegated clock's `D` (read
-//!   fresh) and its latest repair or lowering are written into the key file
+//!   fresh) and its mark (its record's epoch, drawn at every fresh start,
+//!   and its latest repair or lowering) are written into the key file
 //!   with that entry's `seq` and hash, durably: the evidence of when the
 //!   host applied it. A stamp is written once per entry; a later commit of
 //!   the same entry keeps it. A carriage replayed at a start is stamped at
@@ -95,9 +97,10 @@
 //!   where the list moved or a deadline is due, and before building the
 //!   receiver's view, so before any mail is opened). The previous key opens
 //!   mail until `D` reaches its stamp's `D` plus 24 h ([`RETAIN_MS`]); with
-//!   no stamp naming the entry the list holds, `D` below the stamp, or a
-//!   repair or lowering of the delegated clock recorded since the stamp, it
-//!   is erased at once (fail closed: never a fresh or longer window). A
+//!   no stamp naming the entry the list holds, `D` below the stamp, or the
+//!   clock's mark changed since the stamp (a repair, a lowering, or a fresh
+//!   start: a damaged record started afresh, a record read as none), it is
+//!   erased at once (fail closed: never a fresh or longer window). A
 //!   crash between the list's commit and the key file following it never
 //!   restarts or lengthens the window: the stamp is absolute. Each erasure
 //!   writes the ids to `retired` first, then the key file.
@@ -144,11 +147,12 @@ const KEY_NAME: &str = "host_enc_key";
 const PREVIOUS_NAME: &str = "host_enc_key.previous";
 
 /// The delegated clock now, as the key file's windows are judged on it:
-/// `D`, and its latest repair or lowering (`D` just after it), if any.
+/// `D`, and its mark (`host_clock::mark_of`: its record's epoch and its
+/// latest repair or lowering; it changes at each, and at a fresh start).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DNow {
     pub d_ms: u64,
-    pub clock_change: Option<u64>,
+    pub clock: u64,
 }
 
 /// A host encryption key, as handed out: its generation, its public half
@@ -233,23 +237,23 @@ impl Slot {
 
 /// When the host applied the entry at `seq` (its hash `hash`) that turned
 /// a key it holds into the list's previous key: `D` read before the list
-/// committed it, and the delegated clock's latest repair or lowering then.
+/// committed it, and the delegated clock's mark then.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Applied {
     seq: u64,
     hash: Hash32,
     d_ms: u64,
-    clock_change: Option<u64>,
+    clock: u64,
 }
 
 /// A routine rotation's previous key: the `seq` of the entry that replaced
 /// it, `D` when the host applied that entry (its window ends [`RETAIN_MS`]
-/// later), and the clock's latest repair or lowering then.
+/// later), and the clock's mark then.
 struct Previous {
     slot: Slot,
     replaced_at_seq: u64,
     applied_d_ms: u64,
-    clock_change: Option<u64>,
+    clock: u64,
 }
 
 impl Previous {
@@ -258,15 +262,16 @@ impl Previous {
     }
 
     /// Why its window is over at `now` (passed, `D` below its application,
-    /// or the clock repaired or lowered since), if it is.
+    /// or the clock repaired, lowered or started afresh since: its mark
+    /// differs), if it is.
     fn over(&self, now: &DNow) -> Option<&'static str> {
         if now.d_ms < self.applied_d_ms {
             Some("the delegated clock reads below its application; its window can't be established")
         } else if now.d_ms >= self.retire_at() {
             Some("its 24 h window ended")
-        } else if now.clock_change != self.clock_change {
+        } else if now.clock != self.clock {
             Some(
-                "the delegated clock was repaired or lowered after its application; its window can't be established",
+                "the delegated clock was repaired, lowered or started afresh after its application; its window can't be established",
             )
         } else {
             None
@@ -323,7 +328,7 @@ impl Ring {
                 hex(&p.slot.kid),
                 p.replaced_at_seq,
                 p.applied_d_ms,
-                p.clock_change
+                p.clock
             )),
             self.applied
         )
@@ -336,7 +341,6 @@ fn ring_bytes(ring: &Ring) -> Zeroizing<Vec<u8>> {
     let mut parts: Vec<Zeroizing<Vec<u8>>> = Vec::new();
     let plain = |s: String| Zeroizing::new(s.into_bytes());
     let secret = |slot: &Slot| Zeroizing::new(b64u(&*slot.secret).into_bytes());
-    let change = |c: Option<u64>| c.map_or(String::new(), |c| format!(r#","clock_change":{c}"#));
     parts.push(plain(format!(
         r#"{{"v":2,"host_trust_gen":{}"#,
         ring.generation
@@ -357,19 +361,17 @@ fn ring_bytes(ring: &Ring) -> Zeroizing<Vec<u8>> {
     if let Some(previous) = &ring.previous {
         slot_head(&mut parts, "previous", &previous.slot);
         parts.push(plain(format!(
-            r#","replaced_at_seq":{},"applied_d_ms":{}{}}}"#,
-            previous.replaced_at_seq,
-            previous.applied_d_ms,
-            change(previous.clock_change)
+            r#","replaced_at_seq":{},"applied_d_ms":{},"clock":{}}}"#,
+            previous.replaced_at_seq, previous.applied_d_ms, previous.clock
         )));
     }
     if let Some(a) = &ring.applied {
         parts.push(plain(format!(
-            r#","applied":{{"seq":{},"hash":"{}","d_ms":{}{}}}"#,
+            r#","applied":{{"seq":{},"hash":"{}","d_ms":{},"clock":{}}}"#,
             a.seq,
             a.hash.to_hex(),
             a.d_ms,
-            change(a.clock_change)
+            a.clock
         )));
     }
     parts.push(plain("}".into()));
@@ -415,7 +417,7 @@ struct AppliedV2 {
     seq: u64,
     hash: String,
     d_ms: u64,
-    clock_change: Option<u64>,
+    clock: u64,
 }
 
 #[derive(Deserialize)]
@@ -426,7 +428,7 @@ struct PreviousV2 {
     public: String,
     replaced_at_seq: u64,
     applied_d_ms: u64,
-    clock_change: Option<u64>,
+    clock: u64,
 }
 
 #[derive(Deserialize)]
@@ -495,7 +497,7 @@ fn parse_ring(bytes: &[u8]) -> Option<Ring> {
                         slot: slot_of(&p.secret, &p.public)?,
                         replaced_at_seq: p.replaced_at_seq,
                         applied_d_ms: p.applied_d_ms,
-                        clock_change: p.clock_change,
+                        clock: p.clock,
                     }),
                     None => None,
                 },
@@ -504,7 +506,7 @@ fn parse_ring(bytes: &[u8]) -> Option<Ring> {
                         seq: a.seq,
                         hash: Hash32::from_hex(&a.hash).ok()?,
                         d_ms: a.d_ms,
-                        clock_change: a.clock_change,
+                        clock: a.clock,
                     }),
                     None => None,
                 },
@@ -1137,7 +1139,7 @@ fn newest_entry(m: &Membership, host_id: &str, generation: u64) -> Option<(u64, 
 /// written over `prev`, when `next`'s newest `host_enc_key` entry for
 /// `host_id` at `generation` is a new one that turns a key this host holds
 /// into the list's previous key (not retired), `now` (the delegated clock's
-/// `D`, read fresh, and its latest repair or lowering) is written into the
+/// `D`, read fresh, and its mark) is written into the
 /// key file with that entry's `seq` and hash, durably (one atomic replace):
 /// the evidence of when the host applied it. A stamp already naming that
 /// entry is kept (a commit of the same entry again never moves it later).
@@ -1179,7 +1181,7 @@ pub fn stamp_application_locked(
         seq,
         hash,
         d_ms: now.d_ms,
-        clock_change: now.clock_change,
+        clock: now.clock,
     });
     match store.replace(DlFile::HostEncKey, &ring_bytes(&ring)) {
         Ok(()) => Vec::new(),
@@ -1265,7 +1267,7 @@ enum From {
     Previous {
         replaced_at_seq: u64,
         applied_d_ms: u64,
-        clock_change: Option<u64>,
+        clock: u64,
     },
 }
 
@@ -1305,7 +1307,7 @@ fn reconcile_locked(
             From::Previous {
                 replaced_at_seq: p.replaced_at_seq,
                 applied_d_ms: p.applied_d_ms,
-                clock_change: p.clock_change,
+                clock: p.clock,
             },
         )
     }));
@@ -1334,13 +1336,13 @@ fn reconcile_locked(
                     From::Previous {
                         replaced_at_seq,
                         applied_d_ms,
-                        clock_change,
+                        clock,
                     } => {
                         ring.previous = Some(Previous {
                             slot,
                             replaced_at_seq,
                             applied_d_ms,
-                            clock_change,
+                            clock,
                         })
                     }
                 }
@@ -1388,9 +1390,9 @@ fn reconcile_locked(
                             From::Previous {
                                 replaced_at_seq,
                                 applied_d_ms,
-                                clock_change,
+                                clock,
                             } if replaced_at_seq == p.replaced_at_seq => {
-                                Some((applied_d_ms, clock_change))
+                                Some((applied_d_ms, clock))
                             }
                             _ => ring
                                 .applied
@@ -1398,9 +1400,9 @@ fn reconcile_locked(
                                     a.seq == p.replaced_at_seq
                                         && m.entry_hash_at(a.seq) == Some(a.hash)
                                 })
-                                .map(|a| (a.d_ms, a.clock_change)),
+                                .map(|a| (a.d_ms, a.clock)),
                         };
-                        let Some((applied_d_ms, clock_change)) = window else {
+                        let Some((applied_d_ms, clock)) = window else {
                             gone(
                                 slot,
                                 "retired at once: the entry's application time isn't known (no stamp before the commit)".into(),
@@ -1412,7 +1414,7 @@ fn reconcile_locked(
                             slot,
                             replaced_at_seq: p.replaced_at_seq,
                             applied_d_ms,
-                            clock_change,
+                            clock,
                         };
                         match now.as_ref().and_then(|now| previous.over(now)) {
                             Some(why) => gone(previous.slot, why.into(), &mut lines),
@@ -1660,13 +1662,13 @@ mod tests {
                 seq: 9,
                 hash: Hash32([3; 32]),
                 d_ms: u64::MAX,
-                clock_change: Some(6),
+                clock: 6,
             });
             ring.previous = Some(Previous {
                 slot: Slot::of(Zeroizing::new([4; 32])),
                 replaced_at_seq: 7,
                 applied_d_ms: 5,
-                clock_change: None,
+                clock: u64::MAX,
             });
             let bytes = ring_bytes(&ring);
             assert_eq!(bytes.capacity(), bytes.len(), "{generation}");
