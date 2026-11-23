@@ -810,17 +810,41 @@ a native manager reports its control-record signing journal to a Station
 recovering from a rollback, so the replacement feed's snapshot includes
 every stop of the plan that author can have signed. **The journal, its
 exclusive lock, the barrier (B1 to B6), the report's exposure and the
-publication are your adapter's**; these calls are the primitive only:
+publication are your adapter's**; these calls are the primitive only. Five
+points the agreed text leaves open are **Atem's readings, for Astation's
+confirmation on #114**, listed after the table:
 
 | call | what it does |
 |---|---|
-| `signer_report_challenge(signer, slot, origin, connection, issued_at, expires_at, recovery)` (JS `signerReportChallenge`, `recovery` `{generation, planId, candidateFeedId, sourceHash, evidenceHash}`) | the Station's challenge as canonical JSON, a fresh 32-byte nonce from the OS CSPRNG: the verifier report's fields, `signer` a native member (`member:<device_id>`), and `recovery: SignerReportRecovery{generation, plan_id, candidate_feed_id, source_hash, evidence_hash}` (`generation` a canonical decimal string, 1 to 2^63 − 1, no sign or leading zero; the ids UUID v4; the hashes lowercase hex SHA-256). Store it |
+| `signer_report_challenge(signer, slot, origin, connection, issued_at, expires_at, recovery)` (JS `signerReportChallenge`, `recovery` `{generation, planId, candidateFeedId, sourceHash, evidenceHash}`) | the Station's challenge as canonical JSON, a fresh 32-byte nonce from the OS CSPRNG: the verifier report's fields, `signer` a native member (`member:<device_id>`; reading (a)), and `recovery: SignerReportRecovery{generation, plan_id, candidate_feed_id, source_hash, evidence_hash}` (`generation` a canonical decimal string, 1 to 2^63 − 1, no sign or leading zero; the ids UUID v4; the hashes lowercase hex SHA-256). Store it |
 | `parse_signer_report_challenge(challenge_json)` | `SignerReportChallenge{signer, slot, origin, connection, nonce, issued_at, expires_at, recovery}`, read strictly: at most 4,096 bytes, exactly these fields at both levels, each one's grammar |
-| `SignerReportRequest(log, challenge_json, signer, slot, origin, journal, key_id, now_ms)` | an immutable handle (UniFFI Object, a WASM class) on the body the core builds from `journal: SignerJournalView{id, since, revision, records, drafts}`, which your adapter hands over under its journal lock after its barrier's durable commit (B1): `id` the journal's 16 random bytes (base64url), `since` the device-list `seq` at its creation, `revision` its append count, `records` the plan's bodies in `signing` or `signed` (one in `signing` with no saved signature included), `drafts` its unsigned drafts, each a control record's body as JSON. The core reads each body strictly as one of the plan's records by this member (a service's `revoke` or `interrupt_running` naming the challenge's origin, or a `host:` principal's `interrupt_running`), and counts and hashes them itself: you supply no hash. Refused: a challenge for another Station (`origin_mismatch`), signer (`signer_mismatch`) or slot (`slot_mismatch`), a `signer` that isn't `member:<id>` or a field out of its grammar (`malformed`), the log frozen (`frozen`), a signer that isn't a current native member (`unknown_signer`) or never held `manage` (`not_a_manager`), the challenge expired (`expired`), then a journal `id` that isn't 16 bytes, `since` 0, a body that isn't one of the plan's records by this member, or a body twice in a set (`malformed`) |
+| `SignerReportRequest(log, challenge_json, signer, slot, origin, journal, key_id, now_ms)` | an immutable handle (UniFFI Object, a WASM class) on the body the core builds from `journal: SignerJournalView{id, since, revision, records, drafts}`, which your adapter hands over under its journal lock after its barrier's durable commit (B1): `id` the journal's 16 random bytes (base64url), `since` the device-list `seq` at its creation, `revision` its append count, `records` the plan's bodies in `signing` or `signed` (one in `signing` with no saved signature included), `drafts` its unsigned drafts, each a control record's body as JSON. The core reads each body strictly as one of the plan's records by this member (a service's `revoke` or `interrupt_running` naming the challenge's origin, reading (c), or a `host:` principal's `interrupt_running`), and counts and hashes them itself: you supply no hash. Refused: a challenge for another Station (`origin_mismatch`), signer (`signer_mismatch`) or slot (`slot_mismatch`), a `signer` that isn't `member:<id>` or a field out of its grammar (`malformed`), the log frozen (`frozen`), a signer that isn't a current native member (`unknown_signer`) or never held `manage` (`not_a_manager`), the challenge expired at `now_ms` (`expired`; reading (b)), then a journal `id` that isn't 16 bytes, `since` 0, a body that isn't one of the plan's records by this member, or a body twice in a set (`malformed`; the same body as a record and as a draft is read, reading (d)) |
 | `request.sign_request()` / `request.body_json()` | the `SignRequest` for `key_id` (purpose `SignerReport`, `fresh_confirmation: true`, label `atem-signer-report-v1`, `input` = `enc([label, body])`, `body_json` the held body); the held body, read only |
 | `request.finish(signature)` | the report (canonical `{"body":<held body>,"sig":…}`) once `signature` (P-256 64-byte `r‖s`, either S, normalized to low S; or Ed25519) verifies under the signer's key at the log's head over the held body; anything else is `Report{bad_signature}`. The handle never changes |
 | `sign_signer_report(provider, log, challenge_json, signer, slot, origin, journal, key_id, now_ms)` (Swift, Kotlin; JS `signSignerReport(store, …)` with a `SoftwareKeyStore`, for tests and tools: a native's key is never a software key) | the request's checks, then the provider signs at once after the owner's fresh confirmation (no binding lock held meanwhile): the report, or `Report{signing_failed}` when the owner cancels or the provider fails, `Report{bad_signature}` when `key_id` isn't the signer's key in the log |
 | `verify_signer_report(log, report_json, expected_challenge_json, exported_records_json, now_ms)` | `VerifiedSignerReport{signer, slot, process, connection, head, at_head, recovery, journal: SignerReportJournal{id, since, revision, records, records_hash, drafts, drafts_hash}, records}` against `log` at its current head, the challenge the Station stored and the signed records exported with the report, or `Report{code}`: the first failure of `malformed`, `frozen`, `wrong_account`, `unknown_signer`, `not_a_manager`, `bad_signature`, `stale_log`, `fork`, `signer_mismatch`, `slot_mismatch`, `challenge_mismatch`, `recovery_mismatch`, `records_mismatch`, `expired`. `records_mismatch`: an exported record that isn't a signed control record of the plan by this member, one whose signature doesn't verify under its `auth_key`, a duplicate, or another count or `records_hash` than the report's. `records` are the verified records, as given. An expected challenge that doesn't read is `Invalid{malformed}` |
+
+**Atem's readings, for Astation's confirmation on #114** (none is in the
+agreed text; each is fail-closed, and each changes if Astation reads it
+otherwise):
+
+- (a) A challenge's `signer` is `member:<device_id>` only: a challenge
+  naming a `service:` signer is `Report{malformed}` when it is read. A
+  report body naming a service, a host, a grant or `recovery` is
+  `unknown_signer`, as agreed.
+- (b) The builder (`SignerReportRequest`, `sign_signer_report`) also takes
+  `now_ms` and refuses a challenge expired on the reporter's clock
+  (`expired`), as the verifier report's builder does; the agreed inputs
+  name no clock.
+- (c) A service's records of the plan are its `revoke` and
+  `interrupt_running` only (a native manager signs no other action): a
+  `cover`, `hold` or `release` this member's journal holds refuses the
+  request (`malformed`), never skipped. The agreed text says "a service's
+  record naming this origin".
+- (d) One body may be both a record and a draft: each set is read on its
+  own; only a body twice in one set is `malformed`.
+- (e) `journal.since` is compared with nothing, `head.seq` included:
+  whether the member held `manage` before it is the Station's to judge.
 
 The purpose `SignerReport` asks a **fresh confirmation** of the body,
 never in the background or a notification extension: show the plan (the

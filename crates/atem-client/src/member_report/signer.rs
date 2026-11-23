@@ -41,6 +41,20 @@
 //! origin: any Station of the account may carry it. A service's records at
 //! another origin aren't the plan's.
 //!
+//! **Atem's readings, for Astation's confirmation on #114** (the agreed
+//! text leaves them open; each is fail-closed):
+//! - (a) a challenge's `signer` is `member:<id>` only: a `service:` one is
+//!   `malformed` when read (a report body naming a service, a host, a
+//!   grant or `recovery` is `unknown_signer`, as agreed);
+//! - (b) the builder also takes `now_ms` and refuses an expired challenge,
+//!   as the verifier report's builder does;
+//! - (c) a service's records of the plan are its `revoke` and
+//!   `interrupt_running` only: this member's `cover`, `hold` or `release`
+//!   body refuses the build (`malformed`), never skipped;
+//! - (d) one body may be both a record and a draft: only a body twice in
+//!   one set is refused;
+//! - (e) `journal.since` is compared with nothing, `head.seq` included.
+//!
 //! **The set hashes.** `records_hash = SHA-256(enc(["atem-signer-report-
 //! records-v1", d1…dn]))`, each `d` the 32 bytes of `SHA-256(jcs(body))`,
 //! sorted by bytes; `drafts_hash` the same with `atem-signer-report-drafts-

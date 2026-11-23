@@ -27,6 +27,12 @@
 //! plan ends), never in the background; an owner who cancels gives
 //! `signing_failed`.
 //!
+//! Five points the agreed text leaves open (a `member:`-only challenge
+//! signer, the builder's `now_ms`, a service's plan records `revoke` and
+//! `interrupt_running` only, one body both a record and a draft, `since`
+//! compared with nothing) are Atem's readings, for Astation's confirmation
+//! on #114 (the core module's doc lists them).
+//!
 //! The report proves its signature and that the export matches it:
 //! consistency only, never completeness of anything outside the journal. A
 //! body the journal holds as `signing` with no saved signature is in its

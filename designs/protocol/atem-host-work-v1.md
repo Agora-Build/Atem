@@ -1663,7 +1663,7 @@ holds, no more).
 
 **The signer report** (Astation #114 item 4; the author barrier and the
 typed primitive **agreed with Astation, Astation #114 comment
-7089435073**). Before a Station publishes a replacement feed, every
+7089435073**, but for the five points below marked **Atem's reading, for Astation's confirmation on #114**). Before a Station publishes a replacement feed, every
 native manager that could have signed one of the plan's stops reports its
 signing journal, so the snapshot includes every stop that author can have
 signed. The author's own device holds a durable barrier from its report
@@ -1676,7 +1676,13 @@ core builds only the primitive.
   service's `revoke` or `interrupt_running` naming the recovering
   Station's origin, or any `host:` principal's `interrupt_running` (which
   names no origin, so any Station of the account may carry it). A
-  service's records at another origin aren't held.
+  service's records at another origin aren't held. That a service's
+  records of the plan are its `revoke` and `interrupt_running` only, so
+  that this member's `cover`, `hold` or `release` body in the journal
+  refuses the report (`malformed`) rather than being skipped, is
+  **Atem's reading, for Astation's confirmation on #114**: the agreed text says "a service's record naming this
+  origin", the proposal's B2 "a native `revoke` or `interrupt_running`",
+  and a native manager signs no other action (I.5.4).
 - **The barrier, B1 to B6, as the adapter keeps it:**
   - B1: the barrier `{account_id, genesis_hash, origin, generation,
     plan_id, candidate_feed_id, revision}` and the journal state at that
@@ -1712,14 +1718,19 @@ core builds only the primitive.
     changed journal identity or a rolled-back protected store stays an
     unresolved author obligation, which a signed report never waives. The
     barrier's lifetime is independent of the report's 30 s acceptance
-    lease: an expired report needs a fresh one, never a cleared barrier.
+    lease: an expired report needs a fresh one, never a cleared barrier
+    (Astation's rule, from its agreement).
 - **The challenge** the Station mints and stores: the verifier report's
   `{signer, slot, origin, connection, nonce, issued_at, expires_at}`
-  (session-v1 R9.2, its `signer` a `member:<device_id>`) and
+  (session-v1 R9.2) and
   `recovery{generation, plan_id, candidate_feed_id, source_hash,
   evidence_hash}` (`generation` a canonical decimal string, 1 to 2^63 − 1;
   UUID v4 ids; lowercase hex SHA-256), read strictly within 4,096 bytes,
-  the lease `0 < expires_at − issued_at ≤ 30000` ms.
+  the lease `0 < expires_at − issued_at ≤ 30000` ms. Its `signer` is a
+  `member:<device_id>` only, so a challenge naming a `service:` signer is
+  `malformed` when it is read (**Atem's reading, for Astation's confirmation on #114**; a report body
+  naming a service, a host, a grant or `recovery` is `unknown_signer`, as
+  agreed).
 - **The body**, type `atem-signer-report`, `v` 1, signed by the member's
   own `auth_key` over `enc(["atem-signer-report-v1", jcs(body)])`, with a
   fresh confirmation (purpose `SignerReport`: the plan, the origin, the
@@ -1742,7 +1753,10 @@ core builds only the primitive.
   `journal.id` is 16 random bytes made with the journal (a reinstalled or
   wiped journal has another), `since` the device-list `seq` at its
   creation (at least 1), `revision` the count of every append ever made
-  (0 to 2^53 − 1). `records` and `records_hash` are over the plan's
+  (0 to 2^53 − 1). The primitive compares `since` with nothing, the
+  report's `head.seq` included (**Atem's reading, for Astation's confirmation on #114**): whether the member
+  held `manage` before it, a range left unresolved, is the Station's to
+  judge. `records` and `records_hash` are over the plan's
   records the member put into `signing` or `signed`: `records_hash =
   SHA-256(enc(["atem-signer-report-records-v1", d1…dn]))`, each `d` the 32
   bytes of `SHA-256(jcs(body))`, sorted by bytes; `drafts` and
@@ -1758,10 +1772,14 @@ core builds only the primitive.
   one of the plan's records by this member (anything else, or a body
   twice in one set, is `malformed`), computes the counts and the set
   hashes itself (the caller supplies no hash), and refuses a challenge for
-  another Station (`origin_mismatch`), signer or slot, a signer that isn't
-  a current native member (`unknown_signer`) or never held `manage`
-  (`not_a_manager`), and an expired challenge, as the verifier report's
-  builder does.
+  another Station (`origin_mismatch`), signer or slot, and a signer that
+  isn't a current native member (`unknown_signer`) or never held `manage`
+  (`not_a_manager`). Two points are **Atem's reading, for Astation's confirmation on #114**:
+  - it also takes the reporter's clock (`now_ms`) and refuses a challenge
+    expired on it (`expired`), as the verifier report's builder does; the
+    agreed inputs name no clock;
+  - one body may be both a record and a draft: each set is read on its
+    own, and only a body twice in one set is refused.
 - **The verifier**, `verify_signer_report(log, report, expected_challenge,
   exported_records[], now_ms)`, reads membership at the verifier's head;
   the first failure is the code, in this order: `malformed`, `frozen`,
@@ -1786,6 +1804,21 @@ core builds only the primitive.
   tuple, head and commitments: reports of different evidence revisions
   are never mixed. Comparing an author's reports (another `journal.id`, a
   later `since`) is the Station's.
+- **What the Station keeps** (**Astation's rules, from its agreement,
+  #114 comment 7089435073**; the primitive checks none of them):
+  - while the recovery is closed, its fence serves no usable `heads` for
+    the origin, so hosts' gates close within 60 s and nothing delegated
+    starts that a stop would have prevented;
+  - the owner's review explains the temporary stop-signing restriction
+    and the emergency actions that remain (device-list entries: remove a
+    service, `host_sender_revoke` with `interrupt_running`; and
+    `work_interrupt` over a channel);
+  - unknown authors and unknown historical service signing ceilings still
+    block reopening: a verified report from every known author doesn't by
+    itself reopen the recovery;
+  - the barrier's persisted lifetime is independent of the challenge's and
+    the report's short acceptance lease: an expired report may need a
+    fresh one, and never clears the barrier.
 - Vectors: `r9-vectors-signer-report` (below).
 
 **Stations: the trust model** (**Atem's proposal, agreed with Astation
@@ -1962,11 +1995,13 @@ Every SDK package's checksum manifest lists the file.
 **`r9-vectors-signer-report`** (the signer report above; agreed with
 Astation, #114 comment 7089435073): log L of `r9-vectors-membership-log`
 and its own `entries` (dev-desk, an Ed25519 native without `manage`, then
-made a manager; dev-phone demoted; R7 byte for byte); `records`, the
+made a manager; dev-phone demoted; R7 and A8 byte for byte: dev-newmac,
+added by the Recovery Kit, waiting, then a manager); `records`, the
 control records the cases use; the challenges read or refused; valid
 reports (at the head and at an ancestor, with drafts, with zero records, a
 host sender's interrupt with a service's stops, a reinstalled journal, a
-demoted manager, an Ed25519 manager, records exported in another order);
+demoted manager, an Ed25519 manager, a manager added by the Recovery Kit
+once its recovery took effect, records exported in another order);
 refused ones (every malformed form, the recovery and journal grammars
 included; each code in its order; `not_a_manager`; each challenge and
 recovery field mismatched; `records_mismatch` in each form: one missing,
@@ -1974,9 +2009,12 @@ one extra, one signed after the report, a possibly signed body without a
 signature, a wrong signer, another origin, a duplicate, another key, a
 high S; a high-S report; substitution by another member and another slot;
 expiry); the builder's bodies and refusals; and the immutable request's
-finishes. Its runners are `crates/atem-client/tests/signer_report.rs`, the
+finishes (the challenge grammar's forms and the builder's signers as
+#198's file has them, and journal bodies over 4,096 bytes of `jcs` and
+16 KiB of text). Its runners are `crates/atem-client/tests/signer_report.rs`, the
 FFI's, the binding conformance suites and `scripts/check-r9-vectors.py`,
-which derives every verdict with a control-record reader of its own. Every
+which derives every verdict with a control-record reader of its own. Its
+note marks the five readings above for Astation's confirmation. Every
 SDK package's checksum manifest lists the file.
 
 ### 11.2 `work_interrupt` and `work_resolve`
