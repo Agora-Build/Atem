@@ -332,13 +332,15 @@ hook applies as before.
 The waiting hooks and an entry ahead go with the worker's chat snapshot and a
 catch-up, like the owed mark, so an adopting broker decides as the worker does.
 Each prompt is carried as a digest, not as text: the SHA-256 of its text with
-whitespace runs squashed, which is what the matching compares. For a prompt
-over 128 KiB the broker sees a cut copy, whose digest may not match; the time
+whitespace runs squashed, which is what the matching compares. For a very long
+prompt (over 128 KiB, or one whose escaping takes its item over the worker's
+192 KiB bound) the broker sees a cut copy, whose digest may not match; the time
 fallback then applies.
 
-At most 8 hooks wait. Past that the oldest goes, but the newest, which decides
-what a turn end may do, always stays, so a drop never ends a wait early (it
-fails toward `working`). The dropped hook's entry was recorded before every
+At most 8 hooks wait (a carried queue is bound the same way when a broker
+restores or catches up). Past that the oldest goes, but the newest, which
+decides what a turn end may do, always stays, so a drop never ends a wait early
+(it fails toward `working`). The dropped hook's entry was recorded before every
 later hook, so it pairs with none of them (an equal one in its own second, on a
 filesystem keeping whole seconds, aside). In practice the queue holds one or
 two hooks (prompts queued in the terminal); a run of commands whose entries
@@ -363,8 +365,8 @@ Known limits, each failing closed (`working`, so no prompt goes in):
   was pressed while hooks still checked it. Its turn never runs, so the
   `working` its hook set lasts until a later turn ends (typed in the
   terminal), a `/clear` or the agent's exit. This was already so before #126,
-  except that a previous turn's `Stop` read in that hook's own pass made the
-  session `ready` by accident; it no longer does.
+  except that the previous turn's `Stop` or transcript end, read in that
+  hook's own pass, made the session `ready` by accident; neither does now.
 - Typed skills and custom commands fire the prompt hook, but Atem's transcript
   reader skips their entries (`<command-…>`, `isMeta`). The hook waits until the
   next regular prompt's entry ends it. Only an end within the hook's second
