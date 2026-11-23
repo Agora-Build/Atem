@@ -668,7 +668,7 @@ impl VerifierReportBody {
 }
 
 /// The builder's checks both reports share, in this order: `signer`
-/// (by `signer_ok`), `slot` and `station` in their grammar (`malformed`);
+/// (by `signer_allowed`), `slot` and `station` in their grammar (`malformed`);
 /// `log` not frozen (`frozen`); the challenge's `origin` the configured
 /// Station normalized (`origin_mismatch`), its `signer` the reporter
 /// (`signer_mismatch`), its `slot` the reporter's (`slot_mismatch`), its
@@ -679,9 +679,9 @@ fn check_build(
     signer: &str,
     slot: &str,
     station: &str,
-    signer_ok: fn(&str) -> bool,
+    signer_allowed: fn(&str) -> bool,
 ) -> Result<(), ReportRefusal> {
-    if !signer_ok(signer) {
+    if !signer_allowed(signer) {
         return Err(malformed("signer"));
     }
     if !id_ok(slot) {
@@ -854,7 +854,8 @@ impl Common {
             .ok()
             .and_then(|p| b64u_decode_array::<PROCESS_BYTES>(p).ok())
             .ok_or(malformed("process"))?;
-        let echo = Echo::read(exact(&o["challenge"], &ECHO_FIELDS, "challenge")?)?;
+        let echo = o.get("challenge").ok_or(malformed("challenge"))?;
+        let echo = Echo::read(exact(echo, &ECHO_FIELDS, "challenge")?)?;
         Ok(Common {
             account_id: account_id.to_owned(),
             genesis_hash,

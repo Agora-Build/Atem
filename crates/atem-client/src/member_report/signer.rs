@@ -213,18 +213,20 @@ impl RecoveryPlan {
             .ok()
             .and_then(read_generation)
             .ok_or(malformed("recovery.generation"))?;
-        let hash = |key: &'static str| {
+        let text =
+            |key: &'static str, name: &'static str| str_field(o, key).map_err(|_| malformed(name));
+        let hash = |key: &'static str, name: &'static str| {
             str_field(o, key)
                 .ok()
                 .and_then(|h| Hash32::from_hex(h).ok())
-                .ok_or(malformed(key))
+                .ok_or(malformed(name))
         };
         Self::new(
             generation,
-            str_field(o, "plan_id")?,
-            str_field(o, "candidate_feed_id")?,
-            hash("source_hash")?,
-            hash("evidence_hash")?,
+            text("plan_id", "recovery.plan_id")?,
+            text("candidate_feed_id", "recovery.candidate_feed_id")?,
+            hash("source_hash", "recovery.source_hash")?,
+            hash("evidence_hash", "recovery.evidence_hash")?,
         )
     }
 
@@ -333,7 +335,7 @@ impl SignerReportChallenge {
         if !member_signer_ok(base.signer()) {
             return Err(malformed("signer"));
         }
-        let recovery = RecoveryPlan::from_json(&o["recovery"])?;
+        let recovery = RecoveryPlan::from_json(o.get("recovery").ok_or(malformed("recovery"))?)?;
         Ok(SignerReportChallenge { base, recovery })
     }
 
@@ -432,24 +434,26 @@ impl JournalSummary {
             .ok()
             .and_then(|id| b64u_decode_array::<JOURNAL_ID_BYTES>(id).ok())
             .ok_or(malformed("journal.id"))?;
-        let since = int_field(o, "since")?;
+        let int =
+            |key: &'static str, name: &'static str| int_field(o, key).map_err(|_| malformed(name));
+        let since = int("since", "journal.since")?;
         if since == 0 {
-            return Err(malformed("since"));
+            return Err(malformed("journal.since"));
         }
-        let hash = |key: &'static str| {
+        let hash = |key: &'static str, name: &'static str| {
             str_field(o, key)
                 .ok()
                 .and_then(|h| Hash32::from_hex(h).ok())
-                .ok_or(malformed(key))
+                .ok_or(malformed(name))
         };
         Ok(JournalSummary {
             id,
             since,
-            revision: int_field(o, "revision")?,
-            records: int_field(o, "records")?,
-            records_hash: hash("records_hash")?,
-            drafts: int_field(o, "drafts")?,
-            drafts_hash: hash("drafts_hash")?,
+            revision: int("revision", "journal.revision")?,
+            records: int("records", "journal.records")?,
+            records_hash: hash("records_hash", "journal.records_hash")?,
+            drafts: int("drafts", "journal.drafts")?,
+            drafts_hash: hash("drafts_hash", "journal.drafts_hash")?,
         })
     }
 }
@@ -727,9 +731,10 @@ pub struct VerifiedSignerReport {
     pub records: Vec<ControlRecord>,
 }
 
-/// The exported records checked against the report's `records`: each a
+/// The exported records checked against the report's `records`: their
+/// count first (before any record is parsed or verified), then each a
 /// signed control record of the plan by this member, its signature
-/// verified under `key` (low S), none twice, their count and set hash the
+/// verified under `key` (low S), none twice, and their set hash the
 /// journal's. Any failure is `records_mismatch`, naming which.
 fn exported_records<R: AsRef<[u8]>>(
     exported: &[R],
@@ -737,6 +742,11 @@ fn exported_records<R: AsRef<[u8]>>(
     plan: &Plan<'_>,
     key: &PublicKey,
 ) -> Result<Vec<ControlRecord>, ReportRefusal> {
+    // The cheap check first: the exported list isn't signed, so a list of
+    // the wrong length is refused before any record is parsed or verified.
+    if exported.len() as u64 != journal.records {
+        return Err(ReportRefusal::RecordsMismatch("count"));
+    }
     let mut records = Vec::with_capacity(exported.len());
     let mut digests = Vec::with_capacity(exported.len());
     for bytes in exported {
@@ -753,9 +763,6 @@ fn exported_records<R: AsRef<[u8]>>(
         records.push(record);
     }
     let digests = sorted_once(digests).ok_or(ReportRefusal::RecordsMismatch("duplicate"))?;
-    if digests.len() as u64 != journal.records {
-        return Err(ReportRefusal::RecordsMismatch("count"));
-    }
     if set_hash(SIGNER_REPORT_RECORDS, &digests) != journal.records_hash {
         return Err(ReportRefusal::RecordsMismatch("records_hash"));
     }
@@ -800,8 +807,8 @@ pub fn verify_signer_report<R: AsRef<[u8]>>(
         return Err(malformed("type"));
     }
     let body = Common::read(o)?;
-    let recovery = RecoveryPlan::from_json(&o["recovery"])?;
-    let journal = JournalSummary::read(&o["journal"])?;
+    let recovery = RecoveryPlan::from_json(o.get("recovery").ok_or(malformed("recovery"))?)?;
+    let journal = JournalSummary::read(o.get("journal").ok_or(malformed("journal"))?)?;
     body.check_log(log)?;
     let key = manager_key(log, &body.signer)?;
     let at_head = body.check_signed(log, &object, &key, &expected.base)?;

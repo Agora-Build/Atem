@@ -830,7 +830,7 @@ fn records_mismatch_in_each_form() {
         object["sig"] = json!(b64u(&sig));
         object.to_string()
     };
-    let mut twice_signed = all.clone();
+    let mut twice_signed = all[..2].to_vec();
     twice_signed.push(resigned_r1);
     let mac_signed = service_stop(&book, "dev-mac", REVOKE, STATION, 1);
     let elsewhere = service_stop(&book, "dev-phone", REVOKE, OTHER_STATION, 1);
@@ -899,6 +899,42 @@ fn records_mismatch_in_each_form() {
         );
         assert_eq!(check(exported), Err("records_mismatch"), "{what}");
     }
+}
+
+/// The exported set's count is checked before any record is parsed or any
+/// signature verified: a list of the wrong length is refused for its count
+/// however many records it carries, and whatever they are.
+#[test]
+fn the_count_is_checked_before_any_signature() {
+    let (v, book) = (Vectors::load(), Book::load());
+    let log = log_l(&v);
+    let plan = plan(&book);
+    let expected = challenge(PHONE, SLOT);
+    let text = report(
+        &book,
+        "dev-phone/auth",
+        &log,
+        PHONE,
+        &expected,
+        &journal(&plan),
+    );
+    for exported in [
+        vec!["{}".to_owned(); 4],
+        vec!["{}".to_owned(); 2],
+        Vec::new(),
+    ] {
+        assert_eq!(
+            verify(&log, &text, &expected, &exported, NOW).map(|_| ()),
+            Err(ReportRefusal::RecordsMismatch("count")),
+            "{} exported",
+            exported.len()
+        );
+    }
+    // The right count of records that aren't records is refused as such.
+    assert_eq!(
+        verify(&log, &text, &expected, &vec!["{}".to_owned(); 3], NOW).map(|_| ()),
+        Err(ReportRefusal::RecordsMismatch("not a control record"))
+    );
 }
 
 fn text_of(value: &Value) -> String {
