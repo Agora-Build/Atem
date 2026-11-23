@@ -813,9 +813,7 @@ pub enum RerunKeys {
 pub fn rerun_keys(paths: &CredPaths, unlocked: bool) -> RerunKeys {
     if !has_device_keys(paths) {
         // Whatever the store records as home (an old one records none).
-        return RerunKeys::Reset(
-            key_file_problem(paths).unwrap_or_else(|| "no key files on disk".into()),
-        );
+        return RerunKeys::Reset(key_file_problem(paths).unwrap_or_else(|| NO_KEY_FILES.into()));
     }
     if !unlocked {
         return key_file_problem(paths).map_or(RerunKeys::Unlock, RerunKeys::Reset);
@@ -825,6 +823,19 @@ pub fn rerun_keys(paths: &CredPaths, unlocked: bool) -> RerunKeys {
         Ok(None) => RerunKeys::Reset("unlock_auth_key is missing".into()),
         Err(error) => RerunKeys::Reset(format!("unlock_auth_key is unreadable ({error:#})")),
     }
+}
+
+/// A verified device with no key files at all (whatever home its store
+/// records): a rerun's reset, never fresh keys.
+const NO_KEY_FILES: &str = "no key files on disk";
+
+/// The refusal for key files that can't be used: the problem, then the
+/// reset steps.
+fn reset_error(problem: String) -> anyhow::Error {
+    anyhow!(
+        "this device's key files are broken ({problem}). {}",
+        crate::memory::cred_agent::RESET
+    )
 }
 
 /// What is wrong with the key files of a device with a verified home
@@ -846,27 +857,21 @@ pub fn check_keys_for_verification(
     agent: &dyn CredAgentApi,
     rerun: bool,
 ) -> Result<()> {
-    let reset = |problem: String| {
-        anyhow!(
-            "this device's key files are broken ({problem}). {}",
-            crate::memory::cred_agent::RESET
-        )
-    };
     if rerun {
         let unlocked = has_device_keys(paths) && agent.status()?.unlocked;
         return match rerun_keys(paths, unlocked) {
             RerunKeys::Ready => sealed_publics(paths, agent).map(drop),
             RerunKeys::Unlock => Err(anyhow!("{LOCKED}, then `atem pair verify`")),
-            RerunKeys::Reset(problem) => Err(reset(problem)),
+            RerunKeys::Reset(problem) => Err(reset_error(problem)),
         };
     }
     if !has_device_keys(paths) {
-        return key_file_problem(paths).map_or(Ok(()), |problem| Err(reset(problem)));
+        return key_file_problem(paths).map_or(Ok(()), |problem| Err(reset_error(problem)));
     }
     if !agent.status()?.unlocked
         && let Some(problem) = key_file_problem(paths)
     {
-        return Err(reset(problem));
+        return Err(reset_error(problem));
     }
     sealed_publics(paths, agent).map(drop)
 }
@@ -883,6 +888,25 @@ pub fn device_keys_for_verification(
         Some(publics) => VerificationKeys::Sealed(publics),
         None => VerificationKeys::Fresh(DeviceKeys::generate()),
     })
+}
+
+/// The keys a ceremony verifies with (`device_keys_for_verification`). A
+/// `rerun` never makes fresh ones: no key files is the reset, wherever the
+/// checks before it stood (the files can go while the user answers).
+pub fn ceremony_keys(
+    paths: &CredPaths,
+    agent: &dyn CredAgentApi,
+    rerun: bool,
+) -> Result<VerificationKeys> {
+    if !rerun {
+        return device_keys_for_verification(paths, agent);
+    }
+    match sealed_publics(paths, agent)? {
+        Some(publics) => Ok(VerificationKeys::Sealed(publics)),
+        None => Err(reset_error(
+            key_file_problem(paths).unwrap_or_else(|| NO_KEY_FILES.into()),
+        )),
+    }
 }
 
 /// This device's sealed keys' public halves, which only the unlocked cred
@@ -990,6 +1014,36 @@ mod tests {
         assert!(text.ends_with(crate::memory::cred_agent::RESET), "{text}");
         assert!(matches!(rerun_keys(&paths, false), RerunKeys::Reset(_)));
         assert!(matches!(rerun_keys(&paths, true), RerunKeys::Reset(_)));
+    }
+
+    /// Where a ceremony picks its keys: a rerun never makes fresh ones,
+    /// even when the key files went after the check before its question
+    /// (the reset); a first verification without keys still does.
+    #[test]
+    fn a_rerun_ceremony_never_picks_fresh_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, agent, _, device_pub) = verify(dir.path(), EncryptionMode::Off);
+        let keys = ceremony_keys(&paths, &agent, true).unwrap();
+        assert!(matches!(keys, VerificationKeys::Sealed(_)));
+        assert_eq!(keys.device_pub(), device_pub);
+        for file in [&paths.device_keys, &paths.device_keys_sealed] {
+            std::fs::remove_file(file).unwrap();
+        }
+        let error = ceremony_keys(&paths, &agent, true)
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(error.contains("no sealed keys on disk"), "{error}");
+        assert!(error.ends_with(crate::memory::cred_agent::RESET), "{error}");
+        let empty = tempfile::tempdir().unwrap();
+        let empty_paths = CredPaths::in_dir(empty.path());
+        let fresh = ceremony_keys(&empty_paths, &test_agent(&empty_paths), false).unwrap();
+        assert!(matches!(fresh, VerificationKeys::Fresh(_)));
+        let error = ceremony_keys(&empty_paths, &test_agent(&empty_paths), true)
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(error.contains("no key files on disk"), "{error}");
     }
 
     /// `rerun_keys`, the one rule for the rerun's check and `atem status`'s

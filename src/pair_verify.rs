@@ -478,21 +478,23 @@ pub(crate) const PAIRED_NOT_VERIFIED: &str = "Paired, but this device isn't veri
 /// earlier verification is kept, still with no list.
 pub(crate) const VERIFIED_NO_LIST: &str = "This device stays verified, but no device list is pinned yet. Fix the problem above, then run 'atem pair verify'.";
 
-/// What `atem pair verify` ends with when its verification failed after a
-/// pin that couldn't be taken back: the list's files fail the host closed
-/// (no remote access) until it is paired again.
-pub(crate) const PIN_LEFT: &str = "The device list's files couldn't be taken back, so this host refuses remote access until it is paired again: run `atem unpair`, then `atem pair`.";
+/// What `atem pair verify` ends with when a rerun failed after a pin that
+/// couldn't be taken back (in full or in part): a list its verification
+/// never confirmed, which `atem pair verify` won't run over again. Leftovers
+/// without the list fail the host closed; a whole list left still opens.
+pub(crate) const PIN_LEFT: &str = "The device list couldn't be taken back after this failure, so this host keeps a list its verification never confirmed (remote access may be refused): pair it again with `atem unpair`, then `atem pair`.";
 
 /// `atem pair verify` on a device verified before device lists were pinned
 /// (a rerun), before anything moves: why it verifies again, what starting
 /// does on this host, and after. Starting moves the pairing to the next
 /// host trust generation, durably, whatever follows; the session host takes
-/// it at the pin (`reopen_list_if_changed`) or, after a cancel, when the
-/// link is next considered (a reconnect or re-authentication,
-/// `sync_link`) or the runtime starts: `SessionHost::change_trust_gen`.
+/// it at the pin (`reopen_list_if_changed`) or, after a cancelled or failed
+/// rerun, when the link is next considered (a reconnect or
+/// re-authentication, `sync_link`) or the runtime starts:
+/// `SessionHost::change_trust_gen`.
 pub(crate) const RERUN_NOTE: [&str; 3] = [
     "This device was verified before device lists were pinned; verifying again pins one.",
-    "Starting moves this host to its next trust generation, even if you cancel later: Astation's current remote sessions on this host end when the list is pinned or, after a cancel, at the next connection to Astation or restart of Atem's runtime. Its leases are revoked, the work it queued that hasn't started is rejected, and Codex \"always allow\" rules are dropped.",
+    "Starting moves this host to its next trust generation, even if you cancel later: Astation's current remote sessions on this host end when the list is pinned or, if it doesn't finish (you cancel, or it fails), at the next connection to Astation or restart of Atem's runtime. Its leases are revoked, the work it queued that hasn't started is rejected, and Codex \"always allow\" rules are dropped.",
     "Once the list is pinned, Astation reaches this host only through its r9 apps.",
 ];
 /// The rerun's confirmation, before anything moves: only `y` goes on.

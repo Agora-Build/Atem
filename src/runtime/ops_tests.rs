@@ -3657,8 +3657,8 @@ fn a_rerun_astation_never_answers_fails_and_pins_nothing() {
 }
 
 /// A failed rerun that leaves device-list files behind (a pin that couldn't
-/// be taken back) leaves the host failed closed: the last line says to
-/// re-pair it, never to run `atem pair verify` again (which would now
+/// be taken back) leaves the host's list unconfirmed: the last line says to
+/// pair it again, never to run `atem pair verify` again (which would now
 /// answer `Already verified`).
 #[test]
 fn a_failed_rerun_whose_pin_stays_says_to_re_pair() {
@@ -3787,6 +3787,60 @@ fn a_first_verification_with_locked_keys_is_refused_before_anything_moves() {
         peer.drain(Duration::from_millis(300)).await;
         assert!(!peer.seen.iter().any(|m| m["type"] == "verifyCommit"));
         assert_eq!(trust_gen(&profile), start, "no rebind");
+        rt.shutdown().await;
+    });
+}
+
+/// "A rerun never makes fresh keys" holds after the question too: key
+/// files gone while the user answers are found by the check run again after
+/// the answer, so the rerun is refused with the reset steps before the
+/// rebind (and `verify_device` would refuse fresh keys for a rerun anyway,
+/// `ceremony_keys`).
+#[test]
+fn a_rerun_whose_keys_go_during_the_question_is_refused_before_the_rebind() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        let (agent, _) = verified_without_a_list(&dir).await;
+        let profile = dir.path().join("profile");
+        let keys = CredPaths::in_dir(&profile);
+        let before = serde_json::to_value(pin_of(&keys)).unwrap();
+        let start = trust_gen(&profile);
+        let (url, mut peer) = Peer::listen().await;
+        let rt = Runtime::start(dir.clone(), Some(&url), agent).await;
+        let (mut op, question) = rerun_until_continue(&rt).await;
+        for file in [&keys.device_keys, &keys.device_keys_sealed] {
+            std::fs::remove_file(file).unwrap();
+        }
+        op.answer(question, AnswerValue::Text("y".into())).await;
+        let error = op.done().await.unwrap_err();
+        assert!(error.contains("key files are broken"), "{error}");
+        assert!(error.ends_with(crate::memory::cred_agent::RESET), "{error}");
+        peer.drain(Duration::from_millis(300)).await;
+        assert!(!peer.seen.iter().any(|m| m["type"] == "verifyCommit"));
+        assert_eq!(trust_gen(&profile), start, "no rebind");
+        assert_eq!(serde_json::to_value(pin_of(&keys)).unwrap(), before);
+        rt.shutdown().await;
+    });
+}
+
+/// A first verification that fails with device-list files left behind
+/// keeps its own last line: `atem pair verify` again pins over them (the
+/// pin removes leftovers first), so no re-pairing is asked for.
+#[test]
+fn a_failed_first_verification_with_leftovers_keeps_its_last_line() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        paired(&dir.path().join("profile"));
+        let (url, mut peer) = Peer::listen().await;
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
+        let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+        let (mut op, question, _, _) = verify_until_the_question(&rt, &mut peer, "acct-op").await;
+        let pairing = crate::paths::ProfilePaths::in_dir(&rt.profile).pairing;
+        crate::paths::write_test_file(&pairing.host_channel_key, b"{}");
+        op.answer(question, AnswerValue::No).await;
+        peer.next("verifyAbort").await;
+        let error = op.done().await.unwrap_err();
+        assert_eq!(error, crate::pair_verify::PAIRED_NOT_VERIFIED);
         rt.shutdown().await;
     });
 }

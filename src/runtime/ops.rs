@@ -482,7 +482,7 @@ async fn pair_verify<U: OpUi>(
     // link asked for, no rebind (sealed keys need the cred agent unlocked;
     // a rerun never makes fresh keys).
     let agent = env.agent()?;
-    {
+    let check_keys = || {
         let (paths, agent) = (src.paths.cred.clone(), agent.clone());
         guard(
             ui,
@@ -494,9 +494,10 @@ async fn pair_verify<U: OpUi>(
                 )
             }),
         )
-        .await?;
-    }
-    // A rerun goes on only once confirmed: nothing has moved yet.
+    };
+    check_keys().await?;
+    // A rerun goes on only once confirmed: nothing has moved yet. The keys
+    // are checked again after the answer, which can come any time later.
     if rerun {
         let answer = ui
             .ask(AskKind::Text, crate::pair_verify::RERUN_QUESTION)
@@ -505,6 +506,7 @@ async fn pair_verify<U: OpUi>(
             ui.print(PrintLevel::Info, crate::pair_verify::RERUN_CANCELLED);
             return Ok(());
         }
+        check_keys().await?;
     }
     let had_list = crate::session_protocol::membership::has_device_list_files(&src.paths.pairing);
     let mut view = guard(
@@ -545,17 +547,19 @@ async fn pair_verify<U: OpUi>(
         ceremony,
     )
     .await;
-    // A failure that left device-list files behind (a pin that couldn't be
-    // taken back) fails the host closed: only a new pairing clears it.
-    let failed = if verification.is_err()
+    // A rerun that failed with device-list files left behind (a pin that
+    // couldn't be taken back) can't be run again (`verify_start` now finds
+    // a list): only a new pairing settles it. A first verification keeps
+    // its line: running it again pins over the leftovers.
+    let failed = if !rerun {
+        crate::pair_verify::PAIRED_NOT_VERIFIED
+    } else if verification.is_err()
         && !had_list
         && crate::session_protocol::membership::has_device_list_files(&src.paths.pairing)
     {
         crate::pair_verify::PIN_LEFT
-    } else if rerun {
-        crate::pair_verify::VERIFIED_NO_LIST
     } else {
-        crate::pair_verify::PAIRED_NOT_VERIFIED
+        crate::pair_verify::VERIFIED_NO_LIST
     };
     conclude_verification(&mut view, ui, verification, failed).await
 }
@@ -623,7 +627,7 @@ pub(crate) async fn verify_device<U: OpUi>(
 ) -> Result<()> {
     use crate::memory::trust::TrustStore;
     use crate::memory::unlock::PairEscrow;
-    use crate::memory::verification::{AstationKeys, Handshake, device_keys_for_verification};
+    use crate::memory::verification::{AstationKeys, Handshake, ceremony_keys};
     use crate::pair_verify::{
         TOUCH_ID_TIMEOUT, abandon_verification, await_device_verified, code_failure,
         next_verify_message, request_key_after_verification,
@@ -648,7 +652,8 @@ pub(crate) async fn verify_device<U: OpUi>(
         let (paths, agent) = (paths.clone(), agent.clone());
         // Revoked keys are never set aside here (`atem unpair` does that):
         // verification never replaces the keys an Astation trusts.
-        blocking(move || device_keys_for_verification(&paths, agent.as_ref())).await?
+        // A rerun never makes fresh keys (`ceremony_keys`).
+        blocking(move || ceremony_keys(&paths, agent.as_ref(), ceremony.rerun)).await?
     };
     let handshake = Handshake::start(keys);
     // r9 (§R9.2): the binding's generation, captured with the commitment

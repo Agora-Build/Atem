@@ -42,14 +42,24 @@ impl CliUi for Terminal {
                     CodeAnswer::Interrupted => AnswerValue::Unanswered("interrupted".into()),
                 }
             }
-            AskKind::Text => match crate::pair_verify::prompt_text(&format!("{text} ")) {
-                Ok(line) => AnswerValue::Text(line),
-                Err(CodeAnswer::NoTerminal(detail)) => AnswerValue::NoTerminal(detail),
-                Err(other) => AnswerValue::Unanswered(format!("{other:?}")),
-            },
+            AskKind::Text => text_answer(crate::pair_verify::prompt_text(&format!("{text} "))),
         })
         .await;
         answer.unwrap_or_else(|error| AnswerValue::Unanswered(error.to_string()))
+    }
+}
+
+/// A text answer read from the terminal (`prompt_text`): the line, or why
+/// there is none in the reader's own words.
+fn text_answer(read: Result<String, CodeAnswer>) -> AnswerValue {
+    match read {
+        Ok(line) => AnswerValue::Text(line),
+        Err(CodeAnswer::NoTerminal(detail)) => AnswerValue::NoTerminal(detail),
+        Err(CodeAnswer::Unanswered(detail)) => AnswerValue::Unanswered(detail),
+        // `prompt_text` gives none of these; no answer either way.
+        Err(CodeAnswer::Interrupted | CodeAnswer::Match | CodeAnswer::Refused) => {
+            AnswerValue::Unanswered("interrupted".into())
+        }
     }
 }
 
@@ -148,5 +158,32 @@ pub(crate) async fn run_with(
             }
             Some(_) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A text answer read from the terminal: its line, or why there is none
+    /// in the reader's own words (Ctrl-D at `Continue? [y/N]` says the
+    /// terminal closed, never a debug form).
+    #[test]
+    fn a_text_answer_says_why_there_is_none_plainly() {
+        assert_eq!(text_answer(Ok("y".into())), AnswerValue::Text("y".into()));
+        assert_eq!(
+            text_answer(Err(CodeAnswer::NoTerminal("no tty".into()))),
+            AnswerValue::NoTerminal("no tty".into())
+        );
+        assert_eq!(
+            text_answer(Err(CodeAnswer::Unanswered(
+                "the terminal closed before you answered".into()
+            ))),
+            AnswerValue::Unanswered("the terminal closed before you answered".into())
+        );
+        assert_eq!(
+            text_answer(Err(CodeAnswer::Interrupted)),
+            AnswerValue::Unanswered("interrupted".into())
+        );
     }
 }

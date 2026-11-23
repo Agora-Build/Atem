@@ -1417,9 +1417,12 @@ async fn run_pair_with<F: std::future::Future<Output = Result<()>>>(
 
 /// `atem pair verify` — verifies this device with the paired Astation on the
 /// runtime's authenticated link (sessions, viewers and chats stay
-/// connected). Does nothing when that Astation already verified it, and
-/// refuses after a revocation, offline. A cancelled or failed verification
-/// keeps the pairing.
+/// connected). Does nothing when that Astation already verified it, unless
+/// it was verified before device lists were pinned: then it verifies again
+/// to pin one, once confirmed (a rerun: Astation's r8 sessions end at the
+/// pin or, if it doesn't finish, at the link's next connection; the
+/// runtime says so first). Refuses after a revocation, offline. A cancelled
+/// or failed verification keeps the pairing.
 async fn run_pair_verify(src: &crate::profile::Sources) -> Result<()> {
     run_pair_verify_with(src, || {
         crate::runtime::op_client::run(
