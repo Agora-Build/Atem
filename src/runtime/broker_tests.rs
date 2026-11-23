@@ -617,10 +617,10 @@ async fn an_adopted_workers_owed_stop_goes_with_its_chat_snapshot() {
         text: text.into(),
         created_at_ms: at,
     };
-    let hook = |text: &str| AgentEvent::PromptSubmitted {
+    let hook = |text: &str, at: i64| AgentEvent::PromptSubmitted {
         text: text.into(),
         turn_id: None,
-        at_ms: Some(1_999),
+        at_ms: Some(at),
     };
     let stop = AgentEvent::TurnEnded { at_ms: Some(1_999) };
     // The worker's chat: turn 1 typed in the terminal, then its transcript
@@ -636,8 +636,8 @@ async fn an_adopted_workers_owed_stop_goes_with_its_chat_snapshot() {
         1,
         0,
     );
-    worker.on_event(hook("first"), 2, 0);
-    worker.on_log(user("u1", "t1", "first", 1_020), 2, 0);
+    worker.on_event(hook("first", 999), 2, 0);
+    worker.on_log(user("u1", "t1", "first", 120), 2, 0);
     worker.on_log(
         LogItem::TurnEnded {
             turn_id: "t1".into(),
@@ -647,6 +647,7 @@ async fn an_adopted_workers_owed_stop_goes_with_its_chat_snapshot() {
         3,
         0,
     );
+    assert_eq!(worker.status().state, State::Ready);
     // A new broker adopts the worker: its snapshot arrives.
     let mut pumped = Pumped::default();
     session.apply(
@@ -661,12 +662,12 @@ async fn an_adopted_workers_owed_stop_goes_with_its_chat_snapshot() {
     );
     let _ = session.take_chat();
     // The next pass, in the worker's order (events, the log, turn ends).
-    worker.on_event(hook("second"), 4, 0);
+    worker.on_event(hook("second", 1_999), 4, 0);
     worker.on_log(user("u2", "t2", "second", 1_700), 4, 0);
     worker.on_event(stop.clone(), 4, 0);
     session.apply(
         WorkerMsg::Chat {
-            events: vec![hook("second"), stop],
+            events: vec![hook("second", 1_999), stop],
             log: vec![user("u2", "t2", "second", 1_700)],
             input_count: 0,
             chat_v1: true,
