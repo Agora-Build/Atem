@@ -1213,7 +1213,9 @@ impl ChatSession {
                 self.waiting.drain(..i);
                 return None;
             }
-            return self.waiting.drain(..=i).last().map(|h| h.at_ms);
+            let at = self.waiting[i].at_ms;
+            self.waiting.drain(..=i);
+            return Some(at);
         }
         if entry.at_ms > 0
             && self
