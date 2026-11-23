@@ -91,17 +91,21 @@ impl HostBridge {
     }
 }
 
-/// `D` now and the delegated clock's latest repair or lowering: the later
-/// of this pass's reading (the start view's) and one taken now from the
-/// clock as the start view last observed it (`ClockSnapshot::d_ms`; review
-/// L2: never a reading a sleep made stale). The stamp, the key pass and the
-/// receiver's view all read it so: a stamp is never above the `D` a later
-/// check compares it with, as a stamp read fresh after the pass's reading
-/// would be above that reading, which reads as a clock below the
-/// application and retires the previous key at once. None without either.
+/// `D` now and the delegated clock's latest repair or lowering: none
+/// without this pass's reading (the start view's: nothing is decided on
+/// the key's window then, and a commit gets no stamp), else the later of
+/// that reading and one taken now from the clock as the start view last
+/// observed it (`ClockSnapshot::d_ms`; review L2: never a reading a sleep
+/// made stale). The stamp, the key pass and the receiver's view all read
+/// it so: a stamp is never above the `D` a later check compares it with,
+/// as a stamp read fresh after the pass's reading would be above that
+/// reading, which reads as a clock below the application and retires the
+/// previous key at once.
 pub(crate) fn view_now(view: &StartView) -> Option<host_enc::DNow> {
     let clock = view.clock.as_ref();
-    let d_ms = view.now_d_ms.max(clock.and_then(|c| c.d_ms()))?;
+    let d_ms = view
+        .now_d_ms?
+        .max(clock.and_then(|c| c.d_ms()).unwrap_or(0));
     Some(host_enc::DNow {
         d_ms,
         clock_change: clock.and_then(|c| c.change()),

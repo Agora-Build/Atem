@@ -4013,7 +4013,9 @@ are marked **Atem's reading, for Astation's confirmation**.
   before the host writes a device-list commit whose newest `host_enc_key`
   entry for it turns a key the host holds into the list's previous key (not
   retired), it writes the entry's `seq` and hash, `D` (the delegated
-  clock's reading, §11.6, taken fresh at that moment) and the clock's
+  clock's reading, §11.6, taken fresh at that moment; every later check of
+  the window reads `D` the same way, the later of its pass's reading and a
+  fresh one, so a stamp is never above the `D` it is compared with) and the clock's
   latest repair or lowering into the key file (`applied`), one atomic
   replace, under the same lock as the commit. Every such entry gets its own
   stamp, once: a later commit of the same entry keeps the earlier time, so
