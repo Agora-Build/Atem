@@ -48,13 +48,16 @@ pub fn revoked_message(astation_id: &str) -> String {
     )
 }
 
-/// `atem pair verify` on a verified pairing with no device list pinned,
-/// printed before its ceremony.
-pub const PIN_LIST_NOTE: &str =
-    "This device was verified before device lists were pinned; verifying again pins one.";
-/// After the block on a verified pairing with no device list pinned.
+/// After the block on a verified pairing with no device list pinned, its
+/// keys unlocked (`verification::rerun_keys`).
 pub const PIN_LIST_HINT: &str =
     "Run `atem pair verify` to pin a device list (needed for remote sessions over r9).";
+/// The same while its sealed keys are locked: the rerun needs them first.
+pub const PIN_LIST_UNLOCK_HINT: &str = "Run `atem cred unlock`, then `atem pair verify`, to pin a device list (needed for remote sessions over r9).";
+/// `atem pair verify` on a verified pairing with no device list, on a host
+/// that froze on a device list before (`frozen_genesis`, kept by `atem
+/// unpair`): the ceremony would refuse that list only after Touch ID.
+pub const FROZEN_RERUN: &str = "This host froze on a device list before, so verifying again can't pin one here: pair from a new device list, or remove pairing/frozen_genesis and runtime/journal/frozen_genesis in Atem's config directory (~/.config/atem by default) to forget every frozen device list.";
 
 /// `atem pair verify` when the paired Astation already verified this device.
 pub fn already_verified_message(safety_code: &str) -> String {
@@ -342,6 +345,18 @@ fn has_device_list(src: &Sources) -> bool {
     crate::session_protocol::membership::has_device_list_files(&src.paths.pairing)
 }
 
+/// Whether this host froze on a device list before: `frozen_genesis` or
+/// its mirror exists (in any state). Read only.
+fn frozen_genesis_present(src: &Sources) -> bool {
+    let pairing = &src.paths.pairing;
+    [
+        pairing.frozen_genesis.clone(),
+        crate::session_protocol::membership::frozen_genesis_mirror(pairing),
+    ]
+    .iter()
+    .any(|path| path.symlink_metadata().is_ok())
+}
+
 /// The status from `src`, with what the running cred agent answered (if
 /// one runs) and what a passive look at the runtime found.
 pub fn gather_full(
@@ -354,9 +369,7 @@ pub fn gather_full(
     let runtime_differs = matches!(runtime, Look::Running { welcome, .. }
         if welcome.build != crate::memory::cred_agent::build_id());
     let (credentials, mut notes) = credentials_line(&src.paths.cred, agent, runtime_differs);
-    // Key files that need the reset: its steps are the only advice (its
-    // `atem unpair`, then `atem pair` pins a device list too).
-    let reset = !notes.is_empty();
+    let unlocked = matches!(agent, Some(Ok(status)) if status.unlocked);
     let (authorization, relay, local_agents) = runtime_lines(runtime, local_hhmm);
     let device_list = match runtime {
         Look::Running { .. } => device_list_line(runtime, local_datetime),
@@ -389,16 +402,26 @@ pub fn gather_full(
     if paired.as_ref().is_some_and(|p| p.relay_only) && !connected {
         notes.push(RELAY_ONLY_NOTE.into());
     }
-    // Verified before device lists were pinned: `atem pair verify` pins one.
+    // Verified before device lists were pinned: `atem pair verify` pins one,
+    // with what it needs first, the rerun's own rule (`rerun_keys`). The
+    // reset's steps (`atem unpair`, then `atem pair`) pin one too.
     let unpinned = paired.as_ref().is_some_and(|p| {
         bound(src, &p.astation_id)
             && matches!(
                 verification(&src.paths.cred, &p.astation_id),
                 Verification::Verified { .. }
             )
-    }) && !has_device_list(src);
-    if unpinned && !reset {
-        notes.push(PIN_LIST_HINT.into());
+    }) && !has_device_list(src)
+        && !frozen_genesis_present(src);
+    if unpinned {
+        use crate::memory::verification::{RerunKeys, rerun_keys};
+        let reset = crate::memory::cred_agent::RESET;
+        match rerun_keys(&src.paths.cred, unlocked) {
+            RerunKeys::Ready => notes.push(PIN_LIST_HINT.into()),
+            RerunKeys::Unlock => notes.push(PIN_LIST_UNLOCK_HINT.into()),
+            RerunKeys::Reset(_) if notes.iter().any(|n| n == reset) => {}
+            RerunKeys::Reset(_) => notes.push(reset.into()),
+        }
     }
     StatusReport {
         account: account_line(src, crate::credentials::now_secs()),
@@ -721,29 +744,33 @@ pub fn already_paired(src: &Sources) -> Option<String> {
 pub enum VerifyStart {
     /// Nothing to do: print this.
     AlreadyVerified(String),
-    /// Run the verification with this Astation; `note`, printed first,
-    /// says why a device already verified verifies again.
-    Verify {
-        astation_id: String,
-        note: Option<&'static str>,
-    },
+    /// Run the verification with this Astation; `rerun`: a device already
+    /// verified verifies again to pin a device list (warned and confirmed
+    /// first, `pair_verify::RERUN_NOTE`).
+    Verify { astation_id: String, rerun: bool },
 }
 
 /// `atem pair verify`'s offline checks: an existing pairing, not revoked,
 /// not already verified with the paired Astation, unless that verification
 /// pinned no device list (it was made before lists were pinned): then it
 /// verifies again, and the ceremony pins one (owner decision 2026-11-08,
-/// #128). A list that exists in any state is never verified over.
+/// #128), except on a host that froze on a list before (`FROZEN_RERUN`).
+/// A list that exists in any state is never verified over.
 pub fn verify_start(src: &Sources) -> Result<VerifyStart> {
     let pairing = pairing(src)
         .filter(|pairing| bound(src, &pairing.astation_id))
         .ok_or_else(|| anyhow!(NOT_PAIRED))?;
     let astation_id = pairing.astation_id;
     match verification(&src.paths.cred, &astation_id) {
-        Verification::Verified { .. } if !has_device_list(src) => Ok(VerifyStart::Verify {
-            astation_id,
-            note: Some(PIN_LIST_NOTE),
-        }),
+        Verification::Verified { .. } if !has_device_list(src) => {
+            if frozen_genesis_present(src) {
+                return Err(anyhow!(FROZEN_RERUN));
+            }
+            Ok(VerifyStart::Verify {
+                astation_id,
+                rerun: true,
+            })
+        }
         Verification::Verified { safety_code } => Ok(VerifyStart::AlreadyVerified(
             already_verified_message(&safety_code),
         )),
@@ -751,7 +778,7 @@ pub fn verify_start(src: &Sources) -> Result<VerifyStart> {
         Verification::Unknown(error) => Err(anyhow!(error)),
         Verification::NotVerified => Ok(VerifyStart::Verify {
             astation_id,
-            note: None,
+            rerun: false,
         }),
     }
 }
@@ -1480,8 +1507,8 @@ pub(crate) mod tests {
     }
 
     /// Owner decision 2026-11-08 (#128): a pairing verified before device
-    /// lists were pinned (no device-list file at all) verifies again, so
-    /// the ceremony pins one; a note says why.
+    /// lists were pinned (no device-list file at all) verifies again (a
+    /// rerun), so the ceremony pins one.
     #[test]
     fn pair_verify_verifies_again_to_pin_a_device_list() {
         let dir = tempfile::tempdir().unwrap();
@@ -1492,17 +1519,58 @@ pub(crate) mod tests {
             verify_start(&src).unwrap(),
             VerifyStart::Verify {
                 astation_id: ASTATION.into(),
-                note: Some(PIN_LIST_NOTE),
+                rerun: true,
             }
-        );
-        assert_eq!(
-            PIN_LIST_NOTE,
-            "This device was verified before device lists were pinned; verifying again pins one."
         );
         // Read only: nothing is written to decide.
         let before = snapshot(dir.path());
         verify_start(&src).unwrap();
         assert_eq!(snapshot(dir.path()), before);
+    }
+
+    /// A host that froze on a device list before (`frozen_genesis`, or its
+    /// mirror in the journal's directory, which `atem unpair` keeps) can't
+    /// pin this account's list again: the rerun is refused offline with
+    /// the frozen-list guidance (never after Touch ID), and `atem status`
+    /// gives no hint.
+    #[test]
+    fn a_frozen_genesis_refuses_the_rerun_offline_and_gives_no_hint() {
+        for mirror in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            write_paired(dir.path(), ASTATION, later());
+            write_trust(dir.path(), Some(ASTATION), None);
+            let pairing = ProfilePaths::in_dir(dir.path()).pairing;
+            let frozen = if mirror {
+                crate::session_protocol::membership::frozen_genesis_mirror(&pairing)
+            } else {
+                pairing.frozen_genesis.clone()
+            };
+            std::fs::create_dir_all(frozen.parent().unwrap()).unwrap();
+            std::fs::write(&frozen, format!(r#"{{"genesis":["{}"]}}"#, "ab".repeat(32))).unwrap();
+            let src = Sources::in_dir(dir.path());
+            let error = verify_start(&src).unwrap_err();
+            assert_eq!(error.to_string(), FROZEN_RERUN, "mirror {mirror}");
+            assert!(
+                FROZEN_RERUN.contains("pair from a new device list")
+                    && FROZEN_RERUN.contains(
+                        "remove pairing/frozen_genesis and runtime/journal/frozen_genesis"
+                    ),
+                "{FROZEN_RERUN}"
+            );
+            let shown = gather_with(&src, Some(&StubAgent::new(true)));
+            assert!(
+                !shown.notes.iter().any(|n| n.contains("atem pair verify")),
+                "mirror {mirror}: {:?}",
+                shown.notes
+            );
+            // A first verification isn't refused for it (its ceremony
+            // checks the account's genesis against the list).
+            write_trust(dir.path(), Some("astation-9"), None);
+            assert!(matches!(
+                verify_start(&src).unwrap(),
+                VerifyStart::Verify { rerun: false, .. }
+            ));
+        }
     }
 
     /// A device list that exists in any state is never verified over: a
@@ -1557,7 +1625,10 @@ pub(crate) mod tests {
                 "{case}"
             );
             assert!(
-                !report(dir.path()).notes.iter().any(|n| n == PIN_LIST_HINT),
+                !report(dir.path())
+                    .notes
+                    .iter()
+                    .any(|n| n.contains("to pin a device list")),
                 "{case}"
             );
         }
@@ -1585,7 +1656,7 @@ pub(crate) mod tests {
         write_trust(dir.path(), Some("astation-9"), None);
         let first = VerifyStart::Verify {
             astation_id: ASTATION.into(),
-            note: None,
+            rerun: false,
         };
         assert_eq!(verify_start(&Sources::in_dir(dir.path())).unwrap(), first);
         pin_list(dir.path());
@@ -1668,11 +1739,20 @@ pub(crate) mod tests {
             PIN_LIST_HINT,
             "Run `atem pair verify` to pin a device list (needed for remote sessions over r9)."
         );
+        assert_eq!(
+            PIN_LIST_UNLOCK_HINT,
+            "Run `atem cred unlock`, then `atem pair verify`, to pin a device list (needed for remote sessions over r9)."
+        );
         let dir = tempfile::tempdir().unwrap();
         write_paired(dir.path(), ASTATION, later());
         write_trust(dir.path(), Some(ASTATION), None);
         write_device_keys(dir.path());
+        write_unlock_auth_key(dir.path());
         let src = Sources::in_dir(dir.path());
+        // Locked (or no agent running): what the rerun needs first.
+        let locked = gather_with(&src, Some(&StubAgent::new(false)));
+        assert_eq!(locked.notes, vec![PIN_LIST_UNLOCK_HINT.to_string()]);
+        assert_eq!(report(dir.path()).notes, locked.notes);
         let shown = gather_with(&src, Some(&StubAgent::new(true)));
         assert_eq!(shown.notes, vec![PIN_LIST_HINT.to_string()]);
         let text = render(&shown);
@@ -1697,16 +1777,56 @@ pub(crate) mod tests {
             write_trust(dir.path(), verified, revoked);
             write_device_keys(dir.path());
             let notes = report(dir.path()).notes;
-            assert!(!notes.iter().any(|n| n == PIN_LIST_HINT), "{notes:?}");
+            assert!(
+                !notes.iter().any(|n| n.contains("to pin a device list")),
+                "{notes:?}"
+            );
         }
-        // Broken key files: the reset steps only.
+        // Where the rerun refuses with the reset (`rerun_keys`), the
+        // reset steps only, once, whatever the agent says: broken key
+        // files, none on disk (no home recorded either, as an old store),
+        // or an unlocked agent with no key files or unlock-auth key.
+        let reset = vec![crate::memory::cred_agent::RESET.to_string()];
         let dir = tempfile::tempdir().unwrap();
         write_paired(dir.path(), ASTATION, later());
         write_trust(dir.path(), Some(ASTATION), None);
+        let src = Sources::in_dir(dir.path());
+        assert_eq!(report(dir.path()).notes, reset, "no key files");
         assert_eq!(
-            report(dir.path()).notes,
-            vec![crate::memory::cred_agent::RESET.to_string()]
+            gather_with(&src, Some(&StubAgent::new(true))).notes,
+            reset,
+            "unlocked, no key files"
         );
+        forget_home(dir.path());
+        assert_eq!(report(dir.path()).notes, reset, "no home, no key files");
+        let dir = tempfile::tempdir().unwrap();
+        write_paired(dir.path(), ASTATION, later());
+        write_trust(dir.path(), Some(ASTATION), None);
+        write_device_keys(dir.path());
+        let src = Sources::in_dir(dir.path());
+        assert_eq!(
+            gather_with(&src, Some(&StubAgent::new(true))).notes,
+            reset,
+            "unlocked, no unlock-auth key"
+        );
+    }
+
+    /// `unlock_auth_key` on disk, as a verification leaves it.
+    fn write_unlock_auth_key(dir: &Path) {
+        let paths = crate::paths::CredPaths::in_dir(dir);
+        crate::memory::device_keys::DeviceKeys::generate()
+            .unlock_auth_key()
+            .save_to(&paths.unlock_auth_key)
+            .unwrap();
+    }
+
+    /// `cred/state.json` with no home recorded (a store from before homes).
+    fn forget_home(dir: &Path) {
+        let path = crate::paths::CredPaths::in_dir(dir).trust;
+        let mut trust: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        trust.as_object_mut().unwrap().remove("home_astation");
+        crate::paths::write_test_file(&path, trust.to_string());
     }
 
     #[test]

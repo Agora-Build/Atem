@@ -478,6 +478,28 @@ pub(crate) const PAIRED_NOT_VERIFIED: &str = "Paired, but this device isn't veri
 /// earlier verification is kept, still with no list.
 pub(crate) const VERIFIED_NO_LIST: &str = "This device stays verified, but no device list is pinned yet. Fix the problem above, then run 'atem pair verify'.";
 
+/// What `atem pair verify` ends with when its verification failed after a
+/// pin that couldn't be taken back: the list's files fail the host closed
+/// (no remote access) until it is paired again.
+pub(crate) const PIN_LEFT: &str = "The device list's files couldn't be taken back, so this host refuses remote access until it is paired again: run `atem unpair`, then `atem pair`.";
+
+/// `atem pair verify` on a device verified before device lists were pinned
+/// (a rerun), before anything moves: why it verifies again, what starting
+/// does on this host, and after. Starting moves the pairing to the next
+/// host trust generation, durably, whatever follows; the session host takes
+/// it at the pin (`reopen_list_if_changed`) or, after a cancel, when the
+/// link is next considered (a reconnect or re-authentication,
+/// `sync_link`) or the runtime starts: `SessionHost::change_trust_gen`.
+pub(crate) const RERUN_NOTE: [&str; 3] = [
+    "This device was verified before device lists were pinned; verifying again pins one.",
+    "Starting moves this host to its next trust generation, even if you cancel later: Astation's current remote sessions on this host end when the list is pinned or, after a cancel, at the next connection to Astation or restart of Atem's runtime. Its leases are revoked, the work it queued that hasn't started is rejected, and Codex \"always allow\" rules are dropped.",
+    "Once the list is pinned, Astation reaches this host only through its r9 apps.",
+];
+/// The rerun's confirmation, before anything moves: only `y` goes on.
+pub(crate) const RERUN_QUESTION: &str = "Continue? [y/N]";
+/// A rerun not confirmed.
+pub(crate) const RERUN_CANCELLED: &str = "Cancelled; nothing changed.";
+
 /// `atem pair` after the pairing was saved, and `atem pair verify`: a failed
 /// verification shows its reason (one warning line), then ends the command
 /// with `failed` (`PAIRED_NOT_VERIFIED`, or `VERIFIED_NO_LIST` for a device

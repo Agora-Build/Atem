@@ -154,6 +154,9 @@ pub struct OpEnv {
     agent: AgentSource,
     /// How long an operation waits for the link to come up.
     pub link_wait: Duration,
+    /// How long a verification waits for Astation's answer to
+    /// `verifyCommit` (`pair_verify::FIRST_REPLY_TIMEOUT`).
+    pub first_reply_wait: Duration,
 }
 
 impl OpEnv {
@@ -163,6 +166,7 @@ impl OpEnv {
             profile: Arc::new(Sources::current),
             agent: Arc::new(|| Ok(default_agent())),
             link_wait: LINK_WAIT,
+            first_reply_wait: crate::pair_verify::FIRST_REPLY_TIMEOUT,
         }
     }
 
@@ -173,6 +177,7 @@ impl OpEnv {
             profile: Arc::new(move || Ok(src.clone())),
             agent: Arc::new(move || Ok(agent.clone())),
             link_wait: LINK_WAIT,
+            first_reply_wait: crate::pair_verify::FIRST_REPLY_TIMEOUT,
         }
     }
 
@@ -183,6 +188,13 @@ impl OpEnv {
         self
     }
 
+    /// Waits `wait` for Astation's answer to `verifyCommit` instead.
+    #[cfg(test)]
+    pub fn with_first_reply_wait(mut self, wait: Duration) -> Self {
+        self.first_reply_wait = wait;
+        self
+    }
+
     /// No profile: every operation fails (a runtime that runs none).
     #[cfg(test)]
     pub fn unavailable() -> Self {
@@ -190,6 +202,7 @@ impl OpEnv {
             profile: Arc::new(|| Err(anyhow!("this runtime runs no Astation operations"))),
             agent: Arc::new(|| Err(anyhow!("this runtime runs no Astation operations"))),
             link_wait: LINK_WAIT,
+            first_reply_wait: crate::pair_verify::FIRST_REPLY_TIMEOUT,
         }
     }
 
@@ -450,35 +463,50 @@ async fn pair_verify<U: OpUi>(
     env: &OpEnv,
 ) -> Result<()> {
     let src = env.sources()?;
-    let (astation_id, note) = match crate::status::verify_start(&src)? {
+    let (astation_id, rerun) = match crate::status::verify_start(&src)? {
         crate::status::VerifyStart::AlreadyVerified(message) => {
             ui.print(PrintLevel::Info, &message);
             return Ok(());
         }
-        crate::status::VerifyStart::Verify { astation_id, note } => (astation_id, note),
+        crate::status::VerifyStart::Verify { astation_id, rerun } => (astation_id, rerun),
     };
     // A device verified before device lists were pinned verifies again to
-    // pin one (#128); a failure keeps its earlier verification.
-    let failed = match note {
-        Some(note) => {
-            ui.print(PrintLevel::Info, note);
-            crate::pair_verify::VERIFIED_NO_LIST
+    // pin one (#128): first what starting does; a failure keeps its
+    // earlier verification.
+    if rerun {
+        for line in crate::pair_verify::RERUN_NOTE {
+            ui.print(PrintLevel::Info, line);
         }
-        None => crate::pair_verify::PAIRED_NOT_VERIFIED,
-    };
+    }
     // The keys to verify with must be usable before anything moves: no
-    // link asked for, no rebind (sealed keys need the cred agent unlocked).
+    // link asked for, no rebind (sealed keys need the cred agent unlocked;
+    // a rerun never makes fresh keys).
     let agent = env.agent()?;
     {
         let (paths, agent) = (src.paths.cred.clone(), agent.clone());
         guard(
             ui,
             blocking(move || {
-                crate::memory::verification::check_keys_for_verification(&paths, agent.as_ref())
+                crate::memory::verification::check_keys_for_verification(
+                    &paths,
+                    agent.as_ref(),
+                    rerun,
+                )
             }),
         )
         .await?;
     }
+    // A rerun goes on only once confirmed: nothing has moved yet.
+    if rerun {
+        let answer = ui
+            .ask(AskKind::Text, crate::pair_verify::RERUN_QUESTION)
+            .await;
+        if !rerun_confirmed(answer)? {
+            ui.print(PrintLevel::Info, crate::pair_verify::RERUN_CANCELLED);
+            return Ok(());
+        }
+    }
+    let had_list = crate::session_protocol::membership::has_device_list_files(&src.paths.pairing);
     let mut view = guard(
         ui,
         link_to(calls, env, &astation_id, "the paired Astation", true),
@@ -504,8 +532,64 @@ async fn pair_verify<U: OpUi>(
         PrintLevel::Info,
         &format!("Verifying this device with Astation {astation_id}..."),
     );
-    let verification = verify_device(&mut view, &astation_id, &src.paths.cred, agent, ui).await;
+    let ceremony = Ceremony {
+        rerun,
+        first_reply: env.first_reply_wait,
+    };
+    let verification = verify_device(
+        &mut view,
+        &astation_id,
+        &src.paths.cred,
+        agent,
+        ui,
+        ceremony,
+    )
+    .await;
+    // A failure that left device-list files behind (a pin that couldn't be
+    // taken back) fails the host closed: only a new pairing clears it.
+    let failed = if verification.is_err()
+        && !had_list
+        && crate::session_protocol::membership::has_device_list_files(&src.paths.pairing)
+    {
+        crate::pair_verify::PIN_LEFT
+    } else if rerun {
+        crate::pair_verify::VERIFIED_NO_LIST
+    } else {
+        crate::pair_verify::PAIRED_NOT_VERIFIED
+    };
     conclude_verification(&mut view, ui, verification, failed).await
+}
+
+/// A rerun's confirmation (`RERUN_QUESTION`): `y` (or `yes`) goes on,
+/// anything else cancels it; no terminal to ask on, no answer or a CLI
+/// gone refuses it. Nothing has moved either way.
+pub(super) fn rerun_confirmed(answer: Option<AnswerValue>) -> Result<bool> {
+    match answer {
+        Some(AnswerValue::Yes) => Ok(true),
+        Some(AnswerValue::Text(text)) => Ok(matches!(
+            text.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        )),
+        Some(AnswerValue::No) => Ok(false),
+        Some(AnswerValue::NoTerminal(detail)) => bail!(
+            "Verifying again needs a terminal to confirm ({detail}); run `atem pair verify` in an interactive terminal. Nothing changed."
+        ),
+        Some(AnswerValue::Unanswered(detail)) => {
+            bail!("There was no answer to continue ({detail}). Nothing changed.")
+        }
+        None => bail!("{INTERRUPTED}. Nothing changed."),
+    }
+}
+
+/// How a verification's ceremony runs.
+#[derive(Clone, Copy)]
+pub(crate) struct Ceremony {
+    /// A device verified before device lists were pinned verifying again:
+    /// Astation not answering `verifyCommit` is a failure (nothing pinned),
+    /// never "doesn't support device verification".
+    pub rerun: bool,
+    /// How long Astation has to answer `verifyCommit`.
+    pub first_reply: Duration,
 }
 
 /// `verifyAbort` reason when this host's record of frozen device lists
@@ -535,13 +619,14 @@ pub(crate) async fn verify_device<U: OpUi>(
     paths: &CredPaths,
     raw_agent: Arc<dyn CredAgentApi>,
     ui: &U,
+    ceremony: Ceremony,
 ) -> Result<()> {
     use crate::memory::trust::TrustStore;
     use crate::memory::unlock::PairEscrow;
     use crate::memory::verification::{AstationKeys, Handshake, device_keys_for_verification};
     use crate::pair_verify::{
-        FIRST_REPLY_TIMEOUT, TOUCH_ID_TIMEOUT, abandon_verification, await_device_verified,
-        code_failure, next_verify_message, request_key_after_verification,
+        TOUCH_ID_TIMEOUT, abandon_verification, await_device_verified, code_failure,
+        next_verify_message, request_key_after_verification,
     };
 
     // The pairing this verification runs under: every cred-agent request,
@@ -583,13 +668,24 @@ pub(crate) async fn verify_device<U: OpUi>(
         .await?;
 
     let first = tokio::select! {
-        first = tokio::time::timeout(FIRST_REPLY_TIMEOUT, next_verify_message(client)) => Some(first),
+        first = tokio::time::timeout(ceremony.first_reply, next_verify_message(client)) => Some(first),
         _ = ui.gone() => None,
     };
     let astation = match first {
         None => {
             // Nothing is pinned yet; Astation is still told.
             let failure = code_failure(CodeAnswer::Interrupted).expect("a failure");
+            return Err(abandon_verification(client, &paths.trust, astation_id, failure).await);
+        }
+        // A rerun is only for the device list: no answer pins none.
+        Some(Err(_)) if ceremony.rerun => {
+            let secs = ceremony.first_reply.as_secs();
+            let failure = VerifyFailure::local(
+                format!("no answer from Astation within {secs} s on atem"),
+                anyhow!(
+                    "Astation didn't answer the verification within {secs} s, so nothing was pinned."
+                ),
+            );
             return Err(abandon_verification(client, &paths.trust, astation_id, failure).await);
         }
         Some(Err(_)) => {
@@ -937,8 +1033,19 @@ async fn pair<U: OpUi>(
     }
     // A failed verification is shown, then makes the result a failure; the
     // pairing stays saved.
-    let verification =
-        verify_device(&mut view, &astation_id, &src.paths.cred, env.agent()?, ui).await;
+    let ceremony = Ceremony {
+        rerun: false,
+        first_reply: env.first_reply_wait,
+    };
+    let verification = verify_device(
+        &mut view,
+        &astation_id,
+        &src.paths.cred,
+        env.agent()?,
+        ui,
+        ceremony,
+    )
+    .await;
     conclude_verification(
         &mut view,
         ui,

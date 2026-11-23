@@ -793,28 +793,78 @@ pub fn set_aside_revoked_keys(
     )))
 }
 
+/// What a verified device needs before `atem pair verify` can verify it
+/// again to pin a device list (a rerun), from its key files and whether
+/// the cred agent holds them unlocked: the one rule for the rerun's check
+/// and `atem status`'s hint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RerunKeys {
+    /// The keys can be used.
+    Ready,
+    /// Sealed keys, locked: `atem cred unlock` first.
+    Unlock,
+    /// Key files that can't be used (the problem): the reset. A rerun never
+    /// makes fresh keys over the ones Astation pinned.
+    Reset(String),
+}
+
+/// `RerunKeys` for the key files in `paths`, the agent holding them
+/// unlocked or not. Read only.
+pub fn rerun_keys(paths: &CredPaths, unlocked: bool) -> RerunKeys {
+    if !has_device_keys(paths) {
+        // Whatever the store records as home (an old one records none).
+        return RerunKeys::Reset(
+            key_file_problem(paths).unwrap_or_else(|| "no key files on disk".into()),
+        );
+    }
+    if !unlocked {
+        return key_file_problem(paths).map_or(RerunKeys::Unlock, RerunKeys::Reset);
+    }
+    match UnlockAuthKey::load_from(&paths.unlock_auth_key) {
+        Ok(Some(_)) => RerunKeys::Ready,
+        Ok(None) => RerunKeys::Reset("unlock_auth_key is missing".into()),
+        Err(error) => RerunKeys::Reset(format!("unlock_auth_key is unreadable ({error:#})")),
+    }
+}
+
+/// What is wrong with the key files of a device with a verified home
+/// (`unlock::key_file_problem`); none when the store can't be read.
+fn key_file_problem(paths: &CredPaths) -> Option<String> {
+    let trust = TrustStore::load_from(&paths.trust).ok()?;
+    crate::memory::unlock::key_file_problem(paths, &trust)
+}
+
 /// `atem pair verify`'s check before anything moves (no rebind, no
 /// `verifyCommit`): the keys `device_keys_for_verification` would verify
 /// with can be used. Sealed keys need the cred agent unlocked (`atem cred
 /// unlock`). Key files `atem status` shows broken on a verified home (none
 /// on disk, or unreadable while the agent is locked) are never replaced by
 /// fresh ones over the keys that Astation pinned: the reset is the way out.
-pub fn check_keys_for_verification(paths: &CredPaths, agent: &dyn CredAgentApi) -> Result<()> {
-    let broken = || {
-        let trust = TrustStore::load_from(&paths.trust).ok()?;
-        crate::memory::unlock::key_file_problem(paths, &trust)
-    };
+/// A `rerun` (`rerun_keys`) never makes fresh keys at all.
+pub fn check_keys_for_verification(
+    paths: &CredPaths,
+    agent: &dyn CredAgentApi,
+    rerun: bool,
+) -> Result<()> {
     let reset = |problem: String| {
         anyhow!(
             "this device's key files are broken ({problem}). {}",
             crate::memory::cred_agent::RESET
         )
     };
+    if rerun {
+        let unlocked = has_device_keys(paths) && agent.status()?.unlocked;
+        return match rerun_keys(paths, unlocked) {
+            RerunKeys::Ready => sealed_publics(paths, agent).map(drop),
+            RerunKeys::Unlock => Err(anyhow!("{LOCKED}, then `atem pair verify`")),
+            RerunKeys::Reset(problem) => Err(reset(problem)),
+        };
+    }
     if !has_device_keys(paths) {
-        return broken().map_or(Ok(()), |problem| Err(reset(problem)));
+        return key_file_problem(paths).map_or(Ok(()), |problem| Err(reset(problem)));
     }
     if !agent.status()?.unlocked
-        && let Some(problem) = broken()
+        && let Some(problem) = key_file_problem(paths)
     {
         return Err(reset(problem));
     }
@@ -897,34 +947,65 @@ mod tests {
     /// file) gets the reset, never fresh keys over the ones it pinned.
     #[test]
     fn the_keys_are_checked_before_a_verification_moves_anything() {
-        let empty = tempfile::tempdir().unwrap();
-        let empty_paths = CredPaths::in_dir(empty.path());
-        check_keys_for_verification(&empty_paths, &test_agent(&empty_paths)).unwrap();
+        for rerun in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (paths, agent, _, _) = verify(dir.path(), EncryptionMode::Off);
+            check_keys_for_verification(&paths, &agent, rerun).unwrap();
+            // Locked: only the sealed file left (Astation holds the storage
+            // key), the agent restarted.
+            std::fs::remove_file(&paths.device_keys).unwrap();
+            let locked = test_agent(&paths);
+            let error = check_keys_for_verification(&paths, &locked, rerun).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("{LOCKED}, then `atem pair verify`"),
+                "rerun {rerun}"
+            );
+            // Locked over an unreadable sealed file: the reset.
+            crate::paths::write_test_file(&paths.device_keys_sealed, b"{not json");
+            let error = check_keys_for_verification(&paths, &locked, rerun).unwrap_err();
+            let text = error.to_string();
+            assert!(text.contains("device_keys.sealed is unreadable"), "{text}");
+            assert!(text.ends_with(crate::memory::cred_agent::RESET), "{text}");
+            // No key files at all on the verified home: the reset too.
+            std::fs::remove_file(&paths.device_keys_sealed).unwrap();
+            let error = check_keys_for_verification(&paths, &locked, rerun).unwrap_err();
+            let text = error.to_string();
+            assert!(text.contains("no sealed keys on disk"), "{text}");
+            assert!(text.ends_with(crate::memory::cred_agent::RESET), "{text}");
+        }
+    }
 
+    /// A first verification of a device without keys makes fresh ones; a
+    /// rerun (the device verified, its list to pin) never does, whatever
+    /// the store records as home: no key files is the reset.
+    #[test]
+    fn a_rerun_never_makes_fresh_keys() {
+        let empty = tempfile::tempdir().unwrap();
+        let paths = CredPaths::in_dir(empty.path());
+        check_keys_for_verification(&paths, &test_agent(&paths), false).unwrap();
+        let error = check_keys_for_verification(&paths, &test_agent(&paths), true).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("no key files on disk"), "{text}");
+        assert!(text.ends_with(crate::memory::cred_agent::RESET), "{text}");
+        assert!(matches!(rerun_keys(&paths, false), RerunKeys::Reset(_)));
+        assert!(matches!(rerun_keys(&paths, true), RerunKeys::Reset(_)));
+    }
+
+    /// `rerun_keys`, the one rule for the rerun's check and `atem status`'s
+    /// hint: ready with the keys unlocked, `atem cred unlock` first when
+    /// they're locked, the reset when the files can't be used.
+    #[test]
+    fn rerun_keys_says_what_the_rerun_needs_first() {
         let dir = tempfile::tempdir().unwrap();
-        let (paths, agent, _, _) = verify(dir.path(), EncryptionMode::Off);
-        check_keys_for_verification(&paths, &agent).unwrap();
-        // Locked: only the sealed file left (Astation holds the storage
-        // key), the agent restarted.
-        std::fs::remove_file(&paths.device_keys).unwrap();
-        let locked = test_agent(&paths);
-        let error = check_keys_for_verification(&paths, &locked).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            format!("{LOCKED}, then `atem pair verify`")
-        );
-        // Locked over an unreadable sealed file: the reset.
-        crate::paths::write_test_file(&paths.device_keys_sealed, b"{not json");
-        let error = check_keys_for_verification(&paths, &locked).unwrap_err();
-        let text = error.to_string();
-        assert!(text.contains("device_keys.sealed is unreadable"), "{text}");
-        assert!(text.ends_with(crate::memory::cred_agent::RESET), "{text}");
-        // No key files at all on the verified home: the reset too.
-        std::fs::remove_file(&paths.device_keys_sealed).unwrap();
-        let error = check_keys_for_verification(&paths, &locked).unwrap_err();
-        let text = error.to_string();
-        assert!(text.contains("no sealed keys on disk"), "{text}");
-        assert!(text.ends_with(crate::memory::cred_agent::RESET), "{text}");
+        let (paths, _, _, _) = verify(dir.path(), EncryptionMode::Off);
+        assert!(matches!(rerun_keys(&paths, true), RerunKeys::Ready));
+        assert!(matches!(rerun_keys(&paths, false), RerunKeys::Unlock));
+        std::fs::remove_file(&paths.unlock_auth_key).unwrap();
+        let RerunKeys::Reset(problem) = rerun_keys(&paths, true) else {
+            panic!("unlocked with no unlock-auth key");
+        };
+        assert_eq!(problem, "unlock_auth_key is missing");
     }
 
     #[test]
