@@ -636,8 +636,8 @@ async fn an_adopted_workers_owed_stop_goes_with_its_chat_snapshot() {
         1,
         0,
     );
-    worker.on_event(hook("first", 999), 2, 0);
-    worker.on_log(user("u1", "t1", "first", 120), 2, 0);
+    worker.on_event(hook("first", 1_999), 2, 0);
+    worker.on_log(user("u1", "t1", "first", 1_020), 2, 0);
     worker.on_log(
         LogItem::TurnEnded {
             turn_id: "t1".into(),
