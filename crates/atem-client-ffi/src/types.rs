@@ -381,6 +381,98 @@ record! {
 }
 
 record! {
+    /// The recovery a signer report is for (`signer_report_challenge`,
+    /// `parse_signer_report_challenge`, `VerifiedSignerReport`): the
+    /// Station's recovery `generation` (a canonical decimal string, 1 to
+    /// 2^63 − 1: no sign, no leading zero; a string because it may exceed
+    /// 2^53), the plan (`plan_id`) and its candidate feed
+    /// (`candidate_feed_id`), both UUID v4, and the commitments the
+    /// collection is based on (`source_hash`, `evidence_hash`, lowercase hex
+    /// SHA-256).
+    pub struct SignerReportRecovery {
+        pub generation: String,
+        pub plan_id: String,
+        pub candidate_feed_id: String,
+        pub source_hash: String,
+        pub evidence_hash: String,
+    }
+}
+
+record! {
+    /// A signer report's challenge as the minter issues and stores it
+    /// (`signer_report_challenge`, `parse_signer_report_challenge`): the
+    /// verifier report's fields (`signer` a native member,
+    /// `member:<device_id>`; `nonce` base64url) and the `recovery`.
+    pub struct SignerReportChallenge {
+        pub signer: String,
+        pub slot: String,
+        pub origin: String,
+        pub connection: u64,
+        pub nonce: String,
+        pub issued_at: u64,
+        pub expires_at: u64,
+        pub recovery: SignerReportRecovery,
+    }
+}
+
+record! {
+    /// What a native manager's signing journal holds for the plan, as the
+    /// app's adapter hands it to `SignerReportRequest` under its journal
+    /// lock: the journal's `id` (16 random bytes made with the journal,
+    /// base64url), `since` (the device-list `seq` at its creation, at least
+    /// 1), `revision` (the count of every append ever made), and the
+    /// bodies themselves (each a control record's body as JSON): `records`,
+    /// the plan's records it put into `signing` or `signed` (a body in
+    /// `signing` with no saved signature included), and `drafts`, its
+    /// unsigned drafts of the plan's records. The core counts and hashes
+    /// them; the app supplies no hash.
+    pub struct SignerJournalView {
+        pub id: String,
+        pub since: u64,
+        pub revision: u64,
+        pub records: Vec<String>,
+        pub drafts: Vec<String>,
+    }
+}
+
+record! {
+    /// A signer report's `journal` as signed: the journal's `id`
+    /// (base64url), `since` and `revision`, and each set's count and hash
+    /// (`records_hash`, `drafts_hash`: lowercase hex).
+    pub struct SignerReportJournal {
+        pub id: String,
+        pub since: u64,
+        pub revision: u64,
+        pub records: u64,
+        pub records_hash: String,
+        pub drafts: u64,
+        pub drafts_hash: String,
+    }
+}
+
+record! {
+    /// A verified signer report (`verify_signer_report`): who signed it
+    /// (`member:<device_id>`), in which slot and process (base64url, 16
+    /// bytes), for which `connection`, at which head of the reporter's list
+    /// (`at_head` false at an ancestor), the `recovery` and `journal` it
+    /// signed, and `records`, the exported records it verified (canonical
+    /// JSON, in the order given): exactly the report's records. It proves
+    /// the report's signature and that the export matches it; consistency
+    /// only, never completeness of anything outside the journal.
+    pub struct VerifiedSignerReport {
+        pub signer: String,
+        pub slot: String,
+        pub process: String,
+        pub connection: u64,
+        pub head: LogHead,
+        pub at_head: bool,
+        pub recovery: SignerReportRecovery,
+        pub journal: SignerReportJournal,
+        pub records: Vec<String>,
+    }
+}
+
+record! {
     /// The exact action and minimum reported verifier version required before
     /// signing this membership body. The caller authenticates and enumerates
     /// every verifier; this result alone never authorizes a signature.

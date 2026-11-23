@@ -27,6 +27,10 @@
 //! checked that its `label` is `atem-verifier-report-v1`, and never another
 //! label so. The process is per loaded image: a child forked without
 //! `exec` shares its parent's.
+//!
+//! [`signer`] is a native manager's signed report of its control-record
+//! signing journal on the same core (host-work-v1 §11.1 "The signer
+//! report", Astation #114 item 4).
 use std::sync::Arc;
 
 use atem_client::KeyId;
@@ -42,6 +46,8 @@ use crate::log::{MembershipLog, object_json};
 use crate::types::{
     ReportSignerKind, SignRequest, VerifiedReport, VerifierInventory, VerifierReportChallenge,
 };
+
+pub mod signer;
 
 /// A fresh challenge (the minter's side) as canonical JSON: `signer`
 /// (`member:<id>` or `service:<id>`), `slot` (1–128 bytes of

@@ -205,8 +205,9 @@ impl RecoveryPlan {
         })
     }
 
-    /// Exactly the five fields, each in its grammar.
-    fn read(value: &Value) -> Result<Self, ReportRefusal> {
+    /// Exactly the five fields, each in its grammar, as a challenge and a
+    /// report carry them (`malformed` otherwise).
+    pub fn from_json(value: &Value) -> Result<Self, ReportRefusal> {
         let o = exact(value, &RECOVERY_FIELDS, "recovery")?;
         let generation = str_field(o, "generation")
             .ok()
@@ -332,7 +333,7 @@ impl SignerReportChallenge {
         if !member_signer_ok(base.signer()) {
             return Err(malformed("signer"));
         }
-        let recovery = RecoveryPlan::read(&o["recovery"])?;
+        let recovery = RecoveryPlan::from_json(&o["recovery"])?;
         Ok(SignerReportChallenge { base, recovery })
     }
 
@@ -799,7 +800,7 @@ pub fn verify_signer_report<R: AsRef<[u8]>>(
         return Err(malformed("type"));
     }
     let body = Common::read(o)?;
-    let recovery = RecoveryPlan::read(&o["recovery"])?;
+    let recovery = RecoveryPlan::from_json(&o["recovery"])?;
     let journal = JournalSummary::read(&o["journal"])?;
     body.check_log(log)?;
     let key = manager_key(log, &body.signer)?;

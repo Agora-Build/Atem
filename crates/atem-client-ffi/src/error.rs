@@ -73,7 +73,9 @@ pub enum AtemError {
     /// `fork`, `signer_mismatch`, `slot_mismatch`, `challenge_mismatch`,
     /// `expired`), and the reporter's `origin_mismatch` (a challenge for
     /// another Station) and `signing_failed` (the provider declined or
-    /// failed). A new variant: an app that switches over `AtemError`
+    /// failed). A manager's signer report (Astation #114 item 4) adds
+    /// `not_a_manager`, `recovery_mismatch` and `records_mismatch` in its
+    /// own order. A new variant: an app that switches over `AtemError`
     /// exhaustively needs a source change.
     Report { code: String, detail: String },
 }
