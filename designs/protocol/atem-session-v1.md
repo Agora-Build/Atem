@@ -1821,8 +1821,9 @@ Planned:
   `Continue? [y/N]` before anything moves: starting moves the host to its
   next trust generation even if cancelled, so the paired Astation's r8
   sessions on it end (leases revoked, queued work not started rejected,
-  session rules dropped) when the list is pinned or, after a cancel, at the
-  link's next connection. Then the ceremony: commit-then-reveal, the same
+  session rules dropped) when the list is pinned or, after a cancelled or
+  failed rerun, at the link's next connection. Then the ceremony:
+  commit-then-reveal, the same
   Astation's pin updated over the device's sealed keys (the cred agent
   unlocked, checked before anything moves; never fresh keys), and the list
   the certificate carries pinned (R9.2 "Pairing"). From then on the host
