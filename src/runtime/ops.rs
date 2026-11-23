@@ -451,7 +451,7 @@ async fn pair_verify<U: OpUi>(
             ui.print(PrintLevel::Info, &message);
             return Ok(());
         }
-        crate::status::VerifyStart::Verify(astation_id) => astation_id,
+        crate::status::VerifyStart::Verify { astation_id, .. } => astation_id,
     };
     let mut view = guard(
         ui,
