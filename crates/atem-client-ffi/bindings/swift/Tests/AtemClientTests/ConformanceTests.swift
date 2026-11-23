@@ -714,14 +714,20 @@ final class ConformanceTests: XCTestCase {
                 if (v["reason"] as? String) == "not_revoked" { want = .notRevoked }
                 if (v["reason"] as? String) == "enc_key_reused" { want = .encKeyReused }
                 try eq(try log.checkChange(actionJson: action, nowMs: signedAt), want, "\(label) check_change")
-                // previous_key_window: a host_enc_key of a host whose previous
-                // key isn't retired, for a change check_change lets through only.
+                // change_advisories: check_change's refusal, else
+                // previous_key_window for a host_enc_key of a host whose
+                // previous key isn't retired and was replaced by an entry
+                // signed less than 24 h before.
                 var window: [ChangeAdvisoryInfo] = []
                 if s(body["action"]) == "host_enc_key", want == nil, let hostId = body["host_id"] as? String,
                    let p = log.hostEncKey(hostId: hostId)?.previous, !p.retired {
-                    window = [.previousKeyWindow(hostId: hostId, previousEncKid: p.key.encKid, replacedAtSeq: p.replacedAtSeq)]
+                    let labels = a(mlog["log"]).map { s(o($0)["label"]) } + a(v["chain"]).map(s)
+                    let replacedAt = u(labels.map { o(o(byLabel[$0]!["entry"])["body"]) }.first { u($0["seq"]) == p.replacedAtSeq }!["signed_at"])
+                    if signedAt < replacedAt + 86_400_000 {
+                        window = [.previousKeyWindow(hostId: hostId, previousEncKid: p.key.encKid, replacedAtSeq: p.replacedAtSeq, replacedSignedAt: replacedAt)]
+                    }
                 }
-                try eq(try log.changeAdvisories(actionJson: action, nowMs: signedAt), window, "\(label) change_advisories")
+                try eq(try log.changeAdvisories(actionJson: action, nowMs: signedAt), ChangeReviewInfo(refusal: want, advisories: window), "\(label) change_advisories")
                 advised += window.count
             }
             if built < 38 { throw Failure(description: "\(built) built") }

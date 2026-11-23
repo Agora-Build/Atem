@@ -907,11 +907,13 @@ impl MembershipLog {
     pub fn check_change(&self, action_json: String, now_ms: f64) -> JsResult<JsValue> {
         ok(self.0.check_change(action_json, ms(now_ms)?))
     }
-    /// `[{type: "previous_key_window", hostId, previousEncKid,
-    /// replacedAtSeq}]` (advisory, for signers: a `host_enc_key` of a host
-    /// whose previous key isn't retired; a second rotation cuts its window
-    /// short); `[]` for a change `checkChange` refuses (its refusal
-    /// stands).
+    /// `{refusal, advisories}`: `refusal` as `checkChange` gives it (then
+    /// `advisories` is `[]`: the refusal stands), else `null` and
+    /// `advisories` `[{type: "previous_key_window", hostId,
+    /// previousEncKid, replacedAtSeq, replacedSignedAt}]` (advisory, for
+    /// signers: a `host_enc_key` of a host whose previous key isn't retired
+    /// and was replaced by an entry signed less than 24 h before; a second
+    /// rotation cuts its window short).
     #[wasm_bindgen(js_name = changeAdvisories)]
     pub fn change_advisories(&self, action_json: String, now_ms: f64) -> JsResult<JsValue> {
         ok(self.0.change_advisories(action_json, ms(now_ms)?))

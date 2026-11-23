@@ -23,8 +23,9 @@ use crate::encoding::{MAX_SAFE, canonical, canonical_lossy, hash_of, safe_int, s
 use crate::error::{AtemError, Result};
 use crate::types::{
     CapacityInfo, CapacityLevelKind, CarriageResult, CarriageStop, ChangeAdvisoryInfo,
-    ChangeRefusalInfo, FreezeInfo, HeadRelationKind, HostClock, HostInfo, KBackupInfo, LogHead,
-    MemberInfo, MemberStatusKind, MembershipEffect, PendingRecoveryInfo, VerifierInventory,
+    ChangeRefusalInfo, ChangeReviewInfo, FreezeInfo, HeadRelationKind, HostClock, HostInfo,
+    KBackupInfo, LogHead, MemberInfo, MemberStatusKind, MembershipEffect, PendingRecoveryInfo,
+    VerifierInventory,
 };
 
 /// Largest durable snapshot `MembershipLog::from_stored` reads: the host's
@@ -171,6 +172,25 @@ fn member_info(member: &Member, status: MemberStatus) -> MemberInfo {
         scope_json,
         expires_at,
         member_json: canonical_lossy(&member.to_json()),
+    }
+}
+
+/// `check_change`'s refusal as the bindings name it.
+fn refusal_info(refusal: ChangeRefusal) -> ChangeRefusalInfo {
+    match refusal {
+        ChangeRefusal::LogFull => ChangeRefusalInfo::LogFull,
+        ChangeRefusal::MembersFull => ChangeRefusalInfo::MembersFull,
+        ChangeRefusal::HostsFull => ChangeRefusalInfo::HostsFull,
+        ChangeRefusal::ServiceChangeTooSoon {
+            last_signed_at,
+            retry_at,
+        } => ChangeRefusalInfo::ServiceChangeTooSoon {
+            last_signed_at,
+            retry_at,
+        },
+        ChangeRefusal::AlreadyRevoked => ChangeRefusalInfo::AlreadyRevoked,
+        ChangeRefusal::NotRevoked => ChangeRefusalInfo::NotRevoked,
+        ChangeRefusal::EncKeyReused => ChangeRefusalInfo::EncKeyReused,
     }
 }
 
@@ -715,38 +735,23 @@ impl MembershipLog {
         let entry = structural_entry(&body)?;
         let log = self.lock();
         Ok(
-            match atem_client::membership::check_change(&log, &entry.action, now_ms) {
-                Ok(()) => None,
-                Err(ChangeRefusal::LogFull) => Some(ChangeRefusalInfo::LogFull),
-                Err(ChangeRefusal::MembersFull) => Some(ChangeRefusalInfo::MembersFull),
-                Err(ChangeRefusal::HostsFull) => Some(ChangeRefusalInfo::HostsFull),
-                Err(ChangeRefusal::ServiceChangeTooSoon {
-                    last_signed_at,
-                    retry_at,
-                }) => Some(ChangeRefusalInfo::ServiceChangeTooSoon {
-                    last_signed_at,
-                    retry_at,
-                }),
-                Err(ChangeRefusal::AlreadyRevoked) => Some(ChangeRefusalInfo::AlreadyRevoked),
-                Err(ChangeRefusal::NotRevoked) => Some(ChangeRefusalInfo::NotRevoked),
-                Err(ChangeRefusal::EncKeyReused) => Some(ChangeRefusalInfo::EncKeyReused),
-            },
+            atem_client::membership::check_change(&log, &entry.action, now_ms)
+                .err()
+                .map(refusal_info),
         )
     }
 
     /// What to tell the owner before drafting `action_json` (as
-    /// `check_change` takes it) as the next entry at `now_ms`: today
+    /// `check_change` takes it) as the next entry at `now_ms` (the
+    /// `signed_at` it would carry): `refusal` is `check_change`'s (then no
+    /// advisory: the refusal stands), else `advisories`, today
     /// `PreviousKeyWindow` for a `host_enc_key` of a host whose previous
-    /// key isn't retired (a second rotation cuts its window short). Empty
-    /// for a change `check_change` refuses: ask `check_change` first, its
-    /// refusal stands. Advisory, for signers only; it bypasses no refusal
-    /// and no signing gate. A malformed action is `Invalid`/`Membership`
-    /// as in `draft_entry`.
-    pub fn change_advisories(
-        &self,
-        action_json: String,
-        now_ms: u64,
-    ) -> Result<Vec<ChangeAdvisoryInfo>> {
+    /// key isn't retired and was replaced by an entry signed less than 24 h
+    /// before `now_ms` (a second rotation cuts its window short; ask for an
+    /// explicit confirmation). Advisory, for signers only; it bypasses no
+    /// refusal and no signing gate. A malformed action is
+    /// `Invalid`/`Membership` as in `draft_entry`.
+    pub fn change_advisories(&self, action_json: String, now_ms: u64) -> Result<ChangeReviewInfo> {
         let action = strict(&action_json)?;
         let signer = match action["action"].as_str() {
             Some("recovery_add") => atem_client::membership::RECOVERY_SIGNER,
@@ -756,21 +761,31 @@ impl MembershipLog {
         let entry = structural_entry(&body)?;
         let log = self.lock();
         Ok(
-            atem_client::membership::check_change_advisories(&log, &entry.action, now_ms)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|advisory| match advisory {
-                    ChangeAdvisory::PreviousKeyWindow {
-                        host_id,
-                        previous_kid,
-                        replaced_at_seq,
-                    } => ChangeAdvisoryInfo::PreviousKeyWindow {
-                        host_id,
-                        previous_enc_kid: atem_client::encoding::hex(&previous_kid),
-                        replaced_at_seq,
-                    },
-                })
-                .collect(),
+            match atem_client::membership::check_change_advisories(&log, &entry.action, now_ms) {
+                Err(refusal) => ChangeReviewInfo {
+                    refusal: Some(refusal_info(refusal)),
+                    advisories: Vec::new(),
+                },
+                Ok(advisories) => ChangeReviewInfo {
+                    refusal: None,
+                    advisories: advisories
+                        .into_iter()
+                        .map(|advisory| match advisory {
+                            ChangeAdvisory::PreviousKeyWindow {
+                                host_id,
+                                previous_kid,
+                                replaced_at_seq,
+                                replaced_signed_at,
+                            } => ChangeAdvisoryInfo::PreviousKeyWindow {
+                                host_id,
+                                previous_enc_kid: atem_client::encoding::hex(&previous_kid),
+                                replaced_at_seq,
+                                replaced_signed_at,
+                            },
+                        })
+                        .collect(),
+                },
+            },
         )
     }
 

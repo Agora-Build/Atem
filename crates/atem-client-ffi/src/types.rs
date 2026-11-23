@@ -517,8 +517,10 @@ data_enum! {
     /// it and ask for an explicit confirmation; it bypasses neither
     /// `check_change`'s refusals nor the signing gate.
     pub enum ChangeAdvisoryInfo {
-        /// A `host_enc_key` for a host whose previous key isn't retired:
-        /// the list keeps one previous key only, so this rotation (routine
+        /// A `host_enc_key` for a host whose previous key isn't retired,
+        /// replaced by an entry signed less than 24 h before this one
+        /// (conservative: the signers' clocks stand in for the host's
+        /// application): the list keeps one previous key only, so this rotation (routine
         /// or `retire_previous`) ends the window in which the host still
         /// opens mail sealed to `previous_enc_kid` (24 h on the host's own
         /// clock from when it applied the entry at `replaced_at_seq`), and
@@ -530,7 +532,19 @@ data_enum! {
             /// 16 lowercase hex characters.
             previous_enc_kid: String,
             replaced_at_seq: u64,
+            /// That entry's `signed_at` (its signer's clock: display only).
+            replaced_signed_at: u64,
         },
+    }
+}
+
+record! {
+    /// `MembershipLog::change_advisories`: `check_change`'s refusal, if
+    /// any (then no advisory: the refusal stands), and the advisories of a
+    /// change it lets through. A UI reading only this sees a refusal too.
+    pub struct ChangeReviewInfo {
+        pub refusal: Option<ChangeRefusalInfo>,
+        pub advisories: Vec<ChangeAdvisoryInfo>,
     }
 }
 

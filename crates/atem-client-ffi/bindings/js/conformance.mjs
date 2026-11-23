@@ -416,12 +416,14 @@ check("device-list actions: the builders reproduce the vectors; check_change adv
     eq(log.draftEntry("dev-mac", body.signed_at, action), v.jcs, v.label);
     const advice = log.checkChange(action, body.signed_at);
     eq(advice, ADVICE.includes(v.reason) ? { type: v.reason } : null, `${v.label} check_change`);
-    // previous_key_window: a host_enc_key of a host whose previous key
-    // isn't retired, for a change check_change lets through only.
+    // change_advisories: check_change's refusal, else previous_key_window
+    // for a host_enc_key of a host whose previous key isn't retired and was
+    // replaced by an entry signed less than 24 h before.
     const keysOf = body.action === "host_enc_key" && advice === null ? log.hostEncKey(body.host_id) : null;
     const previous = keysOf && keysOf.previous && !keysOf.previous.retired ? keysOf.previous : null;
-    const window = previous ? [{ type: "previous_key_window", hostId: body.host_id, previousEncKid: previous.key.encKid, replacedAtSeq: previous.replacedAtSeq }] : [];
-    eq(log.changeAdvisories(action, body.signed_at), window, `${v.label} change_advisories`);
+    const replacedAt = previous ? [...mlog.log.map((x) => x.label), ...v.chain].map((l) => byLabel[l].entry.body).find((b) => b.seq === previous.replacedAtSeq).signed_at : null;
+    const window = previous && body.signed_at < replacedAt + 86400000 ? [{ type: "previous_key_window", hostId: body.host_id, previousEncKid: previous.key.encKid, replacedAtSeq: previous.replacedAtSeq, replacedSignedAt: replacedAt }] : [];
+    eq(log.changeAdvisories(action, body.signed_at), { refusal: advice, advisories: window }, `${v.label} change_advisories`);
     advised += window.length;
   }
   if (built < 38) throw new Error(`${built} built`);

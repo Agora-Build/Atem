@@ -958,14 +958,17 @@ impl HostEncKeyGet {
 /// the routine rotation of a host's encryption key, agreed with Astation on
 /// 2026-11-23, #120 comment 7089435308): a native manager asks the host for
 /// a *new* key, to draft a `host_enc_key` entry that rotates the one the
-/// device list holds. The host answers one [`HostEncKey`] of a pending key
-/// (`state: "pending"`, this request's `request_id`). One pending key per
-/// trust generation: any request while one exists, from this manager or
-/// another, a retry after a lost answer included, gets that same key; it
-/// stays pending until an entry sets it or its trust generation goes. Only
-/// native members holding `manage` at the host's head get it, checked at
-/// every request and retry, as for [`host_enc_key_get`], which stays a
-/// pure read. `request_id` is a UUID v4 the answer echoes.
+/// device list holds. The host answers one [`HostEncKey`] with this
+/// request's `request_id` and `state: "pending"`: the key the host made for
+/// a rotation (or its own key no entry has set yet), at most one such key
+/// at a time; whether the device list holds it by now is for the manager's
+/// own log to say. Any request while that key isn't set, from this manager
+/// or another, gets it; a retry under the same `request_id` gets the same
+/// key, before or after an entry set it (the host keeps a bounded record of
+/// the `request_id`s it answered). Only native members holding `manage` at
+/// the host's head get it, checked at every request and retry, as for
+/// [`host_enc_key_get`], which stays a pure read. `request_id` is a UUID v4
+/// the answer echoes.
 ///
 /// [`SENDERS_FEATURE`]: crate::session::host_work::SENDERS_FEATURE
 pub fn host_enc_key_new(id: &str, request_id: &str) -> Value {
@@ -1012,8 +1015,10 @@ impl HostEncKeyNew {
     }
 }
 
-/// The one state a `host_enc_key_new`'s answer names: the key is the
-/// host's pending key, not yet set by any entry its device list holds.
+/// The one state a `host_enc_key_new`'s answer names: a key the host
+/// handed out for a rotation, no entry having set it when the host first
+/// answered for it; a retry's answer keeps it after an entry set the key
+/// (no other wire value: the manager's own log says whether it is set).
 pub const HOST_ENC_KEY_PENDING: &str = "pending";
 
 /// `host_enc_key{re, host_id, host_trust_gen, enc_key, enc_sig}` (H→C): the

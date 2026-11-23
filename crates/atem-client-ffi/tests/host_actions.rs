@@ -71,6 +71,16 @@ fn log_after(v: &Vectors, chain: &[&str]) -> Arc<MembershipLog> {
     log
 }
 
+/// `signed_at` of the entry at `seq` of log L and then `chain`.
+fn signed_at_of(v: &Vectors, chain: &[&str], seq: u64) -> u64 {
+    L.iter()
+        .chain(chain.iter())
+        .map(|label| &v.wire(label)["body"])
+        .find(|body| body["seq"] == seq)
+        .and_then(|body| body["signed_at"].as_u64())
+        .unwrap()
+}
+
 fn chain_of(vector: &Value) -> Vec<String> {
     vector["chain"]
         .as_array()
@@ -235,24 +245,35 @@ fn every_builder_goes_through_draft_entry_and_check_change() {
             _ => None,
         };
         assert_eq!(advice, want, "{label}");
-        // `previous_key_window`: a host_enc_key of a host whose previous
-        // key isn't retired, for a change check_change lets through only.
-        let advisories = log.change_advisories(action, signed_at).unwrap();
+        // `change_advisories`: the refusal as check_change gives it, and
+        // `previous_key_window` for a host_enc_key of a host whose previous
+        // key isn't retired and was replaced within 24 h of this signing,
+        // for a change check_change lets through only.
+        let review = log.change_advisories(action, signed_at).unwrap();
+        assert_eq!(review.refusal, advice, "{label}");
         let host = body["host_id"].as_str().unwrap_or_default();
         let window = match log.host_enc_key(host.into()) {
             Some(keys) if body["action"] == "host_enc_key" && advice.is_none() => keys
                 .previous
                 .filter(|p| !p.retired)
-                .map(|p| ChangeAdvisoryInfo::PreviousKeyWindow {
-                    host_id: host.into(),
-                    previous_enc_kid: p.key.enc_kid,
-                    replaced_at_seq: p.replaced_at_seq,
-                }),
+                .map(|p| {
+                    let replaced_signed_at = signed_at_of(&v, &chain, p.replaced_at_seq);
+                    (p, replaced_signed_at)
+                })
+                .filter(|(_, at)| signed_at < at + 86_400_000)
+                .map(
+                    |(p, replaced_signed_at)| ChangeAdvisoryInfo::PreviousKeyWindow {
+                        host_id: host.into(),
+                        previous_enc_kid: p.key.enc_kid,
+                        replaced_at_seq: p.replaced_at_seq,
+                        replaced_signed_at,
+                    },
+                ),
             _ => None,
         };
         advised += usize::from(window.is_some());
         assert_eq!(
-            advisories,
+            review.advisories,
             window.into_iter().collect::<Vec<_>>(),
             "{label}"
         );

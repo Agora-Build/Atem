@@ -523,12 +523,15 @@ fun main(args: Array<String>) {
                 else -> null
             }
             eq(log.checkChange(action, signedAt), want, "$label check_change")
-            // previous_key_window: a host_enc_key of a host whose previous
-            // key isn't retired, for a change check_change lets through only.
+            // change_advisories: check_change's refusal, else
+            // previous_key_window for a host_enc_key of a host whose previous
+            // key isn't retired and was replaced by an entry signed less
+            // than 24 h before.
             val hostId = body.obj()["host_id"] as? String
             val previous = if (body["action"].s() == "host_enc_key" && want == null && hostId != null) log.hostEncKey(hostId)?.previous?.takeIf { !it.retired } else null
-            val window = previous?.let { listOf(ChangeAdvisoryInfo.PreviousKeyWindow(hostId!!, it.key.encKid, it.replacedAtSeq)) } ?: emptyList()
-            eq(log.changeAdvisories(action, signedAt), window, "$label change_advisories")
+            val replacedAt = previous?.let { p -> (mlog["log"].arr().map { it["label"].s() } + strs(v["chain"])).map { byLabel.getValue(it)["entry"]["body"] }.first { it["seq"].l().toULong() == p.replacedAtSeq }["signed_at"].l().toULong() }
+            val window = if (previous != null && signedAt < replacedAt!! + 86_400_000uL) listOf(ChangeAdvisoryInfo.PreviousKeyWindow(hostId!!, previous.key.encKid, previous.replacedAtSeq, replacedAt)) else emptyList()
+            eq(log.changeAdvisories(action, signedAt), ChangeReviewInfo(want, window), "$label change_advisories")
             advised += window.size
         }
         check(built >= 38) { "$built built" }

@@ -730,11 +730,13 @@ fn an_early_second_rotation_is_advised() {
     );
     log.apply(rotation);
     // k1 is now the previous key, not retired: the next rotation, routine
-    // or retiring, is advised, naming the key it would cut short.
+    // or retiring, is advised, naming the key it would cut short and when
+    // the entry that replaced it was signed.
     let window = ChangeAdvisory::PreviousKeyWindow {
         host_id: "host-a".into(),
         previous_kid: hex_decode_array(&enc_kid(&k1).unwrap()).unwrap(),
         replaced_at_seq: log.m.head().seq,
+        replaced_signed_at: log.at,
     };
     assert_eq!(window.code(), "previous_key_window");
     for retire in [false, true] {
@@ -749,6 +751,19 @@ fn an_early_second_rotation_is_advised() {
             Ok(vec![window.clone()])
         );
     }
+    // Signed 24 h or more after the entry that made it the previous key:
+    // its window is taken as over (the signer's clock; advisory), not
+    // advised; a minute less, advised.
+    let day = 24 * 3_600_000;
+    let later = log.entry("host-a", 1, &k3, false);
+    assert_eq!(
+        check_change_advisories(&log.m, &later, log.at + day),
+        Ok(none.clone())
+    );
+    assert_eq!(
+        check_change_advisories(&log.m, &later, log.at + day - 60_000),
+        Ok(vec![window.clone()])
+    );
     // Another host's rotation isn't advised for host-a's window.
     log.add_host("host-b", 1);
     let b = log.entry("host-b", 1, &k4, false);
