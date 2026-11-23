@@ -3005,6 +3005,63 @@ table of `host-work.sqlite`, made only with the hook on):
   where every result sent on the refused one goes again, those that go
   once included: they read as never sent (in memory), so a second refused
   connection in a row that never took one loses none.
+- **A host sender's revoke entry** (**built behind the hook's
+  `host.senders`, 2026-11-23**; wire rules 3 to 6, 9 and 10; design
+  II.3.1, "Reporting a revoke as applied"). Host-work writes each
+  `host_sender_revoke`'s result in the transaction that writes the entry's
+  effects on host senders' tasks and moves its applied device-list `seq`
+  (§11.6, "Host senders on the receiving host", "Crash safety"):
+  `{entry: {seq, entry_hash}, applied_seq, effects}`, `applied_seq` the
+  applied `seq` that transaction writes (the committed head then, at least
+  the entry's). It goes as a record's result does, with the next
+  acknowledgments after the commit, in an ack naming the host's own
+  Station's feed and its cursor there (rule 9; none before the host has
+  read that feed). A crash before that commit loses both the effects and
+  the result, and the replay from the applied `seq` writes them once; a
+  crash after it sends the result at the next start, from the one row the
+  book holds. A store whose control state doesn't load for its identity
+  keeps the result in the book's table, for the start that reads it. With
+  `host.delegated` alone (no `host.senders`) host-work writes no
+  host-sender effects, so no entry is reported. Where the agreed text is
+  silent, **Atem's readings, for Astation's confirmation**:
+  - **Applied, never pending.** Host-work writes an entry's effects in its
+    pass after the device list commits the entry (one pass later at most),
+    and while it can't write them (a receipt-database fault) it can't
+    write a result either, so the host reports an entry only with its
+    effects: the revocation `applied`, and the interrupt `applied` when
+    the entry carries `interrupt_running: true`, with no reason. It never
+    sends `pending` (`revoke_not_applied`, which rule 10 still defines for
+    a reader) nor `refused` (an entry can't fail verification). Nor
+    `duplicate`: the verifier takes a revoke only of a host authorized as
+    a sender (`already_revoked`), so each entry starts a revocation of its
+    own (a revoke after a readmit included), and its interrupt is that
+    revocation's first; a native's `interrupt_running` for the same
+    `revoke_seq` waits (`pending`) until host-work's applied `seq` reaches
+    the entry, and is then `duplicate` (§11.1, rule 4).
+  - **Every revoke entry, whoever carried it.** The host reports each
+    `host_sender_revoke` of its device list, this host's own revocation as
+    a sender included (no host sends to itself, so that revocation is in
+    force on it at once); the Station picks the hosts it waits for. The
+    device list is its authority, not the carrier: an entry the host's own
+    fetch, a carriage or a native's channel brought is reported alike (a
+    carried control record's result, by contrast, goes on its channel
+    only, §11.1 "Carriage"). A Station that doesn't hold the entry yet (a
+    native carried it first) takes the result as information and counts
+    it from a later resend.
+  - **Resends.** In force and bounded by no deadline, an entry's result
+    goes once per connection ("When a host acknowledges" above: "any other
+    in-force result") and stays in the book, as a native record's does; it
+    is never one of a principal's bounded results (those are entirely
+    `duplicate`).
+  - **A new identity's store** applies the device list's entries from its
+    start (its applied `seq` begins at 0), so it reports every revoke entry
+    again, `applied`, under its own claim, as it does the stops it reads
+    from the feed ("Only this identity's store" above).
+  - **The reference ledger** (`AckLedger::ack`) takes an ack with entry
+    results, checking them as the reader does, and counts nothing from
+    them: a host sender has no integration to report to the Portal, and an
+    entry needs no re-signing (owner decision 2026-11-07), so no re-sign
+    alert waits for it.
 
 #### Reports (agreed with Auth/Portal, 2026-11-11)
 
@@ -4989,7 +5046,15 @@ Earlier: the receiving host's mailbox readings
 comment 6903887341][c-6903887341]). All of it runs only behind the
 debug-only hook.
 
-- None today. Astation acknowledged the SDK pins on 2026-11-23 (#120 comment 7089442826) and adopts the production `required_version` and consistency helpers from `atem-client-sdk-de7ec29882f2`.
+- **The host's acknowledgment of a host sender's revoke entry**, built
+  behind the hook on 2026-11-23 (§11.4, "On the host", "A host sender's
+  revoke entry"): wire rule 4's entry form, written with the entry's
+  effects and sent as a record's result is. Where the agreed wire rules
+  are silent, Atem's readings, for Astation's confirmation: never
+  `pending` (reported only with the effects, `applied`), every revoke
+  entry whoever carried it (this host's own revocation included), once
+  per connection and kept, again under a new identity, and counted by
+  nothing in the reference ledger.
 
 [c-6903887341]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-6903887341
 [c-7082465179]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-7082465179
@@ -5219,10 +5284,14 @@ rules into each host sender's task, and the start check asks them again.
   revoke at its `revoke_seq`, never one admitted after a readmit; it
   waits (`pending`) until host-work's applied device-list `seq` reaches
   that revoke.
-- **Not built:** the host's report of a host sender's revoke as applied to
-  its Station (§11.4 rule 4's entry form, with the applied `seq`), and a
-  later answer on its channel for a carried record left `pending` (§11.1
-  "Carriage").
+- **The revoke's acknowledgment** (built 2026-11-23). Each
+  `host_sender_revoke`'s result owed the host's own Station (§11.4 rule
+  4's entry form, with the applied `seq`) is written in the transaction of
+  its effects and sent with the next acknowledgments (§11.4, "On the
+  host", "A host sender's revoke entry", whose readings are Atem's, for
+  Astation's confirmation).
+- **Not built:** a later answer on its channel for a carried record left
+  `pending` (§11.1 "Carriage").
 
 #### Attempts and `receipt_id`
 
