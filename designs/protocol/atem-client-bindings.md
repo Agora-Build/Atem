@@ -77,9 +77,13 @@ with its one pending key, a `host_enc_key` carrying this request's
 `request_id` and `state: "pending"`, taken only for the request it echoes
 (its `id` as `re`, and `request_id`). Before the owner's fresh
 confirmation, verify its `enc_sig`, then run `check_change` and
-`change_advisories` (below): a `previous_key_window` there needs the
-owner's explicit confirmation that the rotation shortens the older key's
-window.
+`change_advisories` (below, with `check_change`'s refusal): a
+`previous_key_window` there needs the owner's explicit confirmation that
+the rotation shortens the older key's window. A retry under the same
+`request_id` gets the same key, before or after an entry set it; `state:
+"pending"` names a key handed out for a rotation, and whether the list
+holds it by now is for the manager's own log (`check_change`'s
+`enc_key_reused`) to say.
 
 Persist launch request IDs and immutable message/task identities before sending.
 Recover uncertain results with their query operations; a retry uses a fresh
@@ -262,7 +266,7 @@ UpperCamelCase types (`MembershipLog.verify(accountId:genesisHash:entries:now:)`
 | `draft_entry(signer, signed_at, action_json)` | the next entry's body, checked with the verifier's own schema; show it, then publish (below) |
 | `check_member(member_json)` | a member object for `add` / `recovery_add`, checked |
 | `capacity()` | `CapacityInfo{entries, max_entries, members, max_members, hosts, max_hosts, level, entries_level, members_level, hosts_level}`: the verifier's own counts against its limits (1024 entries; 256 members, counting members in effect and pending `recovery_add`s; 64 current hosts); `level` `ok` / `nearly_full` (≥ 90 % of any) / `full`. From `nearly_full` show a warning per limit (D23): entries, "renewals use one entry each; a full list needs re-pairing"; members, "remove expired or unused services so a place stays free for a Recovery Kit" (a full member list refuses the kit's `recovery_add` too); hosts, "remove hosts no longer used" |
-| `change_advisories(action_json, now_ms)` | after `check_change`, the same arguments (WASM `changeAdvisories`): `[ChangeAdvisoryInfo]`, today `PreviousKeyWindow{host_id, previous_enc_kid, replaced_at_seq}` (JS `{type: "previous_key_window", hostId, previousEncKid, replacedAtSeq}`) for a `host_enc_key` of a host whose previous key isn't retired in the derived state: the list keeps one previous key only, so this rotation, routine or `retire_previous`, ends the window in which the host still opens mail sealed to that key and refuses mail still in flight to it. Show it and ask for an explicit confirmation; a compromise rotation stays possible at once. Empty for a change `check_change` refuses (its refusal stands). Advisory: it bypasses neither `check_change`'s refusals nor the signing gate |
+| `change_advisories(action_json, now_ms)` | the same arguments as `check_change` (WASM `changeAdvisories`): `ChangeReviewInfo{refusal, advisories}` (JS `{refusal, advisories}`): `refusal` is `check_change`'s (then `advisories` is empty: the refusal stands), else `null` and `advisories`, today `PreviousKeyWindow{host_id, previous_enc_kid, replaced_at_seq, replaced_signed_at}` (JS `{type: "previous_key_window", hostId, previousEncKid, replacedAtSeq, replacedSignedAt}`) for a `host_enc_key` of a host whose previous key isn't retired in the derived state and was replaced by an entry signed less than 24 h before `now_ms`: the list keeps one previous key only, so this rotation, routine or `retire_previous`, ends the window in which the host still opens mail sealed to that key and refuses mail still in flight to it. Show it (`replaced_signed_at`, the signer's clock: how long ago the rotation was) and ask for an explicit confirmation; a compromise rotation stays possible at once. Conservative: the signers' clocks stand in for the host's application, which comes later. Advisory: it bypasses neither `check_change`'s refusals nor the signing gate |
 | `check_change(action_json, now_ms)` | before `draft_entry` (same `action_json`; `now_ms` the `signed_at` it would carry): `None` to go ahead, else `ChangeRefusalInfo` `LogFull` (no entry fits, a removal included), `MembersFull` (no `add`, and no `recovery_add`: a Recovery Kit can't bring the account back until a member is removed), `HostsFull` (no `add_host` of a host that isn't current), `ServiceChangeTooSoon{last_signed_at, retry_at}` (JS `service_change_too_soon`: a service `set_roles` that grants anything new, e.g. a renewal, within 24 h of that service's last grant; a narrowing doesn't restart the clock; narrowing and `remove` are never paced), `AlreadyRevoked` (JS `already_revoked`: a `host_sender_revoke` of a host already revoked; the verifier would refuse it, `already_revoked`), `NotRevoked` (JS `not_revoked`: a `host_sender_readmit` of a host that isn't revoked, a host never added included; `not_revoked`), `EncKeyReused` (JS `enc_key_reused`: a `host_enc_key` of a key already set for that host since its newest `add_host`, the current, previous, a retired or a dropped one; the verifier would refuse it, `enc_key_reused`: ask the host for a new key). The project actions and a revoke of a host never added (the verifier refuses it, `unknown_host`) are never refused here; none of the five actions is paced. Advisory for signers: hosts still accept any valid entry |
 | `admit_carrier(device_id, entries, more, now)` | host role, feature `host` only (never in an app build) |
 | `service_grant(device_id)` | `ServiceGrantInfo{scope, expires_at}` of an active service member (its scope in canonical order), else `None`: what a renewal or narrowing starts from. Status only: an expired service is still returned; compare `expires_at` with the time yourself |
@@ -665,8 +669,8 @@ write the body (not another signer's entry, `retire_previous: false`, a
 missing or extra field, or a set out of order; a shape the verifier refuses
 by itself is the builder's `bad_project`, `malformed` or `wrong_alg` too),
 `check_change` on the redundant revoke and readmit and on a reused host
-key, `change_advisories` on a host key rotation over a previous key not
-retired (`previous_key_window`), `verify_host_enc_sig` on every `enc_sig`
+key, `change_advisories` (its refusal and `previous_key_window` on a host key
+rotation over a previous key not retired, replaced within 24 h), `verify_host_enc_sig` on every `enc_sig`
 whose binding fields parse,
 and (Kotlin and Swift, whose providers see the request) the signing
 purposes.

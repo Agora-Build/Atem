@@ -2037,11 +2037,14 @@ debug-only hook (`host.senders`), the host's key, `pairing/host_enc_key`, made w
 start of a pinned host that holds none for its generation, the record of the key ids it made
 (`pairing/host_enc_generated`, written before a key is handed out), and `host_enc_key_get` (session-v1 R9.14 item 8);
 and the routine rotation (agreed with Astation on 2026-11-23, #120 comment 7089435308): a manager's
-`host_enc_key_new` gets the host's one pending key (made durable before the answer), the host stamps when it applied
-the entry that sets it, promotes it, keeps the old key 24 h on the delegated clock (or erases it at once with
-`retire_previous`, or when that time can't be established), records every retired key so none comes back, and accepts
-only the keys its committed list holds (host-work-v1 §11.5, "The routine rotation of a host's key"; session-v1 R9.13
-item 8, R9.14 item 8); `check_change_advisories` reports `previous_key_window` before an early second rotation.
+`host_enc_key_new` gets the same key on a retry under its `request_id`, else the one key no entry has set (the host's
+current key while unset, else a pending one), made durable before the answer; the host stamps when it applied each
+entry that makes a key it holds the previous one, its key file follows the committed list entry by entry (a key no
+entry has set is never erased), it keeps the old key 24 h on the delegated clock (erased at once with
+`retire_previous`, when that time can't be established, or after a repair or lowering of that clock), records every
+retired key so none comes back, and accepts only the keys its committed list holds (host-work-v1 §11.5, "The routine
+rotation of a host's key"; session-v1 R9.13 item 8, R9.14 item 8); `check_change_advisories` reports
+`previous_key_window` before a second rotation within 24 h of the first.
 **Not built:** the key in the ceremony (the amendment below): Atem's side is draft PR #176, held until Astation's
 native ceremony is ready (#120 comment 6938206284), so a key gets its entry only through `host_enc_key_get` or
 `host_enc_key_new` and a manager's own fresh confirmation. Signing the entry is Astation's, behind the signing gate.

@@ -5216,20 +5216,29 @@ below. Item 8's request stays open.
          holding `manage` at the host's head, checked on every request and
          retry; the channel refuses services and browsers before decoding
          (`Need::HostEncKey`).
-       - **One pending key per trust generation.** The first request makes
-         it; every later one, another manager's or a retry after a lost
-         answer, gets that same key, each answer echoing its own request's
-         `id` (`re`) and `request_id`. It is kept with no expiry until an
-         entry sets it or its generation goes; never replaced or minted in
-         the background. While the list has committed the entry setting it
-         and the host hasn't promoted it yet, a request is `busy`, `host
-         encryption key unavailable` (**Atem's reading**).
-       - **Before the answer**: a fresh key whose `enc_kid` is neither in
-         the host's record nor among the keys the committed list set for
-         it since its `add_host`; its id appended to the record and synced;
-         then the key file written with it pending, one atomic replace. Any
-         write that fails is `busy`, `host encryption key unavailable`,
-         nothing handed out.
+       - **A retry under the same `request_id` gets the same key**, before
+         or after an entry set it (the host records the last 64 requests it
+         answered, written with the key before the answer). `state: "pending"`
+         names a key handed out for a rotation; whether the list holds it by
+         now is for the manager's own log to say (no other wire value).
+       - **One key no entry has set, per trust generation.** A new request
+         gets the host's current key while no entry has set it (**Atem's
+         reading, for Astation's confirmation**: a stale `host_enc_key_get`
+         answer then names the key the host will promote), else the pending
+         key, else a fresh one made pending; every answer echoes its own
+         request's `id` (`re`) and `request_id`. The key is kept with no
+         expiry until an entry sets it or its generation goes; never
+         replaced or minted in the background. While the list has committed
+         the entry setting the pending key and the host hasn't followed it
+         yet, a new request is `busy`, `host encryption key unavailable`
+         (**Atem's reading, for Astation's confirmation**).
+       - **Before the answer**: a fresh key's `enc_kid` is neither in the
+         host's record nor among the keys the committed list set for it
+         since its `add_host`; the request (and a fresh key's id) is
+         appended to the record and synced; then a fresh key is written
+         pending into the key file, one atomic replace (a key already held
+         is synced). Any write that fails is `busy`, `host encryption key
+         unavailable`, nothing handed out.
        - **The client** (`Attached::send_host_enc_key_new(request_id, …)`,
          the bindings' `ClientConnection::send_host_enc_key_new`; the
          generic `send` checks a hand-built one the same way) takes an
@@ -5238,13 +5247,17 @@ below. Item 8's request stays open.
          it nor the other way round (`unbound host enc key`). Before asking
          the owner, the manager verifies `enc_sig` and runs `check_change`
          and `check_change_advisories` (`previous_key_window`: the host's
-         previous key isn't retired, so this rotation cuts its window
-         short; an advisory with an explicit confirmation, never a
-         refusal, in every binding as `change_advisories`).
-       - **What the host does with the entry** (the stamp, the promotion,
-         the 24 h window on the delegated clock, retirement and the record
+         previous key isn't retired and was replaced by an entry signed
+         less than 24 h earlier, so this rotation cuts its window short; an
+         advisory with an explicit confirmation, never a refusal; in every
+         binding as `change_advisories`, which returns `check_change`'s
+         refusal with it).
+       - **What the host does with the entry** (the key file following the
+         committed list entry by entry, the stamp, the 24 h window on the
+         delegated clock and what ends it early, retirement and the record
          of retired keys, the receiver's view following the committed list
-         only): host-work-v1 §11.5, "The routine rotation of a host's key".
+         only, mail in flight and results back under `retire_previous`):
+         host-work-v1 §11.5, "The routine rotation of a host's key".
        - Listed in R9.13 (item 8).
 
 **Errors and details (additions).** Receipt details: `withdrawn by the
