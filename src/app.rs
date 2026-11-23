@@ -1154,7 +1154,13 @@ mod tests {
                     },
                 );
                 app.spawn_astation_connect();
-                while !server.is_finished() {
+                // The server ends 1.5 s after `authenticated` (it keeps the
+                // socket in its result), which a slow runner may not have
+                // read by then: poll on until the link is up, within bounds.
+                let give_up = tokio::time::Instant::now() + Duration::from_secs(15);
+                while !server.is_finished()
+                    || (!app.astation_connected && tokio::time::Instant::now() < give_up)
+                {
                     app.poll_astation_connect();
                     if app.astation_connected {
                         app.process_astation_messages().await;
