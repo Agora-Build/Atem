@@ -427,15 +427,19 @@ async fn settle_encryption<U: OpUi>(view: &mut AstationClient, ui: &U) {
 
 /// The end of `atem pair` and `atem pair verify` after the ceremony:
 /// applies the encryption messages held meanwhile and shows what they did,
-/// and only then the verdict (`verification_result`), so no status line
-/// lands between a failure's lines and the error that ends them.
+/// and only then the verdict (`verification_result`, ending a failure with
+/// `failed`), so no status line lands between a failure's lines and the
+/// error that ends them.
 async fn conclude_verification<U: OpUi>(
     view: &mut AstationClient,
     ui: &U,
     verification: Result<()>,
+    failed: &'static str,
 ) -> Result<()> {
     settle_encryption(view, ui).await;
-    crate::pair_verify::verification_result(verification, |line| ui.print(PrintLevel::Warn, line))
+    crate::pair_verify::verification_result(verification, failed, |line| {
+        ui.print(PrintLevel::Warn, line)
+    })
 }
 
 // ── atem pair verify ──
@@ -446,13 +450,35 @@ async fn pair_verify<U: OpUi>(
     env: &OpEnv,
 ) -> Result<()> {
     let src = env.sources()?;
-    let astation_id = match crate::status::verify_start(&src)? {
+    let (astation_id, note) = match crate::status::verify_start(&src)? {
         crate::status::VerifyStart::AlreadyVerified(message) => {
             ui.print(PrintLevel::Info, &message);
             return Ok(());
         }
-        crate::status::VerifyStart::Verify { astation_id, .. } => astation_id,
+        crate::status::VerifyStart::Verify { astation_id, note } => (astation_id, note),
     };
+    // A device verified before device lists were pinned verifies again to
+    // pin one (#128); a failure keeps its earlier verification.
+    let failed = match note {
+        Some(note) => {
+            ui.print(PrintLevel::Info, note);
+            crate::pair_verify::VERIFIED_NO_LIST
+        }
+        None => crate::pair_verify::PAIRED_NOT_VERIFIED,
+    };
+    // The keys to verify with must be usable before anything moves: no
+    // link asked for, no rebind (sealed keys need the cred agent unlocked).
+    let agent = env.agent()?;
+    {
+        let (paths, agent) = (src.paths.cred.clone(), agent.clone());
+        guard(
+            ui,
+            blocking(move || {
+                crate::memory::verification::check_keys_for_verification(&paths, agent.as_ref())
+            }),
+        )
+        .await?;
+    }
     let mut view = guard(
         ui,
         link_to(calls, env, &astation_id, "the paired Astation", true),
@@ -478,9 +504,8 @@ async fn pair_verify<U: OpUi>(
         PrintLevel::Info,
         &format!("Verifying this device with Astation {astation_id}..."),
     );
-    let verification =
-        verify_device(&mut view, &astation_id, &src.paths.cred, env.agent()?, ui).await;
-    conclude_verification(&mut view, ui, verification).await
+    let verification = verify_device(&mut view, &astation_id, &src.paths.cred, agent, ui).await;
+    conclude_verification(&mut view, ui, verification, failed).await
 }
 
 /// `verifyAbort` reason when this host's record of frozen device lists
@@ -914,7 +939,13 @@ async fn pair<U: OpUi>(
     // pairing stays saved.
     let verification =
         verify_device(&mut view, &astation_id, &src.paths.cred, env.agent()?, ui).await;
-    conclude_verification(&mut view, ui, verification).await
+    conclude_verification(
+        &mut view,
+        ui,
+        verification,
+        crate::pair_verify::PAIRED_NOT_VERIFIED,
+    )
+    .await
 }
 
 /// How long a first pairing waits for Astation's introduction (the relay's

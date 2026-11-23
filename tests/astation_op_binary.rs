@@ -141,3 +141,70 @@ fn pair_verify_runs_through_the_auto_started_runtime() {
     assert!(!written.contains("device verification failed"), "{written}");
     assert!(sandbox.runtime_pid().is_some(), "the runtime ran it");
 }
+
+/// `config`'s trust state: verified with `ASTATION` (safety code `code`),
+/// as a verification made before device lists were pinned left it.
+fn verified_before_lists(config: &std::path::Path, code: &str) {
+    let entry = json!({
+        "device_id": "atem-bin", "data_account": "acct-bin", "sign_gen": 1,
+        "astation_sign_pub": "", "astation_enc_pub": "", "recovery_sign_pub": "",
+        "device_pub": "", "device_sign_pub": "", "unlock_auth_pub": "",
+        "safety_code": code, "epoch_floor": 0, "account_state": null, "account_epoch": 0,
+    });
+    let trust = support::profile::CredPaths::in_dir(config);
+    std::fs::create_dir_all(&trust.dir).unwrap();
+    std::fs::write(
+        &trust.trust,
+        json!({"version": 1, "astations": {ASTATION: entry}}).to_string(),
+    )
+    .unwrap();
+}
+
+/// Owner decision 2026-11-08 (#128): `atem pair verify` on a pairing
+/// verified before device lists were pinned (no device-list file) runs the
+/// ceremony again, saying why first, in the next trust generation. Refused
+/// here, it keeps the earlier verification, and the last line says the
+/// device stays verified with no list yet.
+#[test]
+fn pair_verify_verifies_again_when_no_device_list_is_pinned() {
+    let sandbox = Sandbox::new();
+    paired(&sandbox.config());
+    verified_before_lists(&sandbox.config(), "MN3H-A74N-FJE4");
+    let (url, seen) = fake_astation();
+    let mut cli = sandbox.spawn(&["pair", "verify"], &sandbox.home, &[("ASTATION_WS", &url)]);
+    let commit = saw(&seen, "verifyCommit");
+    assert_eq!(commit["host_trust_gen"], 2, "{commit}");
+    saw(&seen, "verifyReveal");
+    cli.shows("Does the code on your Mac match? Type y or n:");
+    cli.send(b"n\r");
+    let abort = saw(&seen, "verifyAbort");
+    assert_eq!(abort["reason"], "codes didn't match on atem");
+    assert!(!cli.exits(), "a refused code fails the command");
+    let written = cli.written();
+    let note = written
+        .find("This device was verified before device lists were pinned; verifying again pins one.")
+        .unwrap_or_else(|| panic!("the note: {written}"));
+    let ceremony = written.find("Verifying this device").unwrap();
+    assert!(note < ceremony, "{written}");
+    assert!(
+        written.contains(
+            "This device stays verified, but no device list is pinned yet. Fix the problem above, then run 'atem pair verify'."
+        ),
+        "{written}"
+    );
+    assert!(!written.contains("isn't verified yet"), "{written}");
+    // The earlier verification is kept; nothing is pinned.
+    let trust: Value = serde_json::from_slice(
+        &std::fs::read(support::profile::CredPaths::in_dir(&sandbox.config()).trust).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        trust["astations"][ASTATION]["safety_code"], "MN3H-A74N-FJE4",
+        "{trust}"
+    );
+    assert!(
+        trust["pending"].as_object().is_none_or(|p| p.is_empty()),
+        "{trust}"
+    );
+    assert!(!sandbox.config().join("pairing/membership.json").exists());
+}

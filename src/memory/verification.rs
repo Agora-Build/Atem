@@ -793,6 +793,34 @@ pub fn set_aside_revoked_keys(
     )))
 }
 
+/// `atem pair verify`'s check before anything moves (no rebind, no
+/// `verifyCommit`): the keys `device_keys_for_verification` would verify
+/// with can be used. Sealed keys need the cred agent unlocked (`atem cred
+/// unlock`). Key files `atem status` shows broken on a verified home (none
+/// on disk, or unreadable while the agent is locked) are never replaced by
+/// fresh ones over the keys that Astation pinned: the reset is the way out.
+pub fn check_keys_for_verification(paths: &CredPaths, agent: &dyn CredAgentApi) -> Result<()> {
+    let broken = || {
+        let trust = TrustStore::load_from(&paths.trust).ok()?;
+        crate::memory::unlock::key_file_problem(paths, &trust)
+    };
+    let reset = |problem: String| {
+        anyhow!(
+            "this device's key files are broken ({problem}). {}",
+            crate::memory::cred_agent::RESET
+        )
+    };
+    if !has_device_keys(paths) {
+        return broken().map_or(Ok(()), |problem| Err(reset(problem)));
+    }
+    if !agent.status()?.unlocked
+        && let Some(problem) = broken()
+    {
+        return Err(reset(problem));
+    }
+    sealed_publics(paths, agent).map(drop)
+}
+
 /// The keys to verify with: this device's sealed keys when it has them (so
 /// every Astation pins the same device key), fresh ones otherwise. Sealed
 /// keys are revealed only while the cred agent holds them unlocked; starting
@@ -801,8 +829,17 @@ pub fn device_keys_for_verification(
     paths: &CredPaths,
     agent: &dyn CredAgentApi,
 ) -> Result<VerificationKeys> {
+    Ok(match sealed_publics(paths, agent)? {
+        Some(publics) => VerificationKeys::Sealed(publics),
+        None => VerificationKeys::Fresh(DeviceKeys::generate()),
+    })
+}
+
+/// This device's sealed keys' public halves, which only the unlocked cred
+/// agent reveals; `None` when it has no key files.
+fn sealed_publics(paths: &CredPaths, agent: &dyn CredAgentApi) -> Result<Option<DevicePublics>> {
     if !has_device_keys(paths) {
-        return Ok(VerificationKeys::Fresh(DeviceKeys::generate()));
+        return Ok(None);
     }
     if !agent.status()?.unlocked {
         bail!("{LOCKED}, then `atem pair verify`");
@@ -814,7 +851,7 @@ pub fn device_keys_for_verification(
             crate::memory::cred_agent::RESET
         )
     })?;
-    Ok(VerificationKeys::Sealed(DevicePublics {
+    Ok(Some(DevicePublics {
         device_pub,
         device_sign_pub,
         unlock_auth_pub: unlock_auth.public(),
@@ -851,6 +888,43 @@ mod tests {
         let keys = device_keys_for_verification(&paths, &agent).unwrap();
         assert!(matches!(keys, VerificationKeys::Sealed(_)));
         assert_eq!(keys.device_pub(), device_pub);
+    }
+
+    /// `atem pair verify`'s check before anything moves: a device without
+    /// keys verifies with fresh ones; sealed keys need the cred agent
+    /// unlocked (`atem cred unlock`); a verified home whose key files are
+    /// broken (none on disk, or a locked agent over an unreadable sealed
+    /// file) gets the reset, never fresh keys over the ones it pinned.
+    #[test]
+    fn the_keys_are_checked_before_a_verification_moves_anything() {
+        let empty = tempfile::tempdir().unwrap();
+        let empty_paths = CredPaths::in_dir(empty.path());
+        check_keys_for_verification(&empty_paths, &test_agent(&empty_paths)).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let (paths, agent, _, _) = verify(dir.path(), EncryptionMode::Off);
+        check_keys_for_verification(&paths, &agent).unwrap();
+        // Locked: only the sealed file left (Astation holds the storage
+        // key), the agent restarted.
+        std::fs::remove_file(&paths.device_keys).unwrap();
+        let locked = test_agent(&paths);
+        let error = check_keys_for_verification(&paths, &locked).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("{LOCKED}, then `atem pair verify`")
+        );
+        // Locked over an unreadable sealed file: the reset.
+        crate::paths::write_test_file(&paths.device_keys_sealed, b"{not json");
+        let error = check_keys_for_verification(&paths, &locked).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("device_keys.sealed is unreadable"), "{text}");
+        assert!(text.ends_with(crate::memory::cred_agent::RESET), "{text}");
+        // No key files at all on the verified home: the reset too.
+        std::fs::remove_file(&paths.device_keys_sealed).unwrap();
+        let error = check_keys_for_verification(&paths, &locked).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("no sealed keys on disk"), "{text}");
+        assert!(text.ends_with(crate::memory::cred_agent::RESET), "{text}");
     }
 
     #[test]

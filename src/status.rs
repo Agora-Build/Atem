@@ -1510,7 +1510,9 @@ pub(crate) mod tests {
     /// the journal's directory too), keep `Already verified`.
     #[test]
     fn a_device_list_in_any_state_is_not_verified_over() {
-        let cases: [(&str, fn(&Path)); 5] = [
+        // Each case's profile change.
+        type Make = fn(&Path);
+        let cases: [(&str, Make); 5] = [
             ("frozen", |dir| {
                 pin_list(dir);
                 std::fs::write(ProfilePaths::in_dir(dir).pairing.freeze, b"{}").unwrap();
