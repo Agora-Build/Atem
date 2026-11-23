@@ -1018,7 +1018,8 @@ impl HostEncKeyNew {
 /// The one state a `host_enc_key_new`'s answer names: a key the host
 /// handed out for a rotation, no entry having set it when the host first
 /// answered for it; a retry's answer keeps it after an entry set the key
-/// (no other wire value: the manager's own log says whether it is set).
+/// (no other wire value: the manager's own log says whether it is set;
+/// Atem's reading, for Astation's confirmation, host-work-v1 §11.5).
 pub const HOST_ENC_KEY_PENDING: &str = "pending";
 
 /// `host_enc_key{re, host_id, host_trust_gen, enc_key, enc_sig}` (H→C): the

@@ -3970,10 +3970,14 @@ are marked **Atem's reading, for Astation's confirmation**.
     `pairing/host_enc_generated`), written with the key before the answer.
     A retry whose key the host never managed to write (its key file write
     failed after the record) is answered as a new request, never with a key
-    the host doesn't hold. `state` stays `pending` (no new wire value): it
-    names a key handed out for a rotation; whether the list holds it by now
-    is for the manager's own log to say. A request evicted from the 64 is a
-    new request.
+    the host doesn't hold. `state` stays `pending` (no new wire value), also
+    on a retry after an entry set the key (**Atem's reading, for Astation's confirmation**: `pending` names a key
+    handed out for a rotation, not one the list doesn't hold yet; whether
+    the list holds it by now is for the manager's own log to say, where
+    `check_change` reports `enc_key_reused`). A request evicted from the 64
+    is a new request, and gets another key once its own was set (**Atem's reading, for Astation's confirmation**: the
+    bound on Astation's "a retry discovers the same durable key", for a
+    host that answers many requests).
   - **Otherwise the key no entry has set**, at most one at a time: the host's
     current key while no entry has set it (**Atem's reading, for Astation's
     confirmation**: so a stale `host_enc_key_get` answer can only name the
@@ -4015,13 +4019,16 @@ are marked **Atem's reading, for Astation's confirmation**.
   retired), it writes the entry's `seq` and hash, `D` (the delegated
   clock's reading, §11.6, taken fresh at that moment; every later check of
   the window reads `D` the same way, the later of its pass's reading and a
-  fresh one, so a stamp is never above the `D` it is compared with) and the clock's
-  latest repair or lowering into the key file (`applied`), one atomic
+  fresh one, so a stamp is never above the `D` it is compared with) and the
+  clock's mark (§11.6's record's epoch, drawn whenever the clock starts
+  afresh, and its latest repair or lowering, as 64 bits of SHA-256) into
+  the key file (`applied`), one atomic
   replace, under the same lock as the commit. Every such entry gets its own
   stamp, once: a later commit of the same entry keeps the earlier time, so
   nothing moves a window later. A carriage the start replays (§R9.3) is the
   entry's first durable application and is stamped at that commit, `D`
-  taken from the clock's record (review L1). No reading, or a write that
+  and the mark taken from the clock's record, observed at a reading as the
+  clock observes one (review L1; re-review I1). No reading, or a write that
   fails: no stamp, a runtime.log line, and the key is retired at once
   (below).
 - **Following the list** happens whenever the host brings its key file to
@@ -4038,22 +4045,28 @@ are marked **Atem's reading, for Astation's confirmation**.
   previous key only, as the list keeps it.
 - **The window** is 24 h on the delegated clock `D` (§11.6: `wall_hw` and the
   floor rise with the boot-time counter, so a sleep counts and a wall clock
-  set back shortens nothing). `D` is lowered on purpose only by §11.6's
-  repair of an unsynchronized forward jump and its lowering at a boot's
-  first synchronized reading; either, recorded after a key's stamp, retires
-  that key at once (fix round 1, ruling R63), and so does `D` reading
-  below the stamp: a window can then only end early, never run longer than
-  24 h of real time. The floor's follow-down (500 ppm, at most 43 s a day)
-  is not counted.
-- **Retirement**: at the deadline (or a repair, a lowering, `D` below the
-  stamp), at a `retire_previous`, at a newer rotation, and for every key of
+  set back shortens nothing). `D` is lowered beyond the follow-downs in
+  three ways: §11.6's repair of an unsynchronized forward jump, its
+  lowering at a boot's first synchronized reading, and a fresh start (a
+  damaged record started afresh at a synchronized reading or a Station
+  time, or a record read as none: no repair or lowering is recorded, `D`
+  starts again at the truth). Each changes the clock's mark; a mark at a
+  check other than the stamp's retires the key at once (fix round 1,
+  ruling R63; fix round 2, re-review N1), and so does `D` reading below
+  the stamp: a window can then only end early, never run longer than 24 h
+  of real time. The follow-downs of `wall_hw` (when the wall clock is
+  behind it) and of the floor (500 ppm, at most 43 s a day each) are not
+  counted.
+- **Retirement**: at the deadline (or the clock's mark changed: a repair,
+  a lowering, a fresh start; or `D` below the stamp), at a `retire_previous`, at a newer rotation, and for every key of
   a voided generation. The key's id is appended to the record's `retired`
   (synced) first, then the key file is replaced without the secret. A
   retired id is never accepted and never waits again, whatever a restored or
   rolled-back key file holds, and a retirement cut short (the id recorded,
   the file not yet replaced) is finished at the next pass, the secret
   meanwhile accepted nowhere. `retired` only grows within a generation.
-  **Accepted residual:** a restore of the whole of `pairing/` from a backup
+  **A residual** (**Atem's reading, for Astation's confirmation**, where Astation wrote "not resurrected by a
+  restart/rollback"): a restore of the whole of `pairing/` from a backup
   taken before an entry (the key file, the record and the device list
   together) re-applies that entry and stamps it anew, as the project's other
   whole-directory restores are residuals (session-v1 R9.13).
@@ -4084,8 +4097,10 @@ are marked **Atem's reading, for Astation's confirmation**.
 - **The advisory** (`check_change_advisories`, the bindings'
   `change_advisories`): `previous_key_window` for a `host_enc_key` of a host
   whose previous key isn't retired and was replaced by an entry signed less
-  than 24 h before this one (the signers' clocks: conservative and
-  advisory). Reported for a routine and a `retire_previous` rotation alike
+  than 24 h before this one (the signers' clocks: approximate and
+  advisory, optimistic, since the host applies an entry after it is signed:
+  a window the host opened late can still be open when it is no longer
+  reported). Reported for a routine and a `retire_previous` rotation alike
   (**Atem's reading, for Astation's confirmation**: the older key's window
   ends either way). The bindings return it with `check_change`'s refusal,
   if any.
@@ -5400,8 +5415,10 @@ Atem's readings there, each marked **for Astation's confirmation** where it
 is stated: the stamp as the evidence, the host's unset current key answered
 to a new request, `busy` while a committed key awaits the host, a voided
 generation's current key retired too, no status for old-key mail refused
-under `retire_previous` (and its results back), and the advisory on a
-`retire_previous` rotation.
+under `retire_previous` (and its results back), the advisory on a
+`retire_previous` rotation, `state: "pending"` on a retry after the entry
+set the key, the 64 requests a retry is matched against, and a restore of
+the whole of `pairing/` left as a residual.
 Earlier: the receiving host's mailbox readings
 ([#120 comment 6938206284][c-6938206284]) and this section's wire ([#120
 comment 6903887341][c-6903887341]). All of it runs only behind the

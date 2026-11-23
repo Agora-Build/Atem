@@ -334,10 +334,10 @@ pub enum ChangeAdvisory {
     /// `replaced_at_seq`), and mail still in flight to it is refused. A
     /// routine early second rotation needs the owner's explicit
     /// confirmation that it shortens that window; a compromise rotation
-    /// stays possible at once. Conservative and advisory: the signer's
-    /// clocks (`signed_at`) stand in for the host's application, which
-    /// only comes later, so a window the host opened late may still be
-    /// open after 24 h of signing time.
+    /// stays possible at once. Approximate (optimistic) and advisory: the
+    /// signers' clocks (`signed_at`) stand in for the host's application,
+    /// which only comes later, so a window the host opened late may still
+    /// be open after 24 h of signing time, and then goes unreported.
     PreviousKeyWindow {
         host_id: String,
         /// The previous key's `enc_kid` (its hex is the 16-character id).

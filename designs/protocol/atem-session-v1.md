@@ -5218,9 +5218,12 @@ below. Item 8's request stays open.
          (`Need::HostEncKey`).
        - **A retry under the same `request_id` gets the same key**, before
          or after an entry set it (the host records the last 64 requests it
-         answered, written with the key before the answer). `state: "pending"`
-         names a key handed out for a rotation; whether the list holds it by
-         now is for the manager's own log to say (no other wire value).
+         answered, written with the key before the answer; a request past
+         them is a new one: **Atem's reading, for Astation's
+         confirmation**). `state: "pending"` names a key handed out for a
+         rotation, on a retry after an entry set it too (**Atem's reading,
+         for Astation's confirmation**); whether the list holds it by now
+         is for the manager's own log to say (no other wire value).
        - **One key no entry has set, per trust generation.** A new request
          gets the host's current key while no entry has set it (**Atem's
          reading, for Astation's confirmation**: a stale `host_enc_key_get`

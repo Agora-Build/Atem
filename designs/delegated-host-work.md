@@ -2041,7 +2041,7 @@ and the routine rotation (agreed with Astation on 2026-11-23, #120 comment 70894
 current key while unset, else a pending one), made durable before the answer; the host stamps when it applied each
 entry that makes a key it holds the previous one, its key file follows the committed list entry by entry (a key no
 entry has set is never erased), it keeps the old key 24 h on the delegated clock (erased at once with
-`retire_previous`, when that time can't be established, or after a repair or lowering of that clock), records every
+`retire_previous`, when that time can't be established, or after a repair, a lowering or a fresh start of that clock), records every
 retired key so none comes back, and accepts only the keys its committed list holds (host-work-v1 §11.5, "The routine
 rotation of a host's key"; session-v1 R9.13 item 8, R9.14 item 8); `check_change_advisories` reports
 `previous_key_window` before a second rotation within 24 h of the first.

@@ -519,8 +519,9 @@ data_enum! {
     pub enum ChangeAdvisoryInfo {
         /// A `host_enc_key` for a host whose previous key isn't retired,
         /// replaced by an entry signed less than 24 h before this one
-        /// (conservative: the signers' clocks stand in for the host's
-        /// application): the list keeps one previous key only, so this rotation (routine
+        /// (approximate, optimistic: the signers' clocks stand in for the
+        /// host's application, which comes later, so a window the host
+        /// opened late can still be open unreported): the list keeps one previous key only, so this rotation (routine
         /// or `retire_previous`) ends the window in which the host still
         /// opens mail sealed to `previous_enc_kid` (24 h on the host's own
         /// clock from when it applied the entry at `replaced_at_seq`), and
