@@ -535,10 +535,13 @@ fn signer_journal(v: JsValue) -> JsResult<crate::types::SignerJournalView> {
     )?;
     let j: JsJournal = serde_wasm_bindgen::from_value(v)
         .map_err(|_| bad("journal {id, since, revision, records, drafts}"))?;
+    let count = |v: f64, what: &str| {
+        ms(v).map_err(|_| bad(&format!("journal.{what} is a non-negative safe integer")))
+    };
     Ok(crate::types::SignerJournalView {
         id: j.id,
-        since: ms(j.since)?,
-        revision: ms(j.revision)?,
+        since: count(j.since, "since")?,
+        revision: count(j.revision, "revision")?,
         records: j.records,
         drafts: j.drafts,
     })

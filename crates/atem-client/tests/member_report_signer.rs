@@ -696,12 +696,12 @@ fn the_builder_reads_each_journal_body_strictly() {
     ];
     for (what, body) in &refused {
         assert_eq!(
-            build(&[body.clone()], &[]),
+            build(std::slice::from_ref(body), &[]),
             Err("malformed"),
             "a record: {what}"
         );
         assert_eq!(
-            build(&[], &[body.clone()]),
+            build(&[], std::slice::from_ref(body)),
             Err("malformed"),
             "a draft: {what}"
         );
