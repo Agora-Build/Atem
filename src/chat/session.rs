@@ -211,9 +211,13 @@ impl Pending {
 
 /// A chat session's state, for a broker that connects to a running agent's
 /// worker (the worker's session is the authoritative one): status, the
-/// input mark, the current and last completed turn, and the newest history.
-/// Prompt acceptance in flight is not carried (it belongs to the broker that
-/// submitted).
+/// input mark, the current and last completed turn, a turn end whose hook is
+/// owed, and the newest history. Prompt acceptance in flight is not carried
+/// (it belongs to the broker that submitted), nor a prompt hook waiting for
+/// its entry: the snapshot is taken between the worker's passes, and a pass
+/// reads the hooks before the log, so a turn end recorded before such a hook
+/// is read in that hook's pass at the latest (Claude's transcript is read to
+/// its end each pass).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatSnapshot {
     pub started: bool,
@@ -241,6 +245,11 @@ pub struct ChatSnapshot {
     /// The turn ended while it held.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub held_past_turn: bool,
+    /// A turn the log ended whose turn-end hook isn't read yet (Claude's
+    /// `Stop`): a hook turn end in the same second as the current turn's
+    /// start (a filesystem keeping whole seconds) is that earlier turn's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_end_owed: Option<String>,
 }
 
 pub struct ChatSession {
@@ -563,6 +572,7 @@ impl ChatSession {
             last_evicted_turn: self.last_evicted_turn.clone(),
             wait_held: self.wait_held,
             held_past_turn: self.held_past_turn,
+            hook_end_owed: self.hook_end_owed.clone(),
         }
     }
 
@@ -582,6 +592,7 @@ impl ChatSession {
         session.last_outcome = snapshot.last_outcome;
         session.wait_held = snapshot.wait_held;
         session.held_past_turn = snapshot.held_past_turn;
+        session.hook_end_owed = snapshot.hook_end_owed;
         for message in snapshot.history {
             session.push_message(message);
         }
@@ -781,7 +792,9 @@ impl ChatSession {
     /// Catches up with the worker's `snapshot` state (its history replaced
     /// this one's after items were dropped on the way): the turn the worker
     /// saw end completes here too (with its outcome), and status, the
-    /// current turn and the input mark follow the worker's.
+    /// current turn, the input mark and the owed turn end follow the
+    /// worker's. A prompt hook this session holds as waiting for its entry
+    /// goes: the entry may be what was dropped (see `ChatSnapshot`).
     pub fn catch_up(&mut self, snapshot: &ChatSnapshot) -> Vec<Out> {
         let mut out = Vec::new();
         if self.exited {
@@ -803,6 +816,8 @@ impl ChatSession {
         self.input_mark = snapshot.input_mark;
         self.wait_held = snapshot.wait_held;
         self.held_past_turn = snapshot.held_past_turn;
+        self.hook_end_owed = snapshot.hook_end_owed.clone();
+        self.prompt_hook = None;
         self.set_status(
             snapshot.state,
             snapshot.detail.as_deref(),
@@ -2587,6 +2602,116 @@ mod tests {
             );
             assert_eq!(completes(&o), vec![&r1_done], "{case}");
             assert_eq!(s.status().state, State::Ready, "{case}");
+        }
+    }
+
+    type Pass = (Vec<AgentEvent>, Vec<LogItem>);
+
+    /// What a pass decides: the turns it completed (and how), and the
+    /// status after it.
+    fn decided(
+        s: &mut ChatSession,
+        (events, log): &Pass,
+        now: i64,
+    ) -> (Vec<(String, Outcome)>, State) {
+        let done = pass(s, events.clone(), log.clone(), now)
+            .into_iter()
+            .filter_map(|o| match o {
+                Out::Complete {
+                    turn_id, outcome, ..
+                } => Some((turn_id, outcome)),
+                _ => None,
+            })
+            .collect();
+        (done, s.status().state)
+    }
+
+    /// The worker's chat snapshot as it reaches a broker.
+    fn over_the_wire(worker: &ChatSession) -> ChatSnapshot {
+        let json = serde_json::to_string(&worker.snapshot(500, 1 << 20)).unwrap();
+        serde_json::from_str(&json).unwrap()
+    }
+
+    /// A broker that adopts the worker mid-race decides as the worker does,
+    /// on a filesystem keeping whole seconds: the mark of a turn whose
+    /// transcript end was read and its Stop not yet goes with the snapshot
+    /// (`restore`), and with the catch-up after the broker lost a pass on
+    /// the way (`catch_up`). The races: turn 1's Stop read with turn 2's
+    /// prompt hook before turn 2's entry (#126), or with that entry too, in
+    /// its second (#125: only the mark tells that Stop is turn 1's). Turns
+    /// typed in the terminal (a worker's chat names no request).
+    #[test]
+    fn a_broker_adopting_the_worker_mid_race_decides_as_it_does() {
+        let at = |t: i64| file_time(t, true);
+        let start: Pass = (
+            vec![prompt_hook_at("first", at(1_010))],
+            vec![user_at("u1", "t1", "first", 1_020)],
+        );
+        let t1_ends: Pass = (vec![], vec![end_at("t1", 1_500)]);
+        let stop_and_hook = vec![stop_at(at(1_550)), prompt_hook_at("second", at(1_650))];
+        let t2_entry = user_at("u2", "t2", "second", 1_700);
+        let t2_ends: Pass = (vec![stop_at(at(5_010))], vec![end_at("t2", 5_000)]);
+        let races: [Vec<Pass>; 2] = [
+            vec![
+                start.clone(),
+                t1_ends.clone(),
+                (stop_and_hook.clone(), vec![]),
+                (vec![], vec![t2_entry.clone()]),
+                t2_ends.clone(),
+            ],
+            vec![start, t1_ends, (stop_and_hook, vec![t2_entry]), t2_ends],
+        ];
+        for (race, passes) in races.iter().enumerate() {
+            // The worker's own decisions: turn 2 runs until its end.
+            let mut worker = ready();
+            let all: Vec<_> = passes
+                .iter()
+                .enumerate()
+                .map(|(i, p)| decided(&mut worker, p, i as i64))
+                .collect();
+            let t2_done = all
+                .iter()
+                .position(|(done, _)| done.contains(&("t2".to_string(), Outcome::Done)));
+            assert_eq!(t2_done, Some(passes.len() - 1), "race {race}: {all:?}");
+            assert!(
+                all[2..passes.len() - 1]
+                    .iter()
+                    .all(|(_, state)| *state == State::Working),
+                "race {race}: {all:?}"
+            );
+            for adopt in 1..passes.len() {
+                for caught_up in [false, true] {
+                    let case =
+                        format!("race {race}, adopted after pass {adopt}, caught up {caught_up}");
+                    let mut worker = ready();
+                    let mut broker = if caught_up {
+                        // Restored a pass earlier; that pass was lost on
+                        // the way, so the broker reloads the worker's
+                        // history and catches up with its state.
+                        for (i, p) in passes[..adopt - 1].iter().enumerate() {
+                            decided(&mut worker, p, i as i64);
+                        }
+                        let mut broker = ChatSession::restore("g2".into(), over_the_wire(&worker));
+                        decided(&mut worker, &passes[adopt - 1], adopt as i64 - 1);
+                        let snapshot = over_the_wire(&worker);
+                        broker.reload(snapshot.history.clone());
+                        broker.catch_up(&snapshot);
+                        broker
+                    } else {
+                        for (i, p) in passes[..adopt].iter().enumerate() {
+                            decided(&mut worker, p, i as i64);
+                        }
+                        ChatSession::restore("g2".into(), over_the_wire(&worker))
+                    };
+                    assert_eq!(broker.status(), worker.status(), "{case}");
+                    for (i, p) in passes.iter().enumerate().skip(adopt) {
+                        let w = decided(&mut worker, p, i as i64);
+                        let b = decided(&mut broker, p, i as i64);
+                        assert_eq!(b, w, "{case}, pass {i}");
+                        assert_eq!(w, all[i], "{case}, pass {i}");
+                    }
+                }
+            }
         }
     }
 

@@ -598,3 +598,91 @@ async fn the_workers_chat_snapshot_marks_the_chat_synced() {
     assert_eq!(session.chat.current_turn_id(), Some("turn-1"));
     session.stop().unwrap();
 }
+
+/// #126 with #125's race: a broker that adopts a worker mid-race decides as
+/// the worker does. The worker's Claude chat read turn 1's transcript end
+/// and not yet its Stop; the next pass reads that Stop with turn 2's prompt
+/// hook and entry, all in one second (a filesystem keeping whole seconds),
+/// so only the owed Stop tells it is turn 1's. That mark goes with the
+/// worker's `chat_snapshot`: turn 2 neither completes nor shows ready here.
+#[tokio::test]
+async fn an_adopted_workers_owed_stop_goes_with_its_chat_snapshot() {
+    use crate::chat::adapter::Outcome;
+    use crate::chat::session::State;
+    let Setup { mut session, _dir } = launch("exec cat").await;
+    settle(&mut session).await;
+    let user = |id: &str, turn: &str, text: &str, at: i64| LogItem::UserMessage {
+        id: id.into(),
+        turn_id: turn.into(),
+        text: text.into(),
+        created_at_ms: at,
+    };
+    let hook = |text: &str| AgentEvent::PromptSubmitted {
+        text: text.into(),
+        turn_id: None,
+        at_ms: Some(1_999),
+    };
+    let stop = AgentEvent::TurnEnded { at_ms: Some(1_999) };
+    // The worker's chat: turn 1 typed in the terminal, then its transcript
+    // end (its Stop not read yet).
+    let mut worker = ChatSession::new(session.process_gen.clone(), 0);
+    worker.on_event(
+        AgentEvent::SessionStarted {
+            session_id: "s".into(),
+            log_path: "/x/s.jsonl".into(),
+            source: "startup".into(),
+            same_log: false,
+        },
+        1,
+        0,
+    );
+    worker.on_event(hook("first"), 2, 0);
+    worker.on_log(user("u1", "t1", "first", 1_020), 2, 0);
+    worker.on_log(
+        LogItem::TurnEnded {
+            turn_id: "t1".into(),
+            outcome: Outcome::Done,
+            at_ms: 1_500,
+        },
+        3,
+        0,
+    );
+    // A new broker adopts the worker: its snapshot arrives.
+    let mut pumped = Pumped::default();
+    session.apply(
+        WorkerMsg::ChatSnapshot {
+            snapshot: worker.snapshot(500, 1 << 20),
+            input_count: 0,
+            chat_v1: true,
+            reason: None,
+            unavailable: Vec::new(),
+        },
+        &mut pumped,
+    );
+    let _ = session.take_chat();
+    // The next pass, in the worker's order (events, the log, turn ends).
+    worker.on_event(hook("second"), 4, 0);
+    worker.on_log(user("u2", "t2", "second", 1_700), 4, 0);
+    worker.on_event(stop.clone(), 4, 0);
+    session.apply(
+        WorkerMsg::Chat {
+            events: vec![hook("second"), stop],
+            log: vec![user("u2", "t2", "second", 1_700)],
+            input_count: 0,
+            chat_v1: true,
+            reason: None,
+            unavailable: Vec::new(),
+            gap: 0,
+        },
+        &mut pumped,
+    );
+    let outs = session.take_chat();
+    assert!(
+        !outs.iter().any(|o| matches!(o, Out::Complete { .. })),
+        "{outs:?}"
+    );
+    assert_eq!(worker.status().state, State::Working);
+    assert_eq!(session.chat.status().state, State::Working);
+    assert_eq!(session.chat.current_turn_id(), Some("t2"));
+    session.stop().unwrap();
+}
