@@ -1106,12 +1106,13 @@ impl ChatSession {
             .filter(|&t| t > 0)
     }
 
-    /// A prompt went in after a turn end recorded at `end` (or within its
-    /// second) and its transcript entry isn't read yet: that prompt's turn
-    /// runs, so the end makes nothing ready. A prompt's entry follows its
-    /// hook at once and the log is read after the hooks, so the end can't
-    /// be that prompt's turn's; one whose entry never comes (a hook
-    /// blocked it) holds only ends recorded up to its second.
+    /// A prompt went in after a turn end recorded at `end` (or, on a
+    /// filesystem keeping whole seconds, within its second) and its
+    /// transcript entry isn't read yet: that prompt's turn runs, so the end
+    /// makes nothing ready. A prompt's entry follows its hook at once and
+    /// the log is read after the hooks, so the end can't be that prompt's
+    /// turn's; one whose entry never comes (a hook blocked it) holds no end
+    /// recorded surely after it.
     fn prompted_since(&self, end: Recorded) -> bool {
         self.prompt_hook
             .as_ref()
