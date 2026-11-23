@@ -25,16 +25,31 @@ fn mb_host(rig: &mut LocalRig, root: &Path, os: &ManualOs) -> MbHost {
     use crate::runtime::delegated::station::{LinkKind, Station};
     use crate::session_protocol::membership::r9log::secret;
     use atem_client::KeyProvider;
-    let s = host_senders_host(rig, root, os);
+    let mut s = host_senders_host(rig, root, os);
     let pairing = crate::profile::Sources::in_dir(&root.join("profile"))
         .paths
         .pairing;
     crate::session_protocol::r9::host_enc::ensure(&pairing, &rig.bridge.dir, 1);
-    let receiver = crate::session_protocol::r9::host_enc::recipient_at(&pairing, "host".into(), 1);
-    let enc_pub = receiver
-        .provider
-        .public_key(&receiver.recipient.keys[0].0)
-        .unwrap();
+    // The key the host made, set by a manager's entry: only a key the
+    // committed list set opens mail.
+    let enc_pub = mb_enc_pub(&pairing);
+    let entry = mb_enc_entry(&s, &enc_pub, false);
+    sign_and_carry(rig, &mut s, entry);
+    let receiver = crate::session_protocol::r9::host_enc::recipient_at(
+        &pairing,
+        "host".into(),
+        1,
+        rig.bridge.membership.as_ref().unwrap().membership(),
+        Some(host_now().wall_ms),
+    )
+    .unwrap();
+    assert_eq!(
+        receiver
+            .provider
+            .public_key(&receiver.recipient.keys[0].0)
+            .unwrap(),
+        enc_pub
+    );
     rig.bridge.pairing = Some(pairing);
     rig.bridge.start_view().now_d_ms = Some(host_now().wall_ms);
     let mut station = Station::with_senders(true);
@@ -51,6 +66,43 @@ fn mb_host(rig: &mut LocalRig, root: &Path, os: &ManualOs) -> MbHost {
     };
     mb_tick(rig, &mut host, 0);
     host
+}
+
+/// The current key the host's key file holds.
+fn mb_enc_pub(pairing: &crate::paths::PairingPaths) -> atem_client::PublicKey {
+    let file: Value =
+        serde_json::from_slice(&std::fs::read(&pairing.host_enc_key).unwrap()).unwrap();
+    mb_pub(&file["current"])
+}
+
+/// A key slot's public half.
+fn mb_pub(slot: &Value) -> atem_client::PublicKey {
+    let public = atem_client::encoding::b64u_decode(slot["pub"].as_str().unwrap()).unwrap();
+    atem_client::PublicKey::new(atem_client::Alg::X25519, &public).unwrap()
+}
+
+/// A manager's `host_enc_key` entry setting `key` as the host's (its
+/// `enc_sig` by the host's `host_key`, "delegated host").
+fn mb_enc_entry(
+    s: &HostSenders,
+    key: &atem_client::PublicKey,
+    retire_previous: bool,
+) -> ListAction {
+    use crate::session_protocol::membership::r9log::secret;
+    let mut keys = atem_client::SoftwareKeys::new();
+    let id = atem_client::KeyId::new("host");
+    keys.insert_ed25519(id.clone(), &secret("delegated host"));
+    let sig = atem_client::membership::sign_host_enc_key(
+        &keys,
+        &id,
+        &s.log.account,
+        &s.log.genesis_hash(),
+        "host",
+        1,
+        key.as_32().unwrap(),
+    )
+    .unwrap();
+    atem_client::membership::host_enc_key("host", 1, key, &sig, retire_previous, 0).unwrap()
 }
 
 /// The pass's tick, `ms` later.

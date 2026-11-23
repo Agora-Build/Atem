@@ -59,8 +59,9 @@ fn read_json(path: &std::path::Path) -> Option<Value> {
         .map(|b| serde_json::from_slice(&b).unwrap())
 }
 
-/// The key file's generation and public half (b64u), checked against its
-/// secret, and its mode.
+/// The key file's generation and its current key's public half (b64u),
+/// checked against its secret, and its mode (the v2 file, a current key
+/// only: no rotation in these tests).
 fn key_of(pairing: &PairingPaths) -> Option<(u64, String)> {
     let file = read_json(&pairing.host_enc_key)?;
     let mode = std::fs::metadata(&pairing.host_enc_key)
@@ -70,23 +71,29 @@ fn key_of(pairing: &PairingPaths) -> Option<(u64, String)> {
     assert_eq!(mode & 0o777, 0o600, "plain, 0600");
     assert_eq!(
         file.as_object().unwrap().keys().collect::<Vec<_>>(),
-        ["host_trust_gen", "pub", "secret", "v"],
+        ["current", "host_trust_gen", "v"],
         "{file}"
     );
-    assert_eq!(file["v"], 1);
-    let secret: [u8; 32] = b64u_decode(file["secret"].as_str().unwrap())
+    assert_eq!(file["v"], 2);
+    let current = &file["current"];
+    assert_eq!(
+        current.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["pub", "secret"],
+        "{file}"
+    );
+    let secret: [u8; 32] = b64u_decode(current["secret"].as_str().unwrap())
         .unwrap()
         .try_into()
         .unwrap();
     let public = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(secret));
     assert_eq!(
         atem_client::encoding::b64u(public.as_bytes()),
-        file["pub"].as_str().unwrap(),
+        current["pub"].as_str().unwrap(),
         "the public half is the secret's"
     );
     Some((
         file["host_trust_gen"].as_u64().unwrap(),
-        file["pub"].as_str().unwrap().to_owned(),
+        current["pub"].as_str().unwrap().to_owned(),
     ))
 }
 
@@ -101,7 +108,7 @@ fn record(pairing: &PairingPaths) -> Option<Value> {
 }
 
 fn record_of(generation: u64, kids: &[&str]) -> Value {
-    json!({"v": 1, "host_trust_gen": generation, "kids": kids})
+    json!({"v": 2, "host_trust_gen": generation, "kids": kids, "retired": []})
 }
 
 /// Made with the pin when a pairing is verified (its trust generation),
@@ -363,7 +370,7 @@ fn the_record_is_rebuilt_from_the_key_held() {
     let kid = kid_of(&public);
     let rebuilt = |was: &str| {
         vec![format!(
-            "the record of keys made was {was}; rebuilt from the key held (enc_kid {kid}, trust generation 1)"
+            "the record of keys made was {was}; rebuilt from the keys held (enc_kid {kid}, trust generation 1)"
         )]
     };
     std::fs::remove_file(&p.host_enc_generated).unwrap();
@@ -386,12 +393,21 @@ fn the_record_is_rebuilt_from_the_key_held() {
         rebuilt("without its id")
     );
     assert_eq!(record(p), Some(record_of(1, &[other, &kid])));
+    // A v1 record (no retired ids) reads as such.
+    std::fs::write(
+        &p.host_enc_generated,
+        json!({"v": 1, "host_trust_gen": 1, "kids": [kid]}).to_string(),
+    )
+    .unwrap();
+    assert!(host_enc::ensure(p, &journal_of(p), 1).is_empty());
     // Duplicates or bad ids are unreadable.
     for bad in [
         record_of(1, &[&kid, &kid]),
         record_of(1, &["0123"]),
         record_of(1, &["0123456789ABCDEF"]),
         json!({"v": 2, "host_trust_gen": 1, "kids": []}),
+        json!({"v": 1, "host_trust_gen": 1, "kids": [], "retired": []}),
+        json!({"v": 2, "host_trust_gen": 1, "kids": [], "retired": [&kid, &kid]}),
         json!({"v": 1, "host_trust_gen": 1, "kids": [], "more": 1}),
     ] {
         std::fs::write(&p.host_enc_generated, bad.to_string()).unwrap();
@@ -446,7 +462,7 @@ fn a_listed_record_is_synced_before_it_counts() {
         let lines = host_enc::ensure_with(&mut store, p, 1);
         assert_eq!(lines.len(), 1, "{step:?}: {lines:?}");
         assert!(
-            lines[0].starts_with("cannot record the id of the key held"),
+            lines[0].starts_with("cannot record the ids of the keys held"),
             "{lines:?}"
         );
     }
@@ -477,17 +493,47 @@ fn verified(dir: &std::path::Path, generation: u64) -> Sources {
 
 /// The receiver's view of this host (for host senders' mail): its id and
 /// generation from its own pairing, the generation's private key behind
-/// the provider, and the record's ids.
+/// the provider once the committed list set it (committed-list authority:
+/// a key no entry set is no accepted key, only one it made), and the
+/// record's ids.
 #[test]
 fn the_recipient_is_the_pairings_with_the_generations_key_and_record() {
     let dir = tempfile::tempdir().unwrap();
     let src = verified(dir.path(), 4);
     let p = &src.paths.pairing;
-    pinned(p, 4);
+    let mut log = pinned(p, 4);
     host_enc::ensure(p, &journal_of(p), 4);
     let (_, public) = key_of(p).unwrap();
     let kid: [u8; 8] = atem_client::encoding::hex_decode_array(&kid_of(&public)).unwrap();
-    let got = host_enc::recipient(&src).unwrap();
+    let now = Some(crate::session_protocol::membership::r9log::host_now().wall_ms);
+    let got = host_enc::recipient(&src, &log.log, now).unwrap();
+    assert!(got.recipient.keys.is_empty(), "no entry set it yet");
+    assert_eq!(got.recipient.generated, [kid], "made: its mail waits");
+    let enc_pub: [u8; 32] = b64u_decode(&public).unwrap().try_into().unwrap();
+    let host_key = super::HostKey::new(&secret("enc host"));
+    let sig = atem_client::membership::sign_host_enc_key(
+        &host_key.keys,
+        &host_key.id,
+        ACCOUNT,
+        &log.genesis_hash(),
+        HOST,
+        4,
+        &enc_pub,
+    )
+    .unwrap();
+    log.append(
+        crate::session_protocol::membership::r9log::MAC,
+        atem_client::membership::host_enc_key(
+            HOST,
+            4,
+            &PublicKey::new(Alg::X25519, &enc_pub).unwrap(),
+            &sig,
+            false,
+            1,
+        )
+        .unwrap(),
+    );
+    let got = host_enc::recipient(&src, &log.log, now).unwrap();
     assert_eq!(got.recipient.host_id, HOST);
     assert_eq!(got.recipient.host_trust_gen, 4);
     assert_eq!(got.recipient.keys, [(HostEncKey::key_id(), kid)]);
@@ -507,7 +553,7 @@ fn the_recipient_is_the_pairings_with_the_generations_key_and_record() {
         record_of(4, &[older, &hex(&kid)]).to_string(),
     )
     .unwrap();
-    let got = host_enc::recipient(&src).unwrap();
+    let got = host_enc::recipient(&src, &log.log, now).unwrap();
     assert_eq!(
         got.recipient.generated,
         [
@@ -525,7 +571,7 @@ fn the_recipient_is_the_pairings_with_the_generations_key_and_record() {
         "binding-2",
         ("session-1", "token-1"),
     );
-    let got = host_enc::recipient(&src).unwrap();
+    let got = host_enc::recipient(&src, &log.log, now).unwrap();
     assert_eq!(got.recipient.host_trust_gen, 5);
     assert_eq!(got.recipient.host_id, HOST);
     assert!(got.recipient.keys.is_empty());
@@ -535,8 +581,9 @@ fn the_recipient_is_the_pairings_with_the_generations_key_and_record() {
 /// Not paired, or not verified: no recipient.
 #[test]
 fn no_recipient_without_a_verified_pairing() {
+    let list = log_at(1, "enc host").log;
     let (_dir, src) = profile();
-    assert!(host_enc::recipient(&src).is_err());
+    assert!(host_enc::recipient(&src, &list, None).is_err());
     let dir = tempfile::tempdir().unwrap();
     crate::pairing::tests::write_bound(
         dir.path(),
@@ -545,7 +592,7 @@ fn no_recipient_without_a_verified_pairing() {
         "binding-1",
         ("session-1", "token-1"),
     );
-    assert!(host_enc::recipient(&Sources::in_dir(dir.path())).is_err());
+    assert!(host_enc::recipient(&Sources::in_dir(dir.path()), &list, None).is_err());
 }
 
 // ── `host_enc_key_get` over real channels (session-v1 R9.14 item 8) ──
@@ -842,6 +889,123 @@ mod op {
         assert_eq!(replies(&mut rig, "ch-mac").0.len(), 1);
     }
 
+    /// `handle` asks for a new key through the client core: the request's id.
+    fn ask_new(rig: &mut Rig, handle: &str, request_id: &str) -> String {
+        let mono = rig.now.host.mono_ms;
+        let (id, frame) = rig
+            .attached(handle)
+            .send_host_enc_key_new(request_id, mono)
+            .unwrap();
+        rig.send_frame(handle, &frame);
+        id
+    }
+
+    const NEW_1: &str = "aaaaaaaa-0000-4000-8000-0000000000e5";
+    const NEW_2: &str = "aaaaaaaa-0000-4000-8000-0000000000e6";
+
+    /// `host_enc_key_new` (the routine rotation, agreed with Astation on
+    /// 2026-11-23): a manager gets a pending key, bound to this channel's
+    /// host and generation, its `enc_sig` verifying with the host's
+    /// `host_key`, its entry drafted and taken by the chain. A retry after a
+    /// lost answer (the same `request_id`, a fresh `id`) and another
+    /// manager's request get the same key, each answer echoing its own
+    /// request; `host_enc_key_get` still hands out the current key.
+    #[test]
+    fn every_request_gets_the_one_pending_key() {
+        let mut rig = rig();
+        let current = held(&rig);
+        // The phone made a manager too.
+        let entry = rig
+            .log
+            .set_native_roles("dev-phone", &["control", "manage", "view"]);
+        let entry = atem_client::SignedObject::parse(entry.to_string().as_bytes()).unwrap();
+        let mono = rig.now.host.mono_ms;
+        let (_, frame) = rig
+            .attached("ch-mac")
+            .send_membership(&[entry], mono)
+            .unwrap();
+        rig.send_frame("ch-mac", &frame);
+        rig.events("ch-mac");
+        rig.advance(1000);
+        rig.connect("ch-manager", phone());
+        let mut keys = Vec::new();
+        for (handle, request_id) in [("ch-mac", NEW_1), ("ch-mac", NEW_1), ("ch-manager", NEW_2)] {
+            let id = ask_new(&mut rig, handle, request_id);
+            let (answers, errors) = replies(&mut rig, handle);
+            assert!(errors.is_empty(), "{handle}: {errors:?}");
+            let [answer] = answers.as_slice() else {
+                panic!("one answer: {answers:?}");
+            };
+            assert!(answer.answers_new(&id, request_id, R9_HOST, 1), "{handle}");
+            let host_key = rig.log.log.host(R9_HOST).unwrap().host_key.clone();
+            atem_client::membership::verify_host_enc_sig(
+                &host_key,
+                R9_ACCOUNT,
+                &rig.log.log.genesis_hash(),
+                R9_HOST,
+                1,
+                answer.enc_key.as_32().unwrap(),
+                &answer.enc_sig,
+            )
+            .expect("enc_sig verifies");
+            keys.push(answer.enc_key.clone());
+        }
+        assert!(keys.iter().all(|k| *k == keys[0]), "one pending key");
+        assert_ne!(
+            atem_client::encoding::b64u(keys[0].as_bytes()),
+            current,
+            "not the current key"
+        );
+        // The get is a pure read: still the current key.
+        ask(&mut rig, "ch-mac");
+        let (answers, _) = replies(&mut rig, "ch-mac");
+        assert_eq!(
+            atem_client::encoding::b64u(answers[0].enc_key.as_bytes()),
+            current
+        );
+        // The key file holds it as pending.
+        let file: Value = read_json(&rig.pairing.host_enc_key).unwrap();
+        assert_eq!(
+            file["pending"]["pub"],
+            json!(atem_client::encoding::b64u(keys[0].as_bytes()))
+        );
+    }
+
+    /// Only a native member holding `manage` at the head: the phone (no
+    /// manage), a service and a browser are `forbidden`, nothing written.
+    #[test]
+    fn others_are_forbidden_a_new_key_too() {
+        let mut rig = rig();
+        rig.advance(1000);
+        let browser = browser_of(&mut rig, 1);
+        rig.connect("ch-browser", browser);
+        let before = std::fs::read(&rig.pairing.host_enc_key).unwrap();
+        for handle in ["ch-phone", "ch-browser", "ch-bot"] {
+            ask_new(&mut rig, handle, NEW_1);
+            assert_eq!(replies(&mut rig, handle), forbidden(), "{handle}");
+        }
+        assert_eq!(std::fs::read(&rig.pairing.host_enc_key).unwrap(), before);
+    }
+
+    /// A write that fails (the record, then the key file) is `busy` and
+    /// hands nothing out; the next request makes the key.
+    #[test]
+    fn a_failed_write_is_busy_and_hands_out_nothing() {
+        let mut rig = rig();
+        for file in [DlFile::HostEncGenerated, DlFile::HostEncKey] {
+            rig.engine.inject_enc_fault(Injected {
+                file,
+                step: Step::TempWrite,
+            });
+            ask_new(&mut rig, "ch-mac", NEW_1);
+            assert_eq!(replies(&mut rig, "ch-mac"), busy(), "{file:?}");
+            let file: Value = read_json(&rig.pairing.host_enc_key).unwrap();
+            assert!(file.get("pending").is_none());
+        }
+        ask_new(&mut rig, "ch-mac", NEW_1);
+        assert_eq!(replies(&mut rig, "ch-mac").0.len(), 1);
+    }
+
     /// The hook's `host.senders` off (or hosting off): the welcome doesn't
     /// list it and the op is refused as on main, `unsupported_version`, with
     /// nothing read or written; the key held changes nothing.
@@ -868,27 +1032,39 @@ mod op {
             let mono = rig.now.host.mono_ms;
             assert!(rig.attached("ch-mac").send_host_enc_key_get(mono).is_err());
             // Handed to the host anyway (a newer or misbehaving client).
-            let plain =
-                atem_client::session::r9::host_enc_key_get("aaaaaaaa-0000-4000-8000-0000000000e2")
-                    .to_string()
-                    .into_bytes();
-            let (att, authority) = match &rig.engine.chans["ch-mac"].phase {
-                super::super::Phase::Open(a) => (a.attachment.clone(), a.authority.clone()),
-                _ => panic!("ch-mac is open"),
-            };
-            rig.run(|e, p| ((), e.on_record(&att, &authority, &plain, p)));
-            rig.pump();
-            assert_eq!(
-                replies(&mut rig, "ch-mac"),
-                (
-                    Vec::new(),
-                    vec![(
-                        "unsupported_version".into(),
-                        Some("host.senders is not advertised".into())
-                    )]
-                )
+            assert!(
+                rig.attached("ch-mac")
+                    .send_host_enc_key_new(NEW_1, mono)
+                    .is_err()
             );
+            for plain in [
+                atem_client::session::r9::host_enc_key_get("aaaaaaaa-0000-4000-8000-0000000000e2"),
+                atem_client::session::r9::host_enc_key_new(
+                    "aaaaaaaa-0000-4000-8000-0000000000e3",
+                    NEW_1,
+                ),
+            ] {
+                let plain = plain.to_string().into_bytes();
+                let (att, authority) = match &rig.engine.chans["ch-mac"].phase {
+                    super::super::Phase::Open(a) => (a.attachment.clone(), a.authority.clone()),
+                    _ => panic!("ch-mac is open"),
+                };
+                rig.run(|e, p| ((), e.on_record(&att, &authority, &plain, p)));
+                rig.pump();
+                assert_eq!(
+                    replies(&mut rig, "ch-mac"),
+                    (
+                        Vec::new(),
+                        vec![(
+                            "unsupported_version".into(),
+                            Some("host.senders is not advertised".into())
+                        )]
+                    )
+                );
+            }
             assert!(!rig.pairing.host_enc_generated.exists());
+            let file: Value = read_json(&rig.pairing.host_enc_key).unwrap();
+            assert!(file.get("pending").is_none(), "nothing made");
         }
     }
 }

@@ -6,10 +6,10 @@
 //! `approval_seen`, and the fences: each attachment is fenced on its own
 //! (its `attachment_gen`), a principal's attachments together (its §H
 //! `control_gen`). An op of a feature the welcome doesn't list (such as
-//! `control_records` and `host_enc_key_get`, of `host.senders`, which only
-//! the debug-only hook lists) is `unsupported_version`; with it listed,
-//! `control_records` is handed to the runtime ([`ControlRecordsCall`]) and
-//! `host_enc_key_get` served.
+//! `control_records`, `host_enc_key_get` and `host_enc_key_new`, of
+//! `host.senders`, which only the debug-only hook lists) is
+//! `unsupported_version`; with it listed, `control_records` is handed to the
+//! runtime ([`ControlRecordsCall`]) and the two key ops served.
 //!
 //! Sans-I/O. The transport seam is the channel envelope ([`envelope`]):
 //! [`R9Host::link_up`]/[`R9Host::link_down`] for Atem's link, every
@@ -36,6 +36,8 @@ mod fixtures_tests;
 #[cfg(test)]
 mod hold_tests;
 pub mod host_enc;
+#[cfg(test)]
+mod host_enc_rotation_tests;
 #[cfg(test)]
 mod host_enc_tests;
 pub mod host_policy;
@@ -627,12 +629,12 @@ fn close_reason(e: &ChannelError) -> &'static str {
 }
 
 /// The feature of an op that exists only for delegated host work (plan
-/// decision 4): `control_records` and `host_enc_key_get` are
-/// `host.senders`'s; `work_interrupt` and `work_resolve` are
-/// `host.delegated`'s; `alert_list` is `host.alerts`'s.
+/// decision 4): `control_records`, `host_enc_key_get` and
+/// `host_enc_key_new` are `host.senders`'s; `work_interrupt` and
+/// `work_resolve` are `host.delegated`'s; `alert_list` is `host.alerts`'s.
 fn delegated_feature_of(op: &str) -> Option<&'static str> {
     match op {
-        "control_records" | "host_enc_key_get" => {
+        "control_records" | "host_enc_key_get" | "host_enc_key_new" => {
             Some(atem_client::session::host_work::SENDERS_FEATURE)
         }
         "work_interrupt" | "work_resolve" => {
@@ -2354,6 +2356,10 @@ impl R9Host {
                     self.host_enc_key_op(att, authority, plain, re.as_deref(), parts);
                     return Vec::new();
                 }
+                Some("host_enc_key_new") => {
+                    self.host_enc_key_new_op(att, authority, plain, re.as_deref(), parts);
+                    return Vec::new();
+                }
                 _ => {}
             }
         }
@@ -2428,6 +2434,85 @@ impl R9Host {
             id: new_id(),
             re: request.id,
             request_id: None,
+            host_id,
+            host_trust_gen: generation,
+            enc_key: enc.public,
+            enc_sig,
+        };
+        self.seal_to(att, answer.to_json().to_string().as_bytes(), mono);
+    }
+
+    /// `host_enc_key_new{request_id}` → `host_enc_key{re, request_id,
+    /// state: "pending"}` (the routine rotation, agreed with Astation on
+    /// 2026-11-23, #120 comment 7089435308; only while the welcome lists
+    /// `host.senders`): the welcome's trust generation's one pending key
+    /// and its `enc_sig`, for a native member holding `manage` at the
+    /// current head, checked here on every request and retry, as for
+    /// `host_enc_key_get`. The first request makes the key, its id in the
+    /// record and the key file written before the answer goes
+    /// ([`host_enc::new_pending`]); every later one, another manager's or a
+    /// retry, gets the same key, each answer echoing its own request. A
+    /// write that fails, a key file that can't be read, or a pending key
+    /// whose entry the list committed and the host hasn't promoted yet, is
+    /// `busy`, nothing handed out.
+    fn host_enc_key_new_op<J: Journal>(
+        &mut self,
+        att: &str,
+        authority: &Authority,
+        plain: &[u8],
+        re: Option<&str>,
+        parts: &mut Parts<'_, J>,
+    ) {
+        let mono = parts.now.host.mono_ms;
+        let refuse = |me: &mut Self, code: &str, detail: Option<&str>| {
+            me.seal_to(att, &error(code, re, detail).to_bytes(), mono);
+        };
+        let request = match atem_client::session::r9::HostEncKeyNew::decode(plain) {
+            Ok(request) => request,
+            Err(_) => return refuse(self, code::INVALID_REQUEST, None),
+        };
+        let DeviceList::Open { m, key } = &parts.list else {
+            return refuse(self, code::BUSY, Some(DETAIL_UNPAIRED));
+        };
+        if m.held().is_some() {
+            return refuse(self, code::BUSY, Some(DETAIL_NOT_RECONCILED));
+        }
+        if !holds_manage(m, authority) {
+            return refuse(self, code::FORBIDDEN, None);
+        }
+        let Some((pairing, journal)) = self.policy_paths.clone() else {
+            return refuse(self, code::BUSY, Some(host_enc::DETAIL_UNAVAILABLE));
+        };
+        let ctx = parts.host.context();
+        let (host_id, generation) = (ctx.atem_device_id.clone(), ctx.host_trust_gen);
+        let mut store = Store::new(&pairing, &journal);
+        #[cfg(test)]
+        if let Some(fault) = self.enc_fault.take() {
+            store.inject(fault);
+        }
+        let handed = host_enc::new_pending(
+            &mut store,
+            &pairing,
+            m.membership(),
+            key,
+            &host_id,
+            generation,
+        );
+        let (enc, enc_sig, lines) = match handed {
+            Ok(handed) => handed,
+            Err(why) => {
+                self.input_log
+                    .log(mono, || format!("host encryption key: {why}"));
+                return refuse(self, code::BUSY, Some(host_enc::DETAIL_UNAVAILABLE));
+            }
+        };
+        for line in lines {
+            log(&format!("host encryption key: {line}"));
+        }
+        let answer = atem_client::session::r9::HostEncKey {
+            id: new_id(),
+            re: request.id,
+            request_id: Some(request.request_id),
             host_id,
             host_trust_gen: generation,
             enc_key: enc.public,

@@ -1921,6 +1921,48 @@ mod deferrals {
         }
     }
 
+    /// The commit watch (host senders' encryption key: a rotation's
+    /// application stamped before it is durable): told each commit that
+    /// moves the head, with the committed list and the one about to be
+    /// written, before `membership.json` holds it; never for a carriage that
+    /// moves nothing.
+    #[test]
+    fn the_commit_watch_is_told_before_the_list_is_written() {
+        let (rig, mut log) = list();
+        let mut host = open(&rig);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let told = seen.clone();
+        let file = rig.pairing.membership.clone();
+        host.set_commit_watch(Box::new(move |store, prev, next, pin| {
+            let on_disk: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+            let written = on_disk.to_string().contains(&next.head().hash.to_hex());
+            told.lock().unwrap().push(format!(
+                "{} -> {} written={written} pin={} store={}",
+                prev.head().seq,
+                next.head().seq,
+                pin.host_id,
+                store.path(DlFile::HostEncKey).display()
+            ));
+        }));
+        let before = host.head().seq;
+        let entry = log.add_native("dev-ipad", &["view"]);
+        let mut f = RecFences::default();
+        host.apply_carriage(&[strict(&entry)], &host_now(), &mut f);
+        assert_eq!(host.head().seq, before + 1);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [format!(
+                "{before} -> {} written=false pin=host-a store={}",
+                before + 1,
+                rig.pairing.host_enc_key.display()
+            )]
+        );
+        // The same carriage again moves nothing: not told.
+        host.apply_carriage(&[strict(&entry)], &host_now(), &mut f);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
     /// Step 4's Decision 16: host-work's start view is told the committed
     /// list before any fence the commit brings reaches the session host, so
     /// a start the fence lets run sees it: a removal, then a freeze.

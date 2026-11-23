@@ -62,6 +62,9 @@ mod delegated_feed_pass;
 pub(super) use delegated_feed_pass::sync_clocks;
 #[path = "delegated/hints.rs"]
 mod delegated_hints;
+#[path = "delegated/host_key_pass.rs"]
+mod delegated_host_key_pass;
+pub(super) use delegated_host_key_pass::commit_watch;
 #[path = "delegated/host_pass.rs"]
 mod delegated_host_pass;
 #[path = "delegated/mail_pass.rs"]
@@ -254,10 +257,24 @@ pub(super) struct State {
     mail_prepared: Option<HostTarget>,
     /// When the sending host's outbox last pruned its final rows' bytes.
     outbox_pruned_at: Option<Instant>,
-    /// The device-list head and the room freed (`mailbox_store::freed`)
-    /// the mailbox's waiting objects were last judged again at
-    /// (`mail_rejudge`).
-    mail_rejudged: Option<(HostTarget, u64, atem_client::encoding::Hash32, u64)>,
+    /// The device-list head, the room freed (`mailbox_store::freed`) and
+    /// the host keys' changes (`host_keys_changed`) the mailbox's waiting
+    /// objects were last judged again at (`mail_rejudge`).
+    mail_rejudged: Option<(HostTarget, u64, atem_client::encoding::Hash32, u64, u64)>,
+    /// How many times the host encryption key file changed in this run (a
+    /// rotation's promotion, a retirement): the keys this host accepts may
+    /// have, so the waiting objects are judged again.
+    host_keys_changed: u64,
+    /// What the host key pass last brought the key file to (`host_key_pass`):
+    /// the identity and list head, when, and the previous key's deadline on
+    /// `D`, if any.
+    host_key_checked: Option<(
+        HostTarget,
+        u64,
+        atem_client::encoding::Hash32,
+        Instant,
+        Option<u64>,
+    )>,
     /// When the waiting objects were last judged again for an expiry
     /// (at most every `MAIL_REJUDGE_EVERY` while the list stands still).
     mail_rejudge_at: Option<Instant>,
@@ -386,6 +403,8 @@ impl State {
             mail_prepared: None,
             outbox_pruned_at: None,
             mail_rejudged: None,
+            host_keys_changed: 0,
+            host_key_checked: None,
             mail_rejudge_at: None,
             mail_rejudge_failed: false,
             mail_pruned_at: None,
@@ -1183,6 +1202,10 @@ impl HostBridge {
         if Instant::now() >= self.work.read_due {
             self.take_reading();
         }
+        // Host senders' encryption key brought to the committed list (a
+        // rotation's promotion, a retirement at its deadline), hosting on
+        // or off, before anything of the pass opens mail.
+        self.host_key_pass();
         let identity = self.work_host();
         // A stop always wins (ruling T27a): while hosting is paused the r9
         // engine still takes `work_interrupt`, when it can be served.
@@ -3025,6 +3048,7 @@ mod local_tests {
         include!("delegated/reverify_tests.rs");
         include!("delegated/host_effects_tests.rs");
         include!("delegated/mail_pass_tests.rs");
+        include!("delegated/host_key_tests.rs");
         include!("delegated/send_pass_tests.rs");
         include!("delegated/admit_tests.rs");
         include!("delegated/owner_ops_tests.rs");

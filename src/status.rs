@@ -101,6 +101,11 @@ pub struct StatusReport {
     /// The runtime's delegated tasks (`Delegated:`, host-work-v1 §11.6 "On
     /// the host"): only while something is delegated.
     pub delegated: Option<Line>,
+    /// Host senders' encryption key (`Host key:`, host-work-v1 §11.5; the
+    /// debug-only hook's `host.senders`): from the key file, the current
+    /// key's id, a pending one and the previous one with its deadline on
+    /// the delegated clock. Only while the file exists.
+    pub host_key: Option<Line>,
     /// Printed after the block (e.g. the reset steps for broken key files).
     pub notes: Vec<String>,
 }
@@ -435,6 +440,8 @@ pub fn gather_full(
         clock,
         feeds,
         delegated,
+        host_key: crate::session_protocol::r9::host_enc::status_text(&src.paths.pairing)
+            .map(Line::new),
         notes,
     }
 }
@@ -717,6 +724,9 @@ pub fn render(report: &StatusReport) -> String {
     if let Some(line) = &report.delegated {
         out.push_str(&format!("{:<16}{}\n", "Delegated:", line.value));
     }
+    if let Some(line) = &report.host_key {
+        out.push_str(&format!("{:<16}{}\n", "Host key:", line.value));
+    }
     for note in &report.notes {
         out.push_str(note);
         out.push('\n');
@@ -939,6 +949,7 @@ pub(crate) mod tests {
             clock: None,
             feeds: None,
             delegated: None,
+            host_key: None,
             notes: Vec::new(),
         };
         assert!(render(&report).contains("\nDevice list:    held ("));
@@ -1089,6 +1100,7 @@ pub(crate) mod tests {
             clock: None,
             feeds: None,
             delegated: None,
+            host_key: None,
             notes: Vec::new(),
         };
         assert_eq!(
@@ -1297,6 +1309,46 @@ pub(crate) mod tests {
                 { render(&quiet) }
             );
         }
+    }
+
+    /// `Host key:` (host senders' encryption key and its routine rotation,
+    /// host-work-v1 §11.5): read from the key file the debug-only hook
+    /// made, the current key's id, a pending one and the previous one with
+    /// its deadline; no line without a key file, and only the line is
+    /// added.
+    #[test]
+    fn the_host_key_line_reads_the_key_file() {
+        use atem_client::encoding::b64u;
+        let dir = tempfile::tempdir().unwrap();
+        let quiet = report(dir.path());
+        assert_eq!(quiet.host_key, None);
+        assert!(!render(&quiet).contains("Host key"));
+        let src = Sources::in_dir(dir.path());
+        let secret = [7u8; 32];
+        let public =
+            *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(secret)).as_bytes();
+        let kid = atem_client::keys::enc_kid(
+            &atem_client::PublicKey::new(atem_client::Alg::X25519, &public).unwrap(),
+        )
+        .unwrap();
+        crate::paths::write_test_file(
+            &src.paths.pairing.host_enc_key,
+            serde_json::json!({"v": 1, "host_trust_gen": 1, "secret": b64u(&secret),
+                "pub": b64u(&public)})
+            .to_string(),
+        );
+        let text = format!("enc_kid {kid} (current)");
+        let got = report(dir.path());
+        assert_eq!(got.host_key, Some(Line::new(text.clone())));
+        let rendered = render(&got);
+        assert!(
+            rendered.ends_with(&format!("\nHost key:       {text}\n")),
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered.replace(&format!("Host key:       {text}\n"), ""),
+            render(&quiet)
+        );
     }
 
     #[test]

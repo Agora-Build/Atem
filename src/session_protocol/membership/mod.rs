@@ -437,6 +437,14 @@ pub struct ListState {
 /// Where [`MembershipHost`] tells its [`ListState`].
 pub type Publisher = Box<dyn FnMut(ListState) + Send>;
 
+/// Told a commit just before [`MembershipHost`] writes it: the store (its
+/// `trust_gen.lock` held), the committed list, the list about to be
+/// written, and the pin. Host senders' encryption key stamps a pending
+/// key's application here (`r9::host_enc::stamp_application_locked`), so
+/// the evidence of when the host applied an entry is durable before the
+/// entry is.
+pub type CommitWatch = Box<dyn FnMut(&mut Store, &Membership, &Membership, &HostPin) + Send>;
+
 pub struct MembershipHost {
     store: Store,
     m: Membership,
@@ -467,6 +475,8 @@ pub struct MembershipHost {
     deferred_unreadable: Option<String>,
     /// Host-work's start view of the list (Decision 16).
     publisher: Option<Publisher>,
+    /// Told each commit that moves the head, before it is written.
+    commit_watch: Option<CommitWatch>,
     #[cfg(test)]
     crash_after_commit: bool,
 }
@@ -838,6 +848,7 @@ impl MembershipHost {
             persist_deferred: false,
             deferred_unreadable: None,
             publisher: None,
+            commit_watch: None,
             #[cfg(test)]
             crash_after_commit: false,
         };
@@ -1017,6 +1028,12 @@ impl MembershipHost {
 
     pub fn has_publisher(&self) -> bool {
         self.publisher.is_some()
+    }
+
+    /// Told each commit that moves the head, just before it is written
+    /// (host senders' encryption key, with `host.senders` on).
+    pub fn set_commit_watch(&mut self, watch: CommitWatch) {
+        self.commit_watch = Some(watch);
     }
 
     /// The list as host-work's start check reads it.
@@ -1482,6 +1499,9 @@ impl MembershipHost {
                 fences: fenced,
                 announce: false,
             };
+        }
+        if head_moves && let Some(watch) = self.commit_watch.as_mut() {
+            watch(&mut self.store, &self.m, &eval.next, &self.pin);
         }
         if let Err(e) = self
             .store

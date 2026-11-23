@@ -68,7 +68,13 @@ impl Receiver {
     pub fn of(config: &Path, host_id: &str) -> Option<Receiver> {
         let text = std::fs::read(config.join("pairing/host_enc_key")).ok()?;
         let file: serde_json::Value = serde_json::from_slice(&text).ok()?;
-        let public = b64u_decode(file["pub"].as_str()?).ok()?;
+        // Its current key: a v2 file's `current`, a v1 file's only key.
+        let current = if file["v"] == 1 {
+            &file
+        } else {
+            &file["current"]
+        };
+        let public = b64u_decode(current["pub"].as_str()?).ok()?;
         Some(Receiver {
             host_id: host_id.to_owned(),
             host_trust_gen: file["host_trust_gen"].as_u64()?,
@@ -130,6 +136,46 @@ impl SenderHost {
     pub fn with_enc(mut self, seed: &[u8; 32]) -> SenderHost {
         self.keys.insert_x25519(Self::enc(), seed);
         self
+    }
+
+    /// Its encryption key's secret (from [`SenderHost::with_enc`]'s seed)
+    /// written as the receiving host's runtime makes it, in the profile
+    /// `config` (`pairing/host_enc_key` as its current key, and the record
+    /// `pairing/host_enc_generated`), before the runtime starts: a host
+    /// whose list sets that key with [`SenderHost::enc_key_action`] (only a
+    /// key the committed list set opens mail).
+    pub fn write_enc_key(config: &Path, host_trust_gen: u64, seed: &[u8; 32]) {
+        use atem_client::encoding::b64u;
+        let mut keys = SoftwareKeys::new();
+        keys.insert_x25519(Self::enc(), seed);
+        let public = keys.public_key(&Self::enc()).unwrap();
+        let kid = atem_client::keys::enc_kid(&public).unwrap();
+        let pairing = config.join("pairing");
+        let write = |name: &str, text: String| {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::create_dir_all(&pairing).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(pairing.join(name))
+                .unwrap();
+            f.write_all(text.as_bytes()).unwrap();
+        };
+        write(
+            "host_enc_key",
+            serde_json::json!({"v": 2, "host_trust_gen": host_trust_gen,
+                "current": {"secret": b64u(seed), "pub": b64u(public.as_32().unwrap())}})
+            .to_string(),
+        );
+        write(
+            "host_enc_generated",
+            serde_json::json!({"v": 2, "host_trust_gen": host_trust_gen, "kids": [kid],
+                "retired": []})
+            .to_string(),
+        );
     }
 
     /// Its `host_enc_key` entry's action (its `enc_sig` by its `host_key`),

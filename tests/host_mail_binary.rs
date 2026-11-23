@@ -51,6 +51,8 @@ const OTHER_HOST: &str = "host-other";
 /// of its re-verified trust generation 2.
 const SENDER_SEED: &str = "host mail sender";
 const SENDER_SEED_2: &str = "host mail sender, verified again";
+/// This host's encryption key (with `host.senders`): set by the list.
+const HOST_ENC_SEED: &str = "host mail host enc";
 /// The local link's relay setting (refused: the link is Astation's
 /// `:8080`); the selected Station's origin is this, normalized.
 const NO_RELAY: &str = "http://127.0.0.1:1";
@@ -175,6 +177,14 @@ impl Rig {
         log.add_host(HOST, 1, &host_seed);
         log.add_host(SENDER, 1, &secret(SENDER_SEED));
         log.add_host(OTHER_HOST, 1, &secret("host mail other host"));
+        // With `host.senders`, this host's encryption key: written before
+        // the runtime starts (the key it would make), and set by a manager's
+        // entry in the list (only a key the committed list set opens mail).
+        if hook == Hook::Senders {
+            let me = SenderHost::new(&log, HOST, 1, &host_seed).with_enc(&secret(HOST_ENC_SEED));
+            log.append(support::r9log::MAC, me.enc_key_action());
+            SenderHost::write_enc_key(&sandbox.config(), 1, &secret(HOST_ENC_SEED));
+        }
         let mut sender = SenderHost::new(&log, SENDER, 1, &secret(SENDER_SEED));
         if admitting.is_some() {
             sender = sender.with_enc(&secret("host mail sender enc"));

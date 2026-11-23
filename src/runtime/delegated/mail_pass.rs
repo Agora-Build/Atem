@@ -37,6 +37,7 @@ static UNJUDGED: AtomicU64 = AtomicU64::new(0);
 static UNPRUNED: AtomicU64 = AtomicU64::new(0);
 static UNMARKED: AtomicU64 = AtomicU64::new(0);
 static UNREWOUND: AtomicU64 = AtomicU64::new(0);
+static UNKEYED: AtomicU64 = AtomicU64::new(0);
 
 /// While the device list stands still, the waiting objects are judged
 /// again for a passed expiry at most this often.
@@ -162,12 +163,14 @@ impl HostBridge {
 
     /// This host as the receiver its objects are decided with (design
     /// II.4.2): its committed device list, its own identity's host id and
-    /// trust generation with that generation's key and record
-    /// (`host_enc::recipient_at`), and the delegated clock's `D`. None
-    /// while the list doesn't serve or `D` can't be read: nothing is
-    /// decided then.
+    /// trust generation with the keys that list accepts (`host_enc::
+    /// recipient_at`, which first brings the key file to the list: a
+    /// rotation's promotion and the retirements due, before any mail is
+    /// opened), and the delegated clock's `D`. None while the list doesn't
+    /// serve, `D` can't be read, or the key file can't be brought to the
+    /// list: nothing is decided then.
     pub(super) fn mail_receiver(
-        &self,
+        &mut self,
     ) -> Option<(
         crate::session_protocol::membership::ListState,
         crate::session_protocol::r9::host_enc::HostRecipient,
@@ -178,11 +181,24 @@ impl HostBridge {
         let now_ms = view.now_d_ms?;
         drop(view);
         let host = self.work_host();
-        let receiver = crate::session_protocol::r9::host_enc::recipient_at(
+        let receiver = match crate::session_protocol::r9::host_enc::recipient_at(
             self.pairing.as_ref()?,
             host.atem_device_id,
             host.host_trust_gen,
-        );
+            &list.membership,
+            Some(now_ms),
+        ) {
+            Ok(receiver) => receiver,
+            Err(why) => {
+                log_limited(&UNKEYED, || {
+                    format!(
+                        "atem runtime: host encryption key: {why}; no host-sender mail is decided"
+                    )
+                });
+                return None;
+            }
+        };
+        self.host_keys_reconciled(&receiver.reconciled);
         Some((list, receiver, now_ms))
     }
 
@@ -347,7 +363,15 @@ impl HostBridge {
             // Room freed since moves it too (review P1): a waiting object
             // that decided to open with no room is judged again then.
             let freed = mailbox_store::freed(store).unwrap_or(0);
-            let key = (identity.host, head.seq, head.hash, freed);
+            // And a change of the keys this host accepts (a rotation's
+            // promotion, a retirement): what waits for a key may settle.
+            let key = (
+                identity.host,
+                head.seq,
+                head.hash,
+                freed,
+                self.work.host_keys_changed,
+            );
             let moved = self.work.mail_rejudged.as_ref() != Some(&key)
                 && !(self.work.mail_rejudge_failed && throttled);
             (expired || moved).then_some(key)

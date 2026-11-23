@@ -934,6 +934,11 @@ impl HostBridge {
         {
             m.set_persist_deferred(true);
             m.set_publisher(list_publisher(&start_view));
+            // Host senders: a commit that sets this host's pending
+            // encryption key stamps its application first.
+            if features.senders {
+                m.set_commit_watch(host_work_bridge::commit_watch(&start_view));
+            }
         }
         // r9 "No compatibility": a device list (even one that failed to
         // open) refuses r8 admission.
@@ -1396,11 +1401,15 @@ impl HostBridge {
         if !self.features.delegated {
             return;
         }
+        let senders = self.features.senders;
         match self.membership.as_mut() {
             Some(m) if m.has_publisher() => {}
             Some(m) => {
                 m.set_persist_deferred(true);
                 m.set_publisher(list_publisher(&self.start_view));
+                if senders {
+                    m.set_commit_watch(host_work_bridge::commit_watch(&self.start_view));
+                }
             }
             None => self.start_view().list = None,
         }
