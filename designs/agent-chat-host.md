@@ -300,27 +300,48 @@ broker that adopts the worker after a restart decides as the worker does.
 
 Claude runs the `UserPromptSubmit` hook before it writes the prompt's
 transcript entry, so a pass can read the next prompt's hook and not yet its
-entry: no turn start is known, but the prompt went in. Atem keeps that hook (its
-time and prompt) until its entry is read: an entry with the same prompt, or one
-not recorded surely before the hook (an older entry read late is neither).
-Meanwhile no turn end recorded before the hook, or in its second, makes the
-session `ready`. A `Stop` that finds no open turn is the previous turn's, read
-late: it ends nothing. One that ends the open turn, or a transcript end, is that
-turn's own: it still sends `complete` (its receipt completes as before), but the
-session stays `working` for the new turn. A turn end recorded surely after the
-hook applies as before. The waiting hook isn't carried in the snapshot:
-snapshots are taken between the worker's passes, and a pass reads the hooks
-before the transcript, so an end recorded before a hook is read in that hook's
-pass at the latest.
+entry: no turn start is known, but the prompt went in. Atem keeps that hook
+waiting (its time, and the turn it names, which only Codex's hook does) until
+its entry is read: the entry of the turn the hook names, else one recorded
+surely after the hook. The prompt's text doesn't decide. A queued prompt equal
+to the running turn's (`continue` twice) is a new prompt's hook, and an older
+entry with the same prompt, read late in the hook's pass, leaves the hook
+waiting. An entry that can't be told from an older one (in the hook's second on
+a filesystem keeping whole seconds, or with no time) leaves it waiting too: fail
+closed. A hook whose entry was already read (the open turn's, a pass earlier)
+waits for nothing.
+
+While the hook waits, no turn end recorded before it (or in its second, on a
+filesystem keeping whole seconds) makes the session `ready`. A `Stop` that
+finds no open turn is the previous turn's, read late: it ends nothing. One that
+ends the open turn, or a transcript end, is that turn's own: it still sends
+`complete` (its receipt completes as before), but the session stays `working`
+for the new turn. A turn end recorded surely after the hook applies as before.
+The waiting hook goes with the worker's chat snapshot and a catch-up too, like
+the owed mark.
 
 Codex has no hook turn end (its `Stop` only wakes the rollout reader), so the
 `Stop` rules are Claude's. The waiting hook holds a Codex rollout's turn end the
-same way (Codex writes the new turn's `task_started` before the prompt's hook,
-so that pass ends `working` either way; it no longer shows `ready` within it).
-Known limit: a prompt hook whose entry never comes (a hook of the user's
-blocked the prompt) holds the ends recorded up to its second, so the session
-stays `working` until a later turn ends; a previous turn's `Stop` read with it
-no longer makes it `ready`.
+same way, its entry told by the turn its hook names (Codex writes the new turn's
+`task_started` before the prompt's hook, so that pass ends `working` either
+way; it no longer shows `ready` within it).
+
+Known limits, each failing closed (`working`, so no prompt goes in):
+
+- A prompt whose entry never comes: a hook of the user's blocked it (a
+  `UserPromptSubmit` hook's exit 2, or a hook's `onFailure: "block"`), or Esc
+  was pressed while hooks still checked it. Its turn never runs, so the
+  `working` its hook set lasts until a later turn ends (typed in the
+  terminal), a `/clear` or the agent's exit. This was already so before #126,
+  except that a previous turn's `Stop` read in that hook's own pass made the
+  session `ready` by accident; it no longer does.
+- Typed skills and custom commands fire the prompt hook, but Atem's transcript
+  reader skips their entries (`<command-…>`, `isMeta`): the hook waits through
+  that command's turn, which matters only for an end within the hook's second
+  (a filesystem keeping whole seconds).
+- On a filesystem keeping whole seconds a prompt's own entry, in its hook's
+  second, can't be told from an older one, so the hook waits through its turn:
+  a turn that ends within its hook's second stays `working` until a later end.
 
 ### Sending a prompt from chat
 
