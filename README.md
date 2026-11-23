@@ -95,7 +95,9 @@ Once paired, `atem pair` only prints the status (`Already paired. Verify this
 device: atem pair verify · Replace the pairing: atem unpair, then atem pair`):
 it never pairs again or changes keys, trust or sessions. `atem pair verify`
 verifies the existing pairing on the runtime's Astation link, does nothing when the
-device is already verified, and refuses after a revocation (run `atem unpair`,
+device is already verified (unless it was verified before device lists were
+pinned: then it verifies again to pin one, and `atem status` says so), and
+refuses after a revocation (run `atem unpair`,
 which sets the revoked keys aside, then `atem pair`). `atem status` reads
 local files and asks an already running cred agent and `atem runtime` (each
 within half a second; it never starts either, never writes and never uses the
@@ -107,9 +109,9 @@ locally`, `not connected (retrying)`) and the local agents (`2 running
 (claude ready, codex working)`); without a runtime all three say `no runtime
 running`. **Planned (owner decision 2026-11-08), not implemented:** Atem
 serves remote sessions only over r9, so a pairing verified before device lists
-were pinned serves none until the device list is pinned. `atem pair verify`
-(which today answers `Already verified`) will pin it, and `Authorization` will
-say `not authorized (no device list pinned; …)`.
+were pinned serves none until the device list is pinned (`atem pair verify`
+pins it today), and `Authorization` will say `not authorized (no device list
+pinned; …)`.
 
 ### Device keys (`atem cred`)
 
