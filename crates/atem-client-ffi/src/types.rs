@@ -511,6 +511,29 @@ data_enum! {
     }
 }
 
+data_enum! {
+    /// What a signer should be told about a change `check_change` lets
+    /// through (`MembershipLog::change_advisories`): never a refusal. Show
+    /// it and ask for an explicit confirmation; it bypasses neither
+    /// `check_change`'s refusals nor the signing gate.
+    pub enum ChangeAdvisoryInfo {
+        /// A `host_enc_key` for a host whose previous key isn't retired:
+        /// the list keeps one previous key only, so this rotation (routine
+        /// or `retire_previous`) ends the window in which the host still
+        /// opens mail sealed to `previous_enc_kid` (24 h on the host's own
+        /// clock from when it applied the entry at `replaced_at_seq`), and
+        /// mail still in flight to it is refused. A routine early second
+        /// rotation needs the owner's explicit confirmation that it
+        /// shortens that window; a compromise rotation stays possible.
+        PreviousKeyWindow {
+            host_id: String,
+            /// 16 lowercase hex characters.
+            previous_enc_kid: String,
+            replaced_at_seq: u64,
+        },
+    }
+}
+
 record! {
     /// A service scope (§R9.6) to build an `add` or `set_roles` from: the
     /// lists in any order (the builder sorts them and drops duplicates);

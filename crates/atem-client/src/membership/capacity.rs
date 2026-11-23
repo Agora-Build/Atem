@@ -313,6 +313,64 @@ pub fn check_change(log: &Membership, action: &Action, now_ms: u64) -> Result<()
     }
 }
 
+/// What a signer should be told about a change [`check_change`] lets
+/// through ([`check_change_advisories`]): never a refusal. The signer
+/// shows it and asks for an explicit confirmation; it bypasses neither
+/// `check_change`'s refusals nor the signing gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangeAdvisory {
+    /// A `host_enc_key` for a host whose previous key isn't retired in the
+    /// derived state (the routine rotation, agreed with Astation on
+    /// 2026-11-23, #120 comment 7089435308): the list keeps one previous
+    /// key only, so this rotation, routine or `retire_previous`, ends the
+    /// window in which the host still opens mail sealed to `previous_kid`
+    /// (24 h on the host's own clock from when it applied the entry at
+    /// `replaced_at_seq`), and mail still in flight to it is refused. A
+    /// routine early second rotation needs the owner's explicit
+    /// confirmation that it shortens that window; a compromise rotation
+    /// stays possible at once.
+    PreviousKeyWindow {
+        host_id: String,
+        /// The previous key's `enc_kid` (its hex is the 16-character id).
+        previous_kid: [u8; 8],
+        /// The `seq` of the entry that made it the previous key.
+        replaced_at_seq: u64,
+    },
+}
+
+impl ChangeAdvisory {
+    pub fn code(&self) -> &'static str {
+        match self {
+            ChangeAdvisory::PreviousKeyWindow { .. } => "previous_key_window",
+        }
+    }
+}
+
+/// [`check_change`], then what the signer should be told about a change it
+/// lets through ([`ChangeAdvisory`]): a refusal stands as `Err` with no
+/// advisory, so an advisory never bypasses one. Advisory and
+/// deterministic, from the derived state only.
+pub fn check_change_advisories(
+    log: &Membership,
+    action: &Action,
+    now_ms: u64,
+) -> Result<Vec<ChangeAdvisory>, ChangeRefusal> {
+    check_change(log, action, now_ms)?;
+    let mut advisories = Vec::new();
+    if let Action::HostEncKey { host_id, .. } = action
+        && let Some(keys) = log.host_enc_key(host_id)
+        && let Some(previous) = &keys.previous
+        && !previous.retired
+    {
+        advisories.push(ChangeAdvisory::PreviousKeyWindow {
+            host_id: host_id.clone(),
+            previous_kid: previous.key.kid,
+            replaced_at_seq: previous.replaced_at_seq,
+        });
+    }
+    Ok(advisories)
+}
+
 /// `signed_at` of the service's last entry that granted something: its
 /// `add`, or a `set_roles` that didn't only narrow what it had then.
 fn last_grant(log: &Membership, device_id: &str) -> Option<u64> {

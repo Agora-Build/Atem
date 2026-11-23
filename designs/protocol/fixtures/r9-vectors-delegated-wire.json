@@ -220,6 +220,27 @@
       },
       "name": "host_enc_key_sig_base64url",
       "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA"
+          },
+          "enc_sig": "Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAA",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000002",
+          "op": "host_enc_key",
+          "re": "c1c2c3c4-0000-4000-8000-000000000001",
+          "state": "pending",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_get_answer_has_no_state",
+      "valid": false
     }
   ],
   "host_enc_key_binding": {
@@ -320,9 +341,404 @@
       "valid": false
     }
   ],
+  "host_enc_key_new": [
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "host_enc_key_new",
+          "request_id": "c1c2c3c4-0000-4000-8000-000000000003",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_new",
+      "valid": true
+    },
+    {
+      "message": {
+        "data": {
+          "extra": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "host_enc_key_new",
+          "request_id": "c1c2c3c4-0000-4000-8000-000000000003",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_new_unknown_field",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "host_enc_key_new",
+          "request_id": "c1c2c3c4-0000-4000-8000-000000000003",
+          "v": 2
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_new_version",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "id": "6ba7b810-9dad-51d1-80b4-00c04fd430c8",
+          "op": "host_enc_key_new",
+          "request_id": "c1c2c3c4-0000-4000-8000-000000000003",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_new_id_is_uuid_v4",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "host_enc_key_new",
+          "request_id": "6ba7b810-9dad-51d1-80b4-00c04fd430c8",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_new_request_id_is_uuid_v4",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "host_enc_key_new",
+          "request_id": null,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_new_request_id_not_null",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "host_enc_key_new",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_new_needs_a_request_id",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "op": "host_enc_key_new",
+          "request_id": "c1c2c3c4-0000-4000-8000-000000000003",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_new_needs_an_id",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "host_enc_key_new",
+          "request_id": "c1c2c3c4-0000-4000-8000-000000000003",
+          "v": 1
+        },
+        "type": "terminal"
+      },
+      "name": "host_enc_key_new_is_a_session_message",
+      "valid": false
+    },
+    {
+      "name": "host_enc_key_new_duplicate_key",
+      "raw": "{\"type\":\"session\",\"data\":{\"v\":1,\"op\":\"host_enc_key_new\",\"id\":\"c1c2c3c4-0000-4000-8000-000000000001\",\"request_id\":\"c1c2c3c4-0000-4000-8000-000000000003\",\"request_id\":\"c1c2c3c4-0000-4000-8000-000000000002\"}}",
+      "valid": false
+    }
+  ],
+  "host_enc_key_new_exchanges": [
+    {
+      "answer": {
+        "data": {
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "T4GBk6hJO3HayGgpWxRJ7HGwiM6eSc2ZZ-V2SXX4uHE"
+          },
+          "enc_sig": "cq-vZoheFAYyaLKbpYoYH2G5P0TkD1QwMC1mlIT1IdI8I2i3S2hHJkRlIpwE1ztCQOtlJASkCWvabhDFUz8SCg",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000002",
+          "op": "host_enc_key",
+          "re": "c1c2c3c4-0000-4000-8000-000000000001",
+          "request_id": "c1c2c3c4-0000-4000-8000-000000000003",
+          "state": "pending",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "first_manager",
+      "request": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "host_enc_key_new",
+          "request_id": "c1c2c3c4-0000-4000-8000-000000000003",
+          "v": 1
+        },
+        "type": "session"
+      }
+    },
+    {
+      "answer": {
+        "data": {
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "T4GBk6hJO3HayGgpWxRJ7HGwiM6eSc2ZZ-V2SXX4uHE"
+          },
+          "enc_sig": "cq-vZoheFAYyaLKbpYoYH2G5P0TkD1QwMC1mlIT1IdI8I2i3S2hHJkRlIpwE1ztCQOtlJASkCWvabhDFUz8SCg",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000005",
+          "op": "host_enc_key",
+          "re": "c1c2c3c4-0000-4000-8000-000000000004",
+          "request_id": "c1c2c3c4-0000-4000-8000-000000000003",
+          "state": "pending",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "first_manager_retry_after_a_lost_answer",
+      "request": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000004",
+          "op": "host_enc_key_new",
+          "request_id": "c1c2c3c4-0000-4000-8000-000000000003",
+          "v": 1
+        },
+        "type": "session"
+      }
+    },
+    {
+      "answer": {
+        "data": {
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "T4GBk6hJO3HayGgpWxRJ7HGwiM6eSc2ZZ-V2SXX4uHE"
+          },
+          "enc_sig": "cq-vZoheFAYyaLKbpYoYH2G5P0TkD1QwMC1mlIT1IdI8I2i3S2hHJkRlIpwE1ztCQOtlJASkCWvabhDFUz8SCg",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000008",
+          "op": "host_enc_key",
+          "re": "c1c2c3c4-0000-4000-8000-000000000006",
+          "request_id": "c1c2c3c4-0000-4000-8000-000000000007",
+          "state": "pending",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "second_manager",
+      "request": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000006",
+          "op": "host_enc_key_new",
+          "request_id": "c1c2c3c4-0000-4000-8000-000000000007",
+          "v": 1
+        },
+        "type": "session"
+      }
+    }
+  ],
+  "host_enc_key_pending": [
+    {
+      "message": {
+        "data": {
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "T4GBk6hJO3HayGgpWxRJ7HGwiM6eSc2ZZ-V2SXX4uHE"
+          },
+          "enc_sig": "cq-vZoheFAYyaLKbpYoYH2G5P0TkD1QwMC1mlIT1IdI8I2i3S2hHJkRlIpwE1ztCQOtlJASkCWvabhDFUz8SCg",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000002",
+          "op": "host_enc_key",
+          "re": "c1c2c3c4-0000-4000-8000-000000000001",
+          "request_id": "c1c2c3c4-0000-4000-8000-000000000003",
+          "state": "pending",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_pending",
+      "valid": true
+    },
+    {
+      "message": {
+        "data": {
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "T4GBk6hJO3HayGgpWxRJ7HGwiM6eSc2ZZ-V2SXX4uHE"
+          },
+          "enc_sig": "cq-vZoheFAYyaLKbpYoYH2G5P0TkD1QwMC1mlIT1IdI8I2i3S2hHJkRlIpwE1ztCQOtlJASkCWvabhDFUz8SCg",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000002",
+          "op": "host_enc_key",
+          "re": "c1c2c3c4-0000-4000-8000-000000000001",
+          "request_id": "c1c2c3c4-0000-4000-8000-000000000003",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_pending_needs_state",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "T4GBk6hJO3HayGgpWxRJ7HGwiM6eSc2ZZ-V2SXX4uHE"
+          },
+          "enc_sig": "cq-vZoheFAYyaLKbpYoYH2G5P0TkD1QwMC1mlIT1IdI8I2i3S2hHJkRlIpwE1ztCQOtlJASkCWvabhDFUz8SCg",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000002",
+          "op": "host_enc_key",
+          "re": "c1c2c3c4-0000-4000-8000-000000000001",
+          "state": "pending",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_pending_needs_request_id",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "T4GBk6hJO3HayGgpWxRJ7HGwiM6eSc2ZZ-V2SXX4uHE"
+          },
+          "enc_sig": "cq-vZoheFAYyaLKbpYoYH2G5P0TkD1QwMC1mlIT1IdI8I2i3S2hHJkRlIpwE1ztCQOtlJASkCWvabhDFUz8SCg",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000002",
+          "op": "host_enc_key",
+          "re": "c1c2c3c4-0000-4000-8000-000000000001",
+          "request_id": "c1c2c3c4-0000-4000-8000-000000000003",
+          "state": "current",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_pending_state_is_pending",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "T4GBk6hJO3HayGgpWxRJ7HGwiM6eSc2ZZ-V2SXX4uHE"
+          },
+          "enc_sig": "cq-vZoheFAYyaLKbpYoYH2G5P0TkD1QwMC1mlIT1IdI8I2i3S2hHJkRlIpwE1ztCQOtlJASkCWvabhDFUz8SCg",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000002",
+          "op": "host_enc_key",
+          "re": "c1c2c3c4-0000-4000-8000-000000000001",
+          "request_id": "c1c2c3c4-0000-4000-8000-000000000003",
+          "state": null,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_pending_state_not_null",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "T4GBk6hJO3HayGgpWxRJ7HGwiM6eSc2ZZ-V2SXX4uHE"
+          },
+          "enc_sig": "cq-vZoheFAYyaLKbpYoYH2G5P0TkD1QwMC1mlIT1IdI8I2i3S2hHJkRlIpwE1ztCQOtlJASkCWvabhDFUz8SCg",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000002",
+          "op": "host_enc_key",
+          "re": "c1c2c3c4-0000-4000-8000-000000000001",
+          "request_id": "not-a-uuid",
+          "state": "pending",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_pending_request_id_is_uuid_v4",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "T4GBk6hJO3HayGgpWxRJ7HGwiM6eSc2ZZ-V2SXX4uHE"
+          },
+          "enc_sig": "cq-vZoheFAYyaLKbpYoYH2G5P0TkD1QwMC1mlIT1IdI8I2i3S2hHJkRlIpwE1ztCQOtlJASkCWvabhDFUz8SCg",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000002",
+          "op": "host_enc_key",
+          "re": "c1c2c3c4-0000-4000-8000-000000000001",
+          "request_id": null,
+          "state": "pending",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_pending_request_id_not_null",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "T4GBk6hJO3HayGgpWxRJ7HGwiM6eSc2ZZ-V2SXX4uHE"
+          },
+          "enc_sig": "cq-vZoheFAYyaLKbpYoYH2G5P0TkD1QwMC1mlIT1IdI8I2i3S2hHJkRlIpwE1ztCQOtlJASkCWvabhDFUz8SCg",
+          "extra": 1,
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000002",
+          "op": "host_enc_key",
+          "re": "c1c2c3c4-0000-4000-8000-000000000001",
+          "request_id": "c1c2c3c4-0000-4000-8000-000000000003",
+          "state": "pending",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_pending_unknown_field",
+      "valid": false
+    }
+  ],
+  "host_enc_key_pending_binding": {
+    "enc_sig_input_hex": "000000146174656d2d686f73742d656e632d6b65792d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d61000000080000000000000001000000204f818193a8493b71dac868295b1449ec71b088ce9e49cd9967e5764975f8b871"
+  },
   "kind": "vectors",
   "name": "r9-vectors-delegated-wire",
-  "note": "Delegated host work's session-v1 shapes (R9.14, planned; not advertised): host_enc_key_get (exactly v, op and a UUID v4 id), its answer host_enc_key (exactly v, op, id, re, host_id, host_trust_gen, enc_key {alg: x25519, pub: 32 bytes}, enc_sig: 64 bytes), and receipts with provenance (task_id a UUID v4, or for a host: sender the UUID v5 of a selector's fixed resolution (host-work-v1 §11.5; Atem's reading, for Astation's agreement), and sender member:/service:/host: with a 1-128 byte id, both or neither, on a prompt receipt only; absent, never null) and without; and the r9 welcome's optional verifier (R9.2 \"How a verifier reports itself\", R9.8; Atem's proposal, for Astation's agreement): absent, or exactly version (an integer from 1 to 2^32 - 1) and actions (1-64 names, sorted by bytes, each once, each 1-32 bytes of [a-z0-9_] starting with a letter; a name the reader doesn't know is read, never refused); `verifier` is this release's own (version 2: R9.2's sixteen actions). Each case is valid or refused as a whole; a `raw` case is read as its exact text. The valid answer's enc_key and enc_sig are r9-vectors-membership-log's first host_enc_key pair: enc_sig verifies with host-a's host_key of log L over enc_sig_input_hex.",
+  "note": "Delegated host work's session-v1 shapes (R9.14, planned; not advertised): host_enc_key_get (exactly v, op and a UUID v4 id), its answer host_enc_key (exactly v, op, id, re, host_id, host_trust_gen, enc_key {alg: x25519, pub: 32 bytes}, enc_sig: 64 bytes), and receipts with provenance (task_id a UUID v4, or for a host: sender the UUID v5 of a selector's fixed resolution (host-work-v1 §11.5; Atem's reading, for Astation's agreement), and sender member:/service:/host: with a 1-128 byte id, both or neither, on a prompt receipt only; absent, never null) and without; and the r9 welcome's optional verifier (R9.2 \"How a verifier reports itself\", R9.8; Atem's proposal, for Astation's agreement): absent, or exactly version (an integer from 1 to 2^32 - 1) and actions (1-64 names, sorted by bytes, each once, each 1-32 bytes of [a-z0-9_] starting with a letter; a name the reader doesn't know is read, never refused); `verifier` is this release's own (version 2: R9.2's sixteen actions). Each case is valid or refused as a whole; a `raw` case is read as its exact text. The valid answer's enc_key and enc_sig are r9-vectors-membership-log's first host_enc_key pair: enc_sig verifies with host-a's host_key of log L over enc_sig_input_hex. host_enc_key_new (the routine rotation, agreed with Astation on 2026-11-23, #120 comment 7089435308): exactly v, op, a UUID v4 id and a UUID v4 request_id; its answer (host_enc_key_pending) is a host_enc_key with that request's request_id and state \"pending\", both or neither (a get's answer has neither), its key log L's second host-a key (host_enc_key_pending_binding). host_enc_key_new_exchanges: one pending key per generation, so two managers' requests and a retry after a lost answer (the same request_id, a fresh id) get the same key, each answer echoing its own request's id (re) and request_id and answering no other.",
   "receipt": [
     {
       "message": {

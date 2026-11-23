@@ -907,6 +907,15 @@ impl MembershipLog {
     pub fn check_change(&self, action_json: String, now_ms: f64) -> JsResult<JsValue> {
         ok(self.0.check_change(action_json, ms(now_ms)?))
     }
+    /// `[{type: "previous_key_window", hostId, previousEncKid,
+    /// replacedAtSeq}]` (advisory, for signers: a `host_enc_key` of a host
+    /// whose previous key isn't retired; a second rotation cuts its window
+    /// short); `[]` for a change `checkChange` refuses (its refusal
+    /// stands).
+    #[wasm_bindgen(js_name = changeAdvisories)]
+    pub fn change_advisories(&self, action_json: String, now_ms: f64) -> JsResult<JsValue> {
+        ok(self.0.change_advisories(action_json, ms(now_ms)?))
+    }
     #[wasm_bindgen(js_name = checkMember)]
     pub fn check_member(&self, member_json: String) -> JsResult<String> {
         err(self.0.check_member(member_json))
@@ -2728,6 +2737,10 @@ impl ClientConnection {
     #[wasm_bindgen(js_name = hostPolicyReady)]
     pub fn host_policy_ready(&self) -> bool {
         self.0.host_policy_ready()
+    }
+    #[wasm_bindgen(js_name = sendHostEncKeyNew)]
+    pub fn send_host_enc_key_new(&self, request_id: String, now_ms: f64) -> JsResult<JsValue> {
+        ok(self.0.send_host_enc_key_new(request_id, ms(now_ms)?))
     }
     #[wasm_bindgen(js_name = sendMembership)]
     pub fn send_membership(&self, entries: Vec<String>, now_ms: f64) -> JsResult<JsValue> {

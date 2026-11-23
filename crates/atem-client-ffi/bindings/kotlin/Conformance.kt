@@ -498,8 +498,9 @@ fun main(args: Array<String>) {
             (body["action"] == "host_sender_revoke" && body["interrupt_running"] !is Boolean) ||
             v.obj()["reason"] in setOf<Any?>("unknown_field", "array_not_canonical")
     }
-    check("device-list actions: the builders reproduce the vectors; check_change advises on a redundant revoke or readmit and a reused key") {
+    check("device-list actions: the builders reproduce the vectors; check_change advises on a redundant revoke or readmit and a reused key; change_advisories on an early second rotation") {
         var built = 0
+        var advised = 0
         for (v in delegated.filter { fiveActions.contains(it["entry"]["body"]["action"].s()) }) {
             val label = v["label"].s()
             val body = v["entry"]["body"]
@@ -522,8 +523,16 @@ fun main(args: Array<String>) {
                 else -> null
             }
             eq(log.checkChange(action, signedAt), want, "$label check_change")
+            // previous_key_window: a host_enc_key of a host whose previous
+            // key isn't retired, for a change check_change lets through only.
+            val hostId = body.obj()["host_id"] as? String
+            val previous = if (body["action"].s() == "host_enc_key" && want == null && hostId != null) log.hostEncKey(hostId)?.previous?.takeIf { !it.retired } else null
+            val window = previous?.let { listOf(ChangeAdvisoryInfo.PreviousKeyWindow(hostId!!, it.key.encKid, it.replacedAtSeq)) } ?: emptyList()
+            eq(log.changeAdvisories(action, signedAt), window, "$label change_advisories")
+            advised += window.size
         }
         check(built >= 38) { "$built built" }
+        check(advised >= 1) { "$advised advised" }
     }
     check("device-list actions: shapes the verifier refuses by itself") {
         val two = listOf("host-a", "host-b")

@@ -702,6 +702,112 @@ fn check_change_refuses_a_reused_key() {
     );
 }
 
+/// `previous_key_window` (the routine rotation, agreed with Astation on
+/// 2026-11-23, #120 comment 7089435308): reported when the host's previous
+/// key isn't retired in the derived state, since the list keeps one
+/// previous key only and a second rotation would cut its window short. An
+/// advisory, never a refusal: a change `check_change` refuses gets its
+/// refusal, never advisories; a compromise rotation stays possible at once.
+#[test]
+fn an_early_second_rotation_is_advised() {
+    use atem_client::membership::{ChangeAdvisory, check_change_advisories};
+    let mut log = Log::new();
+    log.add_host("host-a", 1);
+    let [k1, k2, k3, k4] = ["1", "2", "3", "4"].map(|n| log.enc_key(n));
+    let none: Vec<ChangeAdvisory> = Vec::new();
+    // The first key: no previous key, no advisory.
+    let first = log.entry("host-a", 1, &k1, false);
+    assert_eq!(
+        check_change_advisories(&log.m, &first, log.at),
+        Ok(none.clone())
+    );
+    log.apply(first);
+    // A rotation of a host with only its current key: none either.
+    let rotation = log.entry("host-a", 1, &k2, false);
+    assert_eq!(
+        check_change_advisories(&log.m, &rotation, log.at),
+        Ok(none.clone())
+    );
+    log.apply(rotation);
+    // k1 is now the previous key, not retired: the next rotation, routine
+    // or retiring, is advised, naming the key it would cut short.
+    let window = ChangeAdvisory::PreviousKeyWindow {
+        host_id: "host-a".into(),
+        previous_kid: hex_decode_array(&enc_kid(&k1).unwrap()).unwrap(),
+        replaced_at_seq: log.m.head().seq,
+    };
+    assert_eq!(window.code(), "previous_key_window");
+    for retire in [false, true] {
+        let second = log.entry("host-a", 1, &k3, retire);
+        assert_eq!(
+            check_change(&log.m, &second, log.at),
+            Ok(()),
+            "advisory only"
+        );
+        assert_eq!(
+            check_change_advisories(&log.m, &second, log.at),
+            Ok(vec![window.clone()])
+        );
+    }
+    // Another host's rotation isn't advised for host-a's window.
+    log.add_host("host-b", 1);
+    let b = log.entry("host-b", 1, &k4, false);
+    assert_eq!(
+        check_change_advisories(&log.m, &b, log.at),
+        Ok(none.clone())
+    );
+    // A refusal stands, with no advisory.
+    let reused = log.entry("host-a", 1, &k1, false);
+    assert_eq!(
+        check_change_advisories(&log.m, &reused, log.at),
+        Err(ChangeRefusal::EncKeyReused)
+    );
+    // A compromise rotation retires the previous key: nothing left to cut
+    // short, so the next rotation isn't advised.
+    log.apply(log.entry("host-a", 1, &k3, true));
+    let after = log.entry("host-a", 1, &k4, false);
+    assert_eq!(
+        check_change_advisories(&log.m, &after, log.at),
+        Ok(none.clone())
+    );
+    // Other actions get none.
+    let add = Action::AddHost {
+        host: HostRecord {
+            host_id: "host-c".into(),
+            host_trust_gen: 1,
+            host_key: log
+                .hosts
+                .generate(host_key_id("host-c", 1), Alg::Ed25519)
+                .unwrap(),
+        },
+    };
+    assert_eq!(check_change_advisories(&log.m, &add, log.at), Ok(none));
+}
+
+/// What the host checks when it draws a new key (the routine rotation): a
+/// key some `host_enc_key` set for it since its newest `add_host`, current,
+/// previous, retired or no longer kept, is one it never offers.
+#[test]
+fn a_key_set_since_the_add_host_is_known_to_the_host() {
+    let mut log = Log::new();
+    log.add_host("host-a", 1);
+    let [k1, k2, k3, k4] = ["1", "2", "3", "4"].map(|n| log.enc_key(n));
+    for key in [&k1, &k2, &k3] {
+        assert!(!log.m.host_enc_key_set_before("host-a", key));
+    }
+    log.set_key("host-a", 1, &k1, false);
+    log.set_key("host-a", 1, &k2, false);
+    log.set_key("host-a", 1, &k3, true);
+    for key in [&k1, &k2, &k3] {
+        assert!(log.m.host_enc_key_set_before("host-a", key));
+        assert!(!log.m.host_enc_key_set_before("host-b", key));
+    }
+    assert!(!log.m.host_enc_key_set_before("host-a", &k4));
+    // A newer add_host starts afresh.
+    log.add_host("host-a", 2);
+    assert!(!log.m.host_enc_key_set_before("host-a", &k1));
+}
+
 #[test]
 fn newer_add_host_voids_keys() {
     let mut log = Log::new();

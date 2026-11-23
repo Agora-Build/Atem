@@ -692,8 +692,9 @@ final class ConformanceTests: XCTestCase {
                 || (s(body["action"]) == "host_sender_revoke" && !(body["interrupt_running"] is Bool))
                 || reason == "unknown_field" || reason == "array_not_canonical"
         }
-        check("device-list actions: the builders reproduce the vectors; check_change advises on a redundant revoke or readmit and a reused key") {
+        check("device-list actions: the builders reproduce the vectors; check_change advises on a redundant revoke or readmit and a reused key; change_advisories on an early second rotation") {
             var built = 0
+            var advised = 0
             for v in delegated.filter({ fiveActions.contains(s(o(o($0["entry"])["body"])["action"])) }) {
                 let label = s(v["label"])
                 let body = o(o(v["entry"])["body"])
@@ -713,8 +714,18 @@ final class ConformanceTests: XCTestCase {
                 if (v["reason"] as? String) == "not_revoked" { want = .notRevoked }
                 if (v["reason"] as? String) == "enc_key_reused" { want = .encKeyReused }
                 try eq(try log.checkChange(actionJson: action, nowMs: signedAt), want, "\(label) check_change")
+                // previous_key_window: a host_enc_key of a host whose previous
+                // key isn't retired, for a change check_change lets through only.
+                var window: [ChangeAdvisoryInfo] = []
+                if s(body["action"]) == "host_enc_key", want == nil, let hostId = body["host_id"] as? String,
+                   let p = log.hostEncKey(hostId: hostId)?.previous, !p.retired {
+                    window = [.previousKeyWindow(hostId: hostId, previousEncKid: p.key.encKid, replacedAtSeq: p.replacedAtSeq)]
+                }
+                try eq(try log.changeAdvisories(actionJson: action, nowMs: signedAt), window, "\(label) change_advisories")
+                advised += window.count
             }
             if built < 38 { throw Failure(description: "\(built) built") }
+            if advised < 1 { throw Failure(description: "\(advised) advised") }
         }
         check("device-list actions: shapes the verifier refuses by itself") {
             let two = ["host-a", "host-b"]

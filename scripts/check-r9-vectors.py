@@ -1943,12 +1943,15 @@ def verifier_ok(v):
 
 def check_delegated_wire(file, data, report, context):
     """Delegated host work's session-v1 shapes (R9.14): host_enc_key_get, its
-    host_enc_key answer, and receipts with and without provenance; and the r9
-    welcome's optional verifier (R9.2, R9.8; Atem's proposal). Each case's
-    verdict is recomputed here from the rules as R9.14, R9.8 and R9.2 write
-    them, the valid answer's enc_sig is verified with host-a's host_key of log
-    L over the enc() input built here, and the release's own verifier is
-    R9.2's sixteen actions at version 2."""
+    host_enc_key answer, host_enc_key_new and its pending answer (the routine
+    rotation, agreed with Astation 2026-11-23, #120 comment 7089435308), and
+    receipts with and without provenance; and the r9 welcome's optional
+    verifier (R9.2, R9.8; Atem's proposal). Each case's verdict is recomputed
+    here from the rules as R9.14, R9.8 and R9.2 write them, the valid
+    answers' enc_sig is verified with host-a's host_key of log L over the
+    enc() input built here, every exchange of host_enc_key_new gets the one
+    pending key with its own request echoed, and the release's own verifier
+    is R9.2's sixteen actions at version 2."""
     ID = r"[A-Za-z0-9._:-]{1,128}"
 
     def whole(case):
@@ -1978,6 +1981,23 @@ def check_delegated_wire(file, data, report, context):
     def get_ok(case):
         data_ = session_data(whole(case), ["v", "op", "id"])
         return data_ is not None and data_["v"] == 1 and data_["op"] == "host_enc_key_get" and uuid4(data_["id"])
+
+    def new_ok(case):
+        data_ = session_data(whole(case), ["v", "op", "id", "request_id"])
+        return (
+            data_ is not None and data_["v"] == 1 and data_["op"] == "host_enc_key_new"
+            and uuid4(data_["id"]) and uuid4(data_["request_id"])
+        )
+
+    def pending_ok(case):
+        # A host_enc_key_new's answer: the get's answer and exactly
+        # request_id (a UUID v4) and state "pending".
+        message = whole(case)
+        data_ = session_data(message, ["v", "op", "id", "re", "request_id", "state", "host_id", "host_trust_gen", "enc_key", "enc_sig"])
+        if data_ is None or data_["state"] != "pending" or not uuid4(data_["request_id"]):
+            return False
+        rest = {k: v for k, v in data_.items() if k not in ("request_id", "state")}
+        return key_ok({"message": {"type": "session", "data": rest}})
 
     def key_ok(case):
         data_ = session_data(whole(case), ["v", "op", "id", "re", "host_id", "host_trust_gen", "enc_key", "enc_sig"])
@@ -2064,6 +2084,8 @@ def check_delegated_wire(file, data, report, context):
     for section, rule, rules in (
         ("host_enc_key_get", get_ok, "R9.14's"),
         ("host_enc_key", key_ok, "R9.14's"),
+        ("host_enc_key_new", new_ok, "R9.14's"),
+        ("host_enc_key_pending", pending_ok, "R9.14's"),
         ("receipt", receipt_ok, "R9.14's"),
         ("welcome", welcome_ok, "R9.8's and R9.2's"),
     ):
@@ -2091,6 +2113,41 @@ def check_delegated_wire(file, data, report, context):
             case.check(verify(named["alg"], b64u_decode(named["pub"]), b64u_decode(d["enc_sig"]), signing_input), f"{c['name']}: enc_sig by host-a's host_key")
             same = [e for e in mlog["log"] + mlog["others"] if e["entry"]["body"].get("action") == "host_enc_key" and e["entry"]["body"]["enc_key"]["pub"] == d["enc_key"]["pub"]]
             case.check(any(e["entry"]["body"]["enc_sig"] == d["enc_sig"] for e in same), f"{c['name']}: the membership log's host_enc_key pair")
+
+    pending_binding = data["host_enc_key_pending_binding"]
+
+    def pending_binding_ok(case, name, d):
+        enc_pub = b64u_decode(d["enc_key"]["pub"])
+        signing_input = enc(["atem-host-enc-key-v1", binding["account_id"], unhex(binding["genesis_hash"]), d["host_id"], u64(d["host_trust_gen"]), enc_pub])
+        case.equal(signing_input.hex(), pending_binding["enc_sig_input_hex"], f"{name}: enc_sig input")
+        case.check(verify(named["alg"], b64u_decode(named["pub"]), b64u_decode(d["enc_sig"]), signing_input), f"{name}: enc_sig by host-a's host_key")
+        # A key the log sets later (its second host-a key): pending until then.
+        same = [e for e in mlog["log"] + mlog["others"] if e["entry"]["body"].get("action") == "host_enc_key" and e["entry"]["body"]["enc_key"]["pub"] == d["enc_key"]["pub"]]
+        case.check(any(e["entry"]["body"]["enc_sig"] == d["enc_sig"] for e in same), f"{name}: a key the membership log's rotation sets")
+        case.check(d["enc_key"]["pub"] != data["host_enc_key"][0]["message"]["data"]["enc_key"]["pub"], f"{name}: not the current key")
+
+    with report.case(file, "host_enc_key_pending binding") as case:
+        for c in data["host_enc_key_pending"]:
+            if c["valid"]:
+                pending_binding_ok(case, c["name"], c["message"]["data"])
+
+    with report.case(file, "host_enc_key_new exchanges") as case:
+        exchanges = data["host_enc_key_new_exchanges"]
+        case.check(len(exchanges) >= 3, "two managers and a retry")
+        requests = [x["request"]["data"] for x in exchanges]
+        answers = [x["answer"]["data"] for x in exchanges]
+        case.check(len({(r["id"]) for r in requests}) == len(requests), "each request its own id")
+        case.check(len({r["request_id"] for r in requests}) < len(requests), "a retry: the same request_id under a fresh id")
+        case.check(len({r["request_id"] for r in requests}) > 1, "another manager's own request_id")
+        for x, r, a in zip(exchanges, requests, answers):
+            name = x["name"]
+            case.check(new_ok({"message": x["request"]}), f"{name}: the request reads")
+            case.check(pending_ok({"message": x["answer"]}), f"{name}: the answer reads")
+            case.equal((a["re"], a["request_id"]), (r["id"], r["request_id"]), f"{name}: its own request echoed")
+            case.equal((a["enc_key"], a["enc_sig"]), (answers[0]["enc_key"], answers[0]["enc_sig"]), f"{name}: the one pending key")
+            others = [o for o in requests if o is not r]
+            case.check(all((a["re"], a["request_id"]) != (o["id"], o["request_id"]) for o in others), f"{name}: answers no other request")
+            pending_binding_ok(case, name, a)
 
 
 # ------------------------------------------------- r9-vectors-host-envelope

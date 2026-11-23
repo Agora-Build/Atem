@@ -7659,10 +7659,11 @@ fn write_control_vectors() {
 
 const WIRE_ID: &str = "c1c2c3c4-0000-4000-8000-000000000001";
 const WIRE_RE: &str = "c1c2c3c4-0000-4000-8000-000000000002";
+const WIRE_REQUEST: &str = "c1c2c3c4-0000-4000-8000-000000000003";
 
 fn delegated_wire_vectors(book: &Book) -> Value {
     use atem_client::membership::{host_enc_sig_input, sign_host_enc_key};
-    use atem_client::session::r9::{HostEncKey, host_enc_key_get};
+    use atem_client::session::r9::{HostEncKey, host_enc_key_get, host_enc_key_new};
     use atem_client::session::wire::{
         Envelope, Op, Receipt, ReceiptKind, ReceiptState, SessionMessage, Target,
     };
@@ -7737,6 +7738,7 @@ fn delegated_wire_vectors(book: &Book) -> Value {
         host_trust_gen: 1,
         enc_key: PublicKey::new(Alg::X25519, &enc_pub).unwrap(),
         enc_sig: enc_sig.clone(),
+        request_id: None,
     }
     .to_json();
     let edit = |f: &dyn Fn(&mut Value)| {
@@ -7788,9 +7790,163 @@ fn delegated_wire_vectors(book: &Book) -> Value {
             "host_enc_key_sig_base64url",
             edit(&|m| m["data"]["enc_sig"] = json!("not base64url!")),
         ),
+        (
+            "host_enc_key_get_answer_has_no_state",
+            edit(&|m| m["data"]["state"] = json!("pending")),
+        ),
     ] {
         keys.push(case(name, false, m));
     }
+
+    // host_enc_key_new (the routine rotation, agreed with Astation on
+    // 2026-11-23, #120 comment 7089435308): exactly v, op, a UUID v4 id and
+    // a UUID v4 request_id.
+    let new = host_enc_key_new(WIRE_ID, WIRE_REQUEST);
+    let edit = |f: &dyn Fn(&mut Value)| {
+        let mut m = new.clone();
+        f(&mut m);
+        m
+    };
+    let mut news = vec![case("host_enc_key_new", true, new.clone())];
+    for (name, m) in [
+        (
+            "host_enc_key_new_unknown_field",
+            edit(&|m| m["data"]["extra"] = json!(1)),
+        ),
+        (
+            "host_enc_key_new_version",
+            edit(&|m| m["data"]["v"] = json!(2)),
+        ),
+        (
+            "host_enc_key_new_id_is_uuid_v4",
+            edit(&|m| m["data"]["id"] = json!("6ba7b810-9dad-51d1-80b4-00c04fd430c8")),
+        ),
+        (
+            "host_enc_key_new_request_id_is_uuid_v4",
+            edit(&|m| m["data"]["request_id"] = json!("6ba7b810-9dad-51d1-80b4-00c04fd430c8")),
+        ),
+        (
+            "host_enc_key_new_request_id_not_null",
+            edit(&|m| m["data"]["request_id"] = Value::Null),
+        ),
+        (
+            "host_enc_key_new_needs_a_request_id",
+            edit(&|m| {
+                m["data"].as_object_mut().unwrap().remove("request_id");
+            }),
+        ),
+        (
+            "host_enc_key_new_needs_an_id",
+            edit(&|m| {
+                m["data"].as_object_mut().unwrap().remove("id");
+            }),
+        ),
+        (
+            "host_enc_key_new_is_a_session_message",
+            edit(&|m| m["type"] = json!("terminal")),
+        ),
+    ] {
+        news.push(case(name, false, m));
+    }
+    news.push(json!({
+        "name": "host_enc_key_new_duplicate_key",
+        "valid": false,
+        "raw": format!(r#"{{"type":"session","data":{{"v":1,"op":"host_enc_key_new","id":"{WIRE_ID}","request_id":"{WIRE_REQUEST}","request_id":"{WIRE_RE}"}}}}"#),
+    }));
+
+    // Its answer: a pending key, host-a's second key of log L ("host-a
+    // host_enc_key 2", the one EK7_set rotates to), bound by host-a's
+    // host_key, with the request's request_id and `state: "pending"`.
+    let pending_key = book.public("host-a-enc-2/enc");
+    let pending_pub = *pending_key.as_32().unwrap();
+    let pending_sig = sign_host_enc_key(
+        &book.provider,
+        &book.signer("host-a"),
+        log.account_id(),
+        &genesis,
+        "host-a",
+        1,
+        &pending_pub,
+    )
+    .unwrap();
+    let pending_answer = |id: &str, re: &str, request_id: &str| HostEncKey {
+        id: id.into(),
+        re: re.into(),
+        host_id: "host-a".into(),
+        host_trust_gen: 1,
+        enc_key: pending_key.clone(),
+        enc_sig: pending_sig.clone(),
+        request_id: Some(request_id.into()),
+    };
+    let pending = pending_answer(WIRE_RE, WIRE_ID, WIRE_REQUEST).to_json();
+    let edit = |f: &dyn Fn(&mut Value)| {
+        let mut m = pending.clone();
+        f(&mut m);
+        m
+    };
+    let mut pendings = vec![case("host_enc_key_pending", true, pending.clone())];
+    for (name, m) in [
+        (
+            "host_enc_key_pending_needs_state",
+            edit(&|m| {
+                m["data"].as_object_mut().unwrap().remove("state");
+            }),
+        ),
+        (
+            "host_enc_key_pending_needs_request_id",
+            edit(&|m| {
+                m["data"].as_object_mut().unwrap().remove("request_id");
+            }),
+        ),
+        (
+            "host_enc_key_pending_state_is_pending",
+            edit(&|m| m["data"]["state"] = json!("current")),
+        ),
+        (
+            "host_enc_key_pending_state_not_null",
+            edit(&|m| m["data"]["state"] = Value::Null),
+        ),
+        (
+            "host_enc_key_pending_request_id_is_uuid_v4",
+            edit(&|m| m["data"]["request_id"] = json!("not-a-uuid")),
+        ),
+        (
+            "host_enc_key_pending_request_id_not_null",
+            edit(&|m| m["data"]["request_id"] = Value::Null),
+        ),
+        (
+            "host_enc_key_pending_unknown_field",
+            edit(&|m| m["data"]["extra"] = json!(1)),
+        ),
+    ] {
+        pendings.push(case(name, false, m));
+    }
+
+    // One pending key per generation: two managers' requests and a retry
+    // after a lost answer (the same request_id under a fresh id) get the
+    // same key, each answer echoing its own request's id and request_id.
+    let exchange = |name: &str, id: &str, request_id: &str, reply: &str| {
+        json!({
+            "name": name,
+            "request": host_enc_key_new(id, request_id),
+            "answer": pending_answer(reply, id, request_id).to_json(),
+        })
+    };
+    let exchanges = vec![
+        exchange("first_manager", WIRE_ID, WIRE_REQUEST, WIRE_RE),
+        exchange(
+            "first_manager_retry_after_a_lost_answer",
+            "c1c2c3c4-0000-4000-8000-000000000004",
+            WIRE_REQUEST,
+            "c1c2c3c4-0000-4000-8000-000000000005",
+        ),
+        exchange(
+            "second_manager",
+            "c1c2c3c4-0000-4000-8000-000000000006",
+            "c1c2c3c4-0000-4000-8000-000000000007",
+            "c1c2c3c4-0000-4000-8000-000000000008",
+        ),
+    ];
 
     // Receipts: provenance on a prompt receipt only, both or neither.
     let target = Target {
@@ -7938,7 +8094,7 @@ fn delegated_wire_vectors(book: &Book) -> Value {
         "name": "r9-vectors-delegated-wire",
         "kind": "vectors",
         "requires": "r9",
-        "note": "Delegated host work's session-v1 shapes (R9.14, planned; not advertised): host_enc_key_get (exactly v, op and a UUID v4 id), its answer host_enc_key (exactly v, op, id, re, host_id, host_trust_gen, enc_key {alg: x25519, pub: 32 bytes}, enc_sig: 64 bytes), and receipts with provenance (task_id a UUID v4, or for a host: sender the UUID v5 of a selector's fixed resolution (host-work-v1 §11.5; Atem's reading, for Astation's agreement), and sender member:/service:/host: with a 1-128 byte id, both or neither, on a prompt receipt only; absent, never null) and without; and the r9 welcome's optional verifier (R9.2 \"How a verifier reports itself\", R9.8; Atem's proposal, for Astation's agreement): absent, or exactly version (an integer from 1 to 2^32 - 1) and actions (1-64 names, sorted by bytes, each once, each 1-32 bytes of [a-z0-9_] starting with a letter; a name the reader doesn't know is read, never refused); `verifier` is this release's own (version 2: R9.2's sixteen actions). Each case is valid or refused as a whole; a `raw` case is read as its exact text. The valid answer's enc_key and enc_sig are r9-vectors-membership-log's first host_enc_key pair: enc_sig verifies with host-a's host_key of log L over enc_sig_input_hex.",
+        "note": "Delegated host work's session-v1 shapes (R9.14, planned; not advertised): host_enc_key_get (exactly v, op and a UUID v4 id), its answer host_enc_key (exactly v, op, id, re, host_id, host_trust_gen, enc_key {alg: x25519, pub: 32 bytes}, enc_sig: 64 bytes), and receipts with provenance (task_id a UUID v4, or for a host: sender the UUID v5 of a selector's fixed resolution (host-work-v1 §11.5; Atem's reading, for Astation's agreement), and sender member:/service:/host: with a 1-128 byte id, both or neither, on a prompt receipt only; absent, never null) and without; and the r9 welcome's optional verifier (R9.2 \"How a verifier reports itself\", R9.8; Atem's proposal, for Astation's agreement): absent, or exactly version (an integer from 1 to 2^32 - 1) and actions (1-64 names, sorted by bytes, each once, each 1-32 bytes of [a-z0-9_] starting with a letter; a name the reader doesn't know is read, never refused); `verifier` is this release's own (version 2: R9.2's sixteen actions). Each case is valid or refused as a whole; a `raw` case is read as its exact text. The valid answer's enc_key and enc_sig are r9-vectors-membership-log's first host_enc_key pair: enc_sig verifies with host-a's host_key of log L over enc_sig_input_hex. host_enc_key_new (the routine rotation, agreed with Astation on 2026-11-23, #120 comment 7089435308): exactly v, op, a UUID v4 id and a UUID v4 request_id; its answer (host_enc_key_pending) is a host_enc_key with that request's request_id and state \"pending\", both or neither (a get's answer has neither), its key log L's second host-a key (host_enc_key_pending_binding). host_enc_key_new_exchanges: one pending key per generation, so two managers' requests and a retry after a lost answer (the same request_id, a fresh id) get the same key, each answer echoing its own request's id (re) and request_id and answering no other.",
         "host_enc_key_binding": {
             "account_id": log.account_id(),
             "genesis_hash": genesis.to_hex(),
@@ -7948,6 +8104,12 @@ fn delegated_wire_vectors(book: &Book) -> Value {
         },
         "host_enc_key_get": gets,
         "host_enc_key": keys,
+        "host_enc_key_new": news,
+        "host_enc_key_pending_binding": {
+            "enc_sig_input_hex": hex(host_enc_sig_input(log.account_id(), &genesis, "host-a", 1, &pending_pub).as_bytes()),
+        },
+        "host_enc_key_pending": pendings,
+        "host_enc_key_new_exchanges": exchanges,
         "receipt": receipts,
         "verifier": atem_client::membership::VerifierInventory::ours().to_json(),
         "welcome": welcomes,
@@ -8161,7 +8323,9 @@ fn write_delegated_wire_vectors() {
 #[test]
 fn delegated_wire() {
     use atem_client::membership::{host_enc_sig_input, verify_host_enc_sig};
-    use atem_client::session::r9::{HostEncKeyGet, Incoming, host_enc_key_get};
+    use atem_client::session::r9::{
+        HostEncKey, HostEncKeyGet, HostEncKeyNew, Incoming, host_enc_key_get, host_enc_key_new,
+    };
     use atem_client::session::wire::{self as swire, Envelope};
     let mut run = Run::new("r9-vectors-delegated-wire");
     let book = Book::load();
@@ -8232,6 +8396,113 @@ fn delegated_wire() {
             } else {
                 "refused"
             }
+        ));
+    }
+    for case in run.get("host_enc_key_new").as_array().unwrap() {
+        let name = s(case, "name");
+        let read = HostEncKeyNew::decode(&bytes(case));
+        assert_eq!(read.is_ok(), case["valid"] == true, "{name}");
+        if let Ok(read) = read {
+            assert_eq!(
+                host_enc_key_new(&read.id, &read.request_id),
+                case["message"],
+                "{name}"
+            );
+            assert!(HostEncKeyGet::decode(&bytes(case)).is_err(), "{name}");
+        }
+        run.pass(format!(
+            "{name}: {}",
+            if case["valid"] == true {
+                "read"
+            } else {
+                "refused"
+            }
+        ));
+    }
+    let pending_binding = run.get("host_enc_key_pending_binding");
+    let pending_of = |answer: &HostEncKey, name: &str| {
+        let enc_pub = answer.enc_key.as_32().unwrap();
+        assert_eq!(
+            hex(host_enc_sig_input(
+                log.account_id(),
+                &log.genesis_hash(),
+                &answer.host_id,
+                answer.host_trust_gen,
+                enc_pub
+            )
+            .as_bytes()),
+            s(&pending_binding, "enc_sig_input_hex"),
+            "{name}"
+        );
+        verify_host_enc_sig(
+            &book.signer_public("host-a"),
+            log.account_id(),
+            &log.genesis_hash(),
+            &answer.host_id,
+            answer.host_trust_gen,
+            enc_pub,
+            &answer.enc_sig,
+        )
+        .unwrap();
+    };
+    for case in run.get("host_enc_key_pending").as_array().unwrap() {
+        let name = s(case, "name");
+        let read = match Incoming::parse(&bytes(case)) {
+            Ok(Incoming::HostEncKey(answer)) => Some(answer),
+            _ => None,
+        };
+        assert_eq!(read.is_some(), case["valid"] == true, "{name}");
+        if let Some(answer) = read {
+            assert_eq!(answer.to_json(), case["message"], "{name}");
+            assert!(answer.request_id.is_some(), "{name}");
+            pending_of(&answer, name);
+            assert!(answer.action(false, 1).is_ok(), "{name}: drafts the entry");
+        }
+        run.pass(format!(
+            "{name}: {}",
+            if case["valid"] == true {
+                "read, binding verified"
+            } else {
+                "refused"
+            }
+        ));
+    }
+    let exchanges = run.get("host_enc_key_new_exchanges");
+    let exchanges = exchanges.as_array().unwrap();
+    let read: Vec<(HostEncKeyNew, Box<HostEncKey>)> = exchanges
+        .iter()
+        .map(|x| {
+            let request = HostEncKeyNew::decode(x["request"].to_string().as_bytes()).unwrap();
+            let Ok(Incoming::HostEncKey(answer)) =
+                Incoming::parse(x["answer"].to_string().as_bytes())
+            else {
+                panic!("{}: an answer", s(x, "name"));
+            };
+            assert_eq!(answer.to_json(), x["answer"]);
+            pending_of(&answer, s(x, "name"));
+            (request, answer)
+        })
+        .collect();
+    for (i, (request, answer)) in read.iter().enumerate() {
+        let name = s(&exchanges[i], "name");
+        // The same pending key for every request.
+        assert_eq!(answer.enc_key, read[0].1.enc_key, "{name}");
+        assert_eq!(answer.enc_sig, read[0].1.enc_sig, "{name}");
+        // Each answer answers its own request, and none other.
+        for (j, (other, _)) in read.iter().enumerate() {
+            assert_eq!(
+                answer.answers_new(&other.id, &other.request_id, "host-a", 1),
+                i == j,
+                "{name} against {}",
+                s(&exchanges[j], "name")
+            );
+        }
+        assert!(
+            !answer.answers(&request.id, "host-a", 1),
+            "{name}: no get's answer"
+        );
+        run.pass(format!(
+            "{name}: the same pending key, its own request echoed"
         ));
     }
     for case in run.get("receipt").as_array().unwrap() {

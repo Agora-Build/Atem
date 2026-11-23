@@ -28,8 +28,8 @@ use atem_client_ffi::log::MembershipLog;
 use atem_client_ffi::provider::{AppKeyProvider, ProviderError};
 use atem_client_ffi::publish::EntryPublisher;
 use atem_client_ffi::types::{
-    CarriageStop, ChangeRefusalInfo, HostClock, HostSenderStateInfo, KeyAlg, MembershipEffect,
-    PublicKeyData, PublishOutcome, SignRequest, SigningPurpose,
+    CarriageStop, ChangeAdvisoryInfo, ChangeRefusalInfo, HostClock, HostSenderStateInfo, KeyAlg,
+    MembershipEffect, PublicKeyData, PublishOutcome, SignRequest, SigningPurpose,
 };
 use serde_json::Value;
 use support::*;
@@ -187,12 +187,14 @@ fn detail(e: &AtemError) -> String {
 /// Every vector's body, rebuilt by the builder, is what `draft_entry` makes
 /// on the vector's chain (`jcs`, byte for byte); `check_change` agrees with
 /// the verifier on the redundant revoke and readmit and on a reused host
-/// key; a shape the verifier refuses on its own is refused by the builder
-/// with its detail.
+/// key, and `change_advisories` reports `previous_key_window` for a host
+/// key rotation on a list whose previous key isn't retired; a shape the
+/// verifier refuses on its own is refused by the builder with its detail.
 #[test]
 fn every_builder_goes_through_draft_entry_and_check_change() {
     let v = Vectors::load();
     let mut built_ok = 0;
+    let mut advised = 0;
     let mut unbuilt = Vec::new();
     for vector in delegated_vectors(&v).into_iter().filter(|x| is_five(x)) {
         let label = vector["label"].as_str().unwrap();
@@ -225,7 +227,7 @@ fn every_builder_goes_through_draft_entry_and_check_change() {
             vector["jcs"].as_str().unwrap(),
             "{label}"
         );
-        let advice = log.check_change(action, signed_at).unwrap();
+        let advice = log.check_change(action.clone(), signed_at).unwrap();
         let want = match reason {
             Some("already_revoked") => Some(ChangeRefusalInfo::AlreadyRevoked),
             Some("not_revoked") => Some(ChangeRefusalInfo::NotRevoked),
@@ -233,7 +235,32 @@ fn every_builder_goes_through_draft_entry_and_check_change() {
             _ => None,
         };
         assert_eq!(advice, want, "{label}");
+        // `previous_key_window`: a host_enc_key of a host whose previous
+        // key isn't retired, for a change check_change lets through only.
+        let advisories = log.change_advisories(action, signed_at).unwrap();
+        let host = body["host_id"].as_str().unwrap_or_default();
+        let window = match log.host_enc_key(host.into()) {
+            Some(keys) if body["action"] == "host_enc_key" && advice.is_none() => keys
+                .previous
+                .filter(|p| !p.retired)
+                .map(|p| ChangeAdvisoryInfo::PreviousKeyWindow {
+                    host_id: host.into(),
+                    previous_enc_kid: p.key.enc_kid,
+                    replaced_at_seq: p.replaced_at_seq,
+                }),
+            _ => None,
+        };
+        advised += usize::from(window.is_some());
+        assert_eq!(
+            advisories,
+            window.into_iter().collect::<Vec<_>>(),
+            "{label}"
+        );
     }
+    assert!(
+        advised >= 1,
+        "a rotation on a list with a previous key: {advised}"
+    );
     // Every five-action vector reproduces through its builder, but those no
     // builder writes and the shapes the builder itself refuses.
     assert_eq!(

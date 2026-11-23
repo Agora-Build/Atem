@@ -205,6 +205,14 @@ impl Membership {
     pub fn host_enc_key(&self, host_id: &str) -> Option<&HostEncKeys> {
         self.derived.host_enc_keys.get(host_id)
     }
+
+    /// Whether a `host_enc_key` set `key` for `host_id` since its newest
+    /// `add_host` (current, previous, retired or no longer kept: one the
+    /// verifier refuses again, `enc_key_reused`). A host drawing a new key
+    /// for a rotation never offers one of these.
+    pub fn host_enc_key_set_before(&self, host_id: &str, key: &PublicKey) -> bool {
+        self.derived.host_enc_keys.was_set(host_id, key)
+    }
 }
 
 /// What a host signs to vouch for its encryption key:

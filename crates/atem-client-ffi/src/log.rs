@@ -15,16 +15,16 @@ use atem_client::canonical::{Numbers, parse_strict};
 use atem_client::channel::HeadRelation;
 use atem_client::encoding::Hash32;
 use atem_client::membership::{
-    Action, CapacityLevel, ChangeRefusal, Conflict, Effect, Entry, Evaluation, Head, HostNow,
-    Invalid, Member, MemberKind, MemberStatus, Membership, Stop,
+    Action, CapacityLevel, ChangeAdvisory, ChangeRefusal, Conflict, Effect, Entry, Evaluation,
+    Head, HostNow, Invalid, Member, MemberKind, MemberStatus, Membership, Stop,
 };
 
 use crate::encoding::{MAX_SAFE, canonical, canonical_lossy, hash_of, safe_int, signed, strict};
 use crate::error::{AtemError, Result};
 use crate::types::{
-    CapacityInfo, CapacityLevelKind, CarriageResult, CarriageStop, ChangeRefusalInfo, FreezeInfo,
-    HeadRelationKind, HostClock, HostInfo, KBackupInfo, LogHead, MemberInfo, MemberStatusKind,
-    MembershipEffect, PendingRecoveryInfo, VerifierInventory,
+    CapacityInfo, CapacityLevelKind, CarriageResult, CarriageStop, ChangeAdvisoryInfo,
+    ChangeRefusalInfo, FreezeInfo, HeadRelationKind, HostClock, HostInfo, KBackupInfo, LogHead,
+    MemberInfo, MemberStatusKind, MembershipEffect, PendingRecoveryInfo, VerifierInventory,
 };
 
 /// Largest durable snapshot `MembershipLog::from_stored` reads: the host's
@@ -731,6 +731,46 @@ impl MembershipLog {
                 Err(ChangeRefusal::NotRevoked) => Some(ChangeRefusalInfo::NotRevoked),
                 Err(ChangeRefusal::EncKeyReused) => Some(ChangeRefusalInfo::EncKeyReused),
             },
+        )
+    }
+
+    /// What to tell the owner before drafting `action_json` (as
+    /// `check_change` takes it) as the next entry at `now_ms`: today
+    /// `PreviousKeyWindow` for a `host_enc_key` of a host whose previous
+    /// key isn't retired (a second rotation cuts its window short). Empty
+    /// for a change `check_change` refuses: ask `check_change` first, its
+    /// refusal stands. Advisory, for signers only; it bypasses no refusal
+    /// and no signing gate. A malformed action is `Invalid`/`Membership`
+    /// as in `draft_entry`.
+    pub fn change_advisories(
+        &self,
+        action_json: String,
+        now_ms: u64,
+    ) -> Result<Vec<ChangeAdvisoryInfo>> {
+        let action = strict(&action_json)?;
+        let signer = match action["action"].as_str() {
+            Some("recovery_add") => atem_client::membership::RECOVERY_SIGNER,
+            _ => "change-check",
+        };
+        let body = self.draft_value(signer, safe_int(now_ms, "now_ms")?, &action)?;
+        let entry = structural_entry(&body)?;
+        let log = self.lock();
+        Ok(
+            atem_client::membership::check_change_advisories(&log, &entry.action, now_ms)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|advisory| match advisory {
+                    ChangeAdvisory::PreviousKeyWindow {
+                        host_id,
+                        previous_kid,
+                        replaced_at_seq,
+                    } => ChangeAdvisoryInfo::PreviousKeyWindow {
+                        host_id,
+                        previous_enc_kid: atem_client::encoding::hex(&previous_kid),
+                        replaced_at_seq,
+                    },
+                })
+                .collect(),
         )
     }
 

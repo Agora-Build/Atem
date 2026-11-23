@@ -2427,6 +2427,7 @@ impl R9Host {
         let answer = atem_client::session::r9::HostEncKey {
             id: new_id(),
             re: request.id,
+            request_id: None,
             host_id,
             host_trust_gen: generation,
             enc_key: enc.public,
