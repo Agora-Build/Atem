@@ -264,10 +264,10 @@ them as follows:
 |---|---|
 | `UserPromptSubmit`, `PreToolUse` | `working` |
 | `Notification` asking for permission | `waiting` (approve on the card or in the terminal) |
-| `Stop` | `ready` (and `complete`, below) |
+| `Stop` | `ready` (and `complete`, below), unless read late (below) |
 | `SessionStart` `startup`/`clear`, or a different transcript | `ready`; the draft mark is reset |
 | `SessionStart` `compact`/`resume` on the transcript being read (or any `SessionStart` on it while a turn is in progress) | unchanged: the turn, a prompt waiting for acceptance and the draft mark stay |
-| transcript: assistant entry with `stop_reason: "end_turn"`, or the interrupt marker after Esc | `ready` (and `complete`, outcome `interrupted` for an interrupt), even if `Stop` was missed |
+| transcript: assistant entry with `stop_reason: "end_turn"`, or the interrupt marker after Esc | `ready` (and `complete`, outcome `interrupted` for an interrupt), even if `Stop` was missed; not while the next prompt's hook waits for its entry (below) |
 | agent process exits | `unknown`; the generation is retired |
 | no `SessionStart`, or chat withdrawn | `unknown`, capability removed |
 
@@ -294,14 +294,33 @@ whole seconds (a time counts to the end of its second), a `Stop` in the same
 second as that entry is stale only while the previous turn's own `Stop` is
 still owed (its transcript end was read, its hook not); otherwise it is the
 current turn's own, which is never dropped. When the current turn's user entry
-is no longer retained or has no time, a `Stop` applies as before. Codex has no
-hook turn end (its rollout's end record ends the turn), so the rule is
-Claude's. Known limits: the owed mark isn't carried across a broker restart, so
-right after one, on a whole-second filesystem, a same-second `Stop` of the
-previous turn still counts as the current turn's; and a previous turn's `Stop`
-read after the new turn's prompt hook but before its transcript entry isn't
-recognized (no turn start is known yet): it makes the session `ready` while the
-new turn runs, though it completes no receipt.
+is no longer retained or has no time, a `Stop` applies as before. The owed mark
+goes with the worker's chat snapshot (and a catch-up after dropped items), so a
+broker that adopts the worker after a restart decides as the worker does.
+
+Claude runs the `UserPromptSubmit` hook before it writes the prompt's
+transcript entry, so a pass can read the next prompt's hook and not yet its
+entry: no turn start is known, but the prompt went in. Atem keeps that hook (its
+time and prompt) until its entry is read: an entry with the same prompt, or one
+not recorded surely before the hook (an older entry read late is neither).
+Meanwhile no turn end recorded before the hook, or in its second, makes the
+session `ready`. A `Stop` that finds no open turn is the previous turn's, read
+late: it ends nothing. One that ends the open turn, or a transcript end, is that
+turn's own: it still sends `complete` (its receipt completes as before), but the
+session stays `working` for the new turn. A turn end recorded surely after the
+hook applies as before. The waiting hook isn't carried in the snapshot:
+snapshots are taken between the worker's passes, and a pass reads the hooks
+before the transcript, so an end recorded before a hook is read in that hook's
+pass at the latest.
+
+Codex has no hook turn end (its `Stop` only wakes the rollout reader), so the
+`Stop` rules are Claude's. The waiting hook holds a Codex rollout's turn end the
+same way (Codex writes the new turn's `task_started` before the prompt's hook,
+so that pass ends `working` either way; it no longer shows `ready` within it).
+Known limit: a prompt hook whose entry never comes (a hook of the user's
+blocked the prompt) holds the ends recorded up to its second, so the session
+stays `working` until a later turn ends; a previous turn's `Stop` read with it
+no longer makes it `ready`.
 
 ### Sending a prompt from chat
 
@@ -636,7 +655,8 @@ and a failure is a session notice (Codex starts anyway).
   went there), or the person at the terminal says it was answered (the
   prefix, then `a`: "approval answered"); never a Stop, a plain
   `task_complete`, a reply or a tool result — `ready` at `task_complete` /
-  `turn_aborted` otherwise.
+  `turn_aborted` otherwise (not while the next prompt's hook waits for its
+  entry: "A `Stop` can be read late" above).
   Codex's waits outlast the turn: Codex (0.163, its exec cell) may end the
   turn while the approval still waits, or with its dialog still open, so a
   plain turn end neither closes an open approval nor makes the session
