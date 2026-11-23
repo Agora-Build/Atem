@@ -1788,7 +1788,8 @@ Mac is the genesis member using the same channel as every other client
 channel envelope of R9.7a). Its link stays for pairing,
 `cred unlock`, `credentialSync`, key grants and relay messages.
 
-**No r8 admission.** *Planned (owner decision 2026-11-08), not implemented.*
+**No r8 admission.** *Planned (owner decision 2026-11-08), not implemented,
+except `atem pair verify` pinning a list (built, below).*
 Atem will serve remote sessions only over r9.
 
 Today a host with no pinned device list (a pairing verified before device
@@ -1815,10 +1816,24 @@ Planned:
   pinned: r9 channels need the list, and r8 is gone. Local agents, the
   terminal and the Astation operations (`atem pair`, `atem pair verify`,
   `atem cred …`) are unaffected.
-- **`atem pair verify` pins one.** Today it prints `Already verified` and does
-  nothing for a pairing verified earlier. It will run the ceremony again when
-  the verified pairing has no pinned list (`atem unpair`, then `atem pair`,
-  also works).
+- **`atem pair verify` pins one.** *Built.* On a verified pairing with no
+  device-list file at all it says why and what starting does, then asks
+  `Continue? [y/N]` before anything moves: starting moves the host to its
+  next trust generation even if cancelled, so the paired Astation's r8
+  sessions on it end (leases revoked, queued work not started rejected,
+  session rules dropped) when the list is pinned or, after a cancelled or
+  failed rerun, at the link's next connection. Then the ceremony:
+  commit-then-reveal, the same
+  Astation's pin updated over the device's sealed keys (the cred agent
+  unlocked, checked before anything moves; never fresh keys), and the list
+  the certificate carries pinned (R9.2 "Pairing"). From then on the host
+  refuses r8 as every host with a list does. A list in any state (frozen,
+  held, damaged) is never verified over, a host that froze on a list before
+  is refused offline, a `verifyCommit` unanswered within 15 s fails, and a
+  failed rerun keeps the earlier verification with no list. `atem status`
+  says what such a pairing needs first (`atem pair verify`, or `atem cred
+  unlock` then `atem pair verify`, or the reset). `atem unpair`, then `atem
+  pair`, also works.
 - **Atem says why.** `atem status` shows `Authorization: not authorized (no
   device list pinned; Atem serves remote sessions only over r9: run atem pair
   verify)`, and runtime.log gets one line when the runtime starts (it already

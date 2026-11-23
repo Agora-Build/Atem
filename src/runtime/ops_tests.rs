@@ -578,6 +578,24 @@ impl Runtime {
         Self::start_with(dir, peer_url, agent, |_| {}).await
     }
 
+    /// [`Runtime::start`], with a verification waiting `first_reply` for
+    /// Astation's answer to `verifyCommit` (15 s in production).
+    async fn start_waiting(
+        dir: Rc<tempfile::TempDir>,
+        peer_url: Option<&str>,
+        agent: Arc<dyn CredAgentApi>,
+        first_reply: Duration,
+    ) -> Self {
+        Self::start_full(
+            dir,
+            peer_url,
+            agent,
+            |_| {},
+            |env| env.with_first_reply_wait(first_reply),
+        )
+        .await
+    }
+
     /// [`Runtime::start`], with `configure` applied to the App before it is
     /// served.
     async fn start_with(
@@ -585,6 +603,17 @@ impl Runtime {
         peer_url: Option<&str>,
         agent: Arc<dyn CredAgentApi>,
         configure: impl FnOnce(&mut App),
+    ) -> Self {
+        Self::start_full(dir, peer_url, agent, configure, |env| env).await
+    }
+
+    /// [`Runtime::start_with`], with `ops` applied to its operations' env.
+    async fn start_full(
+        dir: Rc<tempfile::TempDir>,
+        peer_url: Option<&str>,
+        agent: Arc<dyn CredAgentApi>,
+        configure: impl FnOnce(&mut App),
+        ops: impl FnOnce(OpEnv) -> OpEnv,
     ) -> Self {
         let root = dir.path();
         let profile = root.join("profile");
@@ -619,8 +648,10 @@ impl Runtime {
             profile: Some(crate::profile::Sources::in_dir(&profile)),
             clock: Default::default(),
             // A link that's gone is reported well within the test's wait.
-            ops: OpEnv::for_profile(crate::profile::Sources::in_dir(&profile), agent)
-                .with_link_wait(Duration::from_secs(3)),
+            ops: ops(
+                OpEnv::for_profile(crate::profile::Sources::in_dir(&profile), agent)
+                    .with_link_wait(Duration::from_secs(3)),
+            ),
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::task::spawn_local(serve(app, unix, options, async {
@@ -3117,6 +3148,699 @@ fn an_unreadable_frozen_genesis_aborts_before_touch_id() {
         );
         assert!(!pairing.membership.exists() && !pairing.host_channel_key.exists());
         assert!(!pending(&rt.keys()), "no pending pin");
+        rt.shutdown().await;
+    });
+}
+
+// ── A host verified before device lists were pinned (#128) ──
+
+/// The profile's verification with `ASTATION`, as stored.
+fn pin_of(keys: &CredPaths) -> crate::memory::trust::AstationTrust {
+    crate::memory::trust::TrustStore::load_from(&keys.trust)
+        .unwrap()
+        .verified(ASTATION)
+        .expect("verified")
+        .clone()
+}
+
+/// The device keys a verification pinned (public halves).
+fn device_keys_of(pin: &crate::memory::trust::AstationTrust) -> [String; 3] {
+    [
+        pin.device_pub.clone(),
+        pin.device_sign_pub.clone(),
+        pin.unlock_auth_pub.clone(),
+    ]
+}
+
+/// A host verified with `ASTATION` (as `acct-op`) before device lists were
+/// pinned: a first verification, then its device list's files gone (as a
+/// pin taken back leaves them), the runtime that ran it stopped. Its cred
+/// agent (unlocked; the first escrow refused, so the plain key file stays)
+/// and Astation's side, to verify again.
+async fn verified_without_a_list(dir: &Rc<tempfile::TempDir>) -> (Arc<dyn CredAgentApi>, Verifier) {
+    let profile = dir.path().join("profile");
+    paired(&profile);
+    let keys = CredPaths::in_dir(&profile);
+    let agent: Arc<dyn CredAgentApi> = Arc::new(test_agent(&keys));
+    let (url, mut peer) = Peer::listen().await;
+    let rt = Runtime::start(dir.clone(), Some(&url), agent.clone()).await;
+    let (mut op, question, certificate, verifier) =
+        verify_until_the_question(&rt, &mut peer, "acct-op").await;
+    op.answer(question, AnswerValue::Yes).await;
+    op.printed("Waiting for your Mac").await;
+    peer.send(&certificate);
+    peer.next("storageKeyRotate").await;
+    peer.send(&AstationMessage::StorageKeyRejected {
+        reason: "not now".into(),
+        pending_kid: None,
+    });
+    op.done().await.unwrap();
+    rt.shutdown().await;
+    let _ = std::fs::remove_file(dir.path().join("rt.sock"));
+    let pairing = crate::paths::ProfilePaths::in_dir(&profile).pairing;
+    crate::session_protocol::membership::pairing::unpin_locked(&pairing);
+    // This runtime's journal is its state directory's, not the profile's.
+    let _ = std::fs::remove_file(dir.path().join("state/journal/membership_applied"));
+    assert!(!crate::session_protocol::membership::has_device_list_files(
+        &pairing
+    ));
+    assert!(verified_as(&keys, "acct-op"));
+    (agent, verifier)
+}
+
+/// `atem pair verify`'s offline decision for the profile at `profile`.
+fn verify_start_of(profile: &Path) -> crate::status::VerifyStart {
+    crate::status::verify_start(&crate::profile::Sources::in_dir(profile)).unwrap()
+}
+
+/// Starts `atem pair verify` on a rerun up to its question, before
+/// anything moves: the note (why, and what starting does) printed first,
+/// then `Continue? [y/N]`, asked as text from the CLI's terminal.
+async fn rerun_until_continue(rt: &Runtime) -> (Op, u64) {
+    let mut op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+    let (question, kind, text) = op.ask().await;
+    assert_eq!(kind, AskKind::Text);
+    assert_eq!(text, crate::pair_verify::RERUN_QUESTION);
+    assert_eq!(
+        op.printed,
+        crate::pair_verify::RERUN_NOTE.map(String::from).to_vec(),
+        "the note, before the question"
+    );
+    (op, question)
+}
+
+/// Astation's r8 lease on an echo agent session of `rt` (attached by the
+/// local frontend returned): the session, its process generation and the
+/// lease epoch.
+async fn r8_lease(rt: &Runtime, peer: &mut Peer) -> (RuntimeClient, String, String, u64) {
+    let mut frontend = rt.client().await;
+    let session = rt.attached_session(&mut frontend).await;
+    let welcome = peer.hello().await;
+    assert_eq!(welcome["op"], "welcome", "no list: r8 is served: {welcome}");
+    let id = peer.request(
+        "acquire",
+        json!({"binding": peer.binding(&session.id, &session.generation), "takeover": false}),
+    );
+    let lease = peer.reply(&id).await;
+    assert_eq!(lease["op"], "lease", "{lease}");
+    let epoch = lease["binding"]["lease_epoch"].as_u64().unwrap();
+    (frontend, session.id, session.generation, epoch)
+}
+
+/// Astation renews its r8 lease: the reply's `op` (`lease` while it holds).
+async fn renew(peer: &mut Peer, sid: &str, process_gen: &str, epoch: u64) -> Value {
+    let mut binding = peer.binding(sid, process_gen);
+    binding["lease_epoch"] = epoch.into();
+    let id = peer.request("renew", json!({ "binding": binding }));
+    peer.reply(&id).await
+}
+
+/// Whether Astation was told its lease was revoked (what it got so far).
+fn lease_revoked(peer: &Peer) -> bool {
+    peer.seen.iter().any(|m| {
+        m["type"] == "session"
+            && m["data"]["op"] == "lease_changed"
+            && m["data"]["reason"] == "revoked"
+    })
+}
+
+/// Owner decision 2026-11-08 (#128): a host verified before device lists
+/// were pinned has none, and `atem pair verify` runs the ceremony again
+/// (its note says why and what starting does; nothing moves until `y`) in
+/// the next host trust generation, pinning the list the certificate
+/// carries. The pin ends Astation's r8 lease, as the note says. The same
+/// Astation's pin is updated (a new safety code) over the same device
+/// keys, the pairing and its session stay, and the host, which served r8
+/// while it had no list, now refuses r8 as every pinned host does.
+#[test]
+fn a_verified_host_without_a_device_list_verifies_again_and_pins_one() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        let (agent, verifier) = verified_without_a_list(&dir).await;
+        let profile = dir.path().join("profile");
+        let keys = CredPaths::in_dir(&profile);
+        let before = pin_of(&keys);
+        let start = trust_gen(&profile);
+        let session = record(&profile).session.unwrap().session_id;
+        assert_eq!(
+            verify_start_of(&profile),
+            crate::status::VerifyStart::Verify {
+                astation_id: ASTATION.into(),
+                rerun: true,
+            }
+        );
+        let (url, mut peer) = Peer::listen().await;
+        let rt = Runtime::start(dir.clone(), Some(&url), agent).await;
+        // No list: Astation controls a session over r8, as today.
+        let (_frontend, sid, process_gen, epoch) = r8_lease(&rt, &mut peer).await;
+
+        let (mut op, question) = rerun_until_continue(&rt).await;
+        // Nothing moved before the answer.
+        peer.drain(Duration::from_millis(200)).await;
+        assert!(!peer.seen.iter().any(|m| m["type"] == "verifyCommit"));
+        assert_eq!(trust_gen(&profile), start);
+        assert_eq!(
+            renew(&mut peer, &sid, &process_gen, epoch).await["op"],
+            "lease"
+        );
+        op.answer(question, AnswerValue::Text("y".into())).await;
+        let verifier = verifier.again(&mut peer).await;
+        assert_eq!(verifier.advertised, start + 1, "the next trust generation");
+        assert_eq!(trust_gen(&profile), start + 1, "durable first");
+        let certificate = verifier.certificate(&mut peer, start + 1).await;
+        let (question, _, _) = op.ask().await;
+        op.answer(question, AnswerValue::Yes).await;
+        op.printed("Waiting for your Mac").await;
+        // Astation's lease holds until the list is pinned.
+        assert_eq!(
+            renew(&mut peer, &sid, &process_gen, epoch).await["op"],
+            "lease"
+        );
+        assert!(!lease_revoked(&peer));
+        peer.send(&certificate);
+        // The first escrow Astation refused is offered again, as after
+        // any verification of a device whose storage key it doesn't hold.
+        peer.next("storageKeyRotate").await;
+        peer.send(&AstationMessage::StorageKeyRejected {
+            reason: "not now".into(),
+            pending_kid: None,
+        });
+        op.done().await.unwrap();
+        assert!(
+            line_with(&op.printed, crate::pair_verify::RERUN_NOTE[0])
+                < line_with(&op.printed, "Verifying this device"),
+            "the note first: {:?}",
+            op.printed
+        );
+
+        // The list from the certificate is pinned.
+        let pairing = crate::paths::ProfilePaths::in_dir(&profile).pairing;
+        assert!(pairing.membership.exists() && pairing.host_channel_key.exists());
+        let (state, text, _, _) =
+            crate::session_protocol::membership::passive_status(&pairing).unwrap();
+        assert_eq!(state, "open");
+        let head = verifier.log.borrow().log.head().seq;
+        assert_eq!(text, format!("pinned at seq {head}"));
+        // The same Astation's pin, updated: a new safety code (the one
+        // shown) over the same device keys.
+        let after = pin_of(&keys);
+        assert_ne!(after.safety_code, before.safety_code, "a new safety code");
+        line_with(&op.printed, &format!("Safety code:  {}", after.safety_code));
+        assert_eq!(
+            device_keys_of(&after),
+            device_keys_of(&before),
+            "the same keys"
+        );
+        assert_eq!(after.data_account, "acct-op");
+        assert!(!pending(&keys), "no pending pin");
+        // The pairing and its session stay, in the next generation.
+        assert_eq!(record(&profile).astation_id, ASTATION);
+        assert_eq!(record(&profile).session.unwrap().session_id, session);
+        assert_eq!(trust_gen(&profile), start + 1);
+        // Verified with a list: nothing more to do, nothing to hint.
+        assert_eq!(
+            verify_start_of(&profile),
+            crate::status::VerifyStart::AlreadyVerified(crate::status::already_verified_message(
+                &after.safety_code
+            ))
+        );
+        let src = crate::profile::Sources::in_dir(&profile);
+        let notes = crate::status::gather_with(&src, None).notes;
+        assert!(
+            !notes.iter().any(|n| n.contains("to pin a device list")),
+            "{notes:?}"
+        );
+        // Pinned: Astation's session control ended, as the note said (the
+        // host took the next trust generation and dropped the link's r8
+        // attachment, in either order as the pin's files land), and r8 is
+        // refused, as on every host with a list.
+        assert!(
+            !peer.drain(Duration::from_millis(300)).await,
+            "the link stays"
+        );
+        let renewed = renew(&mut peer, &sid, &process_gen, epoch).await;
+        assert_eq!(renewed["op"], "error", "{renewed}");
+        let refused = peer.hello().await;
+        assert_eq!(refused["op"], "error", "{refused}");
+        assert_eq!(refused["code"], "unsupported_version");
+        assert_eq!(refused["revision"], 9);
+        rt.shutdown().await;
+    });
+}
+
+/// The rerun's confirmation comes before anything moves: anything but `y`
+/// cancels it, and no terminal to ask on (or no answer) refuses it, as the
+/// ceremony does. Either way nothing changed: no rebind, no `verifyCommit`,
+/// the verification as it was, no list, and the session host still in its
+/// generation, serving Astation over r8.
+#[test]
+fn a_rerun_is_confirmed_before_anything_moves() {
+    // Every other answer: `rerun_reads_only_y_as_yes`.
+    let answers = [
+        (AnswerValue::Text("n".into()), None),
+        (
+            AnswerValue::NoTerminal("couldn't open /dev/tty".into()),
+            Some("needs a terminal to confirm"),
+        ),
+        (
+            AnswerValue::Unanswered("the terminal closed before you answered".into()),
+            Some("no answer"),
+        ),
+    ];
+    for (answer, refused) in answers {
+        local(async {
+            let dir = Rc::new(short_dir());
+            let (agent, _) = verified_without_a_list(&dir).await;
+            let profile = dir.path().join("profile");
+            let keys = CredPaths::in_dir(&profile);
+            let before = serde_json::to_value(pin_of(&keys)).unwrap();
+            let start = trust_gen(&profile);
+            let (url, mut peer) = Peer::listen().await;
+            let rt = Runtime::start(dir.clone(), Some(&url), agent).await;
+            let welcome = peer.hello().await;
+            assert_eq!(welcome["host_trust_gen"], start, "{welcome}");
+            let (mut op, question) = rerun_until_continue(&rt).await;
+            op.answer(question, answer.clone()).await;
+            let result = op.done().await;
+            match refused {
+                None => {
+                    result.unwrap_or_else(|e| panic!("{answer:?}: {e}"));
+                    line_with(&op.printed, crate::pair_verify::RERUN_CANCELLED);
+                }
+                Some(text) => {
+                    let error = result.unwrap_err();
+                    assert!(error.contains(text), "{answer:?}: {error}");
+                    assert!(error.contains("Nothing changed"), "{answer:?}: {error}");
+                }
+            }
+            peer.drain(Duration::from_millis(300)).await;
+            assert!(
+                !peer.seen.iter().any(|m| m["type"] == "verifyCommit"),
+                "{answer:?}"
+            );
+            assert_eq!(trust_gen(&profile), start, "{answer:?}: no rebind");
+            assert_eq!(serde_json::to_value(pin_of(&keys)).unwrap(), before);
+            let pairing = crate::paths::ProfilePaths::in_dir(&profile).pairing;
+            assert!(!crate::session_protocol::membership::has_device_list_files(
+                &pairing
+            ));
+            // The session host stays in its generation: Astation's r8
+            // control goes on (a new `hello`, a second later, is welcomed
+            // in it).
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            let welcome = peer.hello().await;
+            assert_eq!(welcome["op"], "welcome", "{answer:?}: {welcome}");
+            assert_eq!(welcome["host_trust_gen"], start, "{answer:?}");
+            rt.shutdown().await;
+        });
+    }
+}
+
+/// `Continue? [y/N]`: only `y` (or `yes`, any case, spaces around) goes
+/// on; anything else (an empty line, a typo) cancels; no terminal, no
+/// answer or a CLI gone refuses, saying nothing changed.
+#[test]
+fn rerun_reads_only_y_as_yes() {
+    use crate::runtime::ops::rerun_confirmed;
+    let text = |t: &str| Some(AnswerValue::Text(t.into()));
+    for yes in ["y", "Y", "yes", " YES "] {
+        assert!(rerun_confirmed(text(yes)).unwrap(), "{yes:?}");
+    }
+    assert!(rerun_confirmed(Some(AnswerValue::Yes)).unwrap());
+    for no in ["", "n", "no", "yy", "sure"] {
+        assert!(!rerun_confirmed(text(no)).unwrap(), "{no:?}");
+    }
+    assert!(!rerun_confirmed(Some(AnswerValue::No)).unwrap());
+    for refused in [
+        Some(AnswerValue::NoTerminal("x".into())),
+        Some(AnswerValue::Unanswered("x".into())),
+        None,
+    ] {
+        let error = rerun_confirmed(refused.clone()).unwrap_err().to_string();
+        assert!(error.ends_with("Nothing changed."), "{refused:?}: {error}");
+    }
+}
+
+/// A rerun that is cancelled (the codes refused) or fails after its pin (a
+/// certificate for another attempt: the pin is taken back) keeps the old
+/// verification and pins nothing: the host still serves r8, `atem pair
+/// verify` can run again, and its last line says the device stays
+/// verified.
+#[test]
+fn a_cancelled_or_failed_rerun_keeps_the_old_verification_and_no_list() {
+    for refuse in [true, false] {
+        local(async {
+            let dir = Rc::new(short_dir());
+            let (agent, verifier) = verified_without_a_list(&dir).await;
+            let profile = dir.path().join("profile");
+            let keys = CredPaths::in_dir(&profile);
+            let before = pin_of(&keys);
+            let start = trust_gen(&profile);
+            let session = record(&profile).session.unwrap().session_id;
+            let (url, mut peer) = Peer::listen().await;
+            let rt = Runtime::start(dir.clone(), Some(&url), agent).await;
+            let (mut op, question) = rerun_until_continue(&rt).await;
+            op.answer(question, AnswerValue::Text("y".into())).await;
+            let verifier = verifier.again(&mut peer).await;
+            let certificate = verifier.certificate(&mut peer, start + 1).await;
+            let (question, _, _) = op.ask().await;
+            let reason = if refuse {
+                op.answer(question, AnswerValue::No).await;
+                "codes didn't match on atem"
+            } else {
+                op.answer(question, AnswerValue::Yes).await;
+                op.printed("Waiting for your Mac").await;
+                peer.send(&another_attempts(&verifier, &peer, certificate));
+                "different verification attempt"
+            };
+            let abort = peer.next("verifyAbort").await;
+            assert!(
+                abort["data"]["reason"].as_str().unwrap().contains(reason),
+                "refuse {refuse}: {abort}"
+            );
+            let error = op.done().await.unwrap_err();
+            assert_eq!(
+                error,
+                crate::pair_verify::VERIFIED_NO_LIST,
+                "refuse {refuse}"
+            );
+            // The old verification, no list, no pending pin.
+            let after = pin_of(&keys);
+            assert_eq!(after.safety_code, before.safety_code, "refuse {refuse}");
+            assert_eq!(device_keys_of(&after), device_keys_of(&before));
+            assert!(!pending(&keys), "refuse {refuse}");
+            let pairing = crate::paths::ProfilePaths::in_dir(&profile).pairing;
+            assert!(
+                !crate::session_protocol::membership::has_device_list_files(&pairing),
+                "refuse {refuse}: nothing pinned"
+            );
+            // The pairing and its session stay (the rebind is kept, as
+            // after any aborted ceremony); the rerun can run again.
+            assert_eq!(record(&profile).session.unwrap().session_id, session);
+            assert_eq!(trust_gen(&profile), start + 1);
+            assert!(matches!(
+                verify_start_of(&profile),
+                crate::status::VerifyStart::Verify { rerun: true, .. }
+            ));
+            // Still no list: r8 is served, as today. Cancelled before any
+            // pin, the session host is still in its generation on this
+            // link (it takes the next one at the link's next connection,
+            // as the note says).
+            let welcome = peer.hello().await;
+            assert_eq!(welcome["op"], "welcome", "refuse {refuse}: {welcome}");
+            if refuse {
+                assert_eq!(welcome["host_trust_gen"], start, "{welcome}");
+            }
+            rt.shutdown().await;
+        });
+    }
+}
+
+/// `certificate` re-signed by Astation for another attempt (its transcript
+/// zero): it names this ceremony's keys and its list this host's key, so
+/// it is refused only after the pin, which is taken back.
+fn another_attempts(
+    verifier: &Verifier,
+    peer: &Peer,
+    certificate: AstationMessage,
+) -> AstationMessage {
+    let reveal = peer
+        .seen
+        .iter()
+        .rev()
+        .find(|m| m["type"] == "verifyReveal")
+        .unwrap()
+        .clone();
+    let AstationMessage::DeviceVerified {
+        account_state,
+        grants,
+        membership,
+        ..
+    } = certificate
+    else {
+        unreachable!()
+    };
+    let key = |name: &str| -> [u8; 32] {
+        STANDARD
+            .decode(reveal["data"][name].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap()
+    };
+    let other = DeviceVerified {
+        account: verifier.account.clone(),
+        sign_gen: 1,
+        device_id: verifier.device_id.clone(),
+        device_pub: key("device_pub"),
+        device_sign_pub: key("device_sign_pub"),
+        unlock_auth_pub: key("unlock_auth_pub"),
+        transcript: [0; 32],
+        epoch: 1,
+    };
+    AstationMessage::DeviceVerified {
+        device_verified: verifier.fake.sign(&other.encode()),
+        account_state,
+        grants,
+        membership,
+    }
+}
+
+/// Astation never answering a rerun's `verifyCommit` is a failure (the
+/// rerun is only for the list, which an Astation that doesn't verify can't
+/// give): `verifyAbort`, the reason, the last line `VERIFIED_NO_LIST`, a
+/// nonzero exit, nothing pinned, the old verification kept. Never "This
+/// Astation doesn't support device verification yet".
+#[test]
+fn a_rerun_astation_never_answers_fails_and_pins_nothing() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        let (agent, _) = verified_without_a_list(&dir).await;
+        let profile = dir.path().join("profile");
+        let keys = CredPaths::in_dir(&profile);
+        let before = pin_of(&keys);
+        let (url, mut peer) = Peer::listen().await;
+        let rt =
+            Runtime::start_waiting(dir.clone(), Some(&url), agent, Duration::from_secs(1)).await;
+        let (mut op, question) = rerun_until_continue(&rt).await;
+        op.answer(question, AnswerValue::Text("y".into())).await;
+        peer.next("verifyCommit").await;
+        // Never answered.
+        let abort = peer.next("verifyAbort").await;
+        assert!(
+            abort["data"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("no answer from Astation"),
+            "{abort}"
+        );
+        let error = op.done().await.unwrap_err();
+        assert_eq!(error, crate::pair_verify::VERIFIED_NO_LIST);
+        line_with(
+            &op.printed,
+            "Astation didn't answer the verification within 1 s",
+        );
+        assert!(
+            !op.printed
+                .iter()
+                .any(|l| l.contains("doesn't support device verification")),
+            "{:?}",
+            op.printed
+        );
+        let pairing = crate::paths::ProfilePaths::in_dir(&profile).pairing;
+        assert!(!crate::session_protocol::membership::has_device_list_files(
+            &pairing
+        ));
+        assert_eq!(pin_of(&keys).safety_code, before.safety_code);
+        assert!(!pending(&keys));
+        rt.shutdown().await;
+    });
+}
+
+/// A failed rerun that leaves device-list files behind (a pin that couldn't
+/// be taken back) leaves the host's list unconfirmed: the last line says to
+/// pair it again, never to run `atem pair verify` again (which would now
+/// answer `Already verified`).
+#[test]
+fn a_failed_rerun_whose_pin_stays_says_to_re_pair() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        let (agent, verifier) = verified_without_a_list(&dir).await;
+        let profile = dir.path().join("profile");
+        let start = trust_gen(&profile);
+        let (url, mut peer) = Peer::listen().await;
+        let rt = Runtime::start(dir.clone(), Some(&url), agent).await;
+        let (mut op, question) = rerun_until_continue(&rt).await;
+        op.answer(question, AnswerValue::Text("y".into())).await;
+        let verifier = verifier.again(&mut peer).await;
+        let _certificate = verifier.certificate(&mut peer, start + 1).await;
+        let (question, _, _) = op.ask().await;
+        // What a pin that couldn't be taken back leaves.
+        let pairing = crate::paths::ProfilePaths::in_dir(&profile).pairing;
+        crate::paths::write_test_file(&pairing.host_channel_key, b"{}");
+        op.answer(question, AnswerValue::No).await;
+        peer.next("verifyAbort").await;
+        let error = op.done().await.unwrap_err();
+        assert_eq!(error, crate::pair_verify::PIN_LEFT);
+        assert!(error.contains("`atem unpair`, then `atem pair`"), "{error}");
+        rt.shutdown().await;
+    });
+}
+
+/// A verified device verifies with its sealed keys, which only an
+/// unlocked cred agent reveals. Locked (Astation holds the storage key, so
+/// no plain key file is left, and the agent restarted), the rerun is
+/// refused before anything moves: no question, no link asked, no rebind,
+/// no `verifyCommit`, saying to run `atem cred unlock` first.
+#[test]
+fn a_rerun_with_locked_keys_is_refused_before_anything_moves() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        let (_, _) = verified_without_a_list(&dir).await;
+        let profile = dir.path().join("profile");
+        let keys = CredPaths::in_dir(&profile);
+        std::fs::remove_file(&keys.device_keys).unwrap();
+        let agent: Arc<dyn CredAgentApi> = Arc::new(test_agent(&keys));
+        assert!(
+            !agent.status().unwrap().unlocked,
+            "a restarted agent is locked"
+        );
+        let before = serde_json::to_value(pin_of(&keys)).unwrap();
+        let start = trust_gen(&profile);
+        let (url, mut peer) = Peer::listen().await;
+        let rt = Runtime::start(dir.clone(), Some(&url), agent).await;
+        let mut op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+        let error = op.done().await.unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "{}, then `atem pair verify`",
+                crate::memory::cred_agent::LOCKED
+            )
+        );
+        line_with(&op.printed, crate::pair_verify::RERUN_NOTE[0]);
+        assert!(
+            !op.printed
+                .iter()
+                .any(|l| l.contains("Verifying this device")),
+            "{:?}",
+            op.printed
+        );
+        peer.drain(Duration::from_millis(300)).await;
+        assert!(
+            !peer.seen.iter().any(|m| m["type"] == "verifyCommit"),
+            "{:#?}",
+            peer.seen
+        );
+        assert_eq!(trust_gen(&profile), start, "no rebind");
+        assert_eq!(serde_json::to_value(pin_of(&keys)).unwrap(), before);
+        let pairing = crate::paths::ProfilePaths::in_dir(&profile).pairing;
+        assert!(!crate::session_protocol::membership::has_device_list_files(
+            &pairing
+        ));
+        rt.shutdown().await;
+    });
+}
+
+/// The keys check runs for a first verification too: a device verified
+/// with another Astation only, its sealed keys locked, is refused before
+/// anything moves (no note, no question, no rebind, no `verifyCommit`).
+#[test]
+fn a_first_verification_with_locked_keys_is_refused_before_anything_moves() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        let (_, _) = verified_without_a_list(&dir).await;
+        let profile = dir.path().join("profile");
+        let keys = CredPaths::in_dir(&profile);
+        // The verification (and the home) are another Astation's.
+        let mut trust: Value =
+            serde_json::from_str(&std::fs::read_to_string(&keys.trust).unwrap()).unwrap();
+        let entry = trust["astations"]
+            .as_object_mut()
+            .unwrap()
+            .remove(ASTATION)
+            .unwrap();
+        trust["astations"]["astation-9"] = entry;
+        trust["home_astation"] = json!("astation-9");
+        std::fs::write(&keys.trust, trust.to_string()).unwrap();
+        std::fs::remove_file(&keys.device_keys).unwrap();
+        assert_eq!(
+            verify_start_of(&profile),
+            crate::status::VerifyStart::Verify {
+                astation_id: ASTATION.into(),
+                rerun: false,
+            }
+        );
+        let agent: Arc<dyn CredAgentApi> = Arc::new(test_agent(&keys));
+        let start = trust_gen(&profile);
+        let (url, mut peer) = Peer::listen().await;
+        let rt = Runtime::start(dir.clone(), Some(&url), agent).await;
+        let mut op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+        let error = op.done().await.unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "{}, then `atem pair verify`",
+                crate::memory::cred_agent::LOCKED
+            )
+        );
+        assert!(op.printed.is_empty(), "{:?}", op.printed);
+        peer.drain(Duration::from_millis(300)).await;
+        assert!(!peer.seen.iter().any(|m| m["type"] == "verifyCommit"));
+        assert_eq!(trust_gen(&profile), start, "no rebind");
+        rt.shutdown().await;
+    });
+}
+
+/// "A rerun never makes fresh keys" holds after the question too: key
+/// files gone while the user answers are found by the check run again after
+/// the answer, so the rerun is refused with the reset steps before the
+/// rebind (and `verify_device` would refuse fresh keys for a rerun anyway,
+/// `ceremony_keys`).
+#[test]
+fn a_rerun_whose_keys_go_during_the_question_is_refused_before_the_rebind() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        let (agent, _) = verified_without_a_list(&dir).await;
+        let profile = dir.path().join("profile");
+        let keys = CredPaths::in_dir(&profile);
+        let before = serde_json::to_value(pin_of(&keys)).unwrap();
+        let start = trust_gen(&profile);
+        let (url, mut peer) = Peer::listen().await;
+        let rt = Runtime::start(dir.clone(), Some(&url), agent).await;
+        let (mut op, question) = rerun_until_continue(&rt).await;
+        for file in [&keys.device_keys, &keys.device_keys_sealed] {
+            std::fs::remove_file(file).unwrap();
+        }
+        op.answer(question, AnswerValue::Text("y".into())).await;
+        let error = op.done().await.unwrap_err();
+        assert!(error.contains("key files are broken"), "{error}");
+        assert!(error.ends_with(crate::memory::cred_agent::RESET), "{error}");
+        peer.drain(Duration::from_millis(300)).await;
+        assert!(!peer.seen.iter().any(|m| m["type"] == "verifyCommit"));
+        assert_eq!(trust_gen(&profile), start, "no rebind");
+        assert_eq!(serde_json::to_value(pin_of(&keys)).unwrap(), before);
+        rt.shutdown().await;
+    });
+}
+
+/// A first verification that fails with device-list files left behind
+/// keeps its own last line: `atem pair verify` again pins over them (the
+/// pin removes leftovers first), so no re-pairing is asked for.
+#[test]
+fn a_failed_first_verification_with_leftovers_keeps_its_last_line() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        paired(&dir.path().join("profile"));
+        let (url, mut peer) = Peer::listen().await;
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
+        let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+        let (mut op, question, _, _) = verify_until_the_question(&rt, &mut peer, "acct-op").await;
+        let pairing = crate::paths::ProfilePaths::in_dir(&rt.profile).pairing;
+        crate::paths::write_test_file(&pairing.host_channel_key, b"{}");
+        op.answer(question, AnswerValue::No).await;
+        peer.next("verifyAbort").await;
+        let error = op.done().await.unwrap_err();
+        assert_eq!(error, crate::pair_verify::PAIRED_NOT_VERIFIED);
         rt.shutdown().await;
     });
 }

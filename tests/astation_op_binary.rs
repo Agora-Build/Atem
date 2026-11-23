@@ -141,3 +141,156 @@ fn pair_verify_runs_through_the_auto_started_runtime() {
     assert!(!written.contains("device verification failed"), "{written}");
     assert!(sandbox.runtime_pid().is_some(), "the runtime ran it");
 }
+
+/// A device's keys from fixed secrets: the plain `cred/device_keys` file
+/// (before its first escrow; the cred agent seals it when it starts) and
+/// the public keys a verification pinned (base64).
+struct Keys {
+    device_pub: String,
+    device_sign_pub: String,
+    unlock_auth_pub: String,
+}
+
+fn device_keys(config: &std::path::Path) -> Keys {
+    let (device, sign, unlock) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+    let ed = |secret: [u8; 32]| {
+        b64(&ed25519_dalek::SigningKey::from_bytes(&secret)
+            .verifying_key()
+            .to_bytes())
+    };
+    let keys = Keys {
+        device_pub: b64(
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(device)).as_bytes(),
+        ),
+        device_sign_pub: ed(sign),
+        unlock_auth_pub: ed(unlock),
+    };
+    let cred = support::profile::CredPaths::in_dir(config);
+    std::fs::create_dir_all(&cred.dir).unwrap();
+    std::fs::write(
+        &cred.device_keys,
+        json!({"version": 1, "device": b64(&device), "device_sign": b64(&sign),
+               "unlock_auth": b64(&unlock)})
+        .to_string(),
+    )
+    .unwrap();
+    keys
+}
+
+/// `config`'s trust state: verified with `ASTATION` (safety code `code`)
+/// with `keys` (none: empty), as a verification made before device lists
+/// were pinned left it; `home` recorded or not (older stores have none).
+fn verified_before_lists(config: &std::path::Path, code: &str, keys: Option<&Keys>, home: bool) {
+    let (device_pub, device_sign_pub, unlock_auth_pub) = keys.map_or(("", "", ""), |k| {
+        (&*k.device_pub, &*k.device_sign_pub, &*k.unlock_auth_pub)
+    });
+    let entry = json!({
+        "device_id": "atem-bin", "data_account": "acct-bin", "sign_gen": 1,
+        "astation_sign_pub": "", "astation_enc_pub": "", "recovery_sign_pub": "",
+        "device_pub": device_pub, "device_sign_pub": device_sign_pub,
+        "unlock_auth_pub": unlock_auth_pub,
+        "safety_code": code, "epoch_floor": 0, "account_state": null, "account_epoch": 0,
+    });
+    let mut store = json!({"version": 1, "astations": {ASTATION: entry}});
+    if home {
+        store["home_astation"] = json!(ASTATION);
+    }
+    let trust = support::profile::CredPaths::in_dir(config);
+    std::fs::create_dir_all(&trust.dir).unwrap();
+    std::fs::write(&trust.trust, store.to_string()).unwrap();
+}
+
+/// The note `atem pair verify` prints before a rerun, line by line.
+const RERUN_NOTE_START: &str =
+    "This device was verified before device lists were pinned; verifying again pins one.";
+
+/// Owner decision 2026-11-08 (#128): `atem pair verify` on a pairing
+/// verified before device lists were pinned (no device-list file) says
+/// why and what starting does, asks to continue, then runs the ceremony
+/// again in the next trust generation with the device's own keys: the
+/// cred agent the runtime starts seals the plain key file and reveals the
+/// keys Astation pinned (never fresh ones). Refused at the code here, it
+/// keeps the earlier verification, and the last line says the device
+/// stays verified with no list yet.
+#[test]
+fn pair_verify_verifies_again_with_the_devices_own_keys() {
+    let sandbox = Sandbox::new();
+    paired(&sandbox.config());
+    let keys = device_keys(&sandbox.config());
+    verified_before_lists(&sandbox.config(), "MN3H-A74N-FJE4", Some(&keys), false);
+    let (url, seen) = fake_astation();
+    let mut cli = sandbox.spawn(&["pair", "verify"], &sandbox.home, &[("ASTATION_WS", &url)]);
+    cli.shows("Continue? [y/N]");
+    let written = cli.written();
+    assert!(written.contains(RERUN_NOTE_START), "{written}");
+    assert!(written.contains("even if you cancel"), "{written}");
+    cli.send(b"y\r");
+    let commit = saw(&seen, "verifyCommit");
+    assert_eq!(commit["host_trust_gen"], 2, "{commit}");
+    let reveal = saw(&seen, "verifyReveal");
+    // The keys Astation pinned, from the cred agent: never fresh ones.
+    assert_eq!(reveal["device_pub"], keys.device_pub.as_str(), "{reveal}");
+    assert_eq!(reveal["device_sign_pub"], keys.device_sign_pub.as_str());
+    assert_eq!(reveal["unlock_auth_pub"], keys.unlock_auth_pub.as_str());
+    cli.shows("Does the code on your Mac match? Type y or n:");
+    cli.send(b"n\r");
+    let abort = saw(&seen, "verifyAbort");
+    assert_eq!(abort["reason"], "codes didn't match on atem");
+    assert!(!cli.exits(), "a refused code fails the command");
+    let written = cli.written();
+    assert!(
+        written.contains(
+            "This device stays verified, but no device list is pinned yet. Fix the problem above, then run 'atem pair verify'."
+        ),
+        "{written}"
+    );
+    assert!(!written.contains("isn't verified yet"), "{written}");
+    // The earlier verification is kept; nothing is pinned.
+    let trust: Value = serde_json::from_slice(
+        &std::fs::read(support::profile::CredPaths::in_dir(&sandbox.config()).trust).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        trust["astations"][ASTATION]["safety_code"], "MN3H-A74N-FJE4",
+        "{trust}"
+    );
+    assert_eq!(
+        trust["astations"][ASTATION]["device_pub"],
+        keys.device_pub.as_str()
+    );
+    assert!(
+        trust["pending"].as_object().is_none_or(|p| p.is_empty()),
+        "{trust}"
+    );
+    assert!(!sandbox.config().join("pairing/membership.json").exists());
+    assert!(
+        sandbox.cred_agent_pid().is_some(),
+        "the runtime's cred agent"
+    );
+}
+
+/// A rerun never makes fresh keys: a verified pairing with no key files at
+/// all (an old store, no home recorded) is refused before anything moves,
+/// with the reset steps; Astation gets no `verifyCommit`.
+#[test]
+fn pair_verify_never_reruns_with_fresh_keys() {
+    let sandbox = Sandbox::new();
+    paired(&sandbox.config());
+    verified_before_lists(&sandbox.config(), "MN3H-A74N-FJE4", None, false);
+    let (url, seen) = fake_astation();
+    let mut cli = sandbox.spawn(&["pair", "verify"], &sandbox.home, &[("ASTATION_WS", &url)]);
+    assert!(!cli.exits(), "refused");
+    let written = cli.written();
+    assert!(written.contains(RERUN_NOTE_START), "{written}");
+    assert!(written.contains("no key files on disk"), "{written}");
+    assert!(
+        written.contains("then run `atem unpair` and `atem pair`"),
+        "{written}"
+    );
+    assert!(!written.contains("Continue?"), "{written}");
+    assert!(
+        !seen.try_iter().any(|(kind, _)| kind == "verifyCommit"),
+        "no verifyCommit"
+    );
+    assert!(!sandbox.config().join("cred/device_keys.sealed").exists());
+}

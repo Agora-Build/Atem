@@ -473,19 +473,51 @@ pub(crate) async fn request_key_after_verification(
 /// the warning line printed just before it.
 pub(crate) const PAIRED_NOT_VERIFIED: &str = "Paired, but this device isn't verified yet. Fix the problem above, then run 'atem pair verify'.";
 
+/// What `atem pair verify` ends with when a verification that was to pin a
+/// device list for a device verified before lists were pinned failed: its
+/// earlier verification is kept, still with no list.
+pub(crate) const VERIFIED_NO_LIST: &str = "This device stays verified, but no device list is pinned yet. Fix the problem above, then run 'atem pair verify'.";
+
+/// What `atem pair verify` ends with when a rerun failed after a pin that
+/// couldn't be taken back (in full or in part): a list its verification
+/// never confirmed, which `atem pair verify` won't run over again. Leftovers
+/// without the list fail the host closed; a whole list left still opens.
+pub(crate) const PIN_LEFT: &str = "The device list couldn't be taken back after this failure, so this host keeps a list its verification never confirmed (remote access may be refused): pair it again with `atem unpair`, then `atem pair`.";
+
+/// `atem pair verify` on a device verified before device lists were pinned
+/// (a rerun), before anything moves: why it verifies again, what starting
+/// does on this host, and after. Starting moves the pairing to the next
+/// host trust generation, durably, whatever follows; the session host takes
+/// it at the pin (`reopen_list_if_changed`) or, after a cancelled or failed
+/// rerun, when the link is next considered (a reconnect or
+/// re-authentication, `sync_link`) or the runtime starts:
+/// `SessionHost::change_trust_gen`.
+pub(crate) const RERUN_NOTE: [&str; 3] = [
+    "This device was verified before device lists were pinned; verifying again pins one.",
+    "Starting moves this host to its next trust generation, even if you cancel later: Astation's current remote sessions on this host end when the list is pinned or, if it doesn't finish (you cancel, or it fails), at the next connection to Astation or restart of Atem's runtime. Its leases are revoked, the work it queued that hasn't started is rejected, and Codex \"always allow\" rules are dropped.",
+    "Once the list is pinned, Astation reaches this host only through its r9 apps.",
+];
+/// The rerun's confirmation, before anything moves: only `y` goes on.
+pub(crate) const RERUN_QUESTION: &str = "Continue? [y/N]";
+/// A rerun not confirmed.
+pub(crate) const RERUN_CANCELLED: &str = "Cancelled; nothing changed.";
+
 /// `atem pair` after the pairing was saved, and `atem pair verify`: a failed
 /// verification shows its reason (one warning line), then ends the command
-/// with `PAIRED_NOT_VERIFIED`, so the exit status is nonzero and the last
-/// line says what is and isn't done. The pairing stays saved either way.
+/// with `failed` (`PAIRED_NOT_VERIFIED`, or `VERIFIED_NO_LIST` for a device
+/// verifying again to pin a device list), so the exit status is nonzero and
+/// the last line says what is and isn't done. The pairing stays saved
+/// either way.
 pub(crate) fn verification_result(
     verification: Result<()>,
+    failed: &'static str,
     mut warn: impl FnMut(&str),
 ) -> Result<()> {
     match verification {
         Ok(()) => Ok(()),
         Err(error) => {
             warn(&format!("\u{26a0}\u{fe0f}  {error}"));
-            Err(anyhow!(PAIRED_NOT_VERIFIED))
+            Err(anyhow!(failed))
         }
     }
 }
@@ -851,11 +883,18 @@ mod tests {
     /// an error that says the pairing stands and the device isn't verified.
     #[test]
     fn pair_fails_after_a_failed_verification() {
-        assert!(verification_result(Ok(()), |_| panic!("nothing to warn about")).is_ok());
+        assert!(
+            verification_result(Ok(()), PAIRED_NOT_VERIFIED, |_| panic!(
+                "nothing to warn about"
+            ))
+            .is_ok()
+        );
         let mut warned = Vec::new();
-        let error = verification_result(Err(anyhow!("codes didn't match")), |line| {
-            warned.push(line.to_string())
-        })
+        let error = verification_result(
+            Err(anyhow!("codes didn't match")),
+            PAIRED_NOT_VERIFIED,
+            |line| warned.push(line.to_string()),
+        )
         .unwrap_err();
         assert_eq!(
             warned,
@@ -871,6 +910,25 @@ mod tests {
         assert!(
             !error.to_string().contains("verification failed"),
             "{error}"
+        );
+    }
+
+    /// `atem pair verify` verifying again to pin a device list (the device
+    /// was verified before lists were pinned): a failure keeps the earlier
+    /// verification, and the last line says so.
+    #[test]
+    fn a_failed_rerun_says_the_device_stays_verified() {
+        let mut warned = Vec::new();
+        let error = verification_result(
+            Err(anyhow!("codes didn't match")),
+            VERIFIED_NO_LIST,
+            |line| warned.push(line.to_string()),
+        )
+        .unwrap_err();
+        assert_eq!(warned, ["\u{26a0}\u{fe0f}  codes didn't match".to_string()]);
+        assert_eq!(
+            error.to_string(),
+            "This device stays verified, but no device list is pinned yet. Fix the problem above, then run 'atem pair verify'."
         );
     }
 

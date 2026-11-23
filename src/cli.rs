@@ -1417,9 +1417,12 @@ async fn run_pair_with<F: std::future::Future<Output = Result<()>>>(
 
 /// `atem pair verify` — verifies this device with the paired Astation on the
 /// runtime's authenticated link (sessions, viewers and chats stay
-/// connected). Does nothing when that Astation already verified it, and
-/// refuses after a revocation, offline. A cancelled or failed verification
-/// keeps the pairing.
+/// connected). Does nothing when that Astation already verified it, unless
+/// it was verified before device lists were pinned: then it verifies again
+/// to pin one, once confirmed (a rerun: Astation's r8 sessions end at the
+/// pin or, if it doesn't finish, at the link's next connection; the
+/// runtime says so first). Refuses after a revocation, offline. A cancelled
+/// or failed verification keeps the pairing.
 async fn run_pair_verify(src: &crate::profile::Sources) -> Result<()> {
     run_pair_verify_with(src, || {
         crate::runtime::op_client::run(
@@ -1439,7 +1442,7 @@ async fn run_pair_verify_with<F: std::future::Future<Output = Result<()>>>(
             println!("{message}");
             Ok(())
         }
-        crate::status::VerifyStart::Verify(_) => op().await,
+        crate::status::VerifyStart::Verify { .. } => op().await,
     }
 }
 
@@ -2452,6 +2455,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         paired_profile(dir.path());
         trust_file(dir.path(), false);
+        crate::status::tests::pin_list(dir.path());
         let mut src = crate::profile::Sources::in_dir(dir.path());
         let listener = trap(&mut src);
         let before = files(dir.path());
@@ -2459,6 +2463,25 @@ mod tests {
         run_pair_verify_with(&src, never).await.unwrap();
         assert_never_dialed(&listener);
         assert_eq!(files(dir.path()), before);
+    }
+
+    /// Verified before device lists were pinned: the runtime runs the
+    /// ceremony again (the CLI itself still dials nothing).
+    #[tokio::test]
+    async fn pair_verify_when_verified_without_a_device_list_asks_the_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        paired_profile(dir.path());
+        trust_file(dir.path(), false);
+        let mut src = crate::profile::Sources::in_dir(dir.path());
+        let listener = trap(&mut src);
+        let asked = std::sync::atomic::AtomicBool::new(false);
+        let op = || async {
+            asked.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        };
+        run_pair_verify_with(&src, op).await.unwrap();
+        assert!(asked.load(std::sync::atomic::Ordering::SeqCst));
+        assert_never_dialed(&listener);
     }
 
     #[tokio::test]
