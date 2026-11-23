@@ -459,14 +459,23 @@ pub struct QueuedLaunch {
     pub admission: super::Admission,
 }
 
-/// A `host_sender_revoke` entry [`list_effects`] applied: what its result
-/// to the host's own Station names (host-work-v1 §11.4 wire rule 4's entry
-/// form, [`super::acks::Acked::entry`]).
+/// A `host_sender_revoke` entry of another host [`list_effects`] applied:
+/// what its result to the host's own Station names (host-work-v1 §11.4
+/// wire rule 4's entry form, [`super::acks::Acked::entry`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevokeApplied {
     pub host_id: String,
     pub entry: EntryRef,
     pub interrupt_running: bool,
+}
+
+/// A `host_sender_readmit` of another host [`list_effects`] applied, at
+/// `seq`: the results of that host's revokes before it are no longer sent
+/// (host-work-v1 §11.4, "A host sender's revoke entry", "Resends").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadmitApplied {
+    pub host_id: String,
+    pub seq: u64,
 }
 
 /// What [`list_effects`] asks of the bridge once its transaction
@@ -480,18 +489,25 @@ pub struct ListEffects {
     /// bridge drops them from its queue, and its spawn check refuses one the
     /// launcher holds.
     pub launches: Vec<(String, &'static str)>,
-    /// Every `host_sender_revoke` applied, in `seq` order: their results
-    /// are written in the same transaction (`host_senders_pass`).
+    /// Every `host_sender_revoke` of another host applied, in `seq` order:
+    /// their results are written in the same transaction
+    /// (`host_senders_pass`). This host's own revocation as a sender is no
+    /// result it owes: nothing here applies it (no host sends to itself;
+    /// its own sends stop by the committed list), as its removal isn't.
     pub revokes: Vec<RevokeApplied>,
+    /// Every `host_sender_readmit` of another host applied, in `seq`
+    /// order: they lift that host's earlier revokes' results.
+    pub readmits: Vec<ReadmitApplied>,
 }
 
 /// The effects on host senders' tasks of `list`'s entries after `after`
 /// (host-work's applied `seq`) up to its head, in `tx`, entry by entry
 /// (design II.2.2, II.3.1, II.8), and on `launches` (this run's queued
 /// launches on message); what must wait for the commit is returned, with
-/// the revokes applied. The caller writes the new applied `seq` in the
-/// same transaction, and the revokes' results owed the host's own Station
-/// (host-work-v1 §11.4 wire rule 4's entry form).
+/// the revokes and readmits of other hosts applied. The caller writes the
+/// new applied `seq` in the same transaction, and the revokes' results
+/// owed the host's own Station (host-work-v1 §11.4 wire rule 4's entry
+/// form), those the readmits lift kept but no longer sent.
 ///
 /// - **`host_sender_revoke`** at `seq` (II.3.1): the sender's tasks
 ///   admitted before it (their generation below `seq`) stop as a revoke
@@ -546,6 +562,7 @@ pub fn list_effects(
     let mut out = Vec::new();
     let mut stopped = Vec::new();
     let mut revokes = Vec::new();
+    let mut readmits = Vec::new();
     // The list as of each project entry (`ListAsOf`), read forward once
     // from the first one; host senders' tasks a project entry may stop,
     // read at the first one; the queued launches not stopped yet.
@@ -568,13 +585,23 @@ pub fn list_effects(
                 if *interrupt_running {
                     effects::interrupt(store, tx, &principal, &tasks, &seq.to_string(), &mut out)?;
                 }
-                revokes.push(RevokeApplied {
+                if host_id != this_host {
+                    revokes.push(RevokeApplied {
+                        host_id: host_id.clone(),
+                        entry: EntryRef {
+                            seq,
+                            entry_hash: entry.hash(),
+                        },
+                        interrupt_running: *interrupt_running,
+                    });
+                }
+            }
+            // No effect on tasks: what is cancelled stays cancelled. Its
+            // host's earlier revokes' results are no longer sent.
+            Action::HostSenderReadmit { host_id } if host_id != this_host => {
+                readmits.push(ReadmitApplied {
                     host_id: host_id.clone(),
-                    entry: EntryRef {
-                        seq,
-                        entry_hash: entry.hash(),
-                    },
-                    interrupt_running: *interrupt_running,
+                    seq,
                 });
             }
             Action::RemoveHost { host_id } if host_id != this_host => {
@@ -609,6 +636,7 @@ pub fn list_effects(
         followups: out,
         launches: stopped,
         revokes,
+        readmits,
     })
 }
 

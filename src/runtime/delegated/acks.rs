@@ -82,13 +82,16 @@
 //!   (`seq`, `entry_hash`) and that applied `seq`; its revocation, and its
 //!   interrupt when it asked for one, `applied`. Feedless (rule 9: the ack
 //!   names the host's own Station's feed and cursor), in force and bounded
-//!   by no deadline: once per connection, as §11.4 says, and kept. Never
-//!   `pending` (**Atem's reading, for Astation's confirmation**: host-work
-//!   writes an entry's effects in the pass after the device list commits
-//!   it, and while it can't write them it can't write a result either). A
-//!   store whose feeds aren't loaded for its identity (its control state
-//!   doesn't read) owes it in the table ([`AckBook::owe`]), for the book
-//!   that loads it.
+//!   by no deadline: once per connection, as §11.4 says, and kept; once
+//!   host-work applied a later `host_sender_readmit` of the same host, kept
+//!   but never sent again ([`AckBook::on_readmitted`], `superseded_by`).
+//!   Due only with `host.senders` on: with it off, rows an earlier run
+//!   wrote wait as they are. Never `pending` (**Atem's readings, for
+//!   Astation's confirmation**: host-work writes an entry's effects in the
+//!   pass after the device list commits it, and while it can't write them
+//!   it can't write a result either). A store whose feeds aren't loaded for
+//!   its identity (its control state doesn't read) owes it in the table
+//!   ([`AckBook::owe`]), for the book that loads it.
 //! - **A new host identity's store** reads its feed from 0 and acknowledges
 //!   what it applied itself (**Atem's reading, for Astation and
 //!   Auth/Portal**): a stop applied under the previous identity is
@@ -136,24 +139,34 @@ pub const ONCE_KEPT_MS: u64 = 600_000;
 /// `entry_hash`. `alone`: 1 when it replaced another body's result under
 /// its `record_id` (ruling T36b, N2): it goes in an ack of its own.
 /// `applied_seq`: an entry's, host-work's applied device-list `seq` its
-/// effects were written with; `NULL` for a record.
+/// effects were written with; `NULL` for a record. `superseded_by`: an
+/// entry's, the `seq` of the later `host_sender_readmit` of the same host
+/// host-work applied: the row is kept and never sent again (`NULL`: in
+/// force, or a record).
 const TABLE: &str = "CREATE TABLE IF NOT EXISTS control_acks (
     origin TEXT NOT NULL, feed_id TEXT NOT NULL, key TEXT NOT NULL, principal TEXT NOT NULL,
     digest TEXT NOT NULL, effects TEXT NOT NULL, resend_until_ms INTEGER, sent_gen INTEGER,
     sent_ms INTEGER, alone INTEGER NOT NULL DEFAULT 0, applied_seq INTEGER,
-    PRIMARY KEY(principal, key))";
+    superseded_by INTEGER, PRIMARY KEY(principal, key))";
 
-/// The table, made if missing; one of a build before entry results gets
-/// its `applied_seq` column first.
+/// The columns a table of an earlier build lacks, in the order they came.
+const NEW_COLUMNS: [&str; 2] = ["applied_seq", "superseded_by"];
+
+/// The table, made if missing; one of an earlier build gets its new
+/// columns first.
 fn prepare(db: &Connection) -> Result<()> {
-    let (made, present): (bool, bool) = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='control_acks'),
-            EXISTS(SELECT 1 FROM pragma_table_info('control_acks') WHERE name='applied_seq')",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
-    if made && !present {
-        db.execute_batch("ALTER TABLE control_acks ADD COLUMN applied_seq INTEGER")?;
+    for column in NEW_COLUMNS {
+        let (made, present): (bool, bool) = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='control_acks'),
+                EXISTS(SELECT 1 FROM pragma_table_info('control_acks') WHERE name=?1)",
+            [column],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if made && !present {
+            db.execute_batch(&format!(
+                "ALTER TABLE control_acks ADD COLUMN {column} INTEGER"
+            ))?;
+        }
     }
     db.execute_batch(TABLE)?;
     Ok(())
@@ -319,6 +332,9 @@ pub struct Acked {
     /// The state took it as a collision (`Why::Collision`, ruling T36b,
     /// N2): never kept.
     pub collision: bool,
+    /// An entry's: the later `host_sender_readmit` of the same host the
+    /// same transaction applied (its `seq`): kept, never sent.
+    pub superseded: Option<u64>,
 }
 
 impl Acked {
@@ -335,6 +351,7 @@ impl Acked {
             effects: applied.effects.clone(),
             resend: Resend::of(record, applied),
             collision: applied.why == Some(Why::Collision),
+            superseded: None,
         }
     }
 
@@ -348,7 +365,9 @@ impl Acked {
     /// revocation's first (a native's `interrupt_running` for it waits,
     /// `pending`, until host-work's applied `seq` reaches the entry, then
     /// is a duplicate). In force and bounded by no deadline: once per
-    /// connection (§11.4).
+    /// connection (§11.4), until host-work applies a later
+    /// `host_sender_readmit` of the same host ([`Acked::superseded`],
+    /// [`AckBook::on_readmitted`]).
     pub fn entry(
         host_id: &str,
         entry: EntryRef,
@@ -372,6 +391,7 @@ impl Acked {
             effects,
             resend: Resend::PerConnection,
             collision: false,
+            superseded: None,
         }
     }
 
@@ -429,11 +449,17 @@ struct Row {
     /// It replaced another body's result under its `record_id` (ruling
     /// T36b, N2): it goes in an ack of its own.
     alone: bool,
+    /// An entry's lifted by a later readmit (its `seq`): kept, never due.
+    superseded: Option<u64>,
 }
 
 impl Row {
     /// Due on `link` at `now_d`; `held`: the connection a refusal came on.
+    /// Never an entry's a readmit lifted.
     fn due(&self, link: Link, held: Option<Link>, now_d: Option<u64>) -> bool {
+        if self.superseded.is_some() {
+            return false;
+        }
         let on_this = matches!(self.sent, Sent::On { link: l, .. } if l == link);
         match self.resend {
             _ if self.sent == Sent::Never => true,
@@ -515,12 +541,13 @@ impl Row {
     /// The row in `tx`, its sent marks cleared (an upsert by its key).
     fn write(&self, tx: &Connection) -> Result<()> {
         tx.execute(
-            "INSERT INTO control_acks(origin,feed_id,key,principal,digest,effects,resend_until_ms,sent_gen,sent_ms,alone,applied_seq)
-            VALUES(?1,?2,?3,?4,?5,?6,?7,NULL,NULL,?8,?9)
+            "INSERT INTO control_acks(origin,feed_id,key,principal,digest,effects,resend_until_ms,sent_gen,sent_ms,alone,applied_seq,superseded_by)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,NULL,NULL,?8,?9,?10)
             ON CONFLICT(principal,key) DO UPDATE SET origin=excluded.origin,
                 feed_id=excluded.feed_id, digest=excluded.digest, effects=excluded.effects,
                 resend_until_ms=excluded.resend_until_ms, sent_gen=NULL, sent_ms=NULL,
-                alone=excluded.alone, applied_seq=excluded.applied_seq",
+                alone=excluded.alone, applied_seq=excluded.applied_seq,
+                superseded_by=excluded.superseded_by",
             params![
                 self.origin,
                 self.feed_id,
@@ -531,6 +558,7 @@ impl Row {
                 self.resend.stored(),
                 i64::from(self.alone),
                 self.subject.applied_seq(),
+                self.superseded.map(|seq| i64::try_from(seq).unwrap_or(i64::MAX)),
             ],
         )?;
         Ok(())
@@ -569,7 +597,7 @@ impl AckBook {
         let mut book = AckBook::default();
         let mut q = db.prepare(
             "SELECT origin, feed_id, key, principal, digest, effects, resend_until_ms, sent_gen,
-                alone, applied_seq
+                alone, applied_seq, superseded_by
             FROM control_acks ORDER BY rowid",
         )?;
         // Each column read as whatever it holds: a row that doesn't read is
@@ -582,34 +610,43 @@ impl AckBook {
                 r.get::<_, Option<i64>>(7).ok(),
                 r.get::<_, i64>(8).ok(),
                 r.get::<_, Option<i64>>(9).ok(),
+                r.get::<_, Option<i64>>(10).ok(),
             ))
         })?;
         for row in rows {
-            let read = row
-                .ok()
-                .and_then(|(texts, resend, sent, alone, applied_seq)| {
-                    let (Some(origin), Some(feed_id), Some(key), Some(principal)) =
-                        (texts.0, texts.1, texts.2, texts.3)
-                    else {
-                        return None;
-                    };
-                    let digest = Hash32::from_hex(&texts.4?).ok()?;
-                    let row = Row {
-                        origin,
-                        feed_id,
-                        principal,
-                        subject: Subject::read(key, digest, applied_seq?)?,
-                        effects: read_effects(&texts.5?).ok()?,
-                        resend: Resend::read(resend?)?,
-                        sent: if sent?.is_some() {
-                            Sent::Earlier
-                        } else {
-                            Sent::Never
-                        },
-                        alone: alone? != 0,
-                    };
-                    writable(&row.result()).then_some(row)
-                });
+            let read =
+                row.ok()
+                    .and_then(|(texts, resend, sent, alone, applied_seq, superseded)| {
+                        let (Some(origin), Some(feed_id), Some(key), Some(principal)) =
+                            (texts.0, texts.1, texts.2, texts.3)
+                        else {
+                            return None;
+                        };
+                        let digest = Hash32::from_hex(&texts.4?).ok()?;
+                        let subject = Subject::read(key, digest, applied_seq?)?;
+                        // Only an entry is lifted by a readmit.
+                        let superseded = match (superseded?, &subject) {
+                            (None, _) => None,
+                            (Some(seq), Subject::Entry { .. }) => Some(u64::try_from(seq).ok()?),
+                            (Some(_), Subject::Record { .. }) => return None,
+                        };
+                        let row = Row {
+                            origin,
+                            feed_id,
+                            principal,
+                            subject,
+                            effects: read_effects(&texts.5?).ok()?,
+                            resend: Resend::read(resend?)?,
+                            sent: if sent?.is_some() {
+                                Sent::Earlier
+                            } else {
+                                Sent::Never
+                            },
+                            alone: alone? != 0,
+                            superseded,
+                        };
+                        writable(&row.result()).then_some(row)
+                    });
             match read {
                 Some(row) => book.rows.push(row),
                 None => book.unreadable += 1,
@@ -703,6 +740,7 @@ impl AckBook {
                 resend,
                 sent: Sent::Never,
                 alone,
+                superseded: acked.superseded,
             };
             row.write(tx)?;
             match held {
@@ -713,20 +751,72 @@ impl AckBook {
         Ok(())
     }
 
-    /// `results`, host senders' revoke entries' ([`Acked::entry`]), written
-    /// in `tx` (the transaction of their effects) where no book is loaded
-    /// for the store's identity (its control state doesn't read): owed to
-    /// the book that loads the table, its table made if missing. Each
-    /// entry's is written once (host-work applies an entry once: its
-    /// applied `seq` moves past it in the same transaction), so no bound
-    /// or collision applies; one the shared writer wouldn't take isn't
-    /// written.
-    pub fn owe(tx: &Connection, results: &[Acked]) -> Result<()> {
-        if results.is_empty() {
+    /// `readmits` (each `(host:<host_id>, seq)`: a `host_sender_readmit`
+    /// host-work applied in `tx`, in `seq` order) lift that host's entry
+    /// results written before them: each row of its revokes at a lower
+    /// `seq`, not lifted yet, gets the readmit's `seq` (`superseded_by`),
+    /// in `tx` and here. A lifted row is kept, never due again: its
+    /// revocation is no longer in force (host-work-v1 §11.4, "A host
+    /// sender's revoke entry", "Resends"). Call it before
+    /// [`AckBook::on_committed`] with the same transaction's results, which
+    /// carry their own ([`Acked::superseded`]).
+    pub fn on_readmitted(&mut self, tx: &Connection, readmits: &[(String, u64)]) -> Result<()> {
+        for (principal, readmit) in readmits {
+            for row in &mut self.rows {
+                let Subject::Entry { entry, .. } = &row.subject else {
+                    continue;
+                };
+                if row.principal != *principal || entry.seq >= *readmit || row.superseded.is_some()
+                {
+                    continue;
+                }
+                tx.execute(
+                    "UPDATE control_acks SET superseded_by=?3 WHERE principal=?1 AND key=?2",
+                    params![
+                        principal,
+                        row.subject.key(),
+                        i64::try_from(*readmit).unwrap_or(i64::MAX)
+                    ],
+                )?;
+                row.superseded = Some(*readmit);
+            }
+        }
+        Ok(())
+    }
+
+    /// `results`, host senders' revoke entries' ([`Acked::entry`]), and
+    /// `readmits` (as [`AckBook::on_readmitted`] takes them), written in
+    /// `tx` (the transaction of their effects) where no book is loaded for
+    /// the store's identity (its control state doesn't read): owed to the
+    /// book that loads the table, its table made if missing; the readmits
+    /// lift the rows already there first. Each entry's result is written
+    /// once (host-work applies an entry once: its applied `seq` moves past
+    /// it in the same transaction), so no bound or collision applies; one
+    /// the shared writer wouldn't take isn't written, and is logged.
+    pub fn owe(tx: &Connection, results: &[Acked], readmits: &[(String, u64)]) -> Result<()> {
+        if results.is_empty() && readmits.is_empty() {
             return Ok(());
         }
         prepare(tx)?;
-        for acked in results.iter().filter(|a| writable(&a.result())) {
+        for (principal, readmit) in readmits {
+            tx.execute(
+                "UPDATE control_acks SET superseded_by=?2 WHERE principal=?1
+                AND applied_seq IS NOT NULL AND superseded_by IS NULL
+                AND CAST(substr(key, ?3) AS INTEGER) < ?2",
+                params![
+                    principal,
+                    i64::try_from(*readmit).unwrap_or(i64::MAX),
+                    ENTRY_KEY.len() + 1
+                ],
+            )?;
+        }
+        for acked in results {
+            if !writable(&acked.result()) {
+                eprintln!(
+                    "atem runtime: a host sender's revoke result the shared writer refused; not kept"
+                );
+                continue;
+            }
             Row {
                 origin: acked.origin.clone(),
                 feed_id: acked.feed_id.clone(),
@@ -736,6 +826,7 @@ impl AckBook {
                 resend: acked.resend,
                 sent: Sent::Never,
                 alone: false,
+                superseded: acked.superseded,
             }
             .write(tx)?;
         }
@@ -743,7 +834,9 @@ impl AckBook {
     }
 
     /// The acks due on `link` at `now_d` (`D`; `None`: no reading, so no
-    /// resend by time), naming `feed` (the host's own Station's feed and its
+    /// resend by time), host senders' entry results only with `entries`
+    /// (`host.senders` on: with it off they wait as they are, ruling R57,
+    /// L1), never one a readmit lifted, naming `feed` (the host's own Station's feed and its
     /// committed cursor; `None`: none read, nothing goes) under `claim`: the
     /// results due, at most [`MAX_ACK_RESULTS`] an ack and a `record_id` or
     /// an entry `seq` once each (wire rule 6), or one ack with none when only
@@ -755,6 +848,7 @@ impl AckBook {
         feed: Option<(&str, u64)>,
         claim: &Claim,
         now_d: Option<u64>,
+        entries: bool,
     ) -> Vec<DueAck> {
         let id = (link.link_gen, link.socket);
         let (Some(origin), Some((feed_id, cursor))) = (link.origin.as_deref(), feed) else {
@@ -766,7 +860,11 @@ impl AckBook {
         let due: Vec<&Row> = self
             .rows
             .iter()
-            .filter(|r| (r.origin.is_empty() || r.origin == origin) && r.due(id, self.held, now_d))
+            .filter(|r| {
+                (r.origin.is_empty() || r.origin == origin)
+                    && (entries || !matches!(r.subject, Subject::Entry { .. }))
+                    && r.due(id, self.held, now_d)
+            })
             .collect();
         let moved = self
             .acked

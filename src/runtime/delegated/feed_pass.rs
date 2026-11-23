@@ -522,7 +522,11 @@ impl HostBridge {
             return Vec::new();
         };
         let now_d = self.start_view().now_d_ms;
-        feeds.acks_due(link, now_d)
+        // Host senders' revoke entries' results only with `host.senders`:
+        // with it off, rows an earlier run wrote wait as they are (ruling
+        // R57, L1).
+        let entries = self.features.delegated && self.features.senders;
+        feeds.acks_due(link, now_d, entries)
     }
 
     /// An ack's wire text, by the shared core's builder; one it refuses
