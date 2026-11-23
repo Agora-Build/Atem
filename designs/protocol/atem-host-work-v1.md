@@ -4,7 +4,8 @@ Status: implemented and released (Atem v0.8.2). §11 (delegated work):
 `host.delegated` and `host.alerts` are built (step 4, 2026-11-14) behind a
 debug-only hook and advertised by no release build, and so is Atem's side of
 `host.senders` (2026-11-17): behind the same hook a debug build lists it
-with hosting on, answers `host_enc_key_get` and `control_records`, judges
+with hosting on, answers `host_enc_key_get`, `host_enc_key_new` (the routine
+rotation of its key, §11.5) and `control_records`, judges
 what a host sender may do on the receiving host (§11.6 "Host senders on the
 receiving host"), and runs both hosts' sides of host senders' mail (§11.5).
 Not built: a Station's side of the mailbox, and the host encryption key in
@@ -863,7 +864,7 @@ three features, defined in `atem_client::session::host_work`
 |---|---|
 | `host.delegated` | `work_interrupt`, `work_resolve` (§11.2) |
 | `host.alerts` | `alert_list` (§11.3), and the push hint of kind `outcome_unknown` (session-v1 R9.9) |
-| `host.senders` | `control_records` (session-v1 R9.3, R9.8; §11.1), `host_enc_key_get` (session-v1 R9.8, R9.14); and host senders' objects through the mailbox (§11.5), with `select` inside their envelopes (agreed with Astation 2026-11-16) |
+| `host.senders` | `control_records` (session-v1 R9.3, R9.8; §11.1), `host_enc_key_get` and `host_enc_key_new` (session-v1 R9.8, R9.14; §11.5, "The routine rotation of a host's key"); and host senders' objects through the mailbox (§11.5), with `select` inside their envelopes (agreed with Astation 2026-11-16) |
 
 **No release build advertises them in this version.** `host.delegated` and
 `host.alerts` are built (step 4 of the design's order of work, 2026-11-14)
@@ -873,16 +874,17 @@ environment (no client passes `ATEM_TEST_*` to a runtime it starts) lists
 them in its `welcome` and serves their ops. Release builds compile the hook
 out. The same hook takes `host.senders` (only with `host.delegated`): a
 debug build then lists it with hosting on, holds its host encryption key
-(design II.4.1) and answers `host_enc_key_get` (session-v1 R9.14 item 8)
-and `control_records` (§11.1 "Carriage", as built). A host refuses
+(design II.4.1) and answers `host_enc_key_get` and `host_enc_key_new`
+(session-v1 R9.14 item 8; the routine rotation, §11.5) and
+`control_records` (§11.1 "Carriage", as built). A host refuses
 each op of a feature it doesn't list as it refuses any such op: a session op
-(`control_records`, `host_enc_key_get`) is `unsupported_version` with no
+(`control_records`, `host_enc_key_get`, `host_enc_key_new`) is `unsupported_version` with no
 effect (session-v1 R9.8; **Atem's choice of code, agreed with Astation (2026-11-11, #120
 comment 6810116314)**), and a host-work request (`work_interrupt`, `work_resolve`,
 `alert_list`) is `busy` (§7, §11.2, §11.3). Clients check
 `welcome.features` first; the client core
-refuses to send `control_records` or `host_enc_key_get` to a host that
-doesn't list `host.senders` (`host feature not available`). The lifecycle
+refuses to send `control_records`, `host_enc_key_get` or `host_enc_key_new`
+to a host that doesn't list `host.senders` (`host feature not available`). The lifecycle
 these ops serve (§11.6) and session-v1's side of it (R9.14) are built with
 them, behind the same hook, and so is Atem's side of host senders: the
 receiving host's authority and the device list's effects on their tasks
@@ -3920,25 +3922,122 @@ comes before its generation.
 **The recipient's keys.** A host accepts mail sealed to its current host
 encryption key, and to the previous one only inside its 24 h window, counted
 on its own clock from when it applied the rotation, and never after a
-rotation with `retire_previous` (R9.2). It **should** also accept a key it
-generated and handed out but whose `host_enc_key` its own list hasn't
-applied yet: a sender whose list already has the entry seals to it, and the
-mail then opens at once, instead of waiting until this host's list reaches
-the head the sender signed at (Pending). A host judges a pending object
-again after each device-list advance and each change of the keys it accepts.
-Mail to any other key it made is refused `enc_key_not_accepted` once this
-host's head is at or beyond the head the object names. Amended for step
+rotation with `retire_previous` (R9.2). **Committed-list authority (agreed
+with Astation on 2026-11-23, #120 comment 7089435308, replacing the earlier
+"should also accept"):** both are the keys its committed device list holds
+for it: a key the host generated and handed out but whose `host_enc_key`
+its own list hasn't applied yet (a rotation's pending key, or its first key
+before its entry) is not an accepted key. Mail sealed to it waits for this
+host's list to reach the head the sender signed at (Pending), and opens once
+the list applies the entry (the host promotes the key first, "The routine
+rotation" below). A host judges a pending object again after each
+device-list advance and each change of the keys it accepts (a promotion, a
+retirement). Mail to any other key it made, or to a key it retired, is
+refused `enc_key_not_accepted` once this host's head is at or beyond the
+head the object names. Amended for step
 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**: the host also passes the id of every key it made in
 its current trust generation (`generated`), from its own record, never
 from its device list; a key it accepts counts as made, listed there or
 not. It writes
-each id to that record durably before `host_enc_key_get` hands the key
-out, and keeps it for the generation; a lost record is rebuilt from the
-private keys it still holds for that generation (design II.4.1). Every
+each id to that record durably before `host_enc_key_get` or
+`host_enc_key_new` hands the key out, and keeps it for the generation; a
+lost record is rebuilt from the private keys it still holds for that
+generation (design II.4.1). Every
 `host_enc_key` entry for a host carries the host's own `enc_sig`, so no
 other key id can ever become one it accepts: mail sealed to one is refused
 `enc_key_not_accepted` at any head and never waits. So a key whose id the
-record lacks has its mail refused for good.
+record lacks has its mail refused for good, and so does one it retired (the
+record's `retired`, below): a retired key never waits.
+
+**The routine rotation of a host's key** (agreed with Astation on
+2026-11-23, #120 comment 7089435308, on Atem's proposal in #120 comment
+7086542274; **built behind the debug-only hook's `host.senders`**:
+`session_protocol/r9/host_enc.rs`, `runtime/delegated/host_key_pass.rs`;
+session-v1 R9.14 item 8):
+
+- **The manager's request.** `host_enc_key_new{id, request_id}` (session-v1
+  R9.14 item 8), from a native member holding `manage` at the host's head,
+  checked at every request and retry; anyone else `forbidden`. The answer is
+  `host_enc_key`'s shape with this request's `request_id` and `state:
+  "pending"`, always echoing this request's `id` (`re`) and `request_id`.
+  `host_enc_key_get` stays a pure read of the current key.
+- **One pending key per trust generation.** The first request makes it; any
+  later request while it is pending (another manager's, or a retry after a
+  lost answer) gets that same key. It is kept with no expiry, no timer and
+  no background minting until an entry sets it or its trust generation
+  goes (a newer `add_host`, a `remove_host`, a new pin). A request while
+  the list has committed an entry setting it and the host hasn't promoted it
+  yet is `busy`, `host encryption key unavailable` (a moment; asked again,
+  the next request makes the next key). A retry after the key was promoted
+  is a new request: it makes a new pending key (the manager's
+  `previous_key_window` advisory says what a second rotation would cut
+  short).
+- **Before the answer**, durably, in this order: a fresh X25519 key whose
+  `enc_kid` is in neither the host's record (made or retired) nor among the
+  keys the committed list set for the host since its `add_host` (drawn again
+  otherwise); its id appended to `pairing/host_enc_generated` and synced;
+  then the key written as `pending` in `pairing/host_enc_key` (format v2),
+  one atomic replace (temp, fsync, rename, directory fsync). Any write that
+  fails is `busy`, `host encryption key unavailable`, and hands out
+  nothing; a pending key handed out again is synced (its file and
+  directory) first. The `enc_sig` is the host's, as for `host_enc_key_get`.
+- **The stamp** (Atem's reading of the agreed "persist the application
+  clock with replayable evidence"). Just before the host writes a device
+  list commit whose newest `host_enc_key` entry for it sets its pending key
+  (a carriage on a channel or its own fetch), it writes into the pending
+  key that entry's `seq` and hash and `D` (the delegated clock's reading,
+  §11.6, the latest one the host took, at or before the commit), one atomic
+  replace, under the same lock as the commit. A stamp is written once per
+  entry: a later commit of the same entry keeps the earlier time, so
+  nothing moves the window later. No `D` then, or a write that fails, or a
+  carriage the start replays (§R9.3) before the delegated clock is read,
+  after a crash that came before its stamp: no stamp, a runtime.log line,
+  and the promotion fails closed (below).
+- **The promotion** (whenever the host brings its key file to its committed
+  list: at every pass where the list moved, at the previous key's
+  deadline, once a minute, and **before any mail is opened**: the
+  receiver's view does it first, so a restart finishes a promotion or a
+  retirement before its first mailbox page). When the list's current key
+  is the pending one, one atomic replace makes it current, and the old
+  current key becomes the previous key, its window starting at the stamp's
+  `D`, when the list keeps it as its previous key, not retired, and the
+  stamp names the entry at the `seq` and hash the list holds. Otherwise it
+  is retired at once: a `retire_previous`, and **no application time
+  (no stamp, or a stamp naming another entry): fail closed, never a fresh
+  24 h**. So a crash between the list's commit and the promotion never
+  restarts or lengthens the window: the deadline is the stamp's, whenever
+  the restart comes. An older previous key goes at the commit of a newer
+  rotation (one previous key only).
+- **The window** is 24 h on the delegated clock `D` (§11.6: `wall_hw`,
+  never lowered, and the boot-time counter, so a sleep counts and a clock
+  set back shortens nothing): the previous key opens mail while `D` is at
+  or past its application and before its application plus 24 h. `D`
+  reading below the application (lowered past it) fails closed: retired at
+  once.
+- **Retirement**: at the deadline, at a `retire_previous`, at a newer
+  rotation, when the list no longer keeps the previous key, and for every
+  key of a generation the list voided (a newer `add_host`, a `remove_host`:
+  the pending key goes with it). The key's id is appended to the record's
+  `retired` (synced) first, then the key file is replaced without the
+  secret. A retired id is never accepted and never waits again, whatever a
+  restored or rolled-back key file holds, and a retirement cut short (the
+  id recorded, the file not yet replaced) is finished at the next pass,
+  the secret meanwhile accepted nowhere: no retired secret ever comes
+  back. `retired` only grows within a generation.
+- **Mail in flight**: after a routine rotation, mail sealed to the old key
+  (a sender whose list is behind) still opens for 24 h. After a
+  `retire_previous`, it is refused `enc_key_not_accepted` and never
+  re-sealed by anyone but its sender. That refusal is step 2's, before the
+  copy is shown to be the sender's, so no status goes back (as for every
+  such refusal, above): the sending host's delivery row stays `sent` and
+  ends `expired`, never accepted or cancelled; a deliberate resend is new
+  work (Astation's answer 3).
+- **`atem status`** shows `Host key:` (the current key's `enc_kid`, a
+  pending one, and the previous one with when its window ends on the
+  delegated clock), from the key file, while the hook made one.
+- **What a rotation can't do**: static-key HPKE gives no forward secrecy
+  across a key compromise (design VI); `retire_previous` stops new exposure
+  only.
 
 **Open items** (left open by Astation's review, 2026-11-11, #120 comment
 6810116314: it signed off the objects above without them, they don't prevent
@@ -5238,7 +5337,11 @@ sender's task"). The routine encryption-key rotation Atem proposed in
 is committed or its generation goes, old-key mail refused under
 `retire_previous` and never re-sealed, `previous_key_window` an advisory
 with an explicit warning, and a 24 h window that a crash never restarts
-or lengthens); it is being built (session-v1 R9.13 item 8, R9.14 item 8).
+or lengthens); it is built behind the debug-only hook (§11.5, "The
+routine rotation of a host's key"; session-v1 R9.13 item 8, R9.14 item 8),
+with Atem's readings where the agreement was silent marked there (the
+stamp, a retry after the promotion, `busy` while a committed key awaits
+its promotion, the voided generation's current key retired too).
 Earlier: the receiving host's mailbox readings
 ([#120 comment 6938206284][c-6938206284]) and this section's wire ([#120
 comment 6903887341][c-6903887341]). All of it runs only behind the

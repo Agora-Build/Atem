@@ -67,7 +67,19 @@ as the host does and tracks each request, and their answers arrive as
 `ClientEvent::Family` with `op` `control_records_result` or `host_enc_key`. A
 `host_enc_key` answer is taken only from the channel's host at its trust
 generation; its `host_id`, `host_trust_gen`, `enc_key.pub` and `enc_sig` are the
-arguments of `host_enc_key_action` (below), which a manager signs.
+arguments of `host_enc_key_action` (below), which a manager signs. A third,
+`host_enc_key_new` (the routine rotation of a host's key, agreed with
+Astation on 2026-11-23, #120 comment 7089435308), has its own sender,
+`send_host_enc_key_new(request_id, now)` → `Outgoing{id, frame}` (WASM
+`sendHostEncKeyNew`; `send_json` takes a hand-built one the same way): keep
+`request_id` (a UUID v4) for a retry after a lost answer. The host answers
+with its one pending key, a `host_enc_key` carrying this request's
+`request_id` and `state: "pending"`, taken only for the request it echoes
+(its `id` as `re`, and `request_id`). Before the owner's fresh
+confirmation, verify its `enc_sig`, then run `check_change` and
+`change_advisories` (below): a `previous_key_window` there needs the
+owner's explicit confirmation that the rotation shortens the older key's
+window.
 
 Persist launch request IDs and immutable message/task identities before sending.
 Recover uncertain results with their query operations; a retry uses a fresh
@@ -250,6 +262,7 @@ UpperCamelCase types (`MembershipLog.verify(accountId:genesisHash:entries:now:)`
 | `draft_entry(signer, signed_at, action_json)` | the next entry's body, checked with the verifier's own schema; show it, then publish (below) |
 | `check_member(member_json)` | a member object for `add` / `recovery_add`, checked |
 | `capacity()` | `CapacityInfo{entries, max_entries, members, max_members, hosts, max_hosts, level, entries_level, members_level, hosts_level}`: the verifier's own counts against its limits (1024 entries; 256 members, counting members in effect and pending `recovery_add`s; 64 current hosts); `level` `ok` / `nearly_full` (≥ 90 % of any) / `full`. From `nearly_full` show a warning per limit (D23): entries, "renewals use one entry each; a full list needs re-pairing"; members, "remove expired or unused services so a place stays free for a Recovery Kit" (a full member list refuses the kit's `recovery_add` too); hosts, "remove hosts no longer used" |
+| `change_advisories(action_json, now_ms)` | after `check_change`, the same arguments (WASM `changeAdvisories`): `[ChangeAdvisoryInfo]`, today `PreviousKeyWindow{host_id, previous_enc_kid, replaced_at_seq}` (JS `{type: "previous_key_window", hostId, previousEncKid, replacedAtSeq}`) for a `host_enc_key` of a host whose previous key isn't retired in the derived state: the list keeps one previous key only, so this rotation, routine or `retire_previous`, ends the window in which the host still opens mail sealed to that key and refuses mail still in flight to it. Show it and ask for an explicit confirmation; a compromise rotation stays possible at once. Empty for a change `check_change` refuses (its refusal stands). Advisory: it bypasses neither `check_change`'s refusals nor the signing gate |
 | `check_change(action_json, now_ms)` | before `draft_entry` (same `action_json`; `now_ms` the `signed_at` it would carry): `None` to go ahead, else `ChangeRefusalInfo` `LogFull` (no entry fits, a removal included), `MembersFull` (no `add`, and no `recovery_add`: a Recovery Kit can't bring the account back until a member is removed), `HostsFull` (no `add_host` of a host that isn't current), `ServiceChangeTooSoon{last_signed_at, retry_at}` (JS `service_change_too_soon`: a service `set_roles` that grants anything new, e.g. a renewal, within 24 h of that service's last grant; a narrowing doesn't restart the clock; narrowing and `remove` are never paced), `AlreadyRevoked` (JS `already_revoked`: a `host_sender_revoke` of a host already revoked; the verifier would refuse it, `already_revoked`), `NotRevoked` (JS `not_revoked`: a `host_sender_readmit` of a host that isn't revoked, a host never added included; `not_revoked`), `EncKeyReused` (JS `enc_key_reused`: a `host_enc_key` of a key already set for that host since its newest `add_host`, the current, previous, a retired or a dropped one; the verifier would refuse it, `enc_key_reused`: ask the host for a new key). The project actions and a revoke of a host never added (the verifier refuses it, `unknown_host`) are never refused here; none of the five actions is paced. Advisory for signers: hosts still accept any valid entry |
 | `admit_carrier(device_id, entries, more, now)` | host role, feature `host` only (never in an app build) |
 | `service_grant(device_id)` | `ServiceGrantInfo{scope, expires_at}` of an active service member (its scope in canonical order), else `None`: what a renewal or narrowing starts from. Status only: an expired service is still returned; compare `expires_at` with the time yourself |
@@ -367,7 +380,7 @@ on_welcome(frame, log, now)             → WelcomeInfo, or AtemError::Refused{n
 list / acquire / renew / release / submit_prompt / submit_interrupt /
 submit_stop / submit_approval / submit_rule_revoke / receipt_query /
 approval_seen / revoke_grant / send_membership / terminal_subscribe /
-chat_open                               → Outgoing{id, frame}   send; replies carry re = id
+chat_open / send_host_enc_key_new       → Outgoing{id, frame}   send; replies carry re = id
 send_json(message_json, now)            → frame                 send (other terminal-v1/chat-v1 messages)
 on_frame(frame, now)                    → [ClientEvent]
 ```
@@ -652,7 +665,9 @@ write the body (not another signer's entry, `retire_previous: false`, a
 missing or extra field, or a set out of order; a shape the verifier refuses
 by itself is the builder's `bad_project`, `malformed` or `wrong_alg` too),
 `check_change` on the redundant revoke and readmit and on a reused host
-key, `verify_host_enc_sig` on every `enc_sig` whose binding fields parse,
+key, `change_advisories` on a host key rotation over a previous key not
+retired (`previous_key_window`), `verify_host_enc_sig` on every `enc_sig`
+whose binding fields parse,
 and (Kotlin and Swift, whose providers see the request) the signing
 purposes.
 

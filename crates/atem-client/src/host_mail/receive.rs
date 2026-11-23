@@ -262,11 +262,13 @@ pub struct Recipient {
     /// head this host's list holds; beyond it, it waits only when it is in
     /// [`generated`](Self::generated).
     ///
-    /// The caller should also list a key it generated and handed out, and
-    /// hasn't retired, before that key's `host_enc_key` entry applies here: a
-    /// sender whose list already has the entry seals to it, and the mail then
-    /// opens at once instead of waiting for this host's list to reach the
-    /// sender's head.
+    /// Committed-list authority (agreed with Astation on 2026-11-23, #120
+    /// comment 7089435308, replacing the earlier advice to list them too):
+    /// the caller lists only keys its committed device list holds, never a
+    /// key it generated whose `host_enc_key` entry hasn't applied here (a
+    /// rotation's pending key): mail sealed to one waits, beyond this head,
+    /// for the list, as [`generated`](Self::generated) says, and opens once
+    /// the host has applied the entry and listed the key.
     pub keys: Vec<(KeyId, [u8; 8])>,
     /// Every `enc_kid` this host made at its current trust generation, from
     /// its own record, never from its device list; a kid in
