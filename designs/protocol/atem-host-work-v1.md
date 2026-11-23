@@ -1591,8 +1591,7 @@ reconstructed safety clock (a revoke counts from any feed, rule 3, and
   it each applies. A current manager's stop so carried is **agreed with
   Astation (2026-11-22, #114 comment 7082464868, item 2)**; the service's
   own key's (a Station's own revoke or interrupt carried unchanged) is
-  **Atem's reading of "Resets" and #114's R4 and item 2, for Astation's
-  confirmation on #114**: item 2 names only manager stops. A removed
+  **Atem's reading of "Resets" and #114's R4 and item 2, agreed with Astation, Astation #114 comment 7089435073**: item 2 names only manager stops. A removed
   manager's original can't be carried: it needs a current manager's fresh
   signature, a new `record_id` (`removed_manager`, I.5.4). Any other
   retained record that doesn't verify at the head isn't the snapshot's to
@@ -4978,13 +4977,19 @@ no effect: the sending host records that cancel `refused by the host
 (busy)`, never as cancelled. The owner's `reply_query` for a host
 sender's selector task, which Atem offered here and Astation asked for in
 that comment, is built behind the hook (§11.2, "The owner's ops on a host
-sender's task"). Earlier: the receiving host's mailbox readings
+sender's task"). The routine encryption-key rotation Atem proposed in
+#120 comment 7086542274 Astation agreed on 2026-11-23 (#120 comment
+7089435308: a separate `host_enc_key_new`, one pending key kept until it
+is committed or its generation goes, old-key mail refused under
+`retire_previous` and never re-sealed, `previous_key_window` an advisory
+with an explicit warning, and a 24 h window that a crash never restarts
+or lengthens); it is being built (session-v1 R9.13 item 8, R9.14 item 8).
+Earlier: the receiving host's mailbox readings
 ([#120 comment 6938206284][c-6938206284]) and this section's wire ([#120
 comment 6903887341][c-6903887341]). All of it runs only behind the
 debug-only hook.
 
-- **Routine encryption-key rotation**, proposed on 2026-11-22 ([#120 comment 7086542274](https://github.com/Agora-Build/Atem/issues/120#issuecomment-7086542274)), for Astation's agreement: a manager's `host_enc_key_new` makes the host's next key (pending, durable before its answer), the host promotes it when it commits the entry, and keeps the previous key 24 h on the delegated clock (none with `retire_previous`). As Astation said, it must define the manager's request, the owner's confirmation, the refusal of a reused key, the publication order and the old key's retention and retirement; `host_enc_key_get` is no rotation, and in-place re-verification is no way to one (session-v1 R9.13 item 8, R9.14 item 8).
-- **The shared pieces for Astation's own run:** the host-result framing vectors and renderers (`framing-host-result-v1.json`, [atem-client-bindings.md](atem-client-bindings.md)), published in the SDK pin `atem-client-sdk-bd19a6358885` with #190's `required_version` helper, whose shape Astation agreed on 2026-11-22 (session-v1 R9.2, "How the signing gate uses it").
+- None today. Astation acknowledged the SDK pins on 2026-11-23 (#120 comment 7089442826) and adopts the production `required_version` and consistency helpers from `atem-client-sdk-de7ec29882f2`.
 
 [c-6903887341]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-6903887341
 [c-7082465179]: https://github.com/Agora-Build/Atem/issues/120#issuecomment-7082465179
