@@ -47,6 +47,11 @@ pub enum SignLabel {
     /// #101): a native member's or a service's signed report of the
     /// verifier its loaded core runs, for a minter's challenge.
     VerifierReport,
+    /// `atem-signer-report` bodies (`member_report::signer`; host-work-v1
+    /// §11.1 "The signer report", agreed with Astation, #114 comment
+    /// 7089435073): a native manager's signed report of its control-record
+    /// signing journal, for a Station's recovery from a rollback.
+    SignerReport,
 }
 
 impl SignLabel {
@@ -66,6 +71,7 @@ impl SignLabel {
             SignLabel::Envelope => "atem-envelope-v1",
             SignLabel::Result => "atem-result-v1",
             SignLabel::VerifierReport => "atem-verifier-report-v1",
+            SignLabel::SignerReport => "atem-signer-report-v1",
         }
     }
 
@@ -83,6 +89,7 @@ impl SignLabel {
             "atem-envelope" => Some(SignLabel::Envelope),
             "atem-result" => Some(SignLabel::Result),
             "atem-verifier-report" => Some(SignLabel::VerifierReport),
+            "atem-signer-report" => Some(SignLabel::SignerReport),
             _ => None,
         }
     }
@@ -153,6 +160,11 @@ pub const STATION_REPORT_ID: &str = "atem-station-report-id-v1";
 /// The `mailbox_id`s the reference mailbox mints from its seed
 /// (`host_mail::reference`).
 pub const REFERENCE_MAILBOX_ID: &str = "atem-reference-mailbox-id-v1";
+/// A signer report's `journal.records_hash`: SHA-256 over this label and
+/// the sorted SHA-256 of each record body (`member_report::signer`).
+pub const SIGNER_REPORT_RECORDS: &str = "atem-signer-report-records-v1";
+/// A signer report's `journal.drafts_hash`, the same over its drafts.
+pub const SIGNER_REPORT_DRAFTS: &str = "atem-signer-report-drafts-v1";
 
 #[cfg(test)]
 mod tests {
@@ -160,7 +172,7 @@ mod tests {
 
     /// Every label, in one list. The match fails to compile until a new
     /// label is listed here too, so the distinctness test covers it.
-    const LABELS: [SignLabel; 14] = [
+    const LABELS: [SignLabel; 15] = [
         SignLabel::MembershipEntry,
         SignLabel::RecoveryCosign,
         SignLabel::BrowserGrant,
@@ -175,6 +187,7 @@ mod tests {
         SignLabel::Result,
         SignLabel::HostRouteProxy,
         SignLabel::VerifierReport,
+        SignLabel::SignerReport,
     ];
 
     const fn listed(label: SignLabel) -> usize {
@@ -193,6 +206,7 @@ mod tests {
             SignLabel::Result => 11,
             SignLabel::HostRouteProxy => 12,
             SignLabel::VerifierReport => 13,
+            SignLabel::SignerReport => 14,
         }
     }
 
@@ -250,6 +264,21 @@ mod tests {
         );
     }
 
+    /// A native manager's signed report of its signing journal (Astation
+    /// #114 item 4): its own body type and label, and its two set-hash
+    /// domains, distinct from every other domain string
+    /// (`every_domain_string_is_distinct`).
+    #[test]
+    fn the_signer_report_has_its_own_label() {
+        assert_eq!(
+            SignLabel::of_body_type("atem-signer-report"),
+            Some(SignLabel::SignerReport)
+        );
+        assert_eq!(SignLabel::SignerReport.as_str(), "atem-signer-report-v1");
+        assert_eq!(SIGNER_REPORT_RECORDS, "atem-signer-report-records-v1");
+        assert_eq!(SIGNER_REPORT_DRAFTS, "atem-signer-report-drafts-v1");
+    }
+
     #[test]
     fn every_domain_string_is_distinct() {
         let signing = LABELS.map(SignLabel::as_str);
@@ -276,6 +305,8 @@ mod tests {
             SAFETY_CODE,
             STATION_REPORT_ID,
             REFERENCE_MAILBOX_ID,
+            SIGNER_REPORT_RECORDS,
+            SIGNER_REPORT_DRAFTS,
         ];
         let mut all: Vec<&str> = signing.iter().chain(others.iter()).copied().collect();
         let n = all.len();

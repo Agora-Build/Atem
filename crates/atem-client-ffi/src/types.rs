@@ -97,6 +97,20 @@ unit_enum! {
         /// The core never creates, rekeys or enrolls a key for it, and
         /// builds the body itself (`body_json` shows it).
         VerifierReport,
+        /// A native manager's signed report of its control-record signing
+        /// journal (`atem-signer-report`, host-work-v1 §11.1 "The signer
+        /// report"; agreed with Astation, #114 comment 7089435073), for a
+        /// Station recovering from a rollback. A fresh confirmation of the
+        /// exact body, never in the background or a notification
+        /// extension: show the plan (the recovery's `generation`, `plan_id`
+        /// and `candidate_feed_id`), the Station (`challenge.origin`), the
+        /// counts (`journal.records`, `journal.drafts`), and that this
+        /// device's recovery barrier holds its stops of the plan (a
+        /// service's `revoke` or `interrupt_running` at that origin, and
+        /// every host sender's `interrupt_running`) until the plan ends.
+        /// The core builds the body from the journal's own bodies
+        /// (`body_json` shows it); the barrier itself is the app's.
+        SignerReport,
     }
 }
 
@@ -131,6 +145,9 @@ unit_enum! {
         /// `atem-verifier-report-v1`: a member's verifier report
         /// (`verify_verifier_report`).
         VerifierReport,
+        /// `atem-signer-report-v1`: a native manager's signer report
+        /// (`verify_signer_report`).
+        SignerReport,
     }
 }
 

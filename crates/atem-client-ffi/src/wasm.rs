@@ -159,6 +159,7 @@ fn label(name: &str) -> JsResult<SignLabelKind> {
         "channel_client" => SignLabelKind::ChannelClient,
         "host_work_control" => SignLabelKind::HostWorkControl,
         "verifier_report" => SignLabelKind::VerifierReport,
+        "signer_report" => SignLabelKind::SignerReport,
         _ => return Err(bad("unknown label")),
     })
 }
