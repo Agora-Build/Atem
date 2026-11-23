@@ -267,13 +267,18 @@ fn hk_tick(rig: &mut LocalRig) {
 
 /// Review L2: the commit watch reads `D` fresh from the clock, never the
 /// start view's last reading: a commit made after a sleep the pass hasn't
-/// read yet stamps the time after it.
+/// read yet stamps the time after it. The key pass and the receiver's view
+/// that follow, before the pass reads the clock again, read it fresh too:
+/// the stamp is never above their `D` (a stale reading would read as a
+/// clock below the application and retire the previous key at once, the
+/// two-host test's intermittent failure).
 #[test]
 fn the_stamp_reads_d_fresh_after_a_sleep() {
     local_test(async |root| {
         let mut rig = LocalRig::new(root).await;
         let os = ManualOs::at(host_now().wall_ms);
         let mut host = mb_host(&mut rig, root, &os);
+        let old = host.enc_pub.clone();
         let d0 = rig.bridge.start_view().now_d_ms.unwrap();
         let new = hk_new_key(&rig);
         // A 10 h sleep (boot time counts it), no pass since.
@@ -285,6 +290,16 @@ fn the_stamp_reads_d_fresh_after_a_sleep() {
             "the view is stale"
         );
         assert_eq!(hk_file(&rig)["applied"]["d_ms"], d0 + 10 * HOUR);
+        rig.bridge.host_key_pass();
+        assert_eq!(rig.bridge.start_view().now_d_ms, Some(d0), "still stale");
+        let file = hk_file(&rig);
+        assert_eq!(file["previous"]["applied_d_ms"], d0 + 10 * HOUR, "{file}");
+        // The pass reads the clock (the envelopes' times are on `D`): mail
+        // to either key opens.
+        hk_tick(&mut rig);
+        let mut position = 0;
+        assert_eq!(hk_deliver(&mut rig, &mut host, &old, &mut position), Ok(()));
+        assert_eq!(hk_deliver(&mut rig, &mut host, &new, &mut position), Ok(()));
     });
 }
 
