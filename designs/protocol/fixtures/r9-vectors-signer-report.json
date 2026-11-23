@@ -612,6 +612,179 @@
       "station": "https://station-dev.agora.build"
     },
     {
+      "chain": [
+        "SR7_recovery_add_newmac"
+      ],
+      "challenge": {
+        "connection": 1,
+        "expires_at": 1793264030000,
+        "issued_at": 1793264000000,
+        "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        "origin": "https://station-dev.agora.build",
+        "recovery": {
+          "candidate_feed_id": "7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c",
+          "evidence_hash": "e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7",
+          "generation": "7",
+          "plan_id": "5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4",
+          "source_hash": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+        },
+        "signer": "member:dev-newmac",
+        "slot": "astation-ios"
+      },
+      "code": "unknown_signer",
+      "journal": {
+        "drafts": [],
+        "id": "dmVjdG9ycy1qb3VybmFsIQ",
+        "records": [],
+        "revision": 0,
+        "since": 7
+      },
+      "label": "pending_recovery_subject",
+      "note": "dev-newmac at L + SR7_recovery_add_newmac, the subject of a recovery still waiting, answers a challenge for itself",
+      "now_ms": 1793264001000,
+      "signer": "member:dev-newmac",
+      "slot": "astation-ios",
+      "station": "https://station-dev.agora.build"
+    },
+    {
+      "chain": [],
+      "challenge": {
+        "connection": 1,
+        "expires_at": 1793264030000,
+        "issued_at": 1793264000000,
+        "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        "origin": "https://station-dev.agora.build",
+        "recovery": {
+          "candidate_feed_id": "7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c",
+          "evidence_hash": "e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7",
+          "generation": "7",
+          "plan_id": "5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4",
+          "source_hash": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+        },
+        "signer": "member:svc-discord",
+        "slot": "astation-ios"
+      },
+      "code": "unknown_signer",
+      "journal": {
+        "drafts": [],
+        "id": "dmVjdG9ycy1qb3VybmFsIQ",
+        "records": [],
+        "revision": 0,
+        "since": 4
+      },
+      "label": "service_as_member",
+      "note": "member:svc-discord: a service named as a native member",
+      "now_ms": 1793264001000,
+      "signer": "member:svc-discord",
+      "slot": "astation-ios",
+      "station": "https://station-dev.agora.build"
+    },
+    {
+      "chain": [],
+      "challenge": {
+        "connection": 1,
+        "expires_at": 1793264030000,
+        "issued_at": 1793264000000,
+        "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        "origin": "https://station-dev.agora.build",
+        "recovery": {
+          "candidate_feed_id": "7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c",
+          "evidence_hash": "e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7",
+          "generation": "7",
+          "plan_id": "5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4",
+          "source_hash": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+        },
+        "signer": "member:dev-evil",
+        "slot": "astation-ios"
+      },
+      "code": "unknown_signer",
+      "journal": {
+        "drafts": [],
+        "id": "dmVjdG9ycy1qb3VybmFsIQ",
+        "records": [],
+        "revision": 0,
+        "since": 4
+      },
+      "label": "unknown_member",
+      "note": "member:dev-evil, never a member",
+      "now_ms": 1793264001000,
+      "signer": "member:dev-evil",
+      "slot": "astation-ios",
+      "station": "https://station-dev.agora.build"
+    },
+    {
+      "body_but_process": {
+        "account_id": "acct-test-1",
+        "challenge": {
+          "connection": 1,
+          "expires_at": 1793264030000,
+          "issued_at": 1793264000000,
+          "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+          "origin": "https://station-dev.agora.build"
+        },
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "head": {
+          "hash": "a7f5b4d7e340bb9bb8f68bf0a96c012a773147d6d9ecd94a5abe58cbae321f18",
+          "seq": 8
+        },
+        "journal": {
+          "drafts": 0,
+          "drafts_hash": "d48708060c5c50eb50d6df5935d932098fcd5ca72eb81a12f0bc1dd67fa55480",
+          "id": "dmVjdG9ycy1qb3VybmFsIQ",
+          "records": 1,
+          "records_hash": "a73e5a28b3483a4f64ae045cfba56b7aa02ff88160777da70605aab7703d02b2",
+          "revision": 1,
+          "since": 8
+        },
+        "recovery": {
+          "candidate_feed_id": "7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c",
+          "evidence_hash": "e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7",
+          "generation": "7",
+          "plan_id": "5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4",
+          "source_hash": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+        },
+        "signer": "member:dev-newmac",
+        "slot": "astation-ios",
+        "type": "atem-signer-report",
+        "v": 1
+      },
+      "chain": [
+        "SR7_recovery_add_newmac",
+        "SR8_recovery_approve_newmac"
+      ],
+      "challenge": {
+        "connection": 1,
+        "expires_at": 1793264030000,
+        "issued_at": 1793264000000,
+        "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        "origin": "https://station-dev.agora.build",
+        "recovery": {
+          "candidate_feed_id": "7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c",
+          "evidence_hash": "e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7",
+          "generation": "7",
+          "plan_id": "5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4",
+          "source_hash": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+        },
+        "signer": "member:dev-newmac",
+        "slot": "astation-ios"
+      },
+      "journal": {
+        "drafts": [],
+        "id": "dmVjdG9ycy1qb3VybmFsIQ",
+        "records": [
+          "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940008,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000008\",\"signer\":\"member:dev-newmac\",\"type\":\"atem-host-work-control\",\"v\":1}"
+        ],
+        "revision": 1,
+        "since": 8
+      },
+      "label": "recovered_manager",
+      "note": "dev-newmac, added by the Recovery Kit with manage, once its recovery took effect (L + SR7_recovery_add_newmac + SR8_recovery_approve_newmac)",
+      "now_ms": 1793264001000,
+      "signer": "member:dev-newmac",
+      "slot": "astation-ios",
+      "station": "https://station-dev.agora.build"
+    },
+    {
       "body_but_process": {
         "account_id": "acct-test-1",
         "challenge": {
@@ -2353,6 +2526,146 @@
       },
       "code": "malformed",
       "journal": {
+        "drafts": [],
+        "id": "dmVjdG9ycy1qb3VybmFsIQ",
+        "records": [
+          "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}"
+        ],
+        "revision": 1,
+        "since": 4
+      },
+      "label": "record_over_4096_bytes",
+      "note": "a record: an account_id of 4,096 bytes: the body's jcs over 4,096 bytes (no control-record body in its grammar reaches the bound)",
+      "now_ms": 1793264001000,
+      "signer": "member:dev-phone",
+      "slot": "astation-ios",
+      "station": "https://station-dev.agora.build"
+    },
+    {
+      "chain": [],
+      "challenge": {
+        "connection": 3,
+        "expires_at": 1793264030000,
+        "issued_at": 1793264000000,
+        "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        "origin": "https://station-dev.agora.build",
+        "recovery": {
+          "candidate_feed_id": "7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c",
+          "evidence_hash": "e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7",
+          "generation": "7",
+          "plan_id": "5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4",
+          "source_hash": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+        },
+        "signer": "member:dev-phone",
+        "slot": "astation-ios"
+      },
+      "code": "malformed",
+      "journal": {
+        "drafts": [
+          "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}"
+        ],
+        "id": "dmVjdG9ycy1qb3VybmFsIQ",
+        "records": [],
+        "revision": 1,
+        "since": 4
+      },
+      "label": "draft_over_4096_bytes",
+      "note": "a draft: an account_id of 4,096 bytes: the body's jcs over 4,096 bytes (no control-record body in its grammar reaches the bound)",
+      "now_ms": 1793264001000,
+      "signer": "member:dev-phone",
+      "slot": "astation-ios",
+      "station": "https://station-dev.agora.build"
+    },
+    {
+      "chain": [],
+      "challenge": {
+        "connection": 3,
+        "expires_at": 1793264030000,
+        "issued_at": 1793264000000,
+        "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        "origin": "https://station-dev.agora.build",
+        "recovery": {
+          "candidate_feed_id": "7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c",
+          "evidence_hash": "e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7",
+          "generation": "7",
+          "plan_id": "5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4",
+          "source_hash": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+        },
+        "signer": "member:dev-phone",
+        "slot": "astation-ios"
+      },
+      "code": "malformed",
+      "journal": {
+        "drafts": [],
+        "id": "dmVjdG9ycy1qb3VybmFsIQ",
+        "records": [
+          "                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                {\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}"
+        ],
+        "revision": 1,
+        "since": 4
+      },
+      "label": "record_text_over_16_kib",
+      "note": "a record: the body's text with 16 KiB of whitespace before it: over the 16 KiB a body's text may take",
+      "now_ms": 1793264001000,
+      "signer": "member:dev-phone",
+      "slot": "astation-ios",
+      "station": "https://station-dev.agora.build"
+    },
+    {
+      "chain": [],
+      "challenge": {
+        "connection": 3,
+        "expires_at": 1793264030000,
+        "issued_at": 1793264000000,
+        "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        "origin": "https://station-dev.agora.build",
+        "recovery": {
+          "candidate_feed_id": "7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c",
+          "evidence_hash": "e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7",
+          "generation": "7",
+          "plan_id": "5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4",
+          "source_hash": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+        },
+        "signer": "member:dev-phone",
+        "slot": "astation-ios"
+      },
+      "code": "malformed",
+      "journal": {
+        "drafts": [
+          "                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                {\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}"
+        ],
+        "id": "dmVjdG9ycy1qb3VybmFsIQ",
+        "records": [],
+        "revision": 1,
+        "since": 4
+      },
+      "label": "draft_text_over_16_kib",
+      "note": "a draft: the body's text with 16 KiB of whitespace before it: over the 16 KiB a body's text may take",
+      "now_ms": 1793264001000,
+      "signer": "member:dev-phone",
+      "slot": "astation-ios",
+      "station": "https://station-dev.agora.build"
+    },
+    {
+      "chain": [],
+      "challenge": {
+        "connection": 3,
+        "expires_at": 1793264030000,
+        "issued_at": 1793264000000,
+        "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        "origin": "https://station-dev.agora.build",
+        "recovery": {
+          "candidate_feed_id": "7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c",
+          "evidence_hash": "e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7",
+          "generation": "7",
+          "plan_id": "5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4",
+          "source_hash": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+        },
+        "signer": "member:dev-phone",
+        "slot": "astation-ios"
+      },
+      "code": "malformed",
+      "journal": {
         "drafts": [
           "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793263940004,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000004\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}"
         ],
@@ -2492,6 +2805,26 @@
       },
       "label": "loopback_http_origin",
       "text": "{\"connection\":3,\"expires_at\":1793264030000,\"issued_at\":1793264000000,\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"origin\":\"http://127.0.0.1:8080\",\"recovery\":{\"candidate_feed_id\":\"7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c\",\"evidence_hash\":\"e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7\",\"generation\":\"7\",\"plan_id\":\"5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4\",\"source_hash\":\"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\"},\"signer\":\"member:dev-phone\",\"slot\":\"astation-ios\"}"
+    },
+    {
+      "fields": {
+        "connection": 3,
+        "expires_at": 1793264030000,
+        "issued_at": 1793264000000,
+        "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        "origin": "https://station-dev.agora.build",
+        "recovery": {
+          "candidate_feed_id": "7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c",
+          "evidence_hash": "e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7",
+          "generation": "7",
+          "plan_id": "5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4",
+          "source_hash": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+        },
+        "signer": "member:dev-phone",
+        "slot": "ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss"
+      },
+      "label": "slot_128_bytes",
+      "text": "{\"connection\":3,\"expires_at\":1793264030000,\"issued_at\":1793264000000,\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"origin\":\"https://station-dev.agora.build\",\"recovery\":{\"candidate_feed_id\":\"7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c\",\"evidence_hash\":\"e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7\",\"generation\":\"7\",\"plan_id\":\"5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4\",\"source_hash\":\"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\"},\"signer\":\"member:dev-phone\",\"slot\":\"ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss\"}"
     },
     {
       "fields": {
@@ -2685,6 +3018,26 @@
     },
     {
       "code": "malformed",
+      "label": "origin_default_port",
+      "text": "{\"connection\":3,\"expires_at\":1793264030000,\"issued_at\":1793264000000,\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"origin\":\"https://station-dev.agora.build:443\",\"recovery\":{\"candidate_feed_id\":\"7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c\",\"evidence_hash\":\"e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7\",\"generation\":\"7\",\"plan_id\":\"5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4\",\"source_hash\":\"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\"},\"signer\":\"member:dev-phone\",\"slot\":\"astation-ios\"}"
+    },
+    {
+      "code": "malformed",
+      "label": "origin_path",
+      "text": "{\"connection\":3,\"expires_at\":1793264030000,\"issued_at\":1793264000000,\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"origin\":\"https://station-dev.agora.build/v1\",\"recovery\":{\"candidate_feed_id\":\"7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c\",\"evidence_hash\":\"e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7\",\"generation\":\"7\",\"plan_id\":\"5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4\",\"source_hash\":\"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\"},\"signer\":\"member:dev-phone\",\"slot\":\"astation-ios\"}"
+    },
+    {
+      "code": "malformed",
+      "label": "origin_userinfo",
+      "text": "{\"connection\":3,\"expires_at\":1793264030000,\"issued_at\":1793264000000,\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"origin\":\"https://user@station-dev.agora.build\",\"recovery\":{\"candidate_feed_id\":\"7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c\",\"evidence_hash\":\"e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7\",\"generation\":\"7\",\"plan_id\":\"5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4\",\"source_hash\":\"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\"},\"signer\":\"member:dev-phone\",\"slot\":\"astation-ios\"}"
+    },
+    {
+      "code": "malformed",
+      "label": "origin_http",
+      "text": "{\"connection\":3,\"expires_at\":1793264030000,\"issued_at\":1793264000000,\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"origin\":\"http://station-dev.agora.build\",\"recovery\":{\"candidate_feed_id\":\"7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c\",\"evidence_hash\":\"e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7\",\"generation\":\"7\",\"plan_id\":\"5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4\",\"source_hash\":\"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\"},\"signer\":\"member:dev-phone\",\"slot\":\"astation-ios\"}"
+    },
+    {
+      "code": "malformed",
       "label": "connection_zero",
       "text": "{\"connection\":0,\"expires_at\":1793264030000,\"issued_at\":1793264000000,\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"origin\":\"https://station-dev.agora.build\",\"recovery\":{\"candidate_feed_id\":\"7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c\",\"evidence_hash\":\"e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7\",\"generation\":\"7\",\"plan_id\":\"5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4\",\"source_hash\":\"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\"},\"signer\":\"member:dev-phone\",\"slot\":\"astation-ios\"}"
     },
@@ -2697,6 +3050,11 @@
       "code": "malformed",
       "label": "lease_zero",
       "text": "{\"connection\":3,\"expires_at\":1793264000000,\"issued_at\":1793264000000,\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"origin\":\"https://station-dev.agora.build\",\"recovery\":{\"candidate_feed_id\":\"7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c\",\"evidence_hash\":\"e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7\",\"generation\":\"7\",\"plan_id\":\"5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4\",\"source_hash\":\"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\"},\"signer\":\"member:dev-phone\",\"slot\":\"astation-ios\"}"
+    },
+    {
+      "code": "malformed",
+      "label": "lease_negative",
+      "text": "{\"connection\":3,\"expires_at\":1793263999999,\"issued_at\":1793264000000,\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"origin\":\"https://station-dev.agora.build\",\"recovery\":{\"candidate_feed_id\":\"7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c\",\"evidence_hash\":\"e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7\",\"generation\":\"7\",\"plan_id\":\"5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4\",\"source_hash\":\"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\"},\"signer\":\"member:dev-phone\",\"slot\":\"astation-ios\"}"
     },
     {
       "code": "malformed",
@@ -2909,6 +3267,29 @@
       "label": "SR7_recovery_add_newmac",
       "note": "r9-vectors-membership-log's R7 (recovery_add of dev-newmac by the recovery key) on E6: dev-newmac is the subject of a recovery still waiting, no current member",
       "on": []
+    },
+    {
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "recovery_approve",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "prev_hash": "5766081f65a59528ab914a1d7f9a49bb3e23c2e86f3694b1e77a0325d0ccf1a9",
+          "seq": 8,
+          "signed_at": 1793181200000,
+          "signer": "dev-mac",
+          "target": "5766081f65a59528ab914a1d7f9a49bb3e23c2e86f3694b1e77a0325d0ccf1a9",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "9w2gwZZhsLndHzFhRqzDbsj92Gc7qqLSF3-_ElK5EL5L8bBTFONfwKh7_O5Qsjgd4XscsD4THZ3PQi9MZs_Mvw"
+      },
+      "entry_hash": "a7f5b4d7e340bb9bb8f68bf0a96c012a773147d6d9ecd94a5abe58cbae321f18",
+      "label": "SR8_recovery_approve_newmac",
+      "note": "r9-vectors-membership-log's A8 (recovery_approve of R7 by dev-mac) on SR7_recovery_add_newmac: the recovery takes effect, and dev-newmac, added by the Recovery Kit with [control, manage, view], is a current manager",
+      "on": [
+        "SR7_recovery_add_newmac"
+      ]
     }
   ],
   "invalid": [
@@ -7740,6 +8121,54 @@
         "sig": "3HvlxZwXO9uRzNRsLm_dmttBJtti5zoD9uxMDxaE4klgiZEtJRTR82seYNnjQGolgsY5v1meobBL_VsLDiPKgA"
       },
       "signed_with": "dev-phone/auth"
+    },
+    {
+      "body": {
+        "about": {
+          "by": "owner",
+          "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+        },
+        "account_id": "acct-test-1",
+        "action": "revoke",
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "interrupt_running": true,
+        "issued_at": 1793263940008,
+        "origin": "https://station-dev.agora.build",
+        "principal": "service:svc-discord",
+        "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+        "record_id": "00000000-0000-4000-8000-000000000008",
+        "signer": "member:dev-newmac",
+        "type": "atem-host-work-control",
+        "v": 1
+      },
+      "digest_hex": "db7d12ccd268958c8c52ac1aa14a6f25878be0a6238a373a3cad1f835f6538db",
+      "jcs": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940008,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000008\",\"signer\":\"member:dev-newmac\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "label": "newmac_revoke",
+      "note": "dev-newmac's (a manager added by the Recovery Kit) revoke of svc-discord with interrupt_running, at this Station",
+      "record": {
+        "body": {
+          "about": {
+            "by": "owner",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+          },
+          "account_id": "acct-test-1",
+          "action": "revoke",
+          "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "interrupt_running": true,
+          "issued_at": 1793263940008,
+          "origin": "https://station-dev.agora.build",
+          "principal": "service:svc-discord",
+          "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+          "record_id": "00000000-0000-4000-8000-000000000008",
+          "signer": "member:dev-newmac",
+          "type": "atem-host-work-control",
+          "v": 1
+        },
+        "sig": "r_wDf9qeVpUv1yJFxEiT4mXeYKr5qOMFthdTjPQm5BBCFdoHiL8-jtV4QgwX8bJ0J5_TbDtnXFzw-6heNVkeyQ"
+      },
+      "signed_with": "dev-newmac/auth"
     }
   ],
   "request": [
@@ -8427,6 +8856,68 @@
       "report": "{\"body\":{\"account_id\":\"acct-test-1\",\"challenge\":{\"connection\":2,\"expires_at\":1793264030000,\"issued_at\":1793264000000,\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"origin\":\"https://station-dev.agora.build\"},\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"head\":{\"hash\":\"1e8e51eb82d01133050c962e9b8d8e7c9d5bff6410250edf87dc5264c2895a25\",\"seq\":8},\"journal\":{\"drafts\":0,\"drafts_hash\":\"d48708060c5c50eb50d6df5935d932098fcd5ca72eb81a12f0bc1dd67fa55480\",\"id\":\"dmVjdG9ycy1qb3VybmFsIQ\",\"records\":1,\"records_hash\":\"d640cb2b1f730e37c36a5d7d6a26ba9efd0ba3eeed38cb39e99d1a615468c30b\",\"revision\":2,\"since\":8},\"process\":\"dmVjdG9ycy1wcm9jZXNzIQ\",\"recovery\":{\"candidate_feed_id\":\"7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c\",\"evidence_hash\":\"e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7\",\"generation\":\"7\",\"plan_id\":\"5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4\",\"source_hash\":\"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\"},\"signer\":\"member:dev-desk\",\"slot\":\"astation-ios\",\"type\":\"atem-signer-report\",\"v\":1},\"sig\":\"Vd2K0MTM0dU5BlSV2EaCL7JsRX8lQTFu8bojb_BUk9BR20_4DXvJkKRcaop9iV__3lxnCBA0eZN40V9lK0ddBQ\"}",
       "signed_with": "dev-desk/auth",
       "signing_input_hex": "000000156174656d2d7369676e65722d7265706f72742d76310000041b7b226163636f756e745f6964223a22616363742d746573742d31222c226368616c6c656e6765223a7b22636f6e6e656374696f6e223a322c22657870697265735f6174223a313739333236343033303030302c226973737565645f6174223a313739333236343030303030302c226e6f6e6365223a2241414543417751464267634943516f4c4441304f4478415245684d554652595847426b6147787764486838222c226f726967696e223a2268747470733a2f2f73746174696f6e2d6465762e61676f72612e6275696c64227d2c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c2268656164223a7b2268617368223a2231653865353165623832643031313333303530633936326539623864386537633964356266663634313032353065646638376463353236346332383935613235222c22736571223a387d2c226a6f75726e616c223a7b22647261667473223a302c226472616674735f68617368223a2264343837303830363063356335306562353064366466353933356439333230393866636435636137326562383161313266306263316464363766613535343830222c226964223a22646d566a644739796379317162335679626d46734951222c227265636f726473223a312c227265636f7264735f68617368223a2264363430636232623166373330653337633336613564376436613236626139656664306261336565656433386362333965393964316136313534363863333062222c227265766973696f6e223a322c2273696e6365223a387d2c2270726f63657373223a22646d566a6447397963793177636d396a5a584e7a4951222c227265636f76657279223a7b2263616e6469646174655f666565645f6964223a2237613264336334622d356536662d343037312d396238632d306431653266336134623563222c2265766964656e63655f68617368223a2265376537653765376537653765376537653765376537653765376537653765376537653765376537653765376537653765376537653765376537653765376537222c2267656e65726174696f6e223a2237222c22706c616e5f6964223a2235623763396431652d326633612d346235632d386436652d376638303931613262336334222c22736f757263655f68617368223a2235613561356135613561356135613561356135613561356135613561356135613561356135613561356135613561356135613561356135613561356135613561227d2c227369676e6572223a226d656d6265723a6465762d6465736b222c22736c6f74223a226173746174696f6e2d696f73222c2274797065223a226174656d2d7369676e65722d7265706f7274222c2276223a317d"
+    },
+    {
+      "chain": [
+        "SR7_recovery_add_newmac",
+        "SR8_recovery_approve_newmac"
+      ],
+      "challenge": {
+        "connection": 1,
+        "expires_at": 1793264030000,
+        "issued_at": 1793264000000,
+        "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        "origin": "https://station-dev.agora.build",
+        "recovery": {
+          "candidate_feed_id": "7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c",
+          "evidence_hash": "e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7",
+          "generation": "7",
+          "plan_id": "5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4",
+          "source_hash": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+        },
+        "signer": "member:dev-newmac",
+        "slot": "astation-ios"
+      },
+      "expect": {
+        "at_head": true,
+        "connection": 1,
+        "head": {
+          "hash": "a7f5b4d7e340bb9bb8f68bf0a96c012a773147d6d9ecd94a5abe58cbae321f18",
+          "seq": 8
+        },
+        "journal": {
+          "drafts": 0,
+          "drafts_hash": "d48708060c5c50eb50d6df5935d932098fcd5ca72eb81a12f0bc1dd67fa55480",
+          "id": "dmVjdG9ycy1qb3VybmFsIQ",
+          "records": 1,
+          "records_hash": "a73e5a28b3483a4f64ae045cfba56b7aa02ff88160777da70605aab7703d02b2",
+          "revision": 1,
+          "since": 8
+        },
+        "process": "dmVjdG9ycy1wcm9jZXNzIQ",
+        "records": [
+          "{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940008,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000008\",\"signer\":\"member:dev-newmac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"r_wDf9qeVpUv1yJFxEiT4mXeYKr5qOMFthdTjPQm5BBCFdoHiL8-jtV4QgwX8bJ0J5_TbDtnXFzw-6heNVkeyQ\"}"
+        ],
+        "recovery": {
+          "candidate_feed_id": "7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c",
+          "evidence_hash": "e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7",
+          "generation": "7",
+          "plan_id": "5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4",
+          "source_hash": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+        },
+        "signer": "member:dev-newmac",
+        "slot": "astation-ios"
+      },
+      "exported": [
+        "{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940008,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000008\",\"signer\":\"member:dev-newmac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"r_wDf9qeVpUv1yJFxEiT4mXeYKr5qOMFthdTjPQm5BBCFdoHiL8-jtV4QgwX8bJ0J5_TbDtnXFzw-6heNVkeyQ\"}"
+      ],
+      "jcs": "{\"account_id\":\"acct-test-1\",\"challenge\":{\"connection\":1,\"expires_at\":1793264030000,\"issued_at\":1793264000000,\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"origin\":\"https://station-dev.agora.build\"},\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"head\":{\"hash\":\"a7f5b4d7e340bb9bb8f68bf0a96c012a773147d6d9ecd94a5abe58cbae321f18\",\"seq\":8},\"journal\":{\"drafts\":0,\"drafts_hash\":\"d48708060c5c50eb50d6df5935d932098fcd5ca72eb81a12f0bc1dd67fa55480\",\"id\":\"dmVjdG9ycy1qb3VybmFsIQ\",\"records\":1,\"records_hash\":\"a73e5a28b3483a4f64ae045cfba56b7aa02ff88160777da70605aab7703d02b2\",\"revision\":1,\"since\":8},\"process\":\"dmVjdG9ycy1wcm9jZXNzIQ\",\"recovery\":{\"candidate_feed_id\":\"7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c\",\"evidence_hash\":\"e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7\",\"generation\":\"7\",\"plan_id\":\"5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4\",\"source_hash\":\"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\"},\"signer\":\"member:dev-newmac\",\"slot\":\"astation-ios\",\"type\":\"atem-signer-report\",\"v\":1}",
+      "label": "recovered_manager",
+      "note": "dev-newmac, added by the Recovery Kit (R7) with manage, once the recovery took effect (approved, A8: L + SR7_recovery_add_newmac + SR8_recovery_approve_newmac), its own revoke exported",
+      "now_ms": 1793264001000,
+      "report": "{\"body\":{\"account_id\":\"acct-test-1\",\"challenge\":{\"connection\":1,\"expires_at\":1793264030000,\"issued_at\":1793264000000,\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"origin\":\"https://station-dev.agora.build\"},\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"head\":{\"hash\":\"a7f5b4d7e340bb9bb8f68bf0a96c012a773147d6d9ecd94a5abe58cbae321f18\",\"seq\":8},\"journal\":{\"drafts\":0,\"drafts_hash\":\"d48708060c5c50eb50d6df5935d932098fcd5ca72eb81a12f0bc1dd67fa55480\",\"id\":\"dmVjdG9ycy1qb3VybmFsIQ\",\"records\":1,\"records_hash\":\"a73e5a28b3483a4f64ae045cfba56b7aa02ff88160777da70605aab7703d02b2\",\"revision\":1,\"since\":8},\"process\":\"dmVjdG9ycy1wcm9jZXNzIQ\",\"recovery\":{\"candidate_feed_id\":\"7a2d3c4b-5e6f-4071-9b8c-0d1e2f3a4b5c\",\"evidence_hash\":\"e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7\",\"generation\":\"7\",\"plan_id\":\"5b7c9d1e-2f3a-4b5c-8d6e-7f8091a2b3c4\",\"source_hash\":\"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\"},\"signer\":\"member:dev-newmac\",\"slot\":\"astation-ios\",\"type\":\"atem-signer-report\",\"v\":1},\"sig\":\"69XtmmBgr3y5RWGzzoIyykG2dlupSplv9vQuKwIh3rNQjkvLP5KUf7RmjGZzCkk52Msw9oRP9f07e20Rx2B_Ow\"}",
+      "signed_with": "dev-newmac/auth",
+      "signing_input_hex": "000000156174656d2d7369676e65722d7265706f72742d76310000041d7b226163636f756e745f6964223a22616363742d746573742d31222c226368616c6c656e6765223a7b22636f6e6e656374696f6e223a312c22657870697265735f6174223a313739333236343033303030302c226973737565645f6174223a313739333236343030303030302c226e6f6e6365223a2241414543417751464267634943516f4c4441304f4478415245684d554652595847426b6147787764486838222c226f726967696e223a2268747470733a2f2f73746174696f6e2d6465762e61676f72612e6275696c64227d2c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c2268656164223a7b2268617368223a2261376635623464376533343062623962623866363862663061393663303132613737333134376436643965636439346135616265353863626165333231663138222c22736571223a387d2c226a6f75726e616c223a7b22647261667473223a302c226472616674735f68617368223a2264343837303830363063356335306562353064366466353933356439333230393866636435636137326562383161313266306263316464363766613535343830222c226964223a22646d566a644739796379317162335679626d46734951222c227265636f726473223a312c227265636f7264735f68617368223a2261373365356132386233343833613466363461653034356366626135366237616130326666383831363037373764613730363035616162373730336430326232222c227265766973696f6e223a312c2273696e6365223a387d2c2270726f63657373223a22646d566a6447397963793177636d396a5a584e7a4951222c227265636f76657279223a7b2263616e6469646174655f666565645f6964223a2237613264336334622d356536662d343037312d396238632d306431653266336134623563222c2265766964656e63655f68617368223a2265376537653765376537653765376537653765376537653765376537653765376537653765376537653765376537653765376537653765376537653765376537222c2267656e65726174696f6e223a2237222c22706c616e5f6964223a2235623763396431652d326633612d346235632d386436652d376638303931613262336334222c22736f757263655f68617368223a2235613561356135613561356135613561356135613561356135613561356135613561356135613561356135613561356135613561356135613561356135613561227d2c227369676e6572223a226d656d6265723a6465762d6e65776d6163222c22736c6f74223a226173746174696f6e2d696f73222c2274797065223a226174656d2d7369676e65722d7265706f7274222c2276223a317d"
     }
   ]
 }

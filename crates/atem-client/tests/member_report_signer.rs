@@ -1174,6 +1174,46 @@ fn a_demoted_manager_still_reports_and_a_native_that_never_managed_does_not() {
     assert!(verify(&promoted, &promoted_text, &never, &[], NOW).is_ok());
 }
 
+/// A manager added through a Recovery Kit (`recovery_add` of a native with
+/// `manage`) is a manager once its recovery took effect (here approved by
+/// dev-mac, r9-vectors-membership-log's R7 then A8): its report verifies.
+/// While the recovery still waits it is no current member.
+#[test]
+fn a_manager_added_by_a_recovery_that_took_effect_reports() {
+    let (v, book) = (Vectors::load(), Book::load());
+    let now = Clock::at(NOW).now;
+    let l = log_l(&v);
+    let waiting = l.evaluate_objects(&[v.object("R7")], &now).next;
+    let recovered = l
+        .evaluate_objects(&[v.object("R7"), v.object("A8")], &now)
+        .next;
+    assert_eq!(recovered.head().seq, 8);
+    let newmac = "member:dev-newmac";
+    let challenge = challenge_with_signer(newmac);
+    let stop = service_stop(&book, "dev-newmac", REVOKE, STATION, 1);
+    let journal = journal_of(&[text(&stop)], &[]);
+    let body =
+        signer_report_body(&recovered, &challenge, newmac, SLOT, STATION, &journal, NOW).unwrap();
+    let report = sign_signer_report(&book.provider, &KeyId::new("dev-newmac/auth"), &body)
+        .unwrap()
+        .to_json()
+        .to_string();
+    let exported = [signed(&book, "dev-newmac/auth", &stop)];
+    let verified = verify(&recovered, &report, &challenge, &exported, NOW).unwrap();
+    assert_eq!(verified.signer, newmac);
+    assert!(verified.at_head);
+    assert_eq!(verified.journal.records, 1);
+    // Still waiting: no current member, at the builder and the verifier.
+    assert_eq!(
+        signer_report_body(&waiting, &challenge, newmac, SLOT, STATION, &journal, NOW).map(|_| ()),
+        Err(ReportRefusal::UnknownSigner)
+    );
+    assert_eq!(
+        verify(&waiting, &report, &challenge, &exported, NOW).map(|_| ()),
+        Err(ReportRefusal::UnknownSigner)
+    );
+}
+
 /// Services, hosts, `recovery`, grants and removed members never report.
 #[test]
 fn only_a_current_native_signs_a_signer_report() {

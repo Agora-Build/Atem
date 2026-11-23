@@ -4210,10 +4210,17 @@ def read_vr_report(text):
 class VrList:
     """A device list as the report's checks read it, replayed from L and a
     case's chain: who is a member of which kind and with which key, the
-    chain's entry hashes, and a freeze."""
+    chain's entry hashes, and a freeze. A recovery_add is pending until a
+    recovery_approve naming its entry_hash makes it take effect (its member
+    then current: `recovered`) or a recovery_veto cancels it (R9.5), as the
+    shared verifier reads them. Its 24 h wait never ends here: each of the
+    vectors' lists is read at one host clock reading, the one its entries
+    were carried at."""
 
     def __init__(self, bodies, frozen):
         self.members, self.hashes, self.frozen = {}, [], frozen
+        self.recovered = set()
+        pending = {}
         for body in bodies:
             self.hashes.append(sha256(enc(["atem-membership-hash-v1", jcs(body)])).hex())
             action = body["action"]
@@ -4221,9 +4228,15 @@ class VrList:
                 member = body["member"]
                 self.members[member["device_id"]] = dict(member, standing="active")
             elif action == "recovery_add":
-                # Pending: the vectors' lists are read within its 24 h wait,
-                # and no chain here approves or vetoes it.
                 self.members[body["member"]["device_id"]] = dict(body["member"], standing="pending")
+                pending[self.hashes[-1]] = body["member"]["device_id"]
+            elif action in ("recovery_approve", "recovery_veto") and body["target"] in pending:
+                device_id = pending.pop(body["target"])
+                if action == "recovery_approve":
+                    self.members[device_id]["standing"] = "active"
+                    self.recovered.add(device_id)
+                else:
+                    self.members[device_id]["standing"] = "cancelled"
             elif action == "set_roles" and "roles" in body:
                 # Roles change, the standing and the key don't.
                 self.members[body["device_id"]]["roles"] = body["roles"]
@@ -4671,8 +4684,8 @@ def read_sr_report(text):
 
 class SrList(VrList):
     """VrList, with who held manage at some seq of it: a native entering
-    with manage (genesis, add), or given it by set_roles. (A recovery_add
-    still waiting here gives nothing.)"""
+    with manage (genesis, add, or a recovery_add once it took effect), or
+    given it by set_roles. A recovery_add still waiting gives nothing."""
 
     def __init__(self, bodies, frozen):
         super().__init__(bodies, frozen)
@@ -4684,6 +4697,11 @@ class SrList(VrList):
                     self.managed.add(member["device_id"])
             elif body["action"] == "set_roles" and "manage" in body.get("roles", []):
                 self.managed.add(body["device_id"])
+        # A recovery_add's member (always [control, manage, view]) once its
+        # recovery took effect.
+        for device_id in self.recovered:
+            if "manage" in self.members[device_id]["roles"]:
+                self.managed.add(device_id)
 
     def manager(self, signer):
         """(alg, public key) of a current native member that held manage, or
@@ -4835,6 +4853,7 @@ def check_signer_report(file, data, report, context):
         case.equal((desk["auth_key"]["alg"], b64u_decode(desk["auth_key"]["pub"])), ("ed25519", keys.public("dev-desk", "auth")), "dev-desk's Ed25519 key")
         case.check("manage" not in desk["roles"], "dev-desk added without manage")
         case.equal(jcs(entries["SR7_recovery_add_newmac"]["entry"]), jcs(next(v["entry"] for v in mlog["others"] if v["label"] == "R7")), "SR7_recovery_add_newmac is R7, byte for byte")
+        case.equal(jcs(entries["SR8_recovery_approve_newmac"]["entry"]), jcs(next(v["entry"] for v in mlog["others"] if v["label"] == "A8")), "SR8_recovery_approve_newmac is A8, byte for byte")
 
     def lst(c):
         return report_list(c, data, mlog, SrList)
@@ -4888,7 +4907,7 @@ def check_signer_report(file, data, report, context):
         labels = {c["label"] for c in data["valid"] + data["invalid"]}
         for label in (
             "at_head", "at_ancestor", "zero_records", "drafts_only", "reinstalled_journal", "demoted_manager",
-            "not_a_manager", "high_s_signature", "signer_mismatch", "slot_mismatch", "records_one_missing",
+            "not_a_manager", "recovered_manager", "pending_recovery_subject", "high_s_signature", "signer_mismatch", "slot_mismatch", "records_one_missing",
             "records_one_extra", "records_signed_after_report", "records_possibly_signed", "records_body_without_signature",
             "records_wrong_signer", "records_another_origin", "records_duplicate", "expired_at_expires_at",
         ):

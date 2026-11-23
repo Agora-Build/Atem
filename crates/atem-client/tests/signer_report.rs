@@ -46,6 +46,7 @@ const SLOT: &str = "astation-ios";
 const PHONE: &str = "member:dev-phone";
 const MAC: &str = "member:dev-mac";
 const DESK: &str = "member:dev-desk";
+const NEWMAC: &str = "member:dev-newmac";
 /// Every case's clock but the expiries': after L and its chain.
 const NOW: u64 = 1_793_264_001_000;
 const ISSUED: u64 = 1_793_264_000_000;
@@ -196,6 +197,7 @@ const DESK_ADDED: &[&str] = &["SR7_add_desk"];
 const DESK_MANAGES: &[&str] = &["SR7_add_desk", "SR8_desk_manages"];
 const DEMOTED: &[&str] = &["SR7_set_roles_phone"];
 const RECOVERING: &[&str] = &["SR7_recovery_add_newmac"];
+const RECOVERED: &[&str] = &["SR7_recovery_add_newmac", "SR8_recovery_approve_newmac"];
 
 impl Gen {
     fn new() -> Gen {
@@ -256,6 +258,15 @@ impl Gen {
             "r9-vectors-membership-log's R7 (recovery_add of dev-newmac by the recovery key) on E6: dev-newmac is the subject of a recovery still waiting, no current member",
             NO_CHAIN,
             r7,
+        ));
+        // r9-vectors-membership-log's A8, byte for byte: dev-mac approves
+        // R7, which takes effect at once. dev-newmac entered with manage.
+        let a8 = made.v.object("A8");
+        made.entries.push((
+            "SR8_recovery_approve_newmac",
+            "r9-vectors-membership-log's A8 (recovery_approve of R7 by dev-mac) on SR7_recovery_add_newmac: the recovery takes effect, and dev-newmac, added by the Recovery Kit with [control, manage, view], is a current manager",
+            RECOVERING,
+            a8,
         ));
         let svc_key = principal_key_of(&made.public("svc-discord/auth")).unwrap();
         let stop = |signer: &str, action: ControlAction, origin: &str, n: u64| ControlBody {
@@ -358,6 +369,12 @@ impl Gen {
                 note: "dev-phone's revoke of svc-discord at another Station's origin: not this plan's",
                 body: stop("dev-phone", revoke, OTHER_STATION, 1),
                 key: "dev-phone/auth",
+            },
+            Rec {
+                label: "newmac_revoke",
+                note: "dev-newmac's (a manager added by the Recovery Kit) revoke of svc-discord with interrupt_running, at this Station",
+                body: stop("dev-newmac", revoke, STATION, 8),
+                key: "dev-newmac/auth",
             },
         ];
         made
@@ -635,6 +652,9 @@ impl Gen {
         let desk_log = self.log(DESK_MANAGES, None, NOW);
         let desk = challenge(DESK, SLOT, 2);
         let desk_journal = self.journal(JOURNAL_ID, 8, 2, &["desk_revoke"], &[]);
+        let recovered = self.log(RECOVERED, None, NOW);
+        let newmac = challenge(NEWMAC, SLOT, 1);
+        let newmac_journal = self.journal(JOURNAL_ID, 8, 1, &["newmac_revoke"], &[]);
         let mut out = vec![
             self.report(
                 "at_head",
@@ -708,6 +728,19 @@ impl Gen {
                 vec![self.record("desk_revoke")],
                 ok(true),
             ),
+            self.report(
+                "recovered_manager",
+                "dev-newmac, added by the Recovery Kit (R7) with manage, once the recovery took effect (approved, A8: L + SR7_recovery_add_newmac + SR8_recovery_approve_newmac), its own revoke exported",
+                RECOVERED,
+                newmac.clone(),
+                signed(
+                    keys,
+                    "dev-newmac/auth",
+                    &self.body_of(&recovered, &newmac, NEWMAC, &newmac_journal),
+                ),
+                vec![self.record("newmac_revoke")],
+                ok(true),
+            ),
         ];
         let signers = [
             "dev-phone/auth",
@@ -718,6 +751,7 @@ impl Gen {
             "dev-phone/auth",
             "dev-phone/auth",
             "dev-desk/auth",
+            "dev-newmac/auth",
         ];
         for (case, key) in out.iter_mut().zip(signers) {
             case.signed_with = Some(key);
@@ -1566,6 +1600,10 @@ fn challenge_cases() -> Vec<ChallengeCase> {
             "loopback_http_origin",
             with(good.clone(), "origin", json!("http://127.0.0.1:8080")),
         ),
+        ok(
+            "slot_128_bytes",
+            with(good.clone(), "slot", json!("s".repeat(128))),
+        ),
         ChallengeCase {
             label: "largest_generation",
             text: recovery_with("generation", json!("9223372036854775807")),
@@ -1657,9 +1695,30 @@ fn challenge_cases() -> Vec<ChallengeCase> {
             "origin",
             json!("https://station-dev.agora.build/"),
         ),
+        (
+            "origin_default_port",
+            "origin",
+            json!("https://station-dev.agora.build:443"),
+        ),
+        (
+            "origin_path",
+            "origin",
+            json!("https://station-dev.agora.build/v1"),
+        ),
+        (
+            "origin_userinfo",
+            "origin",
+            json!("https://user@station-dev.agora.build"),
+        ),
+        (
+            "origin_http",
+            "origin",
+            json!("http://station-dev.agora.build"),
+        ),
         ("connection_zero", "connection", json!(0)),
         ("nonce_31_bytes", "nonce", json!(b64u(&[0u8; 31]))),
         ("lease_zero", "expires_at", json!(ISSUED)),
+        ("lease_negative", "expires_at", json!(ISSUED - 1)),
         (
             "lease_over_30_seconds",
             "expires_at",
@@ -1872,6 +1931,49 @@ impl Gen {
         );
         expired.now_ms = EXPIRES;
         out.push(expired);
+        // Who never reports: the subject of a recovery still waiting, a
+        // service named as a member, a device never added.
+        let mut waiting = case(
+            "pending_recovery_subject",
+            "dev-newmac at L + SR7_recovery_add_newmac, the subject of a recovery still waiting, answers a challenge for itself",
+            NEWMAC,
+            SLOT,
+            STATION,
+            Some("unknown_signer"),
+        );
+        waiting.chain = RECOVERING;
+        waiting.challenge = challenge(NEWMAC, SLOT, 1);
+        waiting.journal = self.journal(JOURNAL_ID, 7, 0, &[], &[]);
+        out.push(waiting);
+        for (label, note, signer) in [
+            (
+                "service_as_member",
+                "member:svc-discord: a service named as a native member",
+                "member:svc-discord",
+            ),
+            (
+                "unknown_member",
+                "member:dev-evil, never a member",
+                "member:dev-evil",
+            ),
+        ] {
+            let mut c = case(label, note, signer, SLOT, STATION, Some("unknown_signer"));
+            c.challenge = challenge(signer, SLOT, 1);
+            c.journal = self.journal(JOURNAL_ID, 4, 0, &[], &[]);
+            out.push(c);
+        }
+        let mut recovered = case(
+            "recovered_manager",
+            "dev-newmac, added by the Recovery Kit with manage, once its recovery took effect (L + SR7_recovery_add_newmac + SR8_recovery_approve_newmac)",
+            NEWMAC,
+            SLOT,
+            STATION,
+            None,
+        );
+        recovered.chain = RECOVERED;
+        recovered.challenge = challenge(NEWMAC, SLOT, 1);
+        recovered.journal = self.journal(JOURNAL_ID, 8, 1, &["newmac_revoke"], &[]);
+        out.push(recovered);
         let mut zero = case(
             "zero_records",
             "a journal that holds nothing of the plan",
@@ -2061,6 +2163,16 @@ impl Gen {
                 "fraction",
                 "v 1.5",
                 good_text.replacen(r#""v":1"#, r#""v":1.5"#, 1),
+            ),
+            (
+                "over_4096_bytes",
+                "an account_id of 4,096 bytes: the body's jcs over 4,096 bytes (no control-record body in its grammar reaches the bound)",
+                edited(&|b| b.account_id = "a".repeat(4096)),
+            ),
+            (
+                "text_over_16_kib",
+                "the body's text with 16 KiB of whitespace before it: over the 16 KiB a body's text may take",
+                format!("{}{good_text}", " ".repeat(16 * 1024)),
             ),
         ];
         for (name, note, body) in &bodies {
