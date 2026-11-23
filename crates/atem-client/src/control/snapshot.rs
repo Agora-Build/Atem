@@ -67,8 +67,8 @@
 //! **Carried as it is** (Atem's reading of host-work-v1 §11.1, "Resets":
 //! the snapshot's revoke and interrupt records "as they are or signed
 //! anew"; a current manager's, agreed with Astation, #114 comment
-//! 7082464868, item 2; the service's own key's, for Astation's
-//! confirmation on #114). A snapshot `revoke` or `interrupt_running` whose
+//! 7082464868, item 2; the service's own key's, agreed with Astation,
+//! #114 comment 7089435073). A snapshot `revoke` or `interrupt_running` whose
 //! signed object (body and signature) is a retained record's is that
 //! record carried unchanged, whoever signed it: it needs neither the
 //! candidate feed nor the mark (a stop applies from any feed, rule 3, and

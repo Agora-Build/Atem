@@ -159,6 +159,7 @@ fn label(name: &str) -> JsResult<SignLabelKind> {
         "channel_client" => SignLabelKind::ChannelClient,
         "host_work_control" => SignLabelKind::HostWorkControl,
         "verifier_report" => SignLabelKind::VerifierReport,
+        "signer_report" => SignLabelKind::SignerReport,
         _ => return Err(bad("unknown label")),
     })
 }
@@ -475,6 +476,221 @@ pub fn sign_verifier_report(
         &signer,
         &slot,
         &origin,
+        key_id,
+        ms(now_ms)?,
+    ))
+}
+
+// ---------------------------------------------------- signer reports
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct JsRecovery {
+    generation: String,
+    plan_id: String,
+    candidate_feed_id: String,
+    source_hash: String,
+    evidence_hash: String,
+}
+
+fn signer_recovery(v: JsValue) -> JsResult<crate::types::SignerReportRecovery> {
+    only_fields(
+        &v,
+        &[
+            "generation",
+            "planId",
+            "candidateFeedId",
+            "sourceHash",
+            "evidenceHash",
+        ],
+        "recovery",
+    )?;
+    let r: JsRecovery = serde_wasm_bindgen::from_value(v).map_err(|_| {
+        bad("recovery {generation, planId, candidateFeedId, sourceHash, evidenceHash}")
+    })?;
+    Ok(crate::types::SignerReportRecovery {
+        generation: r.generation,
+        plan_id: r.plan_id,
+        candidate_feed_id: r.candidate_feed_id,
+        source_hash: r.source_hash,
+        evidence_hash: r.evidence_hash,
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct JsJournal {
+    id: String,
+    since: f64,
+    revision: f64,
+    records: Vec<String>,
+    drafts: Vec<String>,
+}
+
+fn signer_journal(v: JsValue) -> JsResult<crate::types::SignerJournalView> {
+    only_fields(
+        &v,
+        &["id", "since", "revision", "records", "drafts"],
+        "journal",
+    )?;
+    let j: JsJournal = serde_wasm_bindgen::from_value(v)
+        .map_err(|_| bad("journal {id, since, revision, records, drafts}"))?;
+    let count = |v: f64, what: &str| {
+        ms(v).map_err(|_| bad(&format!("journal.{what} is a non-negative safe integer")))
+    };
+    Ok(crate::types::SignerJournalView {
+        id: j.id,
+        since: count(j.since, "since")?,
+        revision: count(j.revision, "revision")?,
+        records: j.records,
+        drafts: j.drafts,
+    })
+}
+
+/// A Station's fresh challenge for a manager's signer report
+/// (`member_report::signer::signer_report_challenge`): canonical JSON, a
+/// 32-byte nonce from `crypto.getRandomValues`; `recovery` is
+/// `{generation, planId, candidateFeedId, sourceHash, evidenceHash}`
+/// (`generation` a decimal string). Throws `kind: "report"`, `code:
+/// "malformed"` for a field outside its grammar.
+#[wasm_bindgen(js_name = signerReportChallenge)]
+pub fn signer_report_challenge(
+    signer: String,
+    slot: String,
+    origin: String,
+    connection: f64,
+    issued_at: f64,
+    expires_at: f64,
+    recovery: JsValue,
+) -> JsResult<String> {
+    err(crate::member_report::signer::signer_report_challenge(
+        signer,
+        slot,
+        origin,
+        ms(connection)?,
+        ms(issued_at)?,
+        ms(expires_at)?,
+        signer_recovery(recovery)?,
+    ))
+}
+
+/// A challenge's fields: `{signer, slot, origin, connection, nonce,
+/// issuedAt, expiresAt, recovery: {generation, planId, candidateFeedId,
+/// sourceHash, evidenceHash}}` (`kind: "report"`, `code: "malformed"`
+/// otherwise).
+#[wasm_bindgen(js_name = parseSignerReportChallenge)]
+pub fn parse_signer_report_challenge(challenge_json: String) -> JsResult<JsValue> {
+    ok(crate::member_report::signer::parse_signer_report_challenge(
+        challenge_json,
+    ))
+}
+
+/// Verifies a signer report against `log` at its head, the stored
+/// challenge and the exported signed records
+/// (`member_report::signer::verify_signer_report`): `{signer, slot,
+/// process, connection, head, atHead, recovery, journal: {id, since,
+/// revision, records, recordsHash, drafts, draftsHash}, records}`, or
+/// throws `kind: "report"` with the first failure's `code`.
+#[wasm_bindgen(js_name = verifySignerReport)]
+pub fn verify_signer_report(
+    log: &MembershipLog,
+    report_json: String,
+    expected_challenge_json: String,
+    exported_records_json: Vec<String>,
+    now_ms: f64,
+) -> JsResult<JsValue> {
+    ok(crate::member_report::signer::verify_signer_report(
+        log.0.clone(),
+        report_json,
+        expected_challenge_json,
+        exported_records_json,
+        ms(now_ms)?,
+    ))
+}
+
+/// A signer report waiting for its signature
+/// (`member_report::signer::SignerReportRequest`): an immutable handle on
+/// the body the core built from the journal (`{id, since, revision,
+/// records, drafts}`, the bodies as JSON texts). A key that answers later
+/// signs `signRequest().input` after the owner's fresh confirmation and
+/// hands the signature to `finish`, which takes only a signature over the
+/// held body by its signer.
+#[wasm_bindgen]
+pub struct SignerReportRequest(crate::member_report::signer::SignerReportRequest);
+
+#[wasm_bindgen]
+impl SignerReportRequest {
+    #[wasm_bindgen(constructor)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        log: &MembershipLog,
+        challenge_json: String,
+        signer: String,
+        slot: String,
+        origin: String,
+        journal: JsValue,
+        key_id: String,
+        now_ms: f64,
+    ) -> JsResult<SignerReportRequest> {
+        Ok(SignerReportRequest(err(
+            crate::member_report::signer::SignerReportRequest::build(
+                &log.0,
+                &challenge_json,
+                &signer,
+                &slot,
+                &origin,
+                &signer_journal(journal)?,
+                key_id,
+                ms(now_ms)?,
+            ),
+        )?))
+    }
+
+    /// `{keyId, purpose: "signer_report", freshConfirmation: true, label,
+    /// input, bodyJson}`.
+    #[wasm_bindgen(js_name = signRequest)]
+    pub fn sign_request(&self) -> JsResult<JsValue> {
+        to_js(&self.0.sign_request())
+    }
+
+    /// The held body (canonical JSON).
+    #[wasm_bindgen(js_name = bodyJson)]
+    pub fn body_json(&self) -> String {
+        self.0.body_json()
+    }
+
+    /// The report with `signature` (throws `kind: "report"`, `code:
+    /// "bad_signature"` for one that isn't the signer's over the held body).
+    pub fn finish(&self, signature: Vec<u8>) -> JsResult<String> {
+        err(self.0.finish(signature))
+    }
+}
+
+/// A signer report signed at once with a key of a software store
+/// (`member_report::signer::sign_signer_report`; tests and tools: a
+/// native's key is never a software key).
+#[cfg(feature = "software-keys")]
+#[wasm_bindgen(js_name = signSignerReport)]
+#[allow(clippy::too_many_arguments)]
+pub fn sign_signer_report(
+    store: &SoftwareKeyStore,
+    log: &MembershipLog,
+    challenge_json: String,
+    signer: String,
+    slot: String,
+    origin: String,
+    journal: JsValue,
+    key_id: String,
+    now_ms: f64,
+) -> JsResult<String> {
+    err(crate::member_report::signer::sign_signer_report_with(
+        &*store.0,
+        &log.0,
+        &challenge_json,
+        &signer,
+        &slot,
+        &origin,
+        &signer_journal(journal)?,
         key_id,
         ms(now_ms)?,
     ))

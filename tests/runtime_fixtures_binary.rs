@@ -2035,8 +2035,10 @@ fn r9_fixtures_run_against_the_real_runtime() {
     // `r9-vectors-required-verifier` (the shared signing-version classifier);
     // 105 with `r9-vectors-verifier-report` (a member's signed verifier
     // report, R9.2); 106 with `r9-control-ack-replacement-feed` (a
-    // Station's replacement feed, Astation #114).
-    assert_eq!(files.len(), 106, "the r9 fixture files");
+    // Station's replacement feed, Astation #114); 107 with
+    // `r9-vectors-signer-report` (a native manager's signed report of its
+    // signing journal, Astation #114 item 4).
+    assert_eq!(files.len(), 107, "the r9 fixture files");
     let only = std::env::var("ATEM_FIXTURE").ok();
     let mut not_expressible = Vec::new();
     let mut runnable = Vec::new();

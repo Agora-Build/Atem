@@ -6,12 +6,13 @@
 # §7): the SHA-256 sums, the source pin, the shared vectors listed in the sums
 # and unchanged (host-work requests, prompt framing, framing size, the
 # host-result header's framing; r9 control, push-hint, delegated-wire,
-# host-envelope, Station-call, required-verifier and verifier-report
-# vectors; the acknowledgment fixtures), no test-only or host-role export in
-# the shipped bindings (the framing's vectors-only rendering and host mail
-# included), and each package used once: the Node build of the WASM package
-# runs the packaged framing vectors (escaping, Unicode version, the preflight
-# size check) and the packaged required-verifier vectors, and, with the JVM
+# host-envelope, Station-call, required-verifier, verifier-report and
+# signer-report vectors; the acknowledgment fixtures), no test-only or
+# host-role export in the shipped bindings (the framing's vectors-only
+# rendering and host mail included), and each package used once: the Node
+# build of the WASM package runs the packaged framing vectors (escaping,
+# Unicode version, the preflight size check) and the packaged
+# required-verifier vectors, and, with the JVM
 # jar (through JNA), reads the r9 pairing vectors' verifyCommit messages with
 # the shared parser. The Android zip: each ABI's ELF class, machine,
 # 16 KB LOAD alignment and exports (READELF, default readelf).
@@ -45,6 +46,7 @@ SHIPPED_VECTORS=(
   r9-vectors-station-calls.json:r9-vectors-station-calls.json
   r9-vectors-required-verifier.json:r9-vectors-required-verifier.json
   r9-vectors-verifier-report.json:r9-vectors-verifier-report.json
+  r9-vectors-signer-report.json:r9-vectors-signer-report.json
 )
 for fixture in "$ROOT"/designs/protocol/fixtures/r9-control-ack-*.json; do
   SHIPPED_VECTORS+=("$(basename "$fixture"):$(basename "$fixture")")

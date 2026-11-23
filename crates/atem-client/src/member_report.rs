@@ -38,6 +38,11 @@
 //! it would still be signed; such a challenge is the minter's never to
 //! mint, and its stored expectation and its own monotonic deadline bound
 //! how long a report counts.
+//!
+//! [`signer`] is the second kind on the same core: a native manager's
+//! signed report of its control-record signing journal, for a Station
+//! recovering from a rollback (host-work-v1 §11.1 "The signer report";
+//! agreed with Astation, #114 comment 7089435073), re-exported here.
 use std::sync::OnceLock;
 
 use serde_json::{Map, Value, json};
@@ -52,6 +57,14 @@ use crate::membership::{Head, MemberKind, MemberStatus, Membership, VerifierInve
 use crate::provider::{KeyId, KeyProvider};
 use crate::signed::{self, MAX_BODY_BYTES, SignedObject};
 use crate::station_route::normalize_relay;
+
+pub mod signer;
+
+pub use signer::{
+    JOURNAL_ID_BYTES, JournalSummary, JournalView, MAX_GENERATION, RecoveryPlan,
+    SIGNER_REPORT_TYPE, SIGNER_VERIFY_ORDER, SignerReportBody, SignerReportChallenge,
+    VerifiedSignerReport, sign_signer_report, signer_report_body, verify_signer_report,
+};
 
 /// The body's `type`.
 pub const REPORT_TYPE: &str = "atem-verifier-report";
@@ -111,12 +124,14 @@ const CHALLENGE_FIELDS: [&str; 7] = [
 ];
 
 /// Why a report, a challenge or a build is refused. `code()` is the
-/// stable name; the verifier's codes come in [`VERIFY_ORDER`].
+/// stable name; the verifiers' codes come in [`VERIFY_ORDER`] and
+/// [`SIGNER_VERIFY_ORDER`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReportRefusal {
     /// Not exactly a report or a challenge (strict I-JSON, exact fields at
     /// every level, no `null`, no `kit_sig`, the grammars, the lease, the
-    /// bounds); the text names the part.
+    /// bounds), or a signer report's journal body that isn't one of the
+    /// plan's records by its signer; the text names the part.
     Malformed(&'static str),
     /// The log is frozen (a conflict, §R9.4): it reports and verifies
     /// nothing.
@@ -126,7 +141,11 @@ pub enum ReportRefusal {
     /// `signer` isn't a current native member (`member:`) or a current
     /// service (`service:`) at the log's head: removed or never added,
     /// pending, `recovery`, a host, a grant, or a member of the other kind.
+    /// A signer report's: anything but a current native member.
     UnknownSigner,
+    /// A signer report's signer is a current native member that never
+    /// held `manage` at any `seq` of the log.
+    NotAManager,
     /// A service whose `expires_at` is at or before `now_ms`.
     SignerExpired,
     /// `sig` doesn't verify under the signer's key at the log's head (a
@@ -144,6 +163,15 @@ pub enum ReportRefusal {
     /// Another `origin`, `connection`, `nonce`, `issued_at` or
     /// `expires_at` than the challenge the minter stored.
     ChallengeMismatch,
+    /// A signer report's `recovery` differs from the stored challenge's in
+    /// any field.
+    RecoveryMismatch,
+    /// A signer report's exported records aren't exactly its `records`:
+    /// one that isn't a signed control record of the plan by its signer,
+    /// one whose signature doesn't verify under the signer's key, a
+    /// duplicate, or a count or `records_hash` other than the report's;
+    /// the text names which.
+    RecordsMismatch(&'static str),
     /// `now_ms` is at or after the challenge's `expires_at`.
     Expired,
     /// The builder only: the challenge's `origin` isn't the reporter's
@@ -161,6 +189,7 @@ impl ReportRefusal {
             ReportRefusal::Frozen => "frozen",
             ReportRefusal::WrongAccount => "wrong_account",
             ReportRefusal::UnknownSigner => "unknown_signer",
+            ReportRefusal::NotAManager => "not_a_manager",
             ReportRefusal::SignerExpired => "signer_expired",
             ReportRefusal::BadSignature => "bad_signature",
             ReportRefusal::StaleLog => "stale_log",
@@ -168,6 +197,8 @@ impl ReportRefusal {
             ReportRefusal::SignerMismatch => "signer_mismatch",
             ReportRefusal::SlotMismatch => "slot_mismatch",
             ReportRefusal::ChallengeMismatch => "challenge_mismatch",
+            ReportRefusal::RecoveryMismatch => "recovery_mismatch",
+            ReportRefusal::RecordsMismatch(_) => "records_mismatch",
             ReportRefusal::Expired => "expired",
             ReportRefusal::OriginMismatch => "origin_mismatch",
             ReportRefusal::Signing(_) => "signing_failed",
@@ -179,6 +210,7 @@ impl std::fmt::Display for ReportRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ReportRefusal::Malformed(what) => write!(f, "malformed ({what})"),
+            ReportRefusal::RecordsMismatch(what) => write!(f, "records_mismatch ({what})"),
             ReportRefusal::Signing(e) => write!(f, "signing_failed ({e})"),
             other => f.write_str(other.code()),
         }
@@ -343,6 +375,22 @@ impl ReportChallenge {
         issued_at: u64,
         expires_at: u64,
     ) -> Result<Self, ReportRefusal> {
+        Self::read(&Value::Object(Self::fresh_fields(
+            signer, slot, origin, connection, issued_at, expires_at,
+        )?))
+    }
+
+    /// The seven fields of a new challenge, its nonce fresh from the OS
+    /// CSPRNG and its origin normalized (a signer report's challenge adds
+    /// its recovery).
+    fn fresh_fields(
+        signer: &str,
+        slot: &str,
+        origin: &str,
+        connection: u64,
+        issued_at: u64,
+        expires_at: u64,
+    ) -> Result<Map<String, Value>, ReportRefusal> {
         let mut nonce = [0u8; NONCE_BYTES];
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut nonce);
         let origin = normalize_relay(origin).map_err(|_| malformed("origin"))?;
@@ -350,23 +398,22 @@ impl ReportChallenge {
             "signer": signer, "slot": slot, "origin": origin, "connection": connection,
             "nonce": b64u(&nonce), "issued_at": issued_at, "expires_at": expires_at,
         });
-        Self::read(&fields)
+        Ok(fields.as_object().expect("an object").clone())
     }
 
     /// Exactly the challenge: one strict I-JSON parse (no duplicate keys,
     /// escaped ones included; integers only), these seven fields and no
     /// other, no `null`, each field's grammar.
     pub fn parse(bytes: &[u8]) -> Result<Self, ReportRefusal> {
-        let value = canonical::parse_strict(bytes, MAX_CHALLENGE_BYTES, Numbers::IntegersOnly)
-            .map_err(|e| match e {
-                canonical::StrictError::TooLarge => malformed("too large"),
-                _ => malformed("not strict JSON"),
-            })?;
-        Self::read(&value)
+        Self::read(&strict_challenge(bytes)?)
     }
 
     fn read(value: &Value) -> Result<Self, ReportRefusal> {
-        let o = exact(value, &CHALLENGE_FIELDS, "challenge fields")?;
+        Self::read_fields(exact(value, &CHALLENGE_FIELDS, "challenge fields")?)
+    }
+
+    /// The seven fields of `o` (its field set the caller's to check).
+    fn read_fields(o: &Map<String, Value>) -> Result<Self, ReportRefusal> {
         let signer = str_field(o, "signer")?;
         if !signer_ok(signer) {
             return Err(malformed("signer"));
@@ -438,6 +485,29 @@ impl ReportChallenge {
             expires_at: self.expires_at,
         }
     }
+
+    /// The body's `challenge`: the echo of every field but the signer and
+    /// slot, which sit at the body's top.
+    fn echo_json(&self) -> Value {
+        json!({
+            "origin": self.echo_origin,
+            "connection": self.connection,
+            "nonce": b64u(&self.nonce),
+            "issued_at": self.issued_at,
+            "expires_at": self.expires_at,
+        })
+    }
+}
+
+/// A challenge text, one strict I-JSON parse within
+/// [`MAX_CHALLENGE_BYTES`].
+fn strict_challenge(bytes: &[u8]) -> Result<Value, ReportRefusal> {
+    canonical::parse_strict(bytes, MAX_CHALLENGE_BYTES, Numbers::IntegersOnly).map_err(
+        |e| match e {
+            canonical::StrictError::TooLarge => malformed("too large"),
+            _ => malformed("not strict JSON"),
+        },
+    )
 }
 
 // -------------------------------------------------------------- process
@@ -491,13 +561,12 @@ fn signer_key(
     Ok((kind, state.member.auth_key.clone()))
 }
 
-/// A report's body, built by [`verifier_report_body`] from the reporter's
-/// own log, inventory and process, with the signer's key at that log's
-/// head. Immutable: nothing outside this module changes a field, so a
-/// signature attached with [`with_signature`](Self::with_signature) is
-/// over exactly this body.
+/// A body a reporter's key signs, built by the core and held unchanged:
+/// a signature attached with [`with_signature`](Self::with_signature) is
+/// over exactly this body, under its own label.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifierReportBody {
+struct HeldBody {
+    label: SignLabel,
     value: Value,
     jcs: String,
     head: Head,
@@ -505,43 +574,38 @@ pub struct VerifierReportBody {
     signer_key: PublicKey,
 }
 
-impl VerifierReportBody {
-    /// The body object.
-    pub fn to_json(&self) -> Value {
-        self.value.clone()
+impl HeldBody {
+    /// `value` checked as a signed body of `label` (R9.1: its `jcs` at
+    /// most 4,096 bytes, no `null`, the arrays its label allows).
+    fn new(
+        label: SignLabel,
+        value: Value,
+        head: Head,
+        process: [u8; PROCESS_BYTES],
+        signer_key: PublicKey,
+    ) -> Result<Self, ReportRefusal> {
+        let (checked, jcs) = signed::check_body(&value).map_err(|_| malformed("body"))?;
+        if checked != label {
+            return Err(malformed("type"));
+        }
+        Ok(HeldBody {
+            label,
+            value,
+            jcs,
+            head,
+            process,
+            signer_key,
+        })
     }
 
-    /// `jcs(body)`.
-    pub fn jcs(&self) -> &str {
-        &self.jcs
-    }
-
-    /// `enc(["atem-verifier-report-v1", jcs(body)])`: what the signer's key
-    /// signs.
-    pub fn signing_input(&self) -> SigningInput {
-        SigningInput::new(SignLabel::VerifierReport, self.jcs.as_bytes())
-    }
-
-    /// The head of the reporter's log the body names.
-    pub fn head(&self) -> Head {
-        self.head
-    }
-
-    /// The process generation the body names ([`process_generation`]).
-    pub fn process(&self) -> [u8; PROCESS_BYTES] {
-        self.process
-    }
-
-    /// The signer's key at the log's head, with its algorithm.
-    pub fn signer_key(&self) -> &PublicKey {
-        &self.signer_key
+    fn signing_input(&self) -> SigningInput {
+        SigningInput::new(self.label, self.jcs.as_bytes())
     }
 
     /// The report: this body with `sig` (P-256 64-byte `r‖s`, either S,
-    /// normalized to low S; or Ed25519), once it verifies under the signer's
-    /// key over this body's signing input. A signature over any other body,
-    /// under any other label or by any other key is `bad_signature`.
-    pub fn with_signature(&self, sig: &[u8]) -> Result<SignedObject, ReportRefusal> {
+    /// normalized to low S; or Ed25519), once it verifies under the
+    /// signer's key over this body's signing input.
+    fn with_signature(&self, sig: &[u8]) -> Result<SignedObject, ReportRefusal> {
         let sig = normalize_signature(self.signer_key.alg(), sig.to_vec())
             .map_err(|_| ReportRefusal::BadSignature)?;
         self.signer_key
@@ -552,6 +616,113 @@ impl VerifierReportBody {
         debug_assert_eq!(object.jcs(), self.jcs);
         Ok(object)
     }
+}
+
+/// A report's body, built by [`verifier_report_body`] from the reporter's
+/// own log, inventory and process, with the signer's key at that log's
+/// head. Immutable: nothing outside this module changes a field, so a
+/// signature attached with [`with_signature`](Self::with_signature) is
+/// over exactly this body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifierReportBody(HeldBody);
+
+impl VerifierReportBody {
+    /// The body object.
+    pub fn to_json(&self) -> Value {
+        self.0.value.clone()
+    }
+
+    /// `jcs(body)`.
+    pub fn jcs(&self) -> &str {
+        &self.0.jcs
+    }
+
+    /// `enc(["atem-verifier-report-v1", jcs(body)])`: what the signer's key
+    /// signs.
+    pub fn signing_input(&self) -> SigningInput {
+        self.0.signing_input()
+    }
+
+    /// The head of the reporter's log the body names.
+    pub fn head(&self) -> Head {
+        self.0.head
+    }
+
+    /// The process generation the body names ([`process_generation`]).
+    pub fn process(&self) -> [u8; PROCESS_BYTES] {
+        self.0.process
+    }
+
+    /// The signer's key at the log's head, with its algorithm.
+    pub fn signer_key(&self) -> &PublicKey {
+        &self.0.signer_key
+    }
+
+    /// The report: this body with `sig` (P-256 64-byte `r‖s`, either S,
+    /// normalized to low S; or Ed25519), once it verifies under the signer's
+    /// key over this body's signing input. A signature over any other body,
+    /// under any other label or by any other key is `bad_signature`.
+    pub fn with_signature(&self, sig: &[u8]) -> Result<SignedObject, ReportRefusal> {
+        self.0.with_signature(sig)
+    }
+}
+
+/// The builder's checks both reports share, in this order: `signer`
+/// (by `signer_allowed`), `slot` and `station` in their grammar (`malformed`);
+/// `log` not frozen (`frozen`); the challenge's `origin` the configured
+/// Station normalized (`origin_mismatch`), its `signer` the reporter
+/// (`signer_mismatch`), its `slot` the reporter's (`slot_mismatch`), its
+/// lease in range (`malformed`; a read challenge always is).
+fn check_build(
+    log: &Membership,
+    challenge: &ReportChallenge,
+    signer: &str,
+    slot: &str,
+    station: &str,
+    signer_allowed: fn(&str) -> bool,
+) -> Result<(), ReportRefusal> {
+    if !signer_allowed(signer) {
+        return Err(malformed("signer"));
+    }
+    if !id_ok(slot) {
+        return Err(malformed("slot"));
+    }
+    let station = normalize_relay(station).map_err(|_| malformed("station"))?;
+    if log.frozen().is_some() {
+        return Err(ReportRefusal::Frozen);
+    }
+    if challenge.origin() != station {
+        return Err(ReportRefusal::OriginMismatch);
+    }
+    if challenge.signer() != signer {
+        return Err(ReportRefusal::SignerMismatch);
+    }
+    if challenge.slot() != slot {
+        return Err(ReportRefusal::SlotMismatch);
+    }
+    if !lease_ok(challenge.issued_at(), challenge.expires_at()) {
+        return Err(malformed("lease"));
+    }
+    Ok(())
+}
+
+/// The fields both reports' bodies share, as the builder writes them for
+/// `challenge` at `log`'s head (the caller adds `type`, `v` and its own).
+fn common_body(
+    log: &Membership,
+    challenge: &ReportChallenge,
+    process: &[u8; PROCESS_BYTES],
+) -> Map<String, Value> {
+    let body = json!({
+        "account_id": log.account_id(),
+        "genesis_hash": log.genesis_hash().to_hex(),
+        "head": log.head().to_json(),
+        "signer": challenge.signer(),
+        "slot": challenge.slot(),
+        "process": b64u(process),
+        "challenge": challenge.echo_json(),
+    });
+    body.as_object().expect("an object").clone()
 }
 
 /// The body a reporter signs for `challenge`, as `signer` (`member:<id>` or
@@ -577,61 +748,24 @@ pub fn verifier_report_body(
     station: &str,
     now_ms: u64,
 ) -> Result<VerifierReportBody, ReportRefusal> {
-    if !signer_ok(signer) {
-        return Err(malformed("signer"));
-    }
-    if !id_ok(slot) {
-        return Err(malformed("slot"));
-    }
-    let station = normalize_relay(station).map_err(|_| malformed("station"))?;
-    if log.frozen().is_some() {
-        return Err(ReportRefusal::Frozen);
-    }
-    if challenge.origin() != station {
-        return Err(ReportRefusal::OriginMismatch);
-    }
-    if challenge.signer() != signer {
-        return Err(ReportRefusal::SignerMismatch);
-    }
-    if challenge.slot() != slot {
-        return Err(ReportRefusal::SlotMismatch);
-    }
-    if !lease_ok(challenge.issued_at(), challenge.expires_at()) {
-        return Err(malformed("lease"));
-    }
+    check_build(log, challenge, signer, slot, station, signer_ok)?;
     let (_, signer_key) = signer_key(log, signer, now_ms)?;
     if now_ms >= challenge.expires_at() {
         return Err(ReportRefusal::Expired);
     }
-    let head = log.head();
     let process = process_generation();
-    let value = json!({
-        "type": REPORT_TYPE,
-        "v": 1,
-        "account_id": log.account_id(),
-        "genesis_hash": log.genesis_hash().to_hex(),
-        "head": head.to_json(),
-        "signer": signer,
-        "slot": slot,
-        "process": b64u(&process),
-        "challenge": {
-            "origin": challenge.origin(),
-            "connection": challenge.connection(),
-            "nonce": b64u(challenge.nonce()),
-            "issued_at": challenge.issued_at(),
-            "expires_at": challenge.expires_at(),
-        },
-        "verifier": VerifierInventory::ours().to_json(),
-    });
-    let (label, jcs) = signed::check_body(&value).map_err(|_| malformed("body"))?;
-    debug_assert_eq!(label, SignLabel::VerifierReport);
-    Ok(VerifierReportBody {
-        value,
-        jcs,
-        head,
+    let mut value = common_body(log, challenge, &process);
+    value.insert("type".into(), json!(REPORT_TYPE));
+    value.insert("v".into(), json!(1));
+    value.insert("verifier".into(), VerifierInventory::ours().to_json());
+    HeldBody::new(
+        SignLabel::VerifierReport,
+        Value::Object(value),
+        log.head(),
         process,
         signer_key,
-    })
+    )
+    .map(VerifierReportBody)
 }
 
 /// Signs `body` with `key` (the signer's own key behind `provider`) and
@@ -681,8 +815,8 @@ pub struct VerifiedReport {
     pub expires_at: u64,
 }
 
-/// What a body says, read exactly.
-struct Read {
+/// What both reports' bodies say beside their own fields, read exactly.
+struct Common {
     account_id: String,
     genesis_hash: Hash32,
     head: Head,
@@ -690,15 +824,12 @@ struct Read {
     slot: String,
     process: [u8; PROCESS_BYTES],
     echo: Echo,
-    inventory: VerifierInventory,
 }
 
-impl Read {
-    fn body(body: &Value) -> Result<Read, ReportRefusal> {
-        let o = exact(body, &BODY_FIELDS, "body fields")?;
-        if o.get("type").and_then(Value::as_str) != Some(REPORT_TYPE) {
-            return Err(malformed("type"));
-        }
+impl Common {
+    /// The shared fields of `o`, whose field set and `type` the caller
+    /// checked.
+    fn read(o: &Map<String, Value>) -> Result<Common, ReportRefusal> {
         let account_id = str_field(o, "account_id")?;
         if account_id.is_empty() || account_id.len() > MAX_ACCOUNT_ID_BYTES {
             return Err(malformed("account_id"));
@@ -723,12 +854,9 @@ impl Read {
             .ok()
             .and_then(|p| b64u_decode_array::<PROCESS_BYTES>(p).ok())
             .ok_or(malformed("process"))?;
-        let echo = Echo::read(exact(&o["challenge"], &ECHO_FIELDS, "challenge")?)?;
-        let inventory = o
-            .get("verifier")
-            .ok_or(malformed("verifier"))
-            .and_then(|v| VerifierInventory::from_json(v).map_err(|_| malformed("verifier")))?;
-        Ok(Read {
+        let echo = o.get("challenge").ok_or(malformed("challenge"))?;
+        let echo = Echo::read(exact(echo, &ECHO_FIELDS, "challenge")?)?;
+        Ok(Common {
             account_id: account_id.to_owned(),
             genesis_hash,
             head,
@@ -736,8 +864,55 @@ impl Read {
             slot: slot.to_owned(),
             process,
             echo,
-            inventory,
         })
+    }
+
+    /// The log's checks before the signer's: not frozen (`frozen`), its
+    /// account and genesis (`wrong_account`).
+    fn check_log(&self, log: &Membership) -> Result<(), ReportRefusal> {
+        if log.frozen().is_some() {
+            return Err(ReportRefusal::Frozen);
+        }
+        if self.account_id != log.account_id() || self.genesis_hash != log.genesis_hash() {
+            return Err(ReportRefusal::WrongAccount);
+        }
+        Ok(())
+    }
+
+    /// The checks after the signer's key, in this order: `sig` by `key`
+    /// (`bad_signature`), `head` the log's head or an ancestor
+    /// (`stale_log` beyond it, `fork` off it), `signer` and `slot` the
+    /// expected ones (`signer_mismatch`, `slot_mismatch`), every echoed
+    /// challenge field the expected one (`challenge_mismatch`). Whether
+    /// `head` is the log's own.
+    fn check_signed(
+        &self,
+        log: &Membership,
+        object: &SignedObject,
+        key: &PublicKey,
+        expected: &ReportChallenge,
+    ) -> Result<bool, ReportRefusal> {
+        object
+            .verify(key)
+            .map_err(|_| ReportRefusal::BadSignature)?;
+        let ours = log.head();
+        if self.head.seq > ours.seq {
+            return Err(ReportRefusal::StaleLog);
+        }
+        match log.entry(self.head.seq) {
+            Some(entry) if entry.hash() == self.head.hash => {}
+            _ => return Err(ReportRefusal::Fork),
+        }
+        if self.signer != expected.signer() {
+            return Err(ReportRefusal::SignerMismatch);
+        }
+        if self.slot != expected.slot() {
+            return Err(ReportRefusal::SlotMismatch);
+        }
+        if !self.echo.same(&expected.echo()) {
+            return Err(ReportRefusal::ChallengeMismatch);
+        }
+        Ok(self.head == ours)
     }
 }
 
@@ -753,6 +928,17 @@ fn object_malformed(e: Error) -> ReportRefusal {
         Error::Malformed(what) => what,
         _ => "report",
     })
+}
+
+/// A report as received, `{"body","sig"}`, read as a signed object of
+/// `label` (R9.1: strict I-JSON within 16 KiB, its body's `jcs` within
+/// 4,096 bytes, no `null`, no `kit_sig`, only the arrays its label allows).
+fn read_report(report_json: &[u8], label: SignLabel) -> Result<SignedObject, ReportRefusal> {
+    let object = SignedObject::parse(report_json).map_err(object_malformed)?;
+    if object.label() != label {
+        return Err(malformed("type"));
+    }
+    Ok(object)
 }
 
 /// Verifies a report (`{"body","sig"}` as received) against `log` at its
@@ -775,38 +961,19 @@ pub fn verify_verifier_report(
     expected: &ReportChallenge,
     now_ms: u64,
 ) -> Result<VerifiedReport, ReportRefusal> {
-    let object = SignedObject::parse(report_json).map_err(object_malformed)?;
-    if object.label() != SignLabel::VerifierReport {
+    let object = read_report(report_json, SignLabel::VerifierReport)?;
+    let o = exact(object.body(), &BODY_FIELDS, "body fields")?;
+    if o.get("type").and_then(Value::as_str) != Some(REPORT_TYPE) {
         return Err(malformed("type"));
     }
-    let body = Read::body(object.body())?;
-    if log.frozen().is_some() {
-        return Err(ReportRefusal::Frozen);
-    }
-    if body.account_id != log.account_id() || body.genesis_hash != log.genesis_hash() {
-        return Err(ReportRefusal::WrongAccount);
-    }
+    let body = Common::read(o)?;
+    let inventory = o
+        .get("verifier")
+        .ok_or(malformed("verifier"))
+        .and_then(|v| VerifierInventory::from_json(v).map_err(|_| malformed("verifier")))?;
+    body.check_log(log)?;
     let (kind, key) = signer_key(log, &body.signer, now_ms)?;
-    object
-        .verify(&key)
-        .map_err(|_| ReportRefusal::BadSignature)?;
-    let ours = log.head();
-    if body.head.seq > ours.seq {
-        return Err(ReportRefusal::StaleLog);
-    }
-    match log.entry(body.head.seq) {
-        Some(entry) if entry.hash() == body.head.hash => {}
-        _ => return Err(ReportRefusal::Fork),
-    }
-    if body.signer != expected.signer() {
-        return Err(ReportRefusal::SignerMismatch);
-    }
-    if body.slot != expected.slot() {
-        return Err(ReportRefusal::SlotMismatch);
-    }
-    if !body.echo.same(&expected.echo()) {
-        return Err(ReportRefusal::ChallengeMismatch);
-    }
+    let at_head = body.check_signed(log, &object, &key, expected)?;
     if now_ms >= expected.expires_at() {
         return Err(ReportRefusal::Expired);
     }
@@ -817,8 +984,8 @@ pub fn verify_verifier_report(
         process: body.process,
         connection: body.echo.connection,
         head: body.head,
-        at_head: body.head == ours,
-        inventory: body.inventory,
+        at_head,
+        inventory,
         expires_at: body.echo.expires_at,
     })
 }

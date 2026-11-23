@@ -22,7 +22,11 @@ mailbox written here from host-work-v1 §11.5 ("The mailbox calls"), not
 from the shared core's reference mailbox, and
 `r9-vectors-verifier-report`, whose every challenge reading, report code
 (in the agreed order) or verified fields, builder outcome and request
-finish it derives from that file's rules (session-v1 R9.2, Astation #101).
+finish it derives from that file's rules (session-v1 R9.2, Astation #101),
+and `r9-vectors-signer-report`, the same for a native manager's signer
+report, its exported records read with a control-record reader written
+here and its set hashes recomputed from the journal's bodies (host-work-v1
+§11.1 "The signer report", Astation #114).
 The other files'
 `expect` and each `reason` are checked by the Rust runner
 (`crates/atem-client/tests/vectors.rs`) and the binding suites.
@@ -4206,10 +4210,17 @@ def read_vr_report(text):
 class VrList:
     """A device list as the report's checks read it, replayed from L and a
     case's chain: who is a member of which kind and with which key, the
-    chain's entry hashes, and a freeze."""
+    chain's entry hashes, and a freeze. A recovery_add is pending until a
+    recovery_approve naming its entry_hash makes it take effect (its member
+    then current: `recovered`) or a recovery_veto cancels it (R9.5), as the
+    shared verifier reads them. Its 24 h wait never ends here: each of the
+    vectors' lists is read at one host clock reading, the one its entries
+    were carried at."""
 
     def __init__(self, bodies, frozen):
         self.members, self.hashes, self.frozen = {}, [], frozen
+        self.recovered = set()
+        pending = {}
         for body in bodies:
             self.hashes.append(sha256(enc(["atem-membership-hash-v1", jcs(body)])).hex())
             action = body["action"]
@@ -4217,9 +4228,15 @@ class VrList:
                 member = body["member"]
                 self.members[member["device_id"]] = dict(member, standing="active")
             elif action == "recovery_add":
-                # Pending: the vectors' lists are read within its 24 h wait,
-                # and no chain here approves or vetoes it.
                 self.members[body["member"]["device_id"]] = dict(body["member"], standing="pending")
+                pending[self.hashes[-1]] = body["member"]["device_id"]
+            elif action in ("recovery_approve", "recovery_veto") and body["target"] in pending:
+                device_id = pending.pop(body["target"])
+                if action == "recovery_approve":
+                    self.members[device_id]["standing"] = "active"
+                    self.recovered.add(device_id)
+                else:
+                    self.members[device_id]["standing"] = "cancelled"
             elif action == "set_roles" and "roles" in body:
                 # Roles change, the standing and the key don't.
                 self.members[body["device_id"]]["roles"] = body["roles"]
@@ -4334,6 +4351,58 @@ def vr_sign(keys, name, message):
     return r.to_bytes(32, "big") + s.to_bytes(32, "big")
 
 
+def report_bodies(data, mlog, labels):
+    """Log L's entry bodies, then the file's `entries` named by `labels`."""
+    entries = {e["label"]: e for e in data["entries"]}
+    return [v["entry"]["body"] for v in mlog["log"]] + [entries[label]["entry"]["body"] for label in labels]
+
+
+def check_report_entries(case, data, mlog):
+    """Each of a report file's `entries`: it chains on L and the entries it
+    extends (`on`), its seq and entry_hash, and its signature by its
+    signer's key on that list (a current member's auth_key, or the recovery
+    key of L's genesis)."""
+    for e in data["entries"]:
+        body = e["entry"]["body"]
+        base = report_bodies(data, mlog, e["on"])
+        case.equal(body["prev_hash"], sha256(enc(["atem-membership-hash-v1", jcs(base[-1])])).hex(), f"{e['label']} chains on L + {e['on']}")
+        case.equal(body["seq"], len(base) + 1, f"{e['label']} seq")
+        case.equal(sha256(enc(["atem-membership-hash-v1", jcs(body)])).hex(), e["entry_hash"], f"{e['label']} entry_hash")
+        if body["signer"] == "recovery":
+            key = base[0]["recovery_key"]
+        else:
+            member = VrList(base, False).members.get(body["signer"], {})
+            key = member.get("auth_key") if member.get("standing") == "active" else None
+        case.check(
+            key is not None and verify(key["alg"], b64u_decode(key["pub"]), b64u_decode(e["entry"]["sig"]), enc(["atem-membership-entry-v1", jcs(body)])),
+            f"{e['label']} signed by {body['signer']}",
+        )
+
+
+def report_list(c, data, mlog, cls):
+    """A case's list: L, its chain (each entry extending the ones before
+    it), then its `freeze` carriage when it names one."""
+    entries = {e["label"]: e for e in data["entries"]}
+    for i, label in enumerate(c["chain"]):
+        if entries[label]["on"] != c["chain"][:i]:
+            raise ValueError(f"{label} doesn't extend {c['chain'][:i]}")
+    bodies = report_bodies(data, mlog, c["chain"])
+    frozen = False
+    if "freeze" in c:
+        # A carriage at a position the list holds, by a current manager,
+        # another body: the conflict rule freezes (R9.4).
+        others = {v["label"]: v["entry"]["body"] for v in mlog["log"] + mlog["others"]}
+        other = others[c["freeze"]]
+        signer = VrList(bodies, False).members.get(other["signer"], {})
+        frozen = (
+            other["seq"] <= len(bodies)
+            and jcs(other) != jcs(bodies[other["seq"] - 1])
+            and signer.get("standing") == "active"
+            and "manage" in signer.get("roles", [])
+        )
+    return cls(bodies, frozen)
+
+
 def check_verifier_report(file, data, report, context):
     """Every case's verdict derived here from the file's note (R9.2's report
     as agreed on Astation #101): each challenge text read or refused; each
@@ -4347,52 +4416,15 @@ def check_verifier_report(file, data, report, context):
     keys = context["keys"]
     mlog = context["membership_log"]
     inventory = {"version": 2, "actions": sorted(R9_2_ACTIONS, key=str.encode)}
-    log_l = [v["entry"]["body"] for v in mlog["log"]]
-    others = {v["label"]: v["entry"]["body"] for v in mlog["log"] + mlog["others"]}
     entries = {e["label"]: e for e in data["entries"]}
-    def base_of(labels):
-        return log_l + [entries[label]["entry"]["body"] for label in labels]
-
     with report.case(file, "entries") as case:
-        for e in data["entries"]:
-            body = e["entry"]["body"]
-            base = base_of(e["on"])
-            case.equal(body["prev_hash"], sha256(enc(["atem-membership-hash-v1", jcs(base[-1])])).hex(), f"{e['label']} chains on L + {e['on']}")
-            case.equal(body["seq"], len(base) + 1, f"{e['label']} seq")
-            case.equal(sha256(enc(["atem-membership-hash-v1", jcs(body)])).hex(), e["entry_hash"], f"{e['label']} entry_hash")
-            # Its signer's key on the list it extends: a current member's
-            # auth_key, or the recovery key of L's genesis.
-            if body["signer"] == "recovery":
-                key = base[0]["recovery_key"]
-            else:
-                member = VrList(base, False).members.get(body["signer"], {})
-                key = member.get("auth_key") if member.get("standing") == "active" else None
-            case.check(
-                key is not None and verify(key["alg"], b64u_decode(key["pub"]), b64u_decode(e["entry"]["sig"]), enc(["atem-membership-entry-v1", jcs(body)])),
-                f"{e['label']} signed by {body['signer']}",
-            )
+        check_report_entries(case, data, mlog)
         desk = entries["VR7_add_desk"]["entry"]["body"]["member"]
         case.equal((desk["auth_key"]["alg"], b64u_decode(desk["auth_key"]["pub"])), ("ed25519", keys.public("dev-desk", "auth")), "dev-desk's Ed25519 key")
         case.equal(jcs(entries["VR7_recovery_add_newmac"]["entry"]), jcs(next(v["entry"] for v in mlog["others"] if v["label"] == "R7")), "VR7_recovery_add_newmac is R7, byte for byte")
 
     def lst(c):
-        for i, label in enumerate(c["chain"]):
-            if entries[label]["on"] != c["chain"][:i]:
-                raise ValueError(f"{label} doesn't extend {c['chain'][:i]}")
-        bodies = base_of(c["chain"])
-        frozen = False
-        if "freeze" in c:
-            # A carriage at a position the list holds, by a current
-            # manager, another body: the conflict rule freezes (R9.4).
-            other = others[c["freeze"]]
-            signer = VrList(bodies, False).members.get(other["signer"], {})
-            frozen = (
-                other["seq"] <= len(bodies)
-                and jcs(other) != jcs(bodies[other["seq"] - 1])
-                and signer.get("standing") == "active"
-                and "manage" in signer.get("roles", [])
-            )
-        return VrList(bodies, frozen)
+        return report_list(c, data, mlog, VrList)
 
     for c in data["challenges"]:
         with report.case(file, f"challenge {c['label']}") as case:
@@ -4453,6 +4485,452 @@ def check_verifier_report(file, data, report, context):
                     over = dict(held, slot=f["over"]["slot"])
                 sig = vr_sign(keys, f["signed_with"], enc([VR_LABEL, jcs(over)]))
                 ok = verify(signer_alg, signer_pub, sig, enc([VR_LABEL, jcs(held)]))
+                case.equal(ok, "code" not in f, f"{f['label']}: {'taken' if ok else 'refused'}")
+                if not ok:
+                    case.equal(f["code"], "bad_signature", f"{f['label']}: bad_signature")
+
+
+# ------------------------------------------------ r9-vectors-signer-report
+
+# A native manager's signed report of its control-record signing journal
+# (host-work-v1 §11.1 "The signer report"; Astation #114 item 4, agreed on
+# #114 comment 7089435073): the verifier report's core with a recovery and a
+# journal in place of the inventory.
+SR_BODY_FIELDS = sorted(["account_id", "challenge", "genesis_hash", "head", "journal", "process", "recovery", "signer", "slot", "type", "v"])
+SR_CHALLENGE_FIELDS = sorted(VR_CHALLENGE_FIELDS + ["recovery"])
+SR_RECOVERY_FIELDS = ["candidate_feed_id", "evidence_hash", "generation", "plan_id", "source_hash"]
+SR_JOURNAL_FIELDS = ["drafts", "drafts_hash", "id", "records", "records_hash", "revision", "since"]
+SR_LABEL = "atem-signer-report-v1"
+SR_RECORDS = "atem-signer-report-records-v1"
+SR_DRAFTS = "atem-signer-report-drafts-v1"
+SR_MAX_GENERATION = 2**63 - 1
+SR_VERIFY_ORDER = [
+    "malformed", "frozen", "wrong_account", "unknown_signer", "not_a_manager", "bad_signature", "stale_log", "fork",
+    "signer_mismatch", "slot_mismatch", "challenge_mismatch", "recovery_mismatch", "records_mismatch", "expired",
+]
+CONTROL_LABEL = "atem-host-work-control-v1"
+# A control record's body fields (record.rs, delegated host-work I.5.3).
+CONTROL_FIELDS = {
+    "type", "v", "account_id", "genesis_hash", "origin", "feed_id", "principal", "principal_key", "signer",
+    "action", "interrupt_running", "revoke_seq", "record_id", "issued_at", "about",
+}
+
+
+def sr_device_id(text, prefix):
+    """`<prefix><id>`, the id opaque and not the reserved `recovery`."""
+    return (
+        isinstance(text, str) and text.startswith(prefix)
+        and re.fullmatch(OPAQUE_ID, text[len(prefix):]) is not None and text[len(prefix):] != "recovery"
+    )
+
+
+def sr_flat(value):
+    """No null and no array anywhere (a control record's body and a signer
+    report's have no array)."""
+    if value is None or isinstance(value, list):
+        return False
+    if isinstance(value, dict):
+        return all(sr_flat(v) for v in value.values())
+    return True
+
+
+def sr_control_body(value):
+    """A control record's body exactly as ControlBody::from_json reads it
+    (R9.1's object rules, then I.5.3's two forms), or Refused("malformed")."""
+    if not isinstance(value, dict) or not sr_flat(value):
+        raise Refused("malformed")
+    if value.get("type") != "atem-host-work-control" or type(value.get("v")) is not int or value["v"] != 1:
+        raise Refused("malformed")
+    if len(jcs(value).encode()) > MAX_BODY_BYTES or not set(value) <= CONTROL_FIELDS:
+        raise Refused("malformed")
+    about = value.get("about")
+    if not isinstance(about, dict) or not set(about) <= {"integration_id", "by"}:
+        raise Refused("malformed")
+    account = value.get("account_id")
+    ok = isinstance(account, str) and 1 <= len(account.encode()) <= 128
+    ok = ok and isinstance(value.get("genesis_hash"), str) and re.fullmatch(HEX64, value["genesis_hash"]) is not None
+    principal, signer, action = value.get("principal"), value.get("signer"), value.get("action")
+    service = sr_device_id(principal, "service:")
+    host = isinstance(principal, str) and principal.startswith("host:") and re.fullmatch(OPAQUE_ID, principal[5:]) is not None
+    ok = ok and (service or host)
+    ok = ok and (signer == principal or sr_device_id(signer, "member:"))
+    ok = ok and action in ("cover", "revoke", "hold", "release", "interrupt_running")
+    if ok and service:
+        ok = (
+            relay_origin_ok(value.get("origin"))
+            and isinstance(value.get("feed_id"), str) and re.fullmatch(UUID_V4, value["feed_id"]) is not None
+            and isinstance(value.get("principal_key"), str) and re.fullmatch(HEX64, value["principal_key"]) is not None
+            and "revoke_seq" not in value
+            and (isinstance(value.get("interrupt_running"), bool) if action == "revoke" else "interrupt_running" not in value)
+            and isinstance(about.get("integration_id"), str) and re.fullmatch(OPAQUE_ID, about["integration_id"]) is not None
+        )
+    elif ok:
+        ok = (
+            action == "interrupt_running"
+            and not {"origin", "feed_id", "principal_key", "interrupt_running"} & set(value)
+            and "integration_id" not in about
+            and vr_int(value.get("revoke_seq"), 1)
+        )
+    ok = ok and isinstance(value.get("record_id"), str) and re.fullmatch(UUID_V4, value["record_id"]) is not None
+    ok = ok and vr_int(value.get("issued_at"))
+    by = about.get("by")
+    ok = ok and isinstance(by, str) and re.fullmatch(r"[a-z_]{1,32}", by) is not None
+    if not ok:
+        raise Refused("malformed")
+    return value
+
+
+def sr_of_plan(body, lst, member, origin):
+    """One of the plan's records by `member:<member>` (B2): of the list's
+    account and genesis, a service's revoke or interrupt_running naming
+    `origin`, or a host principal's interrupt_running (no origin)."""
+    return (
+        body["account_id"] == lst.account_id and body["genesis_hash"] == lst.genesis_hash
+        and body["signer"] == f"member:{member}"
+        and (
+            (body["principal"].startswith("service:") and body["action"] in ("revoke", "interrupt_running") and body["origin"] == origin)
+            or (body["principal"].startswith("host:") and body["action"] == "interrupt_running")
+        )
+    )
+
+
+def sr_set_hash(label, digests):
+    return sha256(enc([label] + sorted(digests))).hex()
+
+
+def sr_recovery_ok(o):
+    """The recovery's five fields: generation a canonical decimal 1 to 2^63 - 1,
+    plan_id and candidate_feed_id UUID v4, the hashes lowercase hex."""
+    if not isinstance(o, dict) or sorted(o) != SR_RECOVERY_FIELDS:
+        return False
+    g = o["generation"]
+    if not isinstance(g, str) or re.fullmatch(r"[1-9][0-9]{0,18}", g) is None or int(g) > SR_MAX_GENERATION:
+        return False
+    if not all(isinstance(o[k], str) and re.fullmatch(UUID_V4, o[k]) is not None for k in ("plan_id", "candidate_feed_id")):
+        return False
+    return all(isinstance(o[k], str) and re.fullmatch(HEX64, o[k]) is not None for k in ("source_hash", "evidence_hash"))
+
+
+def sr_journal_ok(o):
+    if not isinstance(o, dict) or sorted(o) != SR_JOURNAL_FIELDS:
+        return False
+    return (
+        vr_b64u(o["id"], 16) and vr_int(o["since"], 1) and vr_int(o["revision"]) and vr_int(o["records"]) and vr_int(o["drafts"])
+        and all(isinstance(o[k], str) and re.fullmatch(HEX64, o[k]) is not None for k in ("records_hash", "drafts_hash"))
+    )
+
+
+def read_sr_challenge(text):
+    """SignerReportChallenge::parse as the file's note writes it: the
+    verifier report's challenge, its signer a member, and the recovery."""
+    value = vr_strict(text, VR_MAX_CHALLENGE_BYTES)
+    if not isinstance(value, dict) or sorted(value) != SR_CHALLENGE_FIELDS:
+        raise Refused("malformed")
+    signer = value["signer"]
+    m = re.fullmatch(VR_SIGNER, signer) if isinstance(signer, str) else None
+    if m is None or m.group(1) != "member":
+        raise Refused("malformed")
+    if not isinstance(value["slot"], str) or re.fullmatch(OPAQUE_ID, value["slot"]) is None:
+        raise Refused("malformed")
+    vr_echo(value)
+    if not sr_recovery_ok(value["recovery"]):
+        raise Refused("malformed")
+    return value
+
+
+def read_sr_report(text):
+    """The report as the shared core reads it: strict I-JSON within 16 KiB,
+    exactly body and sig, no null and no array, the body's jcs within 4,096
+    bytes, exactly its fields at every level and each field's grammar."""
+    value = vr_strict(text, VR_MAX_OBJECT_BYTES)
+    if not isinstance(value, dict) or sorted(value) != ["body", "sig"]:
+        raise Refused("malformed")
+    body = value["body"]
+    try:
+        sig = b64u_decode(value["sig"])
+    except ValueError:
+        raise Refused("malformed")
+    if not isinstance(body, dict) or not sr_flat(body):
+        raise Refused("malformed")
+    if body.get("type") != "atem-signer-report" or type(body.get("v")) is not int or body["v"] != 1:
+        raise Refused("malformed")
+    if len(jcs(body).encode("utf-8")) > MAX_BODY_BYTES or sorted(body) != SR_BODY_FIELDS:
+        raise Refused("malformed")
+    account = body["account_id"]
+    if not isinstance(account, str) or not 1 <= len(account.encode()) <= 128:
+        raise Refused("malformed")
+    if not isinstance(body["genesis_hash"], str) or re.fullmatch(HEX64, body["genesis_hash"]) is None:
+        raise Refused("malformed")
+    head = body["head"]
+    if (
+        not isinstance(head, dict) or sorted(head) != ["hash", "seq"] or not vr_int(head["seq"], 1)
+        or not isinstance(head["hash"], str) or re.fullmatch(HEX64, head["hash"]) is None
+    ):
+        raise Refused("malformed")
+    if not isinstance(body["signer"], str) or re.fullmatch(VR_SIGNER, body["signer"]) is None:
+        raise Refused("malformed")
+    if not isinstance(body["slot"], str) or re.fullmatch(OPAQUE_ID, body["slot"]) is None:
+        raise Refused("malformed")
+    if not vr_b64u(body["process"], 16):
+        raise Refused("malformed")
+    echo = body["challenge"]
+    if not isinstance(echo, dict) or sorted(echo) != VR_ECHO_FIELDS:
+        raise Refused("malformed")
+    vr_echo(echo)
+    if not sr_recovery_ok(body["recovery"]) or not sr_journal_ok(body["journal"]):
+        raise Refused("malformed")
+    return body, sig
+
+
+class SrList(VrList):
+    """VrList, with who held manage at some seq of it: a native entering
+    with manage (genesis, add, or a recovery_add once it took effect), or
+    given it by set_roles. A recovery_add still waiting gives nothing."""
+
+    def __init__(self, bodies, frozen):
+        super().__init__(bodies, frozen)
+        self.managed = set()
+        for body in bodies:
+            if body["action"] in ("genesis", "add"):
+                member = body["member"]
+                if member["kind"] == "native" and "manage" in member["roles"]:
+                    self.managed.add(member["device_id"])
+            elif body["action"] == "set_roles" and "manage" in body.get("roles", []):
+                self.managed.add(body["device_id"])
+        # A recovery_add's member (always [control, manage, view]) once its
+        # recovery took effect.
+        for device_id in self.recovered:
+            if "manage" in self.members[device_id]["roles"]:
+                self.managed.add(device_id)
+
+    def manager(self, signer):
+        """(alg, public key) of a current native member that held manage, or
+        Refused (unknown_signer, not_a_manager)."""
+        m = re.fullmatch(VR_SIGNER, signer)
+        member = self.members.get(m.group(2)) if m.group(1) == "member" else None
+        if member is None or member["standing"] != "active" or member["kind"] != "native":
+            raise Refused("unknown_signer")
+        if m.group(2) not in self.managed:
+            raise Refused("not_a_manager")
+        return member["auth_key"]["alg"], b64u_decode(member["auth_key"]["pub"])
+
+
+def sr_exported(exported, journal, lst, member, origin, alg, public):
+    """The exported records against the report's records: each a signed
+    control record of the plan by this member, its signature verified
+    (low S), none twice, their count and records_hash the journal's."""
+    digests = []
+    for text in exported:
+        try:
+            value = vr_strict(text, VR_MAX_OBJECT_BYTES)
+            if not isinstance(value, dict) or sorted(value) != ["body", "sig"]:
+                raise Refused("records_mismatch")
+            body = sr_control_body(value["body"])
+            sig = b64u_decode(value["sig"])
+        except (Refused, ValueError):
+            raise Refused("records_mismatch")
+        if not sr_of_plan(body, lst, member, origin):
+            raise Refused("records_mismatch")
+        if not verify(alg, public, sig, enc([CONTROL_LABEL, jcs(body)])):
+            raise Refused("records_mismatch")
+        digests.append(sha256(jcs(body).encode()))
+    if len(set(digests)) != len(digests) or len(digests) != journal["records"]:
+        raise Refused("records_mismatch")
+    if sr_set_hash(SR_RECORDS, digests) != journal["records_hash"]:
+        raise Refused("records_mismatch")
+    return [jcs(vr_strict(t, VR_MAX_OBJECT_BYTES)) for t in exported]
+
+
+def sr_verify(text, lst, expected, exported, now):
+    """verify_signer_report, from the file's note: the first failure in the
+    agreed order, or the verified report."""
+    body, sig = read_sr_report(text)
+    if lst.frozen:
+        raise Refused("frozen")
+    if body["account_id"] != lst.account_id or body["genesis_hash"] != lst.genesis_hash:
+        raise Refused("wrong_account")
+    alg, public = lst.manager(body["signer"])
+    if not verify(alg, public, sig, enc([SR_LABEL, jcs(body)])):
+        raise Refused("bad_signature")
+    head = body["head"]
+    if head["seq"] > len(lst.hashes):
+        raise Refused("stale_log")
+    if lst.hashes[head["seq"] - 1] != head["hash"]:
+        raise Refused("fork")
+    if body["signer"] != expected["signer"]:
+        raise Refused("signer_mismatch")
+    if body["slot"] != expected["slot"]:
+        raise Refused("slot_mismatch")
+    if any(body["challenge"][k] != expected[k] for k in VR_ECHO_FIELDS):
+        raise Refused("challenge_mismatch")
+    if body["recovery"] != expected["recovery"]:
+        raise Refused("recovery_mismatch")
+    member = body["signer"][len("member:"):]
+    records = sr_exported(exported, body["journal"], lst, member, body["challenge"]["origin"], alg, public)
+    if now >= expected["expires_at"]:
+        raise Refused("expired")
+    return {
+        "signer": body["signer"], "slot": body["slot"], "process": body["process"],
+        "connection": body["challenge"]["connection"], "head": head, "at_head": head == lst.head(),
+        "recovery": body["recovery"], "journal": body["journal"], "records": records,
+    }
+
+
+def sr_digests(texts, lst, member, origin):
+    """A journal set's bodies, each read strictly as one of the plan's
+    records by this member: their digests, or Refused("malformed") (a body
+    twice included)."""
+    digests = []
+    for text in texts:
+        try:
+            body = sr_control_body(vr_strict(text, VR_MAX_OBJECT_BYTES))
+        except Refused:
+            raise Refused("malformed")
+        if not sr_of_plan(body, lst, member, origin):
+            raise Refused("malformed")
+        digests.append(sha256(jcs(body).encode()))
+    if len(set(digests)) != len(digests):
+        raise Refused("malformed")
+    return digests
+
+
+def sr_build(case, lst):
+    """signer_report_body, from the file's note: the body but its process,
+    or Refused."""
+    signer, slot, now, challenge, journal = case["signer"], case["slot"], case["now_ms"], case["challenge"], case["journal"]
+    m = re.fullmatch(VR_SIGNER, signer)
+    if m is None or m.group(1) != "member" or re.fullmatch(OPAQUE_ID, slot) is None:
+        raise Refused("malformed")
+    station = vr_normalize(case["station"])
+    if station is None:
+        raise Refused("malformed")
+    if lst.frozen:
+        raise Refused("frozen")
+    if challenge["origin"] != station:
+        raise Refused("origin_mismatch")
+    if challenge["signer"] != signer:
+        raise Refused("signer_mismatch")
+    if challenge["slot"] != slot:
+        raise Refused("slot_mismatch")
+    lst.manager(signer)
+    if now >= challenge["expires_at"]:
+        raise Refused("expired")
+    if not vr_int(journal["since"], 1) or not vr_int(journal["revision"]):
+        raise Refused("malformed")
+    records = sr_digests(journal["records"], lst, m.group(2), challenge["origin"])
+    drafts = sr_digests(journal["drafts"], lst, m.group(2), challenge["origin"])
+    return {
+        "type": "atem-signer-report", "v": 1, "account_id": lst.account_id, "genesis_hash": lst.genesis_hash,
+        "head": lst.head(), "signer": signer, "slot": slot,
+        "challenge": {k: challenge[k] for k in VR_ECHO_FIELDS}, "recovery": challenge["recovery"],
+        "journal": {
+            "id": journal["id"], "since": journal["since"], "revision": journal["revision"],
+            "records": len(records), "records_hash": sr_set_hash(SR_RECORDS, records),
+            "drafts": len(drafts), "drafts_hash": sr_set_hash(SR_DRAFTS, drafts),
+        },
+    }
+
+
+def check_signer_report(file, data, report, context):
+    """Every case's verdict derived here from the file's note (host-work-v1
+    §11.1's signer report as agreed on Astation #114): the chain's entries;
+    each record's body, jcs, digest and signature by its signer's key; each
+    challenge text read or refused; each report's code in the agreed order,
+    or its verified fields, with its exported records against the report's
+    journal (each read as a control record of the plan by the signer,
+    verified, the count and the sorted-digest hash), against log L and the
+    case's chain; the valid reports' jcs, signing input and signature; the
+    builder's bodies (but their process) and refusals, the set hashes
+    recomputed from the journal's bodies; and the immutable request's
+    finishes, signed here (P-256 with a fresh nonce) over the held body with
+    the vectors' process."""
+    keys = context["keys"]
+    mlog = context["membership_log"]
+    entries = {e["label"]: e for e in data["entries"]}
+    with report.case(file, "entries") as case:
+        check_report_entries(case, data, mlog)
+        desk = entries["SR7_add_desk"]["entry"]["body"]["member"]
+        case.equal((desk["auth_key"]["alg"], b64u_decode(desk["auth_key"]["pub"])), ("ed25519", keys.public("dev-desk", "auth")), "dev-desk's Ed25519 key")
+        case.check("manage" not in desk["roles"], "dev-desk added without manage")
+        case.equal(jcs(entries["SR7_recovery_add_newmac"]["entry"]), jcs(next(v["entry"] for v in mlog["others"] if v["label"] == "R7")), "SR7_recovery_add_newmac is R7, byte for byte")
+        case.equal(jcs(entries["SR8_recovery_approve_newmac"]["entry"]), jcs(next(v["entry"] for v in mlog["others"] if v["label"] == "A8")), "SR8_recovery_approve_newmac is A8, byte for byte")
+
+    def lst(c):
+        return report_list(c, data, mlog, SrList)
+
+    for rec in data["records"]:
+        with report.case(file, f"record {rec['label']}") as case:
+            body = sr_control_body(rec["body"])
+            case.equal(jcs(body), rec["jcs"], "jcs")
+            case.equal(sha256(rec["jcs"].encode()).hex(), rec["digest_hex"], "digest = SHA-256(jcs(body))")
+            case.equal(rec["record"]["body"], rec["body"], "the record's body")
+            name, part = rec["signed_with"].split("/")
+            case.check(
+                verify(keys.keys[name][part]["alg"], keys.public(name, part), b64u_decode(rec["record"]["sig"]), enc([CONTROL_LABEL, rec["jcs"]])),
+                f"signed by {rec['signed_with']}",
+            )
+            case.equal(body["signer"], f"member:{name}", "signed by the member it names")
+    for c in data["challenges"]:
+        with report.case(file, f"challenge {c['label']}") as case:
+            try:
+                fields = read_sr_challenge(c["text"])
+                case.equal(fields, c.get("fields"), "read, its fields")
+            except Refused as e:
+                case.equal(e.code, c.get("code"), "refused")
+    codes = set()
+    for c in data["valid"] + data["invalid"]:
+        with report.case(file, f"report {c['label']}") as case:
+            expected = read_sr_challenge(json.dumps(c["challenge"]))
+            try:
+                verified = sr_verify(c["report"], lst(c), expected, c["exported"], c["now_ms"])
+                case.equal(verified, c.get("expect"), "verified")
+                body = json.loads(c["report"])["body"]
+                case.equal(jcs(body), c["jcs"], "jcs")
+                case.equal(enc([SR_LABEL, jcs(body)]).hex(), c["signing_input_hex"], "signing input")
+                name, part = c["signed_with"].split("/")
+                case.check(
+                    verify(keys.keys[name][part]["alg"], keys.public(name, part), b64u_decode(json.loads(c["report"])["sig"]), enc([SR_LABEL, jcs(body)])),
+                    f"signed by {c['signed_with']}",
+                )
+            except Refused as e:
+                case.equal(e.code, c.get("code"), "refused")
+                codes.add(e.code)
+                if c["label"] == "high_s_signature":
+                    report_ = json.loads(c["report"])
+                    sig = b64u_decode(report_["sig"])
+                    s_ = int.from_bytes(sig[32:], "big")
+                    case.check(s_ > P256_N // 2, "S is high")
+                    twin = sig[:32] + (P256_N - s_).to_bytes(32, "big")
+                    case.check(verify("p256", keys.public("dev-phone", "auth"), twin, enc([SR_LABEL, jcs(report_["body"])])), "its low-S twin verifies")
+    with report.case(file, "coverage") as case:
+        case.equal(sorted(codes), sorted(SR_VERIFY_ORDER), "every verifier code")
+        labels = {c["label"] for c in data["valid"] + data["invalid"]}
+        for label in (
+            "at_head", "at_ancestor", "zero_records", "drafts_only", "reinstalled_journal", "demoted_manager",
+            "not_a_manager", "recovered_manager", "pending_recovery_subject", "high_s_signature", "signer_mismatch", "slot_mismatch", "records_one_missing",
+            "records_one_extra", "records_signed_after_report", "records_possibly_signed", "records_body_without_signature",
+            "records_wrong_signer", "records_another_origin", "records_duplicate", "expired_at_expires_at",
+        ):
+            case.check(label in labels, f"{label} present")
+        mismatched = {c["label"] for c in data["invalid"] if c["code"] == "recovery_mismatch"}
+        case.equal(len(mismatched), 5, "each recovery field mismatched")
+    for c in data["builder"] + data["request"]:
+        with report.case(file, f"builder {c['label']}") as case:
+            try:
+                body = sr_build(c, lst(c))
+                case.equal(body, c.get("body_but_process"), "the body but its process")
+            except Refused as e:
+                case.equal(e.code, c.get("code"), "refused")
+    for c in data["request"]:
+        with report.case(file, f"request {c['label']}") as case:
+            case.equal(c["sign_request"], {"purpose": "signer_report", "fresh_confirmation": True, "label": SR_LABEL}, "sign request")
+            held = dict(c["body_but_process"], process=b64u_encode(b"vectors-process!"))
+            signer_alg = keys.keys[c["key"].split("/")[0]]["auth"]["alg"]
+            signer_pub = keys.public(c["key"].split("/")[0], "auth")
+            for f in c["finishes"]:
+                over = held if f["over"] == "held" else dict(held, slot=f["over"]["slot"])
+                sig = vr_sign(keys, f["signed_with"], enc([SR_LABEL, jcs(over)]))
+                ok = verify(signer_alg, signer_pub, sig, enc([SR_LABEL, jcs(held)]))
                 case.equal(ok, "code" not in f, f"{f['label']}: {'taken' if ok else 'refused'}")
                 if not ok:
                     case.equal(f["code"], "bad_signature", f"{f['label']}: bad_signature")
@@ -4755,6 +5233,7 @@ CHECKERS = [
     ("r9-vectors-station-calls", check_station_calls),
     ("r9-vectors-mailbox-calls", check_mailbox_calls),
     ("r9-vectors-verifier-report", check_verifier_report),
+    ("r9-vectors-signer-report", check_signer_report),
 ]
 
 

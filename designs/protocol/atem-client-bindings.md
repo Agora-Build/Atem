@@ -105,7 +105,10 @@ signing gate's shared helper, **Atem's proposal, for Astation's agreement**:
 a new file in the manifest),
 `atem-client-<version>-r9-vectors-verifier-report.json` (amended for a
 member's signed verifier report, agreed for implementation on Astation
-#101: a new file in the manifest) and the six
+#101: a new file in the manifest),
+`atem-client-<version>-r9-vectors-signer-report.json` (amended for a
+native manager's signer report, **agreed with Astation, Astation #114
+comment 7089435073**: a new file in the manifest) and the six
 `atem-client-<version>-r9-control-ack-*.json` (amended for step 4: the
 sixth, `r9-control-ack-reasons`, is O5's, **for Astation's sign-off**) in its SHA-256
 manifest. These are the shared positive/negative request vectors from
@@ -129,7 +132,9 @@ the signing gate's requirement of each unsigned entry body from
 `fixtures/r9-vectors-required-verifier.json` (session-v1 R9.2 "How the
 signing gate uses it"; "The verifier's inventory" below), a member's
 signed verifier reports from `fixtures/r9-vectors-verifier-report.json`
-(session-v1 R9.2; "A member's signed verifier report" below) and the Station's
+(session-v1 R9.2; "A member's signed verifier report" below), a native
+manager's signer reports from `fixtures/r9-vectors-signer-report.json`
+(host-work-v1 §11.1; "A manager's signed signer report" below) and the Station's
 acknowledgment fixtures `fixtures/r9-control-ack-*.json` (§9, delegated
 host-work test 48).
 The Rust core's tests run all of them; the Swift, Kotlin and WASM
@@ -797,6 +802,83 @@ high-S signature, the builder's cases and the request's finishes) runs in the co
 suites and `scripts/check-r9-vectors.py`; the FFI's
 `no_lock_during_signing.rs` checks the synchronous signer.
 
+**A manager's signed signer report** (built; **the author barrier and the
+typed primitive agreed with Astation, Astation #114 comment
+7089435073**; host-work-v1 §11.1 "The signer report"; the core's
+`atem_client::member_report::signer`, on the verifier report's core). How
+a native manager reports its control-record signing journal to a Station
+recovering from a rollback, so the replacement feed's snapshot includes
+every stop of the plan that author can have signed. **The journal, its
+exclusive lock, the barrier (B1 to B6), the report's exposure and the
+publication are your adapter's**; these calls are the primitive only. Five
+points the agreed text leaves open are **Atem's readings, for Astation's
+confirmation on #114**, listed after the table:
+
+| call | what it does |
+|---|---|
+| `signer_report_challenge(signer, slot, origin, connection, issued_at, expires_at, recovery)` (JS `signerReportChallenge`, `recovery` `{generation, planId, candidateFeedId, sourceHash, evidenceHash}`) | the Station's challenge as canonical JSON, a fresh 32-byte nonce from the OS CSPRNG: the verifier report's fields, `signer` a native member (`member:<device_id>`; reading (a)), and `recovery: SignerReportRecovery{generation, plan_id, candidate_feed_id, source_hash, evidence_hash}` (`generation` a canonical decimal string, 1 to 2^63 − 1, no sign or leading zero; the ids UUID v4; the hashes lowercase hex SHA-256). Store it |
+| `parse_signer_report_challenge(challenge_json)` | `SignerReportChallenge{signer, slot, origin, connection, nonce, issued_at, expires_at, recovery}`, read strictly: at most 4,096 bytes, exactly these fields at both levels, each one's grammar |
+| `SignerReportRequest(log, challenge_json, signer, slot, origin, journal, key_id, now_ms)` | an immutable handle (UniFFI Object, a WASM class) on the body the core builds from `journal: SignerJournalView{id, since, revision, records, drafts}`, which your adapter hands over under its journal lock after its barrier's durable commit (B1): `id` the journal's 16 random bytes (base64url), `since` the device-list `seq` at its creation, `revision` its append count, `records` the plan's bodies in `signing` or `signed` (one in `signing` with no saved signature included), `drafts` its unsigned drafts, each a control record's body as JSON. The core reads each body strictly as one of the plan's records by this member (a service's `revoke` or `interrupt_running` naming the challenge's origin, reading (c), or a `host:` principal's `interrupt_running`), and counts and hashes them itself: you supply no hash. Refused: a challenge for another Station (`origin_mismatch`), signer (`signer_mismatch`) or slot (`slot_mismatch`), a `signer` that isn't `member:<id>` or a field out of its grammar (`malformed`), the log frozen (`frozen`), a signer that isn't a current native member (`unknown_signer`) or never held `manage` (`not_a_manager`), the challenge expired at `now_ms` (`expired`; reading (b)), then a journal `id` that isn't 16 bytes, `since` 0, a body that isn't one of the plan's records by this member, or a body twice in a set (`malformed`; the same body as a record and as a draft is read, reading (d)) |
+| `request.sign_request()` / `request.body_json()` | the `SignRequest` for `key_id` (purpose `SignerReport`, `fresh_confirmation: true`, label `atem-signer-report-v1`, `input` = `enc([label, body])`, `body_json` the held body); the held body, read only |
+| `request.finish(signature)` | the report (canonical `{"body":<held body>,"sig":…}`) once `signature` (P-256 64-byte `r‖s`, either S, normalized to low S; or Ed25519) verifies under the signer's key at the log's head over the held body; anything else is `Report{bad_signature}`. The handle never changes |
+| `sign_signer_report(provider, log, challenge_json, signer, slot, origin, journal, key_id, now_ms)` (Swift, Kotlin; JS `signSignerReport(store, …)` with a `SoftwareKeyStore`, for tests and tools: a native's key is never a software key) | the request's checks, then the provider signs at once after the owner's fresh confirmation (no binding lock held meanwhile): the report, or `Report{signing_failed}` when the owner cancels or the provider fails, `Report{bad_signature}` when `key_id` isn't the signer's key in the log |
+| `verify_signer_report(log, report_json, expected_challenge_json, exported_records_json, now_ms)` | `VerifiedSignerReport{signer, slot, process, connection, head, at_head, recovery, journal: SignerReportJournal{id, since, revision, records, records_hash, drafts, drafts_hash}, records}` against `log` at its current head, the challenge the Station stored and the signed records exported with the report, or `Report{code}`: the first failure of `malformed`, `frozen`, `wrong_account`, `unknown_signer`, `not_a_manager`, `bad_signature`, `stale_log`, `fork`, `signer_mismatch`, `slot_mismatch`, `challenge_mismatch`, `recovery_mismatch`, `records_mismatch`, `expired`. `records_mismatch`: an exported record that isn't a signed control record of the plan by this member, one whose signature doesn't verify under its `auth_key`, a duplicate, or another count or `records_hash` than the report's. `records` are the verified records, as given. An expected challenge that doesn't read is `Invalid{malformed}` |
+
+**Atem's readings, for Astation's confirmation on #114** (none is in the
+agreed text; each is fail-closed, and each changes if Astation reads it
+otherwise):
+
+- (a) A challenge's `signer` is `member:<device_id>` only: a challenge
+  naming a `service:` signer is `Report{malformed}` when it is read. A
+  report body naming a service, a host, a grant or `recovery` is
+  `unknown_signer`, as agreed.
+- (b) The builder (`SignerReportRequest`, `sign_signer_report`) also takes
+  `now_ms` and refuses a challenge expired on the reporter's clock
+  (`expired`), as the verifier report's builder does; the agreed inputs
+  name no clock.
+- (c) A service's records of the plan are its `revoke` and
+  `interrupt_running` only (a native manager signs no other action): a
+  `cover`, `hold` or `release` this member's journal holds refuses the
+  request (`malformed`), never skipped. The agreed text says "a service's
+  record naming this origin".
+- (d) One body may be both a record and a draft: each set is read on its
+  own; only a body twice in one set is `malformed`.
+- (e) `journal.since` is compared with nothing, `head.seq` included:
+  whether the member held `manage` before it is the Station's to judge.
+
+The purpose `SignerReport` asks a **fresh confirmation** of the body,
+never in the background or a notification extension: show the plan (the
+recovery's `generation`, `plan_id` and `candidate_feed_id`), the Station
+(`challenge.origin`), the counts (`journal.records`, `journal.drafts`),
+and that this device's barrier holds its stops of the plan (a service's
+`revoke` or `interrupt_running` at that origin, and every `host:`
+principal's `interrupt_running`) until the plan ends; the owner keeps the
+device-list entries and `work_interrupt` over a channel. The report
+proves its signature and that the export matches it: **consistency only,
+never completeness of anything outside the journal**. A body your journal
+holds as `signing` with no saved signature is in `records` and can't be
+exported as signed, so the Station gets `records_mismatch` until its exact
+signature is recovered: never drop the body to make the check pass
+(Astation's conservative rule). Adding `SigningPurpose.SignerReport`,
+`SignLabelKind.SignerReport` and the new `Report` codes is a source change
+for an app that switches over them exhaustively. In JS, a time,
+`connection`, `since` or `revision` that isn't a non-negative safe integer
+is refused before the report's checks (`kind: "invalid"`, `code:
+"malformed"`); `generation` is a string in every language, since it may
+exceed 2^53.
+
+Tests: `r9-vectors-signer-report` (the challenges; valid reports at the
+head and at an ancestor, with drafts, with zero records, a host sender's
+interrupt with a service's stops, a reinstalled journal, a demoted
+manager, an Ed25519 manager, a manager added by the Recovery Kit once its
+recovery took effect; refused ones with every code, each challenge
+and recovery field mismatched, `records_mismatch` in each form, a high S,
+substitution; the builder's cases and the request's finishes) runs in the
+core's `tests/signer_report.rs` (with `tests/member_report_signer.rs`), the
+FFI's `tests/signer_report.rs`, all three suites and
+`scripts/check-r9-vectors.py`; the FFI's `no_lock_during_signing.rs`
+checks the synchronous signer.
+
 ### Control records (delegated host work; planned)
 
 `build_control_record`, `control_record_signing_input`,
@@ -1007,6 +1089,7 @@ errors: ProviderError.Cancelled{reason} | UnknownKey | OpenFailed | Failed{reaso
   | `BrowserGrant` | a browser grant | fresh |
   | `HostSigning` | `sig_h`, push hints, seens, a host's `enc_sig` | never asked of a client |
   | `VerifierReport` | a member's signed verifier report (`atem-verifier-report`, §2 "A member's signed verifier report"): read-only reporting of this core's verifier, the body built by the core | none, and never a prompt: first check that `label` is `atem-verifier-report-v1`, then sign only with a key that needs no interaction, else `Cancelled` (the slot stays unconfirmed); never sign another label without its prompt |
+  | `SignerReport` | a native manager's signed report of its control-record signing journal (`atem-signer-report`, §2 "A manager's signed signer report"), for a Station recovering from a rollback; the body built by the core from your journal's bodies (show the plan, the origin, the counts, and that the barrier holds this device's stops of the plan until it ends) | fresh |
 
   `fresh_confirmation` is true for every purpose but `Channel`,
   `HostSigning`, `ServiceControl` and `VerifierReport`. A control record's purpose comes from
@@ -1017,7 +1100,7 @@ errors: ProviderError.Cancelled{reason} | UnknownKey | OpenFailed | Failed{reaso
   with the passcode fallback).
 - **Cancel.** Return `ProviderError.Cancelled`: nothing is sent; the call
   fails with `Channel{code: signing_failed}` (handshake), `Report{code:
-  signing_failed}` (a verifier report) or `Publish{code: sign}` /
+  signing_failed}` (a verifier or signer report) or `Publish{code: sign}` /
   `Invalid{code: provider_error}`.
 - **Asynchronous signers** (WebCrypto, or an app whose owner-auth prompt
   must not block a thread): `on_accept_deferred` returns the
@@ -1059,7 +1142,7 @@ errors: ProviderError.Cancelled{reason} | UnknownKey | OpenFailed | Failed{reaso
 | `Publish{code, detail}` | `outstanding` (also: another publisher or writer of this device holds a prepared body), `not_on_head`, `nothing_prepared`, `sign` |
 | `Push{code, detail}` | `malformed`, `binding`, `bad_signature`, `invalid_times`, `skew`, `stale`, `bad_sealed`, `duplicate` |
 | `Stored{code, detail}` | a stored snapshot didn't load. `MembershipLog::from_stored`: `too_large` (over 16 MiB), `malformed` (not strict JSON, not an object, no `v`, no `account_id`/`genesis_hash`), `unsupported_version` (a `v` other than 1), `account_mismatch`, `genesis_mismatch` (the snapshot's are not the caller's anchors), `stored_invalid` (the shared verifier refused it, or it isn't exactly `stored_json()`'s form); a malformed anchor argument is `Invalid`. `ControlStateHandle::from_json` (§9): `too_large` (over 64 MiB), `malformed` (not strict JSON, not an object, no `v`, an `account_id` or `genesis_hash` missing or not readable: such a header names no list; amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**), `unsupported_version` (a `v` other than 2: amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**), `account_mismatch`, `genesis_mismatch` (a well-formed header naming another device list: delete the state and start with `new`), `stored_invalid` (the state's own rules refuse it, or it isn't exactly `to_json()`'s form). `control_state_from_parts` (§9; amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**: new): `too_large` (over 64 MiB in all), `malformed` (a part that isn't strict JSON), `stored_invalid` (a principal given twice; a part of this list its rules refuse, that isn't exactly `part()`'s form, or whose principal is no principal; a part whose device list can't be read); never `account_mismatch` or `genesis_mismatch` (another list's parts are reported in `foreign`) |
-| `Report{code, detail}` | a member's verifier report, its challenge or its build refused: `malformed`, `frozen`, `wrong_account`, `unknown_signer`, `signer_expired`, `bad_signature`, `stale_log`, `fork`, `signer_mismatch`, `slot_mismatch`, `challenge_mismatch`, `expired` (the verifier's order); the reporter's `origin_mismatch` and `signing_failed` (JS `kind: "report"`; a new variant: a source change for an exhaustive switch) |
+| `Report{code, detail}` | a member's verifier report, its challenge or its build refused: `malformed`, `frozen`, `wrong_account`, `unknown_signer`, `signer_expired`, `bad_signature`, `stale_log`, `fork`, `signer_mismatch`, `slot_mismatch`, `challenge_mismatch`, `expired` (the verifier's order); the reporter's `origin_mismatch` and `signing_failed` (JS `kind: "report"`; a new variant: a source change for an exhaustive switch). A manager's signer report (§2 "A manager's signed signer report") adds `not_a_manager`, `recovery_mismatch` and `records_mismatch`, in its own order |
 | `State{detail}` | `state` (a call out of order: `already started`, `not waiting for accept`, `no signature pending`, …; or the object changed while the provider was signing) |
 
 `detail` is for logs and may change; branch on the variant and `code`.
@@ -1217,12 +1300,12 @@ jar); it can be run on a download the same way.
 `WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
 Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 
-- **Conformance** (142 checks in JS, 144 in Kotlin and in Swift: the same 142
+- **Conformance** (147 checks in JS, 149 in Kotlin and in Swift: the same 147
   in each language, plus two in Kotlin and Swift, whose provider sees the
   signing request and so the purposes of the five device-list actions and
-  of control records; five of each language's are the verifier reports':
-  the challenges, the reports, the builder, the immutable request's
-  finishes and the synchronous signer; over `designs/protocol/fixtures/r9-vectors-*.json`,
+  of control records; five of each language's are the verifier reports',
+  and five the signer reports': the challenges, the reports, the builder,
+  the immutable request's finishes and the synchronous signer; over `designs/protocol/fixtures/r9-vectors-*.json`,
   the acknowledgment fixtures `r9-control-ack-*.json`, atem-client's own
   `crates/atem-client/vectors/r9-svc-fingerprint.json` and the framing vectors
   `designs/protocol/fixtures/host-work/{prompt-framing-v1,framing-size-v1,framing-host-result-v1}.json`

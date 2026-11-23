@@ -38,7 +38,10 @@
 //!   results between hosts, sealed and judged by the receiver's checks;
 //! - [`member_report`]: a member's signed verifier report (session-v1 R9.2,
 //!   Astation #101): the minter's challenge and verifier, the reporter's
-//!   synchronous signer and its immutable `VerifierReportRequest`;
+//!   synchronous signer and its immutable `VerifierReportRequest`; and its
+//!   [`member_report::signer`], a native manager's signed report of its
+//!   signing journal (host-work-v1 §11.1, Astation #114 item 4), with its
+//!   immutable `SignerReportRequest`;
 //! - [`host_work`]: a task's `result_id` (host-work-v1 §11.5), the
 //!   derivation the connection checks a `reply_query`'s reply against, and
 //!   the request reader and result correlation the connection applies;

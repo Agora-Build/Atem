@@ -465,6 +465,36 @@ mod tests {
         ));
     }
 
+    /// A signer report (Astation #114 item 4) has no array at all: its
+    /// journal carries counts and set hashes, never the bodies; nothing
+    /// sits beside it but `sig`.
+    #[test]
+    fn a_signer_report_takes_no_array() {
+        let report = |extra: Value| {
+            let mut body = json!({"type": "atem-signer-report", "v": 1, "slot": "astation-ios"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            json!({"body": body, "sig": "AA"})
+        };
+        let object = parse(&report(json!({}))).unwrap();
+        assert_eq!(object.label(), SignLabel::SignerReport);
+        for extra in [
+            json!({"slot": ["a"]}),
+            json!({"journal": {"records": ["a"]}}),
+            json!({"recovery": {"plan_id": []}}),
+        ] {
+            assert_eq!(parse(&report(extra)), Err(Error::ArrayNotCanonical));
+        }
+        let mut kit = report(json!({}));
+        kit["kit_sig"] = json!("AA");
+        assert_eq!(parse(&kit), Err(Error::KitSigUnexpected));
+        let mut sealed = report(json!({}));
+        sealed["enc"] = json!("AA");
+        sealed["ct"] = json!("AA");
+        assert!(matches!(parse(&sealed), Err(Error::Malformed(_))));
+    }
+
     /// A verifier report's one array is its inventory's `actions`, a set
     /// (R9.2 "How a verifier reports itself"); none may sit elsewhere.
     #[test]
