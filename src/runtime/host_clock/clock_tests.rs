@@ -1190,3 +1190,23 @@ fn a_station_time_that_raises_nothing_writes_no_row() {
     assert!(clock.station(ORIGIN, os.wall(), &store));
     assert_eq!(stored(&store), clock.state);
 }
+
+/// Review L1: `start_reading` reads `D` and the latest repair or lowering
+/// from the record a store at `state` keeps, read only, before the
+/// runtime opens the store (a carriage record replayed at the start); none
+/// without a store or a record.
+#[test]
+fn the_start_reading_takes_the_records_clock() {
+    let (dir, store) = open_store();
+    let os = Os::new(T, 100 * SEC, "boot-a", Synced::Yes);
+    let mut clock = HostClock::with_reader(&store, os.reader());
+    assert_eq!(super::start_reading(&store.state), None, "no record yet");
+    clock.tick(&store);
+    let (d, change) = super::start_reading(&store.state).expect("a record");
+    // The OS's own reading (no hook here): `D` is at least the record's.
+    assert!(d >= T, "{d}");
+    assert_eq!(change, None);
+    let empty = tempfile::tempdir().unwrap();
+    assert_eq!(super::start_reading(empty.path()), None);
+    drop(dir);
+}

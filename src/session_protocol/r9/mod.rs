@@ -2497,6 +2497,7 @@ impl R9Host {
             key,
             &host_id,
             generation,
+            &request.request_id,
         );
         let (enc, enc_sig, lines) = match handed {
             Ok(handed) => handed,

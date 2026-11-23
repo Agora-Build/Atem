@@ -250,6 +250,10 @@ pub struct StartView {
     /// a damaged one; deadlines aren't compared then, and the dispatch
     /// waits).
     pub now_d_ms: Option<u64>,
+    /// The delegated clock as that pass observed it (none: no clock, or a
+    /// damaged one): a later reading from it is a fresh `D` (host senders'
+    /// key stamps), and its latest repair or lowering.
+    pub clock: Option<crate::runtime::host_clock::ClockSnapshot>,
     /// The live attempts the session host may ask about: attempt id → its
     /// task.
     live: HashMap<String, StartTask>,
@@ -280,6 +284,7 @@ impl StartView {
             senders: false,
             host_applied: None,
             now_d_ms: None,
+            clock: None,
             live: HashMap::new(),
             refused: HashMap::new(),
             launches_stopped: HashMap::new(),

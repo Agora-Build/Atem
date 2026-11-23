@@ -744,12 +744,28 @@ impl MembershipHost {
     /// recovered work. `None` when this host has no device list (not paired
     /// for r9). An `Err` disables remote sessions (`welcome.host_error`):
     /// nothing is reset silently.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn open(
         pairing: &PairingPaths,
         journal_dir: &Path,
         runtime_epoch: u64,
         now: &HostNow,
         fences: &mut dyn Fences,
+    ) -> Result<Option<(MembershipHost, Vec<Fence>)>, String> {
+        Self::open_watched(pairing, journal_dir, runtime_epoch, now, fences, None)
+    }
+
+    /// [`MembershipHost::open`], `watch` told the commit a carriage record's
+    /// replay makes (host senders' encryption key: the replay is the entry's
+    /// first durable application, stamped then), and kept as the commit
+    /// watch until another is set.
+    pub fn open_watched(
+        pairing: &PairingPaths,
+        journal_dir: &Path,
+        runtime_epoch: u64,
+        now: &HostNow,
+        fences: &mut dyn Fences,
+        watch: Option<CommitWatch>,
     ) -> Result<Option<(MembershipHost, Vec<Fence>)>, String> {
         let store = Store::new(pairing, journal_dir);
         let state_path = store.path(DlFile::State);
@@ -848,7 +864,7 @@ impl MembershipHost {
             persist_deferred: false,
             deferred_unreadable: None,
             publisher: None,
-            commit_watch: None,
+            commit_watch: watch,
             #[cfg(test)]
             crash_after_commit: false,
         };

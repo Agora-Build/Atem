@@ -40,7 +40,10 @@ fn mb_host(rig: &mut LocalRig, root: &Path, os: &ManualOs) -> MbHost {
         "host".into(),
         1,
         rig.bridge.membership.as_ref().unwrap().membership(),
-        Some(host_now().wall_ms),
+        Some(crate::session_protocol::r9::host_enc::DNow {
+            d_ms: host_now().wall_ms,
+            clock_change: None,
+        }),
     )
     .unwrap();
     assert_eq!(
@@ -51,7 +54,8 @@ fn mb_host(rig: &mut LocalRig, root: &Path, os: &ManualOs) -> MbHost {
         enc_pub
     );
     rig.bridge.pairing = Some(pairing);
-    rig.bridge.start_view().now_d_ms = Some(host_now().wall_ms);
+    // `D` and the clock as a pass reads them (the manual OS's).
+    rig.bridge.take_reading();
     let mut station = Station::with_senders(true);
     station.sync_link(Some(1), 1, || LinkKind::Routed, || Some(ORIGIN.into()));
     rig.bridge.station = Some(station);

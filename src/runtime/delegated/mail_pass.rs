@@ -178,7 +178,8 @@ impl HostBridge {
     )> {
         let view = self.start_view();
         let list = view.list.clone().filter(FeedStore::serves)?;
-        let now_ms = view.now_d_ms?;
+        let now = delegated_host_key_pass::view_now(&view)?;
+        let now_ms = now.d_ms;
         drop(view);
         let host = self.work_host();
         let receiver = match crate::session_protocol::r9::host_enc::recipient_at(
@@ -186,7 +187,7 @@ impl HostBridge {
             host.atem_device_id,
             host.host_trust_gen,
             &list.membership,
-            Some(now_ms),
+            Some(now),
         ) {
             Ok(receiver) => receiver,
             Err(why) => {

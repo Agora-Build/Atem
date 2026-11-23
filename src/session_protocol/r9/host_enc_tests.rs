@@ -108,7 +108,7 @@ fn record(pairing: &PairingPaths) -> Option<Value> {
 }
 
 fn record_of(generation: u64, kids: &[&str]) -> Value {
-    json!({"v": 2, "host_trust_gen": generation, "kids": kids, "retired": []})
+    json!({"v": 2, "host_trust_gen": generation, "kids": kids, "retired": [], "requests": []})
 }
 
 /// Made with the pin when a pairing is verified (its trust generation),
@@ -505,7 +505,10 @@ fn the_recipient_is_the_pairings_with_the_generations_key_and_record() {
     host_enc::ensure(p, &journal_of(p), 4);
     let (_, public) = key_of(p).unwrap();
     let kid: [u8; 8] = atem_client::encoding::hex_decode_array(&kid_of(&public)).unwrap();
-    let now = Some(crate::session_protocol::membership::r9log::host_now().wall_ms);
+    let now = Some(host_enc::DNow {
+        d_ms: crate::session_protocol::membership::r9log::host_now().wall_ms,
+        clock_change: None,
+    });
     let got = host_enc::recipient(&src, &log.log, now).unwrap();
     assert!(got.recipient.keys.is_empty(), "no entry set it yet");
     assert_eq!(got.recipient.generated, [kid], "made: its mail waits");
@@ -903,21 +906,9 @@ mod op {
     const NEW_1: &str = "aaaaaaaa-0000-4000-8000-0000000000e5";
     const NEW_2: &str = "aaaaaaaa-0000-4000-8000-0000000000e6";
 
-    /// `host_enc_key_new` (the routine rotation, agreed with Astation on
-    /// 2026-11-23): a manager gets a pending key, bound to this channel's
-    /// host and generation, its `enc_sig` verifying with the host's
-    /// `host_key`, its entry drafted and taken by the chain. A retry after a
-    /// lost answer (the same `request_id`, a fresh `id`) and another
-    /// manager's request get the same key, each answer echoing its own
-    /// request; `host_enc_key_get` still hands out the current key.
-    #[test]
-    fn every_request_gets_the_one_pending_key() {
-        let mut rig = rig();
-        let current = held(&rig);
-        // The phone made a manager too.
-        let entry = rig
-            .log
-            .set_native_roles("dev-phone", &["control", "manage", "view"]);
+    /// `entry` (a list entry's wire JSON) carried to the host on the
+    /// Mac's channel.
+    fn carry(rig: &mut Rig, entry: Value) {
         let entry = atem_client::SignedObject::parse(entry.to_string().as_bytes()).unwrap();
         let mono = rig.now.host.mono_ms;
         let (_, frame) = rig
@@ -927,48 +918,102 @@ mod op {
         rig.send_frame("ch-mac", &frame);
         rig.events("ch-mac");
         rig.advance(1000);
+    }
+
+    /// The Mac drafts the host's current key (its get answer) into a
+    /// `host_enc_key` entry, signed and carried: the list sets it.
+    fn set_current(rig: &mut Rig) -> atem_client::PublicKey {
+        ask(rig, "ch-mac");
+        let (answers, _) = replies(rig, "ch-mac");
+        let action = answers[0].action(false, r9log::host_now().wall_ms).unwrap();
+        let entry = rig.log.append(r9log::MAC, action);
+        carry(rig, entry);
+        answers[0].enc_key.clone()
+    }
+
+    /// One `host_enc_key_new` on `handle` under `request_id`: its key,
+    /// the answer bound to the request and its `enc_sig` verified.
+    fn new_on(rig: &mut Rig, handle: &str, request_id: &str) -> atem_client::PublicKey {
+        let id = ask_new(rig, handle, request_id);
+        let (answers, errors) = replies(rig, handle);
+        assert!(errors.is_empty(), "{handle}: {errors:?}");
+        let [answer] = answers.as_slice() else {
+            panic!("one answer: {answers:?}");
+        };
+        assert!(answer.answers_new(&id, request_id, R9_HOST, 1), "{handle}");
+        let host_key = rig.log.log.host(R9_HOST).unwrap().host_key.clone();
+        atem_client::membership::verify_host_enc_sig(
+            &host_key,
+            R9_ACCOUNT,
+            &rig.log.log.genesis_hash(),
+            R9_HOST,
+            1,
+            answer.enc_key.as_32().unwrap(),
+            &answer.enc_sig,
+        )
+        .expect("enc_sig verifies");
+        answer.enc_key.clone()
+    }
+
+    const NEW_3: &str = "aaaaaaaa-0000-4000-8000-0000000000e7";
+
+    /// `host_enc_key_new` (the routine rotation, agreed with Astation on
+    /// 2026-11-23), over channels:
+    /// - while the host's key is one no entry has set, every request gets
+    ///   that key (R61 rule 2), as the get does;
+    /// - once the list sets it, a request gets a new pending key, a retry
+    ///   under the same `request_id` and another manager's request the same
+    ///   one, each answer echoing its own request; the get still hands out
+    ///   the current key.
+    #[test]
+    fn every_request_gets_the_one_key_no_entry_has_set() {
+        let mut rig = rig();
+        let current = held(&rig);
+        let b64 = |k: &atem_client::PublicKey| atem_client::encoding::b64u(k.as_bytes());
+        assert_eq!(b64(&new_on(&mut rig, "ch-mac", NEW_1)), current);
+        assert_eq!(b64(&new_on(&mut rig, "ch-mac", NEW_1)), current);
+        let set = set_current(&mut rig);
+        assert_eq!(b64(&set), current);
+        // The phone made a manager too.
+        let entry = rig
+            .log
+            .set_native_roles("dev-phone", &["control", "manage", "view"]);
+        carry(&mut rig, entry);
         rig.connect("ch-manager", phone());
-        let mut keys = Vec::new();
-        for (handle, request_id) in [("ch-mac", NEW_1), ("ch-mac", NEW_1), ("ch-manager", NEW_2)] {
-            let id = ask_new(&mut rig, handle, request_id);
-            let (answers, errors) = replies(&mut rig, handle);
-            assert!(errors.is_empty(), "{handle}: {errors:?}");
-            let [answer] = answers.as_slice() else {
-                panic!("one answer: {answers:?}");
-            };
-            assert!(answer.answers_new(&id, request_id, R9_HOST, 1), "{handle}");
-            let host_key = rig.log.log.host(R9_HOST).unwrap().host_key.clone();
-            atem_client::membership::verify_host_enc_sig(
-                &host_key,
-                R9_ACCOUNT,
-                &rig.log.log.genesis_hash(),
-                R9_HOST,
-                1,
-                answer.enc_key.as_32().unwrap(),
-                &answer.enc_sig,
-            )
-            .expect("enc_sig verifies");
-            keys.push(answer.enc_key.clone());
-        }
-        assert!(keys.iter().all(|k| *k == keys[0]), "one pending key");
-        assert_ne!(
-            atem_client::encoding::b64u(keys[0].as_bytes()),
-            current,
-            "not the current key"
+        let pending = new_on(&mut rig, "ch-mac", NEW_3);
+        assert_ne!(b64(&pending), current);
+        assert_eq!(new_on(&mut rig, "ch-mac", NEW_3), pending, "a retry");
+        assert_eq!(
+            new_on(&mut rig, "ch-manager", NEW_2),
+            pending,
+            "another manager"
         );
+        // The first request's retry: its own key, the current one.
+        assert_eq!(b64(&new_on(&mut rig, "ch-mac", NEW_1)), current);
         // The get is a pure read: still the current key.
         ask(&mut rig, "ch-mac");
         let (answers, _) = replies(&mut rig, "ch-mac");
-        assert_eq!(
-            atem_client::encoding::b64u(answers[0].enc_key.as_bytes()),
-            current
-        );
-        // The key file holds it as pending.
+        assert_eq!(b64(&answers[0].enc_key), current);
         let file: Value = read_json(&rig.pairing.host_enc_key).unwrap();
-        assert_eq!(
-            file["pending"]["pub"],
-            json!(atem_client::encoding::b64u(keys[0].as_bytes()))
-        );
+        assert_eq!(file["pending"]["pub"], json!(b64(&pending)));
+    }
+
+    /// `manage` lost between a request and its retry (R62's retry is still
+    /// a request): `forbidden`, nothing handed out.
+    #[test]
+    fn a_retry_after_manage_is_lost_is_forbidden() {
+        let mut rig = rig();
+        let entry = rig
+            .log
+            .set_native_roles("dev-phone", &["control", "manage", "view"]);
+        carry(&mut rig, entry);
+        rig.connect("ch-manager", phone());
+        new_on(&mut rig, "ch-manager", NEW_2);
+        let entry = rig.log.set_native_roles("dev-phone", &["control", "view"]);
+        carry(&mut rig, entry);
+        rig.connect("ch-demoted", phone());
+        ask_new(&mut rig, "ch-demoted", NEW_2);
+        assert_eq!(replies(&mut rig, "ch-demoted"), forbidden());
     }
 
     /// Only a native member holding `manage` at the head: the phone (no
@@ -992,6 +1037,7 @@ mod op {
     #[test]
     fn a_failed_write_is_busy_and_hands_out_nothing() {
         let mut rig = rig();
+        set_current(&mut rig);
         for file in [DlFile::HostEncGenerated, DlFile::HostEncKey] {
             rig.engine.inject_enc_fault(Injected {
                 file,

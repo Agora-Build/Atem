@@ -27,10 +27,11 @@ impl HostBridge {
         let Some(pairing) = self.pairing.clone() else {
             return;
         };
-        let (list, now_d) = {
+        let (list, now) = {
             let view = self.start_view();
-            (view.list.clone(), view.now_d_ms)
+            (view.list.clone(), view_now(&view))
         };
+        let now_d = now.map(|now| now.d_ms);
         let Some(list) = list.filter(FeedStore::serves) else {
             return;
         };
@@ -54,7 +55,7 @@ impl HostBridge {
             &identity.atem_device_id,
             identity.host_trust_gen,
             &list.membership,
-            now_d,
+            now,
         ) {
             Ok(done) => {
                 self.work.host_key_checked = Some((
@@ -88,26 +89,60 @@ impl HostBridge {
     }
 }
 
+/// `D` and the delegated clock's latest repair or lowering as the start
+/// view holds them (this pass's `D`; none without a reading).
+pub(crate) fn view_now(view: &StartView) -> Option<host_enc::DNow> {
+    view.now_d_ms.map(|d_ms| host_enc::DNow {
+        d_ms,
+        clock_change: view.clock.as_ref().and_then(|c| c.change()),
+    })
+}
+
 /// The device list's commit watch (`MembershipHost::set_commit_watch`), with
-/// `host.senders` on: a commit that sets this host's pending key stamps it,
-/// just before the list is written, with `D` as the start view last read it
-/// (at or before the commit).
+/// `host.senders` on: a commit that turns a key this host holds into the
+/// list's previous key stamps it, just before the list is written, with
+/// `D` read fresh from the clock as the start view last observed it (review
+/// L2: never a reading a sleep made stale) and its latest repair or
+/// lowering.
 pub(crate) fn commit_watch(
     view: &Arc<std::sync::Mutex<StartView>>,
 ) -> crate::session_protocol::membership::CommitWatch {
     let view = view.clone();
-    Box::new(move |store, prev, next, pin| {
-        let now_d = view
+    watch(Box::new(move || {
+        let view = view
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .now_d_ms;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let clock = view.clock.as_ref()?;
+        Some(host_enc::DNow {
+            d_ms: clock.d_ms()?,
+            clock_change: clock.change(),
+        })
+    }))
+}
+
+/// The commit watch of the device list's open at a runtime's start (review
+/// L1): a carriage record the open replays is the entry's first durable
+/// application, stamped at that commit with the clock as its record in the
+/// host-work store under `state` has it then (none: no stamp, the previous
+/// key retired at once).
+pub(crate) fn start_watch(state: PathBuf) -> crate::session_protocol::membership::CommitWatch {
+    watch(Box::new(move || {
+        crate::runtime::host_clock::start_reading(&state)
+            .map(|(d_ms, clock_change)| host_enc::DNow { d_ms, clock_change })
+    }))
+}
+
+type Reading = Box<dyn Fn() -> Option<host_enc::DNow> + Send>;
+
+fn watch(now: Reading) -> crate::session_protocol::membership::CommitWatch {
+    Box::new(move |store, prev, next, pin| {
         for line in host_enc::stamp_application_locked(
             store,
             prev,
             next,
             &pin.host_id,
             pin.host_trust_gen,
-            now_d,
+            now(),
         ) {
             eprintln!("atem runtime: host encryption key: {line}");
         }

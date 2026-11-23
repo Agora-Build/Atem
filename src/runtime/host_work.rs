@@ -2125,6 +2125,30 @@ impl Store {
         Ok(due.len())
     }
 
+    /// The delegated clock's record in the store at `state`, read only (none
+    /// without the store or the row): what the clock reads at a start before
+    /// the store opens (`host_clock::start_reading`).
+    pub fn clock_at(state: &Path) -> Result<Option<rusqlite::types::Value>> {
+        let path = state.join("host-work.sqlite");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let db = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        Ok(db
+            .query_row("SELECT state FROM clock WHERE id=1", [], |r| r.get(0))
+            .optional()
+            .or_else(|e| match e {
+                // A store made before the clock's table: no record.
+                rusqlite::Error::SqliteFailure(_, Some(m)) if m.contains("no such table") => {
+                    Ok(None)
+                }
+                e => Err(e),
+            })?)
+    }
+
     /// The principals of every task in the store in `state` not settled yet
     /// (its sender's authority over it still matters), read without opening
     /// it for writing; none when there is no store yet.

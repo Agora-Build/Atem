@@ -64,7 +64,7 @@ pub(super) use delegated_feed_pass::sync_clocks;
 mod delegated_hints;
 #[path = "delegated/host_key_pass.rs"]
 mod delegated_host_key_pass;
-pub(super) use delegated_host_key_pass::commit_watch;
+pub(super) use delegated_host_key_pass::{commit_watch, start_watch};
 #[path = "delegated/host_pass.rs"]
 mod delegated_host_pass;
 #[path = "delegated/mail_pass.rs"]
@@ -1138,8 +1138,10 @@ impl HostBridge {
             .map(|n| n.d_ms);
         if self.features.delegated {
             let halted = self.host.journal_halted();
+            let clock = self.work.clock.as_ref().and_then(HostClock::snapshot);
             let mut view = self.start_view();
             view.now_d_ms = now_d;
+            view.clock = clock;
             view.halted = halted;
         }
         now_d

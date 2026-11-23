@@ -1963,6 +1963,38 @@ mod deferrals {
         assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
+    /// Review L1: a carriage record replayed at the start's open is the
+    /// entry's first durable application, so the watch `open_watched` is
+    /// given is told that commit (and stays the commit watch).
+    #[test]
+    fn a_carriage_replayed_at_open_is_told_to_the_watch() {
+        let (rig, mut log) = list();
+        let base = open(&rig).head();
+        let entry = log.add_native("dev-ipad", &["view"]);
+        let record = serde_json::json!({"v": 1, "runtime_epoch": 2,
+            "base": {"seq": base.seq, "hash": base.hash.to_hex()}, "entries": [entry]});
+        std::fs::write(&rig.pairing.carriage, record.to_string()).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let told = seen.clone();
+        let mut f = RecFences::default();
+        let (host, _) = MembershipHost::open_watched(
+            &rig.pairing,
+            &rig.journal,
+            3,
+            &host_now(),
+            &mut f,
+            Some(Box::new(move |_, prev, next, _| {
+                told.lock()
+                    .unwrap()
+                    .push((prev.head().seq, next.head().seq));
+            })),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(host.head().seq, base.seq + 1, "replayed");
+        assert_eq!(*seen.lock().unwrap(), [(base.seq, base.seq + 1)]);
+    }
+
     /// Step 4's Decision 16: host-work's start view is told the committed
     /// list before any fence the commit brings reaches the session host, so
     /// a start the fence lets run sees it: a removal, then a freeze.

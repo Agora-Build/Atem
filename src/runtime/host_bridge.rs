@@ -861,12 +861,18 @@ impl HostBridge {
         let (membership, membership_error, membership_effects) = match profile {
             Some(profile) => {
                 let mut fences = HostFences::new(&mut host);
-                let opened = MembershipHost::open(
+                // Host senders: a carriage record the open replays stamps a
+                // rotation's application with the clock's record (review L1).
+                let watch = (features.delegated && features.senders).then(|| {
+                    host_work_bridge::start_watch(dir.parent().unwrap_or(dir).to_path_buf())
+                });
+                let opened = MembershipHost::open_watched(
                     &profile.paths.pairing,
                     dir,
                     epoch,
                     &host_now(),
                     &mut fences,
+                    watch,
                 );
                 let effects = fences.effects;
                 match opened {
@@ -1886,7 +1892,16 @@ impl HostBridge {
             super::test_hooks::reopen_hold();
             let epoch = self.host.context().runtime_epoch;
             let mut fences = HostFences::new(&mut self.host);
-            let opened = MembershipHost::open(&pairing, &self.dir, epoch, &host_now(), &mut fences);
+            let watch = (self.features.delegated && self.features.senders)
+                .then(|| host_work_bridge::commit_watch(&self.start_view));
+            let opened = MembershipHost::open_watched(
+                &pairing,
+                &self.dir,
+                epoch,
+                &host_now(),
+                &mut fences,
+                watch,
+            );
             #[cfg(test)]
             after_reopen(&pairing);
             let effects = fences.effects;

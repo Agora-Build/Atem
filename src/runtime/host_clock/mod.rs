@@ -115,6 +115,52 @@ fn system_reading() -> Option<OsReading> {
     }
 }
 
+/// The delegated clock as last observed, for a reading taken later without
+/// the clock itself (`HostClock::snapshot`): host senders' key stamps (a
+/// device-list commit made between two passes) read `D` fresh from it,
+/// with the latest repair or lowering the record keeps.
+#[derive(Clone)]
+pub struct ClockSnapshot {
+    state: ClockState,
+    read: Reader,
+    last: Option<OsReading>,
+}
+
+impl std::fmt::Debug for ClockSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClockSnapshot")
+            .field("change", &self.change())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ClockSnapshot {
+    /// `D` at a reading taken now (the last reading observed when the
+    /// hook's file has none; none without either).
+    pub fn d_ms(&self) -> Option<u64> {
+        let r = (self.read)().or_else(|| self.last.clone())?;
+        Some(self.state.deadline_ms(&r))
+    }
+
+    /// The latest repair or lowering the record keeps (§11.6): `D` just
+    /// after it. A later one differs.
+    pub fn change(&self) -> Option<u64> {
+        self.state.last_change().map(|c| c.at_ms)
+    }
+}
+
+/// `D` and the latest repair or lowering at a runtime's start, before the
+/// host-work store opens (the device list's replay of a carriage record at
+/// its open): the clock's record read from the store at `state` (read
+/// only) and a reading taken now, as `HostClock::reading` takes it. None
+/// without a store, a record, a readable record or a reading.
+pub fn start_reading(state: &std::path::Path) -> Option<(u64, Option<u64>)> {
+    let value = Store::clock_at(state).ok()??;
+    let state = parse(&value).ok()?;
+    let r = system_reading()?;
+    Some((state.deadline_ms(&r), state.last_change().map(|c| c.at_ms)))
+}
+
 /// What became of a Station's `station_time` ([`HostClock::station_time`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StationTime {
@@ -458,6 +504,16 @@ impl HostClock {
             return Some(if d.aside { DAMAGED } else { DAMAGED_UNKEPT }.to_string());
         }
         status_text(&self.state, self.last.as_ref()?, cfg!(target_os = "macos"))
+    }
+
+    /// The clock as last observed, for a reading taken later (none while its
+    /// record is damaged).
+    pub fn snapshot(&self) -> Option<ClockSnapshot> {
+        self.damaged.is_none().then(|| ClockSnapshot {
+            state: self.state.clone(),
+            read: self.read.clone(),
+            last: self.last.clone(),
+        })
     }
 
     /// A forward jump's anchor is pending (§11.6 "Automatic repair"): `D`

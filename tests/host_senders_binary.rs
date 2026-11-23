@@ -1063,6 +1063,22 @@ fn put_kids(pair: &Pair, id: &str) -> Vec<String> {
 /// given to B's Station only: B applies it, A's list stays behind (A still
 /// seals to B's old key, as a sender whose list is behind does).
 fn rotate_b(pair: &mut Pair, retire_previous: bool) -> String {
+    let answer = new_key_of_b(pair);
+    let new = publish_to_b(pair, &answer, retire_previous);
+    let head = pair.log.log.head().seq;
+    pair.b.within("B's list applies the rotation", || {
+        list_head(&pair.b) == head
+            && key_file(&pair.b)["current"]["pub"].is_string()
+            && kid_of_slot(&key_file(&pair.b)["current"]) == new
+    });
+    assert!(list_head(&pair.a) < head, "A's list is behind");
+    new
+}
+
+/// B's manager's `host_enc_key_new`, asked twice under one `request_id`
+/// (the second a retry after a lost answer): both answers name the one
+/// pending key B wrote, each echoing its own request.
+fn new_key_of_b(pair: &mut Pair) -> atem_client::session::r9::HostEncKey {
     use support::delegated::{Dev, HostIds};
     use support::r9::Router;
     let old = kid_of_slot(&key_file(&pair.b)["current"]);
@@ -1088,18 +1104,76 @@ fn rotate_b(pair: &mut Pair, retire_previous: bool) -> String {
     let new = atem_client::keys::enc_kid(&answers[0].enc_key).unwrap();
     assert_ne!(new, old);
     assert_eq!(kid_of_slot(&key_file(&pair.b)["pending"]), new);
-    // The manager drafts and signs the rotation; only B's Station has it.
-    let action = answers[0].action(retire_previous, 0).unwrap();
+    answers.remove(0)
+}
+
+/// The manager drafts and signs the rotation to `answer`'s key; only B's
+/// Station has it: the new key's id.
+fn publish_to_b(
+    pair: &mut Pair,
+    answer: &atem_client::session::r9::HostEncKey,
+    retire_previous: bool,
+) -> String {
+    let action = answer.action(retire_previous, 0).unwrap();
     pair.log.append(MAC, action);
     pair.b.station().set_log(&pair.log);
-    let head = pair.log.log.head().seq;
-    pair.b.within("B's list applies the rotation", || {
-        list_head(&pair.b) == head
-            && key_file(&pair.b)["current"]["pub"].is_string()
-            && kid_of_slot(&key_file(&pair.b)["current"]) == new
+    atem_client::keys::enc_kid(&answer.enc_key).unwrap()
+}
+
+/// A real crash point (review L7): B's runtime is SIGKILLed after its
+/// device list committed the rotation's entry and before its key file
+/// followed it (`crash_before_enc_key_promotion`). The key file then holds
+/// the new key still pending and the entry's stamp. Restarted, B promotes
+/// it with the old key's window from that stamp (never restarted at the
+/// restart), and A's mail in flight to the old key opens.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_HOST_CLOCK hooks"
+)]
+fn a_kill_after_the_list_commit_keeps_the_stamps_window() {
+    let mut pair = Pair::start(Hook::On, "");
+    let old = kid_of_slot(&key_file(&pair.b)["current"]);
+    let answer = new_key_of_b(&mut pair);
+    std::fs::write(pair.b.faults().join("crash_before_enc_key_promotion"), "").unwrap();
+    let new = publish_to_b(&mut pair, &answer, false);
+    let deadline = std::time::Instant::now() + WAIT;
+    let child = pair.b.runtime.as_mut().unwrap();
+    while child.try_wait().unwrap().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "B never reached the crash point"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        pair.b
+            .runtime_log()
+            .contains("killed after the device list committed a host_enc_key entry"),
+    );
+    let file = key_file(&pair.b);
+    assert_eq!(kid_of_slot(&file["current"]), old, "{file}");
+    assert_eq!(kid_of_slot(&file["pending"]), new, "{file}");
+    let stamp = file["applied"]["d_ms"]
+        .as_u64()
+        .expect("stamped before the commit");
+    pair.b.gone();
+    pair.b.start_again();
+    pair.b.within("B follows its list after the restart", || {
+        let file = key_file(&pair.b);
+        file["current"]["pub"].is_string() && kid_of_slot(&file["current"]) == new
     });
-    assert!(list_head(&pair.a) < head, "A's list is behind");
-    new
+    let file = key_file(&pair.b);
+    assert_eq!(kid_of_slot(&file["previous"]), old, "{file}");
+    assert_eq!(
+        file["previous"]["applied_d_ms"], stamp,
+        "the stamp's window"
+    );
+    let id = pair.send(1, &format!("atem:{B}"), "HS_AFTER_THE_KILL", false);
+    let task = pair.b.task_of(&id);
+    support::delegated::in_turn(&pair.b, &task, "HS_AFTER_THE_KILL");
+    assert_eq!(put_kids(&pair, &id).first(), Some(&old));
+    support::delegated::complete_turn(&pair.b, &task);
 }
 
 /// The routine rotation of the receiving host's key (agreed with Astation

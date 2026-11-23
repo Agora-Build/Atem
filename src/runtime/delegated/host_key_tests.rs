@@ -32,6 +32,7 @@ fn hk_new_key(rig: &LocalRig) -> atem_client::PublicKey {
         rig.bridge.host_key.as_ref().unwrap(),
         "host",
         1,
+        &uuid::Uuid::new_v4().to_string(),
     )
     .unwrap();
     key.public
@@ -123,7 +124,7 @@ fn a_routine_rotation_keeps_the_old_key_for_mail_in_flight_for_24_hours() {
         let old = host.enc_pub.clone();
         let new = hk_new_key(&rig);
         hk_rotate(&mut rig, &mut host, &new, false);
-        let stamp = hk_file(&rig)["pending"]["applied"].clone();
+        let stamp = hk_file(&rig)["applied"].clone();
         assert_eq!(stamp["d_ms"], d0, "stamped at the commit: {stamp}");
         assert_eq!(stamp["seq"], host.s.log.log.head().seq);
         rig.bridge.host_key_pass();
@@ -254,5 +255,83 @@ fn a_restart_after_the_commit_keeps_the_stamps_deadline() {
         rig.bridge.start_view().now_d_ms = Some(d0 + 24 * HOUR);
         rig.bridge.host_key_pass();
         assert!(hk_file(&rig).get("previous").is_none());
+    });
+}
+
+/// The clock's tick now (its throttle aside), then a pass's reading.
+fn hk_tick(rig: &mut LocalRig) {
+    let store = rig.bridge.work.store.as_ref().unwrap();
+    rig.bridge.work.clock.as_mut().unwrap().tick(store);
+    rig.bridge.take_reading();
+}
+
+/// Review L2: the commit watch reads `D` fresh from the clock, never the
+/// start view's last reading: a commit made after a sleep the pass hasn't
+/// read yet stamps the time after it.
+#[test]
+fn the_stamp_reads_d_fresh_after_a_sleep() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = mb_host(&mut rig, root, &os);
+        let d0 = rig.bridge.start_view().now_d_ms.unwrap();
+        let new = hk_new_key(&rig);
+        // A 10 h sleep (boot time counts it), no pass since.
+        os.pass(10 * HOUR);
+        hk_rotate(&mut rig, &mut host, &new, false);
+        assert_eq!(
+            rig.bridge.start_view().now_d_ms,
+            Some(d0),
+            "the view is stale"
+        );
+        assert_eq!(hk_file(&rig)["applied"]["d_ms"], d0 + 10 * HOUR);
+    });
+}
+
+/// Ruling R63 (review M2) on the real delegated clock: `D` ahead at the
+/// stamp (an unsynchronized forward jump, its anchor pending), then the
+/// jump undone (a repair, recorded with the clock): the previous key is
+/// retired at once, since its window could otherwise run longer than 24 h
+/// of real time.
+#[test]
+fn a_clock_repair_after_the_stamp_retires_the_previous_key_at_once() {
+    local_test(async |root| {
+        use crate::runtime::host_clock::os::Synced;
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = mb_host(&mut rig, root, &os);
+        hk_tick(&mut rig);
+        let old = host.enc_pub.clone();
+        // An unsynchronized jump of 2 h: `D` runs ahead.
+        {
+            let mut r = os.0.lock().unwrap();
+            r.wall_ms += 2 * HOUR + 1_000;
+            r.boot_ns += 1_000_000_000;
+            r.synced = Synced::No;
+        }
+        hk_tick(&mut rig);
+        let ahead = rig.bridge.start_view().now_d_ms.unwrap();
+        let new = hk_new_key(&rig);
+        hk_rotate(&mut rig, &mut host, &new, false);
+        rig.bridge.host_key_pass();
+        assert_eq!(hk_file(&rig)["previous"]["applied_d_ms"], ahead);
+        let mut position = 0;
+        assert_eq!(hk_deliver(&mut rig, &mut host, &old, &mut position), Ok(()));
+        // The jump undone a second later: the clock repairs `D`.
+        {
+            let mut r = os.0.lock().unwrap();
+            r.wall_ms -= 2 * HOUR;
+            r.boot_ns += 1_000_000_000;
+        }
+        hk_tick(&mut rig);
+        let change = rig.bridge.start_view().clock.as_ref().unwrap().change();
+        assert!(change.is_some(), "a repair recorded");
+        rig.bridge.work.host_key_checked = None;
+        rig.bridge.host_key_pass();
+        assert!(hk_file(&rig).get("previous").is_none(), "retired at once");
+        assert_eq!(
+            hk_deliver(&mut rig, &mut host, &old, &mut position),
+            Err("enc_key_not_accepted".into())
+        );
     });
 }

@@ -3647,12 +3647,15 @@ fn host_senders_hand_a_manager_the_host_encryption_key() {
 }
 
 /// The routine rotation's request (`host_enc_key_new`, agreed with
-/// Astation on 2026-11-23) on the real runtime, behind the hook: the Mac
-/// (a manager) gets a pending key, its `enc_sig` verifying; the runtime
-/// SIGKILLed right after (as if the answer was lost), the restarted host
-/// answers a retry (the same `request_id`, a fresh `id`) with that same
-/// key; `host_enc_key_get` still hands out the current key, and the phone
-/// (no `manage`) is `forbidden`.
+/// Astation on 2026-11-23) on the real runtime, behind the hook:
+/// - while the host's key is one no entry has set, the Mac (a manager)
+///   gets that key (ruling R61: no second key beside it);
+/// - once a manager's entry sets it, a request gets a new pending key, its
+///   `enc_sig` verifying; the runtime SIGKILLed right after (as if the
+///   answer was lost), the restarted host answers a retry (the same
+///   `request_id`, a fresh `id`) with that same key;
+/// - `host_enc_key_get` still hands out the current key, and the phone (no
+///   `manage`) is `forbidden`.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
@@ -3664,8 +3667,7 @@ fn host_senders_keep_one_pending_key_across_a_restart() {
     rig.start();
     let mut r = Router::new(&rig.astation);
     let mut mac = Dev::new(&mut r, IDS, &rig.log, MAC, false);
-    let request_id = uuid();
-    let ask = |mac: &mut Dev, r: &mut Router| {
+    let ask = |mac: &mut Dev, r: &mut Router, request_id: &str| {
         let answer = mac.request(
             r,
             json!({"op": "host_enc_key_new", "request_id": request_id}),
@@ -3674,7 +3676,19 @@ fn host_senders_keep_one_pending_key_across_a_restart() {
         assert_eq!(answer["request_id"], json!(request_id), "{answer}");
         atem_client::session::r9::HostEncKey::from_data(&answer).unwrap()
     };
-    let pending = ask(&mut mac, &mut r);
+    let current = mac.request(&mut r, json!({"op": "host_enc_key_get"}));
+    let current = atem_client::session::r9::HostEncKey::from_data(&current).unwrap();
+    assert_eq!(
+        ask(&mut mac, &mut r, &uuid()).enc_key,
+        current.enc_key,
+        "unset: that key"
+    );
+    // A manager's entry sets it.
+    let entry = rig.log.append(MAC, current.action(false, 0).unwrap());
+    mac.carry(&mut r, &[entry]);
+    let request_id = uuid();
+    let pending = ask(&mut mac, &mut r, &request_id);
+    assert_ne!(pending.enc_key, current.enc_key);
     let host_key = rig.log.log.host(HOST).unwrap().host_key.clone();
     atem_client::membership::verify_host_enc_sig(
         &host_key,
@@ -3691,13 +3705,13 @@ fn host_senders_keep_one_pending_key_across_a_restart() {
     let mut r = Router::new(&rig.astation);
     let mut mac = Dev::new(&mut r, IDS, &rig.log, MAC, false);
     assert_eq!(
-        ask(&mut mac, &mut r).enc_key,
+        ask(&mut mac, &mut r, &request_id).enc_key,
         pending.enc_key,
         "the same key"
     );
-    let current = mac.request(&mut r, json!({"op": "host_enc_key_get"}));
-    let current = atem_client::session::r9::HostEncKey::from_data(&current).unwrap();
-    assert_ne!(current.enc_key, pending.enc_key, "the get: the current key");
+    let got = mac.request(&mut r, json!({"op": "host_enc_key_get"}));
+    let got = atem_client::session::r9::HostEncKey::from_data(&got).unwrap();
+    assert_eq!(got.enc_key, current.enc_key, "the get: the current key");
     let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
     let refused = phone.request(
         &mut r,
