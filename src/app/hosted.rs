@@ -171,12 +171,19 @@ impl App {
     /// owner-present Astation's, and the Station refuses the link's calls
     /// as it does today, so its gate stays closed.
     pub(super) fn local_route_message(&mut self, text: &str) {
+        use crate::session_protocol::r9::route::RouteResult;
         if !self.astation_connected || self.astation_reauth.is_some() {
             // Not authenticated now: ignored, with the route's line.
             self.astation_client.local_route_ignored(text);
             return;
         }
-        let _ = self.astation_client.local_route_message(text);
+        // The Station's `service_suspended` refusal of the proof (III.5):
+        // its text recorded, the link kept; an ok lifts one read here.
+        match self.astation_client.local_route_message(text) {
+            Some(RouteResult::Suspended(text)) => self.local_route_suspended(text),
+            Some(RouteResult::Routed { .. }) => self.local_route_ok(),
+            _ => {}
+        }
     }
 
     /// A relay message dropped unread (over its bound, or past this pass's

@@ -267,6 +267,20 @@ pub enum AstationMessage {
     #[serde(skip)]
     HostRouteRefused(String),
 
+    /// The Station refused this link's host route proof, which verified,
+    /// with `service_suspended` (the delegated host-work design III.5): its
+    /// text, checked by the link's reader. The relay closes the connection.
+    #[serde(skip)]
+    HostRouteSuspended(String),
+
+    /// The Station's `service_suspended` notice on the open link (the
+    /// delegated host-work design III.5,
+    /// `atem_client::station_notice::ServiceSuspended`, read strictly by the
+    /// link's reader): its text. On a relay or routed link the Station
+    /// closes the socket after it.
+    #[serde(skip)]
+    ServiceSuspended(String),
+
     /// A `host_challenge`, `host_route_ok` or `host_route_refused` the
     /// Station sent through Astation's local link (`:8080`), as its raw
     /// JSON text (`host.delegated` only; the delegated host-work design
@@ -664,7 +678,33 @@ pub struct AstationClient {
     /// The local link's route (§R9.7b through Astation's `:8080`, design
     /// I.5.8), made by `connect_raw` for each socket of a local link.
     local_route: Option<crate::session_protocol::r9::route::LinkRoute>,
+    /// A Station's `service_suspended` (its proof's refusal, or the open
+    /// link's notice) read while the connect path authenticated the link
+    /// (the delegated host-work design III.5): its text. A relay link's
+    /// connect then fails ([`ServiceSuspendedError`]); a local link keeps
+    /// it for the App (`take_connect_suspension`).
+    connect_suspension: Option<String>,
 }
+
+/// A relay link's connect the Station refused with `service_suspended`
+/// (the delegated host-work design III.5): at its route proof, or with the
+/// notice while the link was being authenticated. The App records the
+/// text for `atem status` and retries after the usual 30 s; no trust or
+/// state changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceSuspendedError {
+    pub text: String,
+    /// The Station's origin (the relay URL, normalized).
+    pub origin: Option<String>,
+}
+
+impl std::fmt::Display for ServiceSuspendedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the Station suspended this host's service ({})", self.text)
+    }
+}
+
+impl std::error::Error for ServiceSuspendedError {}
 
 /// The relay's verdict while the connect path waits for Astation (§R9.7b).
 #[derive(Default)]
@@ -807,6 +847,7 @@ impl AstationClient {
             routed_auth: None,
             local_room: None,
             local_route: None,
+            connect_suspension: None,
         }
     }
 
@@ -870,6 +911,14 @@ impl AstationClient {
         if let Some(route) = self.local_route.as_mut() {
             route.retire();
         }
+    }
+
+    /// A `service_suspended` read while the connect path authenticated a
+    /// link that connected anyway (Astation's local link, which the
+    /// Station's suspension never closes; the delegated host-work design
+    /// III.5), for the App to record; taken once.
+    pub(crate) fn take_connect_suspension(&mut self) -> Option<String> {
+        self.connect_suspension.take()
     }
 
     /// The local route answers nothing more on this socket (retired, or a
@@ -1443,6 +1492,7 @@ impl AstationClient {
 
         let route_tx = msg_tx.clone();
         let mut route_ignored = false;
+        let mut unread_notices: u64 = 0;
         // The peer's close code, once the reader read its close frame.
         let close_code = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
         self.peer_close = Some(close_code.clone());
@@ -1528,11 +1578,30 @@ impl AstationClient {
                                 }
                                 None
                             }
+                            // The Station's notice on the open link (the
+                            // delegated host-work design III.5), read strictly
+                            // here; one the reader refuses is dropped, counted.
+                            None if atem_client::station_notice::is_service_suspended(&text) => {
+                                match atem_client::station_notice::ServiceSuspended::parse(text.as_bytes()) {
+                                    Ok(notice) => Some(AstationMessage::ServiceSuspended(notice.text().to_owned())),
+                                    Err(error) => {
+                                        unread_notices += 1;
+                                        if unread_notices.is_power_of_two() {
+                                            eprintln!(
+                                                "atem: {unread_notices} service_suspended notice(s) the reader refused were dropped (the last: {})",
+                                                error.code()
+                                            );
+                                        }
+                                        None
+                                    }
+                                }
+                            }
                             // §R9.7b: the relay's reply to this link's proof,
                             // checked here (never passed on raw).
                             None if is_relay_message(&text) => match route.as_mut().map(|route| (route.on_reply(&text), atem_client::host_route::RelayReply::parse(text.as_bytes()).is_some())) {
                                 Some((Some(crate::session_protocol::r9::route::RouteResult::Routed { .. }), _)) => Some(AstationMessage::HostRouted),
                                 Some((Some(crate::session_protocol::r9::route::RouteResult::Refused(code)), _)) => Some(AstationMessage::HostRouteRefused(code)),
+                                Some((Some(crate::session_protocol::r9::route::RouteResult::Suspended(text)), _)) => Some(AstationMessage::HostRouteSuspended(text)),
                                 Some((None, true)) => None,
                                 // The Station's verdict on a local link's proof:
                                 // its client checks it, in order.
@@ -1664,13 +1733,26 @@ impl AstationClient {
             challenge_timeout,
             self.wait_for_message(|m| {
                 is_auth_required(m)
-                    || matches!(m, AstationMessage::HostRouted | AstationMessage::HostRouteRefused(_))
+                    || matches!(
+                        m,
+                        AstationMessage::HostRouted
+                            | AstationMessage::HostRouteRefused(_)
+                            | AstationMessage::HostRouteSuspended(_)
+                            | AstationMessage::ServiceSuspended(_)
+                    )
             }),
         )
         .await
         .map_err(|_| anyhow!("Timeout waiting for auth_required"))?
         .ok_or_else(|| anyhow!("Connection closed before auth_required"))?;
         match first {
+            // The delegated host-work design III.5: the connect fails (no
+            // route, no Astation authentication on this socket); the text
+            // is the connect's (`connect_relay_identity_with_mode`).
+            AstationMessage::HostRouteSuspended(text) | AstationMessage::ServiceSuspended(text) => {
+                self.connect_suspension = Some(text.clone());
+                Err(anyhow!("the Station suspended this host's service ({text})"))
+            }
             AstationMessage::HostRouted => {
                 // Under the pairing it was opened for: `atem unpair` (or a
                 // new pairing) drops it like an authenticated link.
@@ -1733,7 +1815,12 @@ impl AstationClient {
         let verdict = tokio::time::timeout(
             ROUTE_VERDICT_GRACE,
             self.wait_for_message(|m| {
-                matches!(m, AstationMessage::HostRouted | AstationMessage::HostRouteRefused(_))
+                matches!(
+                    m,
+                    AstationMessage::HostRouted
+                        | AstationMessage::HostRouteRefused(_)
+                        | AstationMessage::HostRouteSuspended(_)
+                )
             }),
         )
         .await;
@@ -2238,8 +2325,19 @@ impl AstationClient {
                         wait.verdict = Some(false);
                         continue;
                     }
+                    AstationMessage::HostRouteSuspended(ref text) => {
+                        wait.verdict = Some(false);
+                        self.connect_suspension = Some(text.clone());
+                        continue;
+                    }
                     _ => {}
                 }
+            }
+            // The delegated host-work design III.5: the Station's notice
+            // while Astation authenticates the link is the connect's.
+            if let AstationMessage::ServiceSuspended(text) = &msg {
+                self.connect_suspension = Some(text.clone());
+                continue;
             }
             if let Some((response, saved)) = self.auth_response_saving(&msg, astation_id, save)? {
                 // A grant saved a new session (under the captured pairing):
@@ -2269,6 +2367,11 @@ impl AstationClient {
             // ignored, with a line (design I.5.8).
             if let AstationMessage::LocalRoute(text) = &msg {
                 self.local_route_ignored(text);
+            }
+            // The Station's suspension (III.5) is the connect's, never
+            // dropped with the waits' other messages.
+            if let AstationMessage::HostRouteSuspended(text) | AstationMessage::ServiceSuspended(text) = &msg {
+                self.connect_suspension = Some(text.clone());
             }
         }
         None
@@ -2851,6 +2954,17 @@ impl AstationClient {
             .await
         }
         .await;
+        // The delegated host-work design III.5: a suspension read while
+        // the link was being authenticated fails the connect, typed, with
+        // its text (even if Astation accepted the link meanwhile: the
+        // Station closes it).
+        let result = match self.connect_suspension.take() {
+            Some(text) => Err(anyhow::Error::new(ServiceSuspendedError {
+                text,
+                origin: atem_client::station_route::normalize_relay(relay_url).ok(),
+            })),
+            None => result,
+        };
         if result.is_err() {
             self.abort_transport();
         } else {
@@ -3187,6 +3301,110 @@ mod tests {
             (challenge, answer)
         });
         (format!("http://{address}"), server)
+    }
+
+    /// A test relay that challenges for `room`, waits for Atem's proof,
+    /// answers it with `reply` and closes the socket.
+    async fn answering_relay(room: &'static str, reply: String) -> (String, tokio::task::JoinHandle<bool>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let challenge = atem_client::host_route::HostChallenge::new(room);
+            socket.send(Message::Text(challenge.to_json().to_string())).await.unwrap();
+            let proved = tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(Ok(frame)) = socket.next().await {
+                    if let Message::Text(text) = frame
+                        && text.contains("\"host_route\"")
+                    {
+                        return true;
+                    }
+                }
+                false
+            })
+            .await
+            .unwrap_or(false);
+            let _ = socket.send(Message::Text(reply)).await;
+            let _ = socket.close(None).await;
+            proved
+        });
+        (format!("http://{address}"), server)
+    }
+
+    /// The route state of a pinned host (`host-1` at its list's head).
+    fn ready_route() -> crate::session_protocol::r9::route::RouteHandle {
+        use crate::session_protocol::membership::r9log::{TestLog, secret};
+        use crate::session_protocol::r9::route::{self, RouteIdentity, RouteState};
+        let mut log = TestLog::genesis("acct-1", &secret("ws astation"));
+        log.add_host("host-1", 1, &secret("ws host"));
+        let handle = route::new_handle();
+        route::set(
+            &handle,
+            RouteState::Ready {
+                id: RouteIdentity {
+                    account_id: "acct-1".into(),
+                    genesis_hash: log.log.genesis_hash(),
+                    host_id: "host-1".into(),
+                    head: log.log.head(),
+                    chain: std::sync::Arc::new(log.log.entries().iter().map(|e| e.hash()).collect()),
+                },
+                key: std::sync::Arc::new(crate::session_protocol::r9::HostKey::new(&secret(
+                    "ws host",
+                ))),
+            },
+        );
+        handle
+    }
+
+    /// The delegated host-work design III.5 (Atem's proposal, for
+    /// Astation's agreement, #120 7207832274): the Station's
+    /// `service_suspended` refusal of the relay link's proof, or its notice
+    /// before Astation authenticated the link, fails the connect typed,
+    /// with the Station's text and origin; a verifier code's refusal and a
+    /// malformed suspension are no suspension.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_suspended_route_fails_the_relay_connect_with_its_text() {
+        use atem_client::host_route::{HostRouteRefusal, RelayReply};
+        const TEXT: &str = "service suspended: account disabled at Agora.Build";
+        let (state, client) = isolated_client("hosta-0000000-1a2b3c4d");
+        let _profile = crate::test_profile::use_dir(state.path());
+        let mut client = client.with_host_route(ready_route());
+        let notice = atem_client::station_notice::ServiceSuspended::new(TEXT).unwrap();
+        for reply in [
+            RelayReply::suspended(TEXT).unwrap().to_json().to_string(),
+            notice.to_json().to_string(),
+        ] {
+            let (base, server) = answering_relay("mac-room", reply.clone()).await;
+            let error = client
+                .connect_relay_identity_without_pairing(&base, "mac-room")
+                .await
+                .expect_err("refused");
+            assert!(server.await.unwrap(), "the proof went out");
+            let suspended = error
+                .downcast_ref::<ServiceSuspendedError>()
+                .unwrap_or_else(|| panic!("{reply}: {error:#}"));
+            assert_eq!(suspended.text, TEXT);
+            assert_eq!(
+                suspended.origin,
+                atem_client::station_route::normalize_relay(&base).ok()
+            );
+            assert!(!client.routed());
+        }
+        for reply in [
+            RelayReply::refused(&HostRouteRefusal::UnknownHost).to_json().to_string(),
+            r#"{"type":"relay","op":"host_route_refused","v":1,"code":"service_suspended"}"#.to_string(),
+            r#"{"type":"relay","op":"service_suspended","v":1,"text":""}"#.to_string(),
+        ] {
+            let (base, server) = answering_relay("mac-room", reply.clone()).await;
+            let error = client
+                .connect_relay_identity_without_pairing(&base, "mac-room")
+                .await
+                .expect_err("not connected");
+            server.await.unwrap();
+            assert!(error.downcast_ref::<ServiceSuspendedError>().is_none(), "{reply}");
+        }
     }
 
     /// §R9.7b: a relay identity link answers the relay's `host_challenge` as
