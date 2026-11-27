@@ -142,10 +142,13 @@ pub enum ReportRefusal {
     /// `signer` isn't a current native member (`member:`) or a current
     /// service (`service:`) at the log's head: removed or never added,
     /// pending, `recovery`, a host, a grant, or a member of the other kind.
-    /// A signer report's: anything but a current native member.
+    /// A signer report's and a Station binding's: anything but a current
+    /// native member.
     UnknownSigner,
     /// A signer report's signer is a current native member that never
-    /// held `manage` at any `seq` of the log.
+    /// held `manage` at any `seq` of the log; a Station binding's doesn't
+    /// hold `manage` at the head (the signer's own in the builder, the
+    /// verifier's in the verifier).
     NotAManager,
     /// A service whose `expires_at` is at or before `now_ms`.
     SignerExpired,
@@ -162,7 +165,8 @@ pub enum ReportRefusal {
     /// The report's (or the builder's) `slot` isn't the challenge's.
     SlotMismatch,
     /// Another `origin`, `connection`, `nonce`, `issued_at` or
-    /// `expires_at` than the challenge the minter stored.
+    /// `expires_at` than the challenge the minter stored; a Station
+    /// binding's body other than its stored challenge (compared on `jcs`).
     ChallengeMismatch,
     /// A signer report's `recovery` differs from the stored challenge's in
     /// any field.
@@ -178,6 +182,9 @@ pub enum ReportRefusal {
     /// The builder only: the challenge's `origin` isn't the reporter's
     /// configured Station.
     OriginMismatch,
+    /// A Station binding's builder only: the challenge's `issuer`,
+    /// `subject` or `auth_time` isn't what the app was told.
+    BindingMismatch,
     /// The signer only: the key provider failed or declined (a key that
     /// can't sign without interaction returns `Cancelled`).
     Signing(Error),
@@ -202,6 +209,7 @@ impl ReportRefusal {
             ReportRefusal::RecordsMismatch(_) => "records_mismatch",
             ReportRefusal::Expired => "expired",
             ReportRefusal::OriginMismatch => "origin_mismatch",
+            ReportRefusal::BindingMismatch => "binding_mismatch",
             ReportRefusal::Signing(_) => "signing_failed",
         }
     }
@@ -220,7 +228,7 @@ impl std::fmt::Display for ReportRefusal {
 
 impl std::error::Error for ReportRefusal {}
 
-fn malformed(what: &'static str) -> ReportRefusal {
+pub(crate) fn malformed(what: &'static str) -> ReportRefusal {
     ReportRefusal::Malformed(what)
 }
 
@@ -230,13 +238,13 @@ fn malformed(what: &'static str) -> ReportRefusal {
 /// principal name whose id is an opaque id, so that a host, a grant or
 /// `recovery` is refused as `unknown_signer`, not as `malformed`; only a
 /// member and a service can sign.
-enum Signer<'a> {
+pub(crate) enum Signer<'a> {
     Member(&'a str),
     Service(&'a str),
     Other,
 }
 
-fn read_signer(text: &str) -> Option<Signer<'_>> {
+pub(crate) fn read_signer(text: &str) -> Option<Signer<'_>> {
     let (kind, id) = text.split_once(':')?;
     if !id_ok(id) {
         return None;
@@ -258,27 +266,30 @@ fn signer_ok(text: &str) -> bool {
 }
 
 /// A Station's exact origin, as `normalize_relay` writes it.
-fn origin_ok(origin: &str) -> bool {
+pub(crate) fn origin_ok(origin: &str) -> bool {
     normalize_relay(origin).as_deref() == Ok(origin)
 }
 
-fn lease_ok(issued_at: u64, expires_at: u64) -> bool {
+pub(crate) fn lease_ok(issued_at: u64, expires_at: u64) -> bool {
     expires_at > issued_at && expires_at - issued_at <= MAX_LEASE_MS
 }
 
-fn int_field(o: &Map<String, Value>, key: &'static str) -> Result<u64, ReportRefusal> {
+pub(crate) fn int_field(o: &Map<String, Value>, key: &'static str) -> Result<u64, ReportRefusal> {
     o.get(key)
         .and_then(Value::as_u64)
         .filter(|n| *n <= canonical::MAX_SAFE_INTEGER)
         .ok_or(malformed(key))
 }
 
-fn str_field<'a>(o: &'a Map<String, Value>, key: &'static str) -> Result<&'a str, ReportRefusal> {
+pub(crate) fn str_field<'a>(
+    o: &'a Map<String, Value>,
+    key: &'static str,
+) -> Result<&'a str, ReportRefusal> {
     o.get(key).and_then(Value::as_str).ok_or(malformed(key))
 }
 
 /// Exactly `fields`, each once (a strict parse already refused duplicates).
-fn exact<'a>(
+pub(crate) fn exact<'a>(
     value: &'a Value,
     fields: &[&str],
     what: &'static str,
@@ -502,7 +513,7 @@ impl ReportChallenge {
 
 /// A challenge text, one strict I-JSON parse within
 /// [`MAX_CHALLENGE_BYTES`].
-fn strict_challenge(bytes: &[u8]) -> Result<Value, ReportRefusal> {
+pub(crate) fn strict_challenge(bytes: &[u8]) -> Result<Value, ReportRefusal> {
     canonical::parse_strict(bytes, MAX_CHALLENGE_BYTES, Numbers::IntegersOnly).map_err(
         |e| match e {
             canonical::StrictError::TooLarge => malformed("too large"),
@@ -562,27 +573,26 @@ fn signer_key(
     Ok((kind, state.member.auth_key.clone()))
 }
 
-/// A body a reporter's key signs, built by the core and held unchanged:
-/// a signature attached with [`with_signature`](Self::with_signature) is
-/// over exactly this body, under its own label.
+/// A body a member's key signs, built by the core and held unchanged: a
+/// signature attached with [`with_signature`](Self::with_signature) is over
+/// exactly this body, under its own label. A report's and a Station
+/// binding's (`station_binding`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct HeldBody {
+pub(crate) struct HeldBody {
     label: SignLabel,
-    value: Value,
-    jcs: String,
-    head: Head,
-    process: [u8; PROCESS_BYTES],
-    signer_key: PublicKey,
+    pub(crate) value: Value,
+    pub(crate) jcs: String,
+    pub(crate) head: Head,
+    pub(crate) signer_key: PublicKey,
 }
 
 impl HeldBody {
     /// `value` checked as a signed body of `label` (R9.1: its `jcs` at
     /// most 4,096 bytes, no `null`, the arrays its label allows).
-    fn new(
+    pub(crate) fn new(
         label: SignLabel,
         value: Value,
         head: Head,
-        process: [u8; PROCESS_BYTES],
         signer_key: PublicKey,
     ) -> Result<Self, ReportRefusal> {
         let (checked, jcs) = signed::check_body(&value).map_err(|_| malformed("body"))?;
@@ -594,19 +604,18 @@ impl HeldBody {
             value,
             jcs,
             head,
-            process,
             signer_key,
         })
     }
 
-    fn signing_input(&self) -> SigningInput {
+    pub(crate) fn signing_input(&self) -> SigningInput {
         SigningInput::new(self.label, self.jcs.as_bytes())
     }
 
-    /// The report: this body with `sig` (P-256 64-byte `r‖s`, either S,
-    /// normalized to low S; or Ed25519), once it verifies under the
-    /// signer's key over this body's signing input.
-    fn with_signature(&self, sig: &[u8]) -> Result<SignedObject, ReportRefusal> {
+    /// The signed object: this body with `sig` (P-256 64-byte `r‖s`,
+    /// either S, normalized to low S; or Ed25519), once it verifies under
+    /// the signer's key over this body's signing input.
+    pub(crate) fn with_signature(&self, sig: &[u8]) -> Result<SignedObject, ReportRefusal> {
         let sig = normalize_signature(self.signer_key.alg(), sig.to_vec())
             .map_err(|_| ReportRefusal::BadSignature)?;
         self.signer_key
@@ -625,38 +634,41 @@ impl HeldBody {
 /// signature attached with [`with_signature`](Self::with_signature) is
 /// over exactly this body.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifierReportBody(HeldBody);
+pub struct VerifierReportBody {
+    held: HeldBody,
+    process: [u8; PROCESS_BYTES],
+}
 
 impl VerifierReportBody {
     /// The body object.
     pub fn to_json(&self) -> Value {
-        self.0.value.clone()
+        self.held.value.clone()
     }
 
     /// `jcs(body)`.
     pub fn jcs(&self) -> &str {
-        &self.0.jcs
+        &self.held.jcs
     }
 
     /// `enc(["atem-verifier-report-v1", jcs(body)])`: what the signer's key
     /// signs.
     pub fn signing_input(&self) -> SigningInput {
-        self.0.signing_input()
+        self.held.signing_input()
     }
 
     /// The head of the reporter's log the body names.
     pub fn head(&self) -> Head {
-        self.0.head
+        self.held.head
     }
 
     /// The process generation the body names ([`process_generation`]).
     pub fn process(&self) -> [u8; PROCESS_BYTES] {
-        self.0.process
+        self.process
     }
 
     /// The signer's key at the log's head, with its algorithm.
     pub fn signer_key(&self) -> &PublicKey {
-        &self.0.signer_key
+        &self.held.signer_key
     }
 
     /// The report: this body with `sig` (P-256 64-byte `r‖s`, either S,
@@ -664,7 +676,7 @@ impl VerifierReportBody {
     /// key over this body's signing input. A signature over any other body,
     /// under any other label or by any other key is `bad_signature`.
     pub fn with_signature(&self, sig: &[u8]) -> Result<SignedObject, ReportRefusal> {
-        self.0.with_signature(sig)
+        self.held.with_signature(sig)
     }
 }
 
@@ -759,14 +771,13 @@ pub fn verifier_report_body(
     value.insert("type".into(), json!(REPORT_TYPE));
     value.insert("v".into(), json!(1));
     value.insert("verifier".into(), VerifierInventory::ours().to_json());
-    HeldBody::new(
+    let held = HeldBody::new(
         SignLabel::VerifierReport,
         Value::Object(value),
         log.head(),
-        process,
         signer_key,
-    )
-    .map(VerifierReportBody)
+    )?;
+    Ok(VerifierReportBody { held, process })
 }
 
 /// Signs `body` with `key` (the signer's own key behind `provider`) and
@@ -868,16 +879,9 @@ impl Common {
         })
     }
 
-    /// The log's checks before the signer's: not frozen (`frozen`), its
-    /// account and genesis (`wrong_account`).
+    /// The log's checks before the signer's ([`check_account`]).
     fn check_log(&self, log: &Membership) -> Result<(), ReportRefusal> {
-        if log.frozen().is_some() {
-            return Err(ReportRefusal::Frozen);
-        }
-        if self.account_id != log.account_id() || self.genesis_hash != log.genesis_hash() {
-            return Err(ReportRefusal::WrongAccount);
-        }
-        Ok(())
+        check_account(log, &self.account_id, self.genesis_hash)
     }
 
     /// The checks after the signer's key, in this order: `sig` by `key`
@@ -896,14 +900,7 @@ impl Common {
         object
             .verify(key)
             .map_err(|_| ReportRefusal::BadSignature)?;
-        let ours = log.head();
-        if self.head.seq > ours.seq {
-            return Err(ReportRefusal::StaleLog);
-        }
-        match log.entry(self.head.seq) {
-            Some(entry) if entry.hash() == self.head.hash => {}
-            _ => return Err(ReportRefusal::Fork),
-        }
+        let at_head = check_head(log, self.head)?;
         if self.signer != expected.signer() {
             return Err(ReportRefusal::SignerMismatch);
         }
@@ -913,12 +910,42 @@ impl Common {
         if !self.echo.same(&expected.echo()) {
             return Err(ReportRefusal::ChallengeMismatch);
         }
-        Ok(self.head == ours)
+        Ok(at_head)
+    }
+}
+
+/// The log's checks a signed body's account goes through before its
+/// signer's: the log not frozen (`frozen`), `account_id` and
+/// `genesis_hash` the log's (`wrong_account`).
+pub(crate) fn check_account(
+    log: &Membership,
+    account_id: &str,
+    genesis_hash: Hash32,
+) -> Result<(), ReportRefusal> {
+    if log.frozen().is_some() {
+        return Err(ReportRefusal::Frozen);
+    }
+    if account_id != log.account_id() || genesis_hash != log.genesis_hash() {
+        return Err(ReportRefusal::WrongAccount);
+    }
+    Ok(())
+}
+
+/// `head` the log's head or an ancestor on its chain (`stale_log` beyond
+/// it, `fork` off it); whether it is the log's head.
+pub(crate) fn check_head(log: &Membership, head: Head) -> Result<bool, ReportRefusal> {
+    let ours = log.head();
+    if head.seq > ours.seq {
+        return Err(ReportRefusal::StaleLog);
+    }
+    match log.entry(head.seq) {
+        Some(entry) if entry.hash() == head.hash => Ok(head == ours),
+        _ => Err(ReportRefusal::Fork),
     }
 }
 
 /// The signed-object layer's refusal, as the report's `malformed` part.
-fn object_malformed(e: Error) -> ReportRefusal {
+pub(crate) fn object_malformed(e: Error) -> ReportRefusal {
     malformed(match e {
         Error::Strict(canonical::StrictError::TooLarge) | Error::TooLarge => "too large",
         Error::Strict(_) => "not strict JSON",
@@ -934,7 +961,10 @@ fn object_malformed(e: Error) -> ReportRefusal {
 /// A report as received, `{"body","sig"}`, read as a signed object of
 /// `label` (R9.1: strict I-JSON within 16 KiB, its body's `jcs` within
 /// 4,096 bytes, no `null`, no `kit_sig`, only the arrays its label allows).
-fn read_report(report_json: &[u8], label: SignLabel) -> Result<SignedObject, ReportRefusal> {
+pub(crate) fn read_report(
+    report_json: &[u8],
+    label: SignLabel,
+) -> Result<SignedObject, ReportRefusal> {
     let object = SignedObject::parse(report_json).map_err(object_malformed)?;
     if object.label() != label {
         return Err(malformed("type"));
