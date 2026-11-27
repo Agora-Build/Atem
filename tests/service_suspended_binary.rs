@@ -547,17 +547,14 @@ fn a_suspended_routed_host_keeps_its_state_retries_and_resumes_once_restored() {
     complete_turn(&rig, &second["task_id"]);
 }
 
-/// III.5 with the hook off (a release build's reading): a routed host's
+/// III.5 with the hook off (a release build's reading; run by release
+/// builds too, where the state dump reads as nothing): a routed host's
 /// open link gets the notice and the Station leaves the link open. The
 /// host drops it 10 s later (not before), the next connect waits the usual
 /// 30 s and is refused at its proof; the Relay line shows the text, there
 /// is no Control feeds line, and the host makes no Station call. Restored,
 /// the next connect is routed and the text is gone.
 #[test]
-#[cfg_attr(
-    not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_CLOCK hook"
-)]
 fn with_the_hook_off_the_host_shows_the_text_drops_the_link_after_10_s_and_retries() {
     let rig = Rig::start(Via::Routed, false);
     rig.status_line("Relay:", "routed via relay");
