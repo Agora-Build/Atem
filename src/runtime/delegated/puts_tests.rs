@@ -198,3 +198,32 @@ fn an_answer_carries_where_its_put_went() {
     let put = c.take(rows(0..1), went).remove(0);
     assert_eq!(c.on_stored(&stored(&put)), Answer::Row(0, went));
 }
+
+/// The delegated host-work design III.5: the Station's `service_suspended`
+/// retires every live put; on a relay or routed link nothing more is put
+/// on that socket, a new socket's `heads` announcing the mailbox puts
+/// again; on Astation's local link the next `heads` that announces it.
+#[test]
+fn a_suspension_retires_the_live_puts() {
+    let mut c = client();
+    c.on_heads(true);
+    assert_eq!(c.take(rows(0..1), AT).len(), 1);
+    c.on_suspended(true);
+    assert_eq!(c.dump()["live"], serde_json::json!([]));
+    c.on_heads(true);
+    assert!(c.take(rows(0..1), AT).is_empty(), "nothing on the socket");
+    c.on_link(Some(&link(2, 1)));
+    c.on_heads(true);
+    assert!(c.take(rows(0..1), AT).is_empty(), "the same socket");
+    c.on_link(Some(&link(3, 2)));
+    c.on_heads(true);
+    assert_eq!(c.take(rows(0..1), AT).len(), 1);
+    // The local link.
+    c.on_suspended(false);
+    assert!(
+        c.take(rows(0..1), AT).is_empty(),
+        "until a heads announces it"
+    );
+    c.on_heads(true);
+    assert_eq!(c.take(rows(0..1), AT).len(), 1);
+}

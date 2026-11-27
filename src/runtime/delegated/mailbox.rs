@@ -167,6 +167,9 @@ pub struct Outgoing {
 enum Resync {
     Refused,
     Fault(&'static str),
+    /// The Station suspended this host's service on Astation's local link
+    /// (the delegated host-work design III.5): as a refusal.
+    Suspended,
 }
 
 /// The live `mailbox_sync`, and what it was captured with.
@@ -211,6 +214,10 @@ pub struct MailboxClient {
     /// The host's identity moved since the link's socket was authenticated:
     /// nothing more is asked or applied on that socket.
     moved: bool,
+    /// The Station suspended this host's service on the link's socket, a
+    /// relay or routed one (III.5): as `moved`, nothing more on it.
+    suspended: bool,
+    suspensions: u64,
     /// The host's monotonic clock at the last tick (ms).
     now: u64,
     announced: Option<MailboxHead>,
@@ -295,6 +302,7 @@ impl MailboxClient {
         self.dones_refused = false;
         if now.map(|(_, socket)| socket) != self.socket {
             self.moved = false;
+            self.suspended = false;
         }
         self.link_gen = now.map(|(link_gen, _)| link_gen);
         self.socket = now.map(|(_, socket)| socket);
@@ -307,6 +315,30 @@ impl MailboxClient {
         self.retire_all();
         self.announced = None;
         self.moved = true;
+    }
+
+    /// The Station suspended this host's service on the link (the
+    /// delegated host-work design III.5): every live sync and done is
+    /// retired (the owed dones go again on the next link). `socket_ends`
+    /// (a relay or routed link): nothing more is synced or marked done on
+    /// that socket, as after an identity change. Else (Astation's local
+    /// link) as a refusal of both calls: no sync before a `heads` past the
+    /// backoff, no done more on this link generation.
+    pub fn on_suspended(&mut self, socket_ends: bool) {
+        if self.link_gen.is_none() {
+            return;
+        }
+        self.suspensions += 1;
+        self.retire_all();
+        if socket_ends {
+            self.announced = None;
+            self.suspended = true;
+        } else {
+            self.resync = Some(Resync::Suspended);
+            self.refused_at = Some(self.now);
+            self.epoch += 1;
+            self.dones_refused = true;
+        }
     }
 
     /// The pass's monotonic time: a live call unanswered for 35 s is
@@ -330,7 +362,7 @@ impl MailboxClient {
         for id in late {
             self.retire_done(&id);
         }
-        if self.resync != Some(Resync::Refused) {
+        if !matches!(self.resync, Some(Resync::Refused | Resync::Suspended)) {
             self.ask(true);
         }
     }
@@ -355,7 +387,7 @@ impl MailboxClient {
     /// A `heads` on the link: the host's own mailbox, or none (rule 6). A
     /// sync, if one is due.
     pub fn on_heads(&mut self, mailbox: Option<MailboxHead>) {
-        if self.link_gen.is_none() || self.moved {
+        if self.link_gen.is_none() || self.moved || self.suspended {
             return;
         }
         self.announced = mailbox;
@@ -422,6 +454,7 @@ impl MailboxClient {
         if self.link_gen.zip(self.socket) != Some((ask.link_gen, ask.socket))
             || identity != Some(&ask.identity)
             || self.moved
+            || self.suspended
         {
             self.drained += 1;
             return PageCheck::Drained;
@@ -562,7 +595,12 @@ impl MailboxClient {
             ask.sent = true;
             out.sync.push(ask.call.clone());
         }
-        if self.link_gen.is_none() || self.moved || self.dones_refused || self.reset {
+        if self.link_gen.is_none()
+            || self.moved
+            || self.suspended
+            || self.dones_refused
+            || self.reset
+        {
             return out;
         }
         let (Some(announced), Some(observed)) = (&self.announced, &self.observed) else {
@@ -633,6 +671,9 @@ impl MailboxClient {
         if self.moved {
             return Some("this host's identity changed".into());
         }
+        if self.suspended {
+            return Some("the Station suspended this host's service".into());
+        }
         let Some(observed) = &self.observed else {
             return Some("the mailbox state isn't loaded".into());
         };
@@ -642,6 +683,9 @@ impl MailboxClient {
             }
             Some(Resync::Fault(code)) => {
                 return Some(format!("Station sent a mailbox page it shouldn't ({code})"));
+            }
+            Some(Resync::Suspended) => {
+                return Some("the Station suspended this host's service; retrying".into());
             }
             None => {}
         }
@@ -749,6 +793,8 @@ impl MailboxClient {
             "dones_refused": self.dones_refused,
             "unsolicited": self.unsolicited,
             "identity_moved": self.moved,
+            "suspended": self.suspended,
+            "suspensions": self.suspensions,
         })
     }
 
@@ -879,7 +925,7 @@ impl MailboxClient {
     /// one live, none before a reset's mark or in a refusal's backoff;
     /// `paced` at most one a second, none in a stall's 30 s).
     fn ask(&mut self, paced: bool) {
-        if self.in_flight.is_some() || self.moved || self.reset {
+        if self.in_flight.is_some() || self.moved || self.suspended || self.reset {
             return;
         }
         let (Some(link_gen), Some(socket), Some(announced), Some(observed)) = (

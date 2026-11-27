@@ -733,6 +733,12 @@ pub struct HostBridge {
     /// The host's Station link (its calls and the Station's messages,
     /// host-work-v1 §11.4): only with `host.delegated` (Decision 11).
     station: Option<Station>,
+    /// The App's record of the Station's suspension of this host's service
+    /// (the delegated host-work design III.5), as the last pass read it:
+    /// its origin and text, for the `Control feeds:` line.
+    suspension: Option<(Option<String>, String)>,
+    /// The App's last `service_suspended` notice the Station link took.
+    suspension_applied: u64,
     /// Fetch results not carried because an entry didn't read back (never
     /// expected: they came from the strict reader).
     unconverted_fetches: u64,
@@ -998,6 +1004,8 @@ impl HostBridge {
             r9_link: None,
             r9_socket: 0,
             station: None,
+            suspension: None,
+            suspension_applied: 0,
             unconverted_fetches: 0,
             pairing,
             host_key,
@@ -1565,8 +1573,14 @@ impl HostBridge {
     fn sync_station_link(&mut self, app: &App) {
         if !self.features.delegated {
             self.station = None;
+            self.suspension = None;
             return;
         }
+        // The Station's suspension, as the App recorded it (III.5).
+        self.suspension = app
+            .service_suspension
+            .as_ref()
+            .map(|s| (s.origin.clone(), s.text.clone()));
         let link_gen = self.r9_link;
         // With `host.senders` (the hook's) its `heads` carry the host's
         // own mailbox head (host-work-v1 §11.5 rule 6).
@@ -2140,6 +2154,10 @@ impl HostBridge {
             #[cfg(debug_assertions)]
             self.drive_pass(&mut cx);
         }
+        // III.5: the Station's suspension the App read is applied to the
+        // Station link it came on before this pass takes the link as it
+        // is now (the Station closes it right after).
+        self.station_suspension(app);
         self.sync_r9_link(r9_app_link(app), &mut cx);
         self.sync_station_link(app);
         // The services' r9 admission as the control state stands, before
@@ -2185,6 +2203,20 @@ impl HostBridge {
             }
             let station = self.r9.take_station_messages();
             self.station_pass(station, &mut cx);
+            // III.5: a suspension read on Astation's local link is lifted
+            // once the Station serves that link again (its feed gate open).
+            if app
+                .service_suspension
+                .as_ref()
+                .is_some_and(crate::app::suspension::Suspension::local)
+                && self
+                    .station
+                    .as_ref()
+                    .is_some_and(|station| station.feed.closed().is_none())
+            {
+                app.service_suspension = None;
+                self.suspension = None;
+            }
             for (link_gen, handle, why) in overflow {
                 if Some(link_gen) == self.r9_link {
                     let effects = self.r9_call(|r9, parts| r9.refuse_unread(&handle, why, parts));

@@ -1231,3 +1231,105 @@ fn control_alerts_and_unknown_outcome_alerts_stay_apart() {
         );
     });
 }
+
+/// The delegated host-work design III.5 (Atem's proposal, for Astation's
+/// agreement, #120 7207832274): the App's record of the Station's
+/// `service_suspended` on the host's routed link, handed to its Station
+/// link once and only for the link it came on, closes the gate at once and
+/// names the Station's text on the `Control feeds:` line; with the link
+/// down afterwards, the line keeps the App's record of it (its origin and
+/// text) until it is lifted. Nothing durable moves: the cursor stays.
+#[test]
+fn a_suspension_closes_the_gate_at_once_and_names_the_text() {
+    use atem_client::control::ControlAction;
+    const TEXT: &str = "service suspended: account disabled at Agora.Build";
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let s = fed_host(&mut rig, root, &os);
+        let head = s.log.log.head();
+        bridge_heads(&mut rig, 1, head);
+        let cover = own_record(&s.log, "svc-bot", ControlAction::Cover, 1);
+        bridge_page(&mut rig, 1, &[(1, &cover)]);
+        assert!(
+            rig.bridge
+                .feeds_status()
+                .unwrap()
+                .starts_with("revocations checked")
+        );
+        // The App's record of the notice, on another link: nothing.
+        let suspension = |notice, socket, link_gen| crate::app::suspension::Suspension {
+            text: TEXT.into(),
+            on: crate::app::suspension::SuspendedOn::Relay { socket },
+            origin: Some(ORIGIN.into()),
+            notice: Some(notice),
+            link_gen,
+        };
+        rig.app.service_suspension = Some(suspension(1, 2, 1));
+        rig.bridge.station_suspension(&rig.app);
+        assert!(
+            rig.bridge
+                .feeds_status()
+                .unwrap()
+                .starts_with("revocations checked")
+        );
+        // On the link: applied once, at once.
+        rig.app.service_suspension = Some(suspension(2, 1, 1));
+        rig.bridge.station_suspension(&rig.app);
+        rig.bridge.station_suspension(&rig.app);
+        assert_eq!(
+            rig.bridge.station.as_ref().unwrap().dump()["suspensions"],
+            1
+        );
+        let line = rig.bridge.feeds_status().unwrap();
+        assert!(
+            line.starts_with(&format!(
+                "revocations not yet checked ({ORIGIN}: {TEXT}; retrying)"
+            )),
+            "{line}"
+        );
+        // Nothing read on that socket opens it again.
+        bridge_heads_quiet(&mut rig, 1, head);
+        assert!(
+            rig.bridge
+                .feeds_status()
+                .unwrap()
+                .starts_with("revocations not yet checked")
+        );
+        // The link down; the App's record names the Station still.
+        rig.bridge.suspension = Some((Some(ORIGIN.to_string()), TEXT.to_string()));
+        rig.bridge
+            .station
+            .as_mut()
+            .unwrap()
+            .sync_link(None, 0, || unreachable!(), || None);
+        let line = rig.bridge.feeds_status().unwrap();
+        assert!(
+            line.starts_with(&format!(
+                "revocations not yet checked ({ORIGIN}: {TEXT}; retrying)"
+            )),
+            "{line}"
+        );
+        if let crate::runtime::delegated::feeds::Feeds::Loaded(feeds) = &rig.bridge.work.feeds {
+            assert_eq!(
+                feeds.current_feed(ORIGIN),
+                Some((OWN_FEED.to_string(), 1)),
+                "the cursor stays"
+            );
+        }
+    });
+}
+
+/// The Station's `heads` read by the link's reader, which may take nothing
+/// (a socket the Station suspended this host's service on).
+fn bridge_heads_quiet(rig: &mut LocalRig, head: u64, membership: atem_client::membership::Head) {
+    use crate::runtime::delegated::station::Inbound;
+    let text = heads_text(&[(ORIGIN, OWN_FEED, head)], membership);
+    let inbound = rig
+        .bridge
+        .station
+        .as_mut()
+        .unwrap()
+        .receive(&text, None, None);
+    assert_eq!(inbound, Inbound::Nothing);
+}

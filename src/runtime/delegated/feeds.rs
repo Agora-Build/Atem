@@ -722,6 +722,14 @@ impl FeedStore {
         }
     }
 
+    /// The Station suspended this host's service on `link` (III.5,
+    /// [`AckBook::on_suspended`]).
+    pub fn acks_suspended(&mut self, link: &super::station::StationLink) {
+        if let Some(book) = self.mem.acks.as_mut() {
+            book.on_suspended(link);
+        }
+    }
+
     /// The acknowledgments' state, for the state dump (debug builds).
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub fn acks_dump(&self) -> Option<Value> {

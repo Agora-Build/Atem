@@ -661,6 +661,55 @@ fn the_bound_never_takes_an_applied_effect_or_an_own_revoke() {
     );
 }
 
+/// The delegated host-work design III.5: the Station suspended this
+/// host's service on a connection (its `service_suspended` notice). What
+/// went on that connection reads as never sent, so a result that goes
+/// once goes again on the next connection, exactly once, and nothing more
+/// goes on the suspended one; a later connection sends it no more. One
+/// sent on an earlier connection, which ended with no refusal, isn't sent
+/// again.
+#[test]
+fn a_suspended_connections_once_results_go_again_on_the_next_exactly_once() {
+    let (db, mut book) = fresh();
+    let early = record(BOT, ControlSigner::Principal, ControlAction::Cover, ISSUED);
+    commit(
+        &db,
+        &mut book,
+        &[Acked::of(
+            &early,
+            &in_force(EffectKind::Cover),
+            Some(&at(1)),
+        )],
+    );
+    assert_eq!(
+        ids(&send(&db, &mut book, &link(1), 1, ISSUED)),
+        [early.record_id()]
+    );
+    let hold = record(BOT, ControlSigner::Principal, ControlAction::Hold, ISSUED);
+    commit(
+        &db,
+        &mut book,
+        &[Acked::of(&hold, &in_force(EffectKind::Hold), Some(&at(2)))],
+    );
+    assert_eq!(
+        ids(&send(&db, &mut book, &link(2), 2, ISSUED + MIN)),
+        [hold.record_id()]
+    );
+    book.on_suspended(&link(2));
+    assert!(
+        send(&db, &mut book, &link(2), 2, ISSUED + 2 * MIN).is_empty(),
+        "nothing more on the suspended connection"
+    );
+    assert_eq!(
+        ids(&send(&db, &mut book, &link(3), 2, ISSUED + 3 * MIN)),
+        [hold.record_id()],
+        "once again on the next, and only the suspended connection's"
+    );
+    assert!(send(&db, &mut book, &link(3), 2, ISSUED + 4 * MIN).is_empty());
+    assert!(send(&db, &mut book, &link(4), 2, ISSUED + 5 * MIN).is_empty());
+    assert!(table(&db).is_empty(), "{:?}", table(&db));
+}
+
 /// Review m1 (ruling T36a): a result that goes once is kept until its
 /// connection ends with no `control_ack_refused`. On a connection that is
 /// refused it goes again on the next one; one that ends with no refusal

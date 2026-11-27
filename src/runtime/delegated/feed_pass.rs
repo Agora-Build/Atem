@@ -506,11 +506,12 @@ impl HostBridge {
     /// its fence ran.
     pub(crate) fn acks_due(&self) -> Vec<DueAck> {
         // None on a link whose association is another identity's (§11.4
-        // "An identity change"): its acks wait for the next link.
+        // "An identity change"), or whose socket the Station suspended
+        // this host's service on (III.5): its acks wait for the next link.
         if self
             .station
             .as_ref()
-            .is_some_and(|station| station.feed.moved_socket().is_some())
+            .is_some_and(|station| station.feed.socket_ended())
         {
             return Vec::new();
         }
@@ -621,6 +622,52 @@ impl HostBridge {
     pub(crate) fn ack_refused(&mut self) {
         if let Feeds::Loaded(feeds) = &mut self.work.feeds {
             feeds.acks_refused();
+        }
+    }
+
+    /// The App's record of a `service_suspended` notice (the delegated
+    /// host-work design III.5), applied once, at the start of a pass, to
+    /// the Station link it came on (its link generation and socket, as the
+    /// last pass left the link): its calls retired and its gates closed
+    /// ([`super::station::Station::on_suspended`]), and the book's
+    /// acknowledgments on that connection sent again on the next
+    /// ([`HostBridge::acks_suspended`]). A notice for another link, or
+    /// with no Station link (the hook off), does nothing.
+    pub(crate) fn station_suspension(&mut self, app: &crate::app::App) {
+        let Some(s) = app.service_suspension.as_ref() else {
+            return;
+        };
+        let Some(notice) = s.notice else {
+            return;
+        };
+        if notice <= self.suspension_applied {
+            return;
+        }
+        self.suspension_applied = notice;
+        let Some(station) = self.station.as_mut() else {
+            return;
+        };
+        let on_link = station
+            .link()
+            .is_some_and(|l| Some(l.socket) == s.socket() && l.link_gen == s.link_gen);
+        if !on_link || !station.on_suspended(&s.text) {
+            return;
+        }
+        self.acks_suspended();
+        self.publish_feed_gates();
+        self.refresh_fetch_view();
+    }
+
+    /// The Station suspended this host's service on its link (the
+    /// delegated host-work design III.5): the book takes nothing as
+    /// delivered, sends nothing more on that connection, and what went on
+    /// it goes again on the next ([`super::acks::AckBook::on_suspended`]).
+    pub(crate) fn acks_suspended(&mut self) {
+        let Some(link) = self.station.as_ref().and_then(|s| s.link()).cloned() else {
+            return;
+        };
+        if let Feeds::Loaded(feeds) = &mut self.work.feeds {
+            feeds.acks_suspended(&link);
         }
     }
 
@@ -1003,7 +1050,24 @@ impl HostBridge {
         let view = self.start_view();
         let list = view.list.as_ref();
         let deferred = list.is_some_and(|l| l.deferred.is_some());
-        let gate = if deferred {
+        // The Station's suspension of this host's service (the delegated
+        // host-work design III.5), the link up or down, while the gate is
+        // closed: its origin and text.
+        let suspended = self
+            .suspension
+            .as_ref()
+            .filter(|_| station.feed.closed().is_some());
+        let gate = if let Some((origin, text)) = suspended {
+            let origin = origin
+                .as_deref()
+                .or(station.feed.own())
+                .unwrap_or("the Station");
+            format!(
+                "{} ({origin}: {}; retrying)",
+                crate::runtime::delegated::details::REVOCATIONS_NOT_YET_CHECKED,
+                crate::app::suspension::shown(text)
+            )
+        } else if deferred {
             crate::runtime::delegated::details::DEVICE_LIST_UPDATE_PENDING.to_string()
         } else if let Some(closed) = station.feed.closed() {
             format!(

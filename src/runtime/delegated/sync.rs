@@ -233,6 +233,11 @@ pub enum Closed {
     /// authenticated: nothing more on it, until a link authenticated under
     /// the new identity.
     IdentityMoved,
+    /// The Station suspended this host's service (the delegated host-work
+    /// design III.5, `service_suspended`): on a relay or routed link
+    /// nothing more on its socket, until a new one; on Astation's local
+    /// link as a refusal, until a page asked after the backoff reads.
+    Suspended { origin: String, text: String },
 }
 
 impl Closed {
@@ -262,6 +267,12 @@ impl Closed {
                 format!("reading the control feed (0 of {head})")
             }
             Closed::IdentityMoved => IDENTITY_MOVED.into(),
+            Closed::Suspended { origin, text } => {
+                format!(
+                    "{origin}: {}; retrying",
+                    crate::app::suspension::shown(text)
+                )
+            }
         }
     }
 }
@@ -526,6 +537,15 @@ pub struct FeedSync {
     /// again): nothing is asked or applied on it again, whatever link
     /// generation it carries, until a new socket.
     moved: bool,
+    /// The Station suspended this host's service on the link's socket, a
+    /// relay or routed one (the delegated host-work design III.5): as
+    /// `moved`, nothing is asked or applied on it again, until a new
+    /// socket.
+    suspended: bool,
+    /// The text of the Station's last suspension on this link (its socket
+    /// while `suspended`; on Astation's local link while its refusal's
+    /// backoff and resynchronization last).
+    suspension: Option<String>,
     /// The live call (ruling C1b-a).
     in_flight: Option<Ask>,
     /// The ids of the calls retired, the latest [`RETIRED_KEPT`]: their
@@ -567,6 +587,8 @@ pub struct FeedSync {
     unsolicited: u64,
     /// Identity changes that ended a link's association.
     identity_moves: u64,
+    /// The Station's suspensions read on the link (III.5).
+    suspensions: u64,
 }
 
 impl Default for FeedSync {
@@ -596,6 +618,8 @@ impl FeedSync {
             identity: None,
             socket_identity: None,
             moved: false,
+            suspended: false,
+            suspension: None,
             in_flight: None,
             retired: std::collections::VecDeque::new(),
             unanswered: false,
@@ -619,6 +643,7 @@ impl FeedSync {
             drained: 0,
             unsolicited: 0,
             identity_moves: 0,
+            suspensions: 0,
         }
     }
 
@@ -646,6 +671,8 @@ impl FeedSync {
         if self.socket != Some(link.socket) {
             self.socket_identity = self.identity.clone();
             self.moved = false;
+            self.suspended = false;
+            self.suspension = None;
         }
         self.link_gen = Some(link.link_gen);
         self.socket = Some(link.socket);
@@ -673,6 +700,10 @@ impl FeedSync {
         self.resync = None;
         self.refused_at = None;
         self.unanswered = false;
+        // A suspended socket keeps its text; a local link's refusal ends.
+        if !self.suspended {
+            self.suspension = None;
+        }
     }
 
     /// The live call, if any, retired by its id: a page that carries it is
@@ -729,6 +760,45 @@ impl FeedSync {
                 true
             }
         }
+    }
+
+    /// The Station suspended this host's service on the link (the delegated
+    /// host-work design III.5; its `service_suspended` notice, `text`).
+    /// `socket_ends` (a relay or routed link, which the Station closes
+    /// after it): the live call is retired, the generation's `heads` and
+    /// any backoff go, and nothing is asked or applied on that socket again
+    /// (its `heads` ask nothing, a late page is drained), until a link on a
+    /// new socket ([`Closed::Suspended`]). Else (Astation's local link,
+    /// which stays) as a refusal of the sync: the live call retired, the
+    /// gate closed until a page asked after the 30-second backoff reads.
+    /// Nothing durable moves either way: no cursor, no reset mark, no
+    /// trust.
+    pub fn on_suspended(&mut self, text: &str, socket_ends: bool) {
+        if self.link_gen.is_none() {
+            return;
+        }
+        self.suspensions += 1;
+        self.note_alert(format!(
+            "the Station suspended this host's service ({})",
+            crate::app::suspension::shown(text)
+        ));
+        self.retire_live();
+        self.epoch += 1;
+        self.suspension = Some(text.to_owned());
+        if socket_ends {
+            self.suspended = true;
+            self.fresh_generation();
+        } else {
+            self.resync = Some(Resync::Refused);
+            self.refused_at = Some(self.now);
+        }
+    }
+
+    /// Whether nothing more is asked or applied on the link's socket: its
+    /// association is another identity's, or the Station suspended this
+    /// host's service there (III.5).
+    pub fn socket_ended(&self) -> bool {
+        self.moved || self.suspended
     }
 
     /// The link's socket (its last one while the link is down), while its
@@ -829,8 +899,9 @@ impl FeedSync {
         }
         self.heads += 1;
         // Another identity's association: no `heads` counts there (§11.4
-        // "An identity change").
-        if self.moved {
+        // "An identity change"); nor on a socket the Station suspended
+        // this host's service on (III.5).
+        if self.moved || self.suspended {
             return Vec::new();
         }
         self.heads_at = Some(Clocks {
@@ -1083,6 +1154,10 @@ impl FeedSync {
         // restart ends its resynchronization.
         if ask.epoch == self.epoch {
             self.resync = None;
+            // A local link's suspension ends with its resynchronization.
+            if !self.suspended {
+                self.suspension = None;
+            }
         }
         let moved = self.synced != before;
         synced.next = if moved {
@@ -1118,6 +1193,11 @@ impl FeedSync {
         }
         self.refusals += 1;
         self.note_alert(REFUSED_STATUS.into());
+        // A refusal's own reason from now on (a local link's suspension
+        // ends with it).
+        if !self.suspended {
+            self.suspension = None;
+        }
         self.resync = Some(Resync::Refused);
         self.refused_at = Some(self.now);
         self.epoch += 1;
@@ -1210,8 +1290,19 @@ impl FeedSync {
         if self.moved {
             return Some(Closed::IdentityMoved);
         }
+        let suspended = |text: &String| Closed::Suspended {
+            origin: self.own.clone().unwrap_or_default(),
+            text: text.clone(),
+        };
+        if self.suspended
+            && let Some(text) = &self.suspension
+        {
+            return Some(suspended(text));
+        }
         match self.resync {
-            Some(Resync::Refused) => return Some(Closed::Refused),
+            Some(Resync::Refused) => {
+                return Some(self.suspension.as_ref().map_or(Closed::Refused, suspended));
+            }
             Some(Resync::Fault(code)) => return Some(Closed::Fault(code)),
             _ => {}
         }
@@ -1301,6 +1392,8 @@ impl FeedSync {
             "other_origin": self.other_origin,
             "identity_moved": self.moved,
             "identity_moves": self.identity_moves,
+            "suspended": self.suspended,
+            "suspensions": self.suspensions,
         })
     }
 
@@ -1425,7 +1518,7 @@ impl FeedSync {
     fn ask(&mut self, paced: bool) -> Option<ControlSync> {
         let own = self.own.clone()?;
         let announced = self.announced.clone()?;
-        if !self.loaded || self.in_flight.is_some() || self.moved {
+        if !self.loaded || self.in_flight.is_some() || self.moved || self.suspended {
             return None;
         }
         // Nothing for a reset before its mark is written (ruling T33c).

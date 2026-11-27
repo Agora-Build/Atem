@@ -580,6 +580,8 @@ pub struct AckBook {
     /// once each; bounded by the record ids the state counts).
     collisions: BTreeSet<(String, String)>,
     refusals: u64,
+    /// The Station's suspensions of this host's service (III.5).
+    suspensions: u64,
     /// Rows that don't read, or that the shared writer wouldn't take: kept
     /// on disk as they are, never sent (review m6).
     unreadable: u64,
@@ -1014,6 +1016,23 @@ impl AckBook {
         }
     }
 
+    /// The Station suspended this host's service on `link` (the delegated
+    /// host-work design III.5, its `service_suspended`): as after a
+    /// refusal, but for that connection whatever the last ack's was:
+    /// nothing more goes on it, and what went on it reads as never sent (in
+    /// memory), so it goes on the next connection that takes it. Nothing
+    /// is taken as delivered.
+    pub fn on_suspended(&mut self, link: &StationLink) {
+        let held = (link.link_gen, link.socket);
+        self.suspensions += 1;
+        self.held = Some(held);
+        for row in &mut self.rows {
+            if matches!(row.sent, Sent::On { link, .. } if link == held) {
+                row.sent = Sent::Never;
+            }
+        }
+    }
+
     /// The `runtime.log` lines not taken yet (rows that don't read, a
     /// collision, a result the writer refused).
     pub fn take_lines(&mut self) -> Vec<String> {
@@ -1029,6 +1048,7 @@ impl AckBook {
             "acked": self.acked.as_ref().map(|(feed_id, cursor)| json!({"feed_id": feed_id, "cursor": cursor})),
             "held": self.held.is_some() && self.held == self.link,
             "refusals": self.refusals,
+            "suspensions": self.suspensions,
             "unreadable": self.unreadable,
         })
     }
