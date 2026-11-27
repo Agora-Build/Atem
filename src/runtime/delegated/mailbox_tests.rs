@@ -672,3 +672,35 @@ fn a_suspension_retires_every_mailbox_call() {
     owing(&mut c, (MAILBOX, 3), [1]);
     assert_eq!(positions(&c.take_outgoing().dones), vec![1]);
 }
+
+/// Review N1 (the reviewer's probe): on Astation's local link the
+/// suspended Station refuses the sync asked after the backoff (and a done
+/// in flight); the done hold stays owed to end, and the page asked after
+/// the refusal's backoff that commits ends it.
+#[test]
+fn a_sync_refusal_during_a_local_suspension_keeps_the_done_hold_owed() {
+    let mut c = client(10 * SEC, Some((MAILBOX, 2)));
+    owing(&mut c, (MAILBOX, 2), [1]);
+    c.on_heads(head(MAILBOX, 3));
+    assert_eq!(c.take_outgoing().sync.len(), 1);
+    c.on_suspended(false);
+    c.tick(41 * SEC);
+    c.on_heads(head(MAILBOX, 3));
+    let out = c.take_outgoing();
+    assert_eq!(out.sync.len(), 1, "asked after the backoff");
+    // The Station, still suspended, refuses it, and a done.
+    c.on_sync_refused();
+    c.on_done_refused();
+    c.tick(72 * SEC);
+    c.on_heads(head(MAILBOX, 3));
+    let out = c.take_outgoing();
+    assert_eq!(out.sync.len(), 1, "asked after the refusal's backoff");
+    assert!(out.dones.is_empty(), "held");
+    commit(&mut c, page(&out.sync[0], 3, 3));
+    owing(&mut c, (MAILBOX, 3), [1]);
+    assert_eq!(
+        positions(&c.take_outgoing().dones),
+        vec![1],
+        "the hold ended with the Station serving the link"
+    );
+}

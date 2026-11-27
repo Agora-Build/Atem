@@ -788,12 +788,7 @@ fn a_local_suspensions_hold_ends_when_the_station_serves_the_link_again() {
         send(&db, &mut book, &local, 1, ISSUED + MIN).is_empty(),
         "held"
     );
-    book.on_resumed(&on(2, 1));
-    assert!(
-        send(&db, &mut book, &local, 1, ISSUED + MIN).is_empty(),
-        "another connection's"
-    );
-    book.on_resumed(&local);
+    book.on_resumed();
     assert_eq!(
         ids(&send(&db, &mut book, &local, 1, ISSUED + 2 * MIN)),
         [cover.record_id()],
@@ -802,7 +797,7 @@ fn a_local_suspensions_hold_ends_when_the_station_serves_the_link_again() {
     assert!(send(&db, &mut book, &local, 1, ISSUED + 3 * MIN).is_empty());
     // A refusal's hold stays.
     book.on_refused();
-    book.on_resumed(&local);
+    book.on_resumed();
     assert!(send(&db, &mut book, &local, 1, ISSUED + 4 * MIN).is_empty());
     assert_eq!(book.dump()["held"], true);
 }
@@ -1791,4 +1786,57 @@ fn entry_results_wait_while_host_senders_is_off() {
         keys(&send(&db, &mut again, &link(3), 1, ISSUED)),
         ["entry:7"]
     );
+}
+
+/// Review N1: while a suspension holds the local connection, the
+/// suspended Station's refusals (a `control_ack_refused` answering an ack
+/// sent before it) are the suspension's: the hold stays the suspension's
+/// and still ends when the Station serves the link again, and what it held
+/// goes once. A hold whose link generation ended is over, and a later
+/// refusal on the next connection is a refusal's.
+#[test]
+fn a_refusal_during_a_local_suspension_keeps_its_hold_owed_to_end() {
+    let (db, mut book) = fresh();
+    let cover = record(BOT, ControlSigner::Principal, ControlAction::Cover, ISSUED);
+    commit(
+        &db,
+        &mut book,
+        &[Acked::of(
+            &cover,
+            &in_force(EffectKind::Cover),
+            Some(&at(1)),
+        )],
+    );
+    let local = on(1, 1);
+    assert_eq!(
+        ids(&send(&db, &mut book, &local, 1, ISSUED)),
+        [cover.record_id()]
+    );
+    book.on_suspended(&local);
+    book.on_refused();
+    assert!(
+        send(&db, &mut book, &local, 1, ISSUED + MIN).is_empty(),
+        "held"
+    );
+    book.on_resumed();
+    assert_eq!(
+        ids(&send(&db, &mut book, &local, 1, ISSUED + 2 * MIN)),
+        [cover.record_id()],
+        "once, on the same connection"
+    );
+    assert!(send(&db, &mut book, &local, 1, ISSUED + 3 * MIN).is_empty());
+    // A suspension whose link generation ended: over at the next one.
+    book.on_suspended(&local);
+    book.on_resumed();
+    let next = on(2, 1);
+    assert_eq!(
+        ids(&send(&db, &mut book, &next, 1, ISSUED + 4 * MIN)),
+        [cover.record_id()]
+    );
+    book.on_refused();
+    assert!(
+        send(&db, &mut book, &next, 1, ISSUED + 5 * MIN).is_empty(),
+        "a refusal's hold"
+    );
+    assert_eq!(book.dump()["held"], true);
 }

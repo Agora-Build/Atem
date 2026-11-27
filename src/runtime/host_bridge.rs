@@ -736,7 +736,9 @@ pub struct HostBridge {
     /// The App's record of the Station's suspension of this host's service
     /// (the delegated host-work design III.5), as the last pass read it:
     /// its origin and text, for the `Control feeds:` line.
-    suspension: Option<(Option<String>, String)>,
+    /// Its socket too (none: a connect's), so the line names it only as the
+    /// reason of its own link's gate (review N3).
+    suspension: Option<(Option<String>, String, Option<u64>)>,
     /// The App's last `service_suspended` notice the Station link took,
     /// and one taken but not applied yet (its socket and text): the
     /// Station link isn't on that socket yet.
@@ -1584,7 +1586,7 @@ impl HostBridge {
         self.suspension = app
             .service_suspension
             .as_ref()
-            .map(|s| (s.origin.clone(), s.text.clone()));
+            .map(|s| (s.origin.clone(), s.text.clone(), s.socket()));
         let link_gen = self.r9_link;
         // With `host.senders` (the hook's) its `heads` carry the host's
         // own mailbox head (host-work-v1 §11.5 rule 6).
@@ -2167,7 +2169,11 @@ impl HostBridge {
         self.sync_station_link(app);
         // A notice for a link this pass just synced (installed or
         // authenticated again in the notice's tick): applied before the
-        // pass reads the Station's messages on it.
+        // pass reads the Station's messages on it. The order (the first call
+        // before host work dispatches, this one right after the link sync
+        // and before `take_station_messages`) is what
+        // `a_notice_read_as_a_link_is_installed_or_authenticated_again_still_applies`
+        // replays (review I-1).
         self.station_suspension(app);
         // The services' r9 admission as the control state stands, before
         // any `hello` of this pass (ruling T35c).

@@ -2842,3 +2842,62 @@ fn a_suspension_on_the_local_link_is_a_refusal_with_the_stations_text() {
     rig.sync.on_refused(RefusedCall::ControlSync);
     assert_eq!(rig.sync.closed(), Some(Closed::Refused));
 }
+
+/// Review N1 (the reviewer's probe): on Astation's local link the
+/// suspended Station refuses the call asked after the backoff; the
+/// suspension stays the gate's reason and its end stays owed, and the page
+/// asked after the refusal's backoff that reads ends it.
+#[test]
+fn a_refusal_during_a_local_suspension_keeps_its_end() {
+    let mut rig = rig();
+    rig.sync.on_link(Some(&StationLink {
+        kind: LinkKind::Local,
+        ..link(1, ORIGIN)
+    }));
+    let (_cover, _hold) = rig.opened();
+    rig.pass(SEC);
+    let release = rig.record(FEED, ControlAction::Release);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    rig.sync.on_suspended(SUSPENDED, false);
+    rig.pass(35 * SEC);
+    assert_eq!(
+        rig.heads(FEED, 3),
+        [sync_call(FEED, 2)],
+        "after the backoff"
+    );
+    // The Station, still suspended, refuses it.
+    rig.sync.on_refused(RefusedCall::ControlSync);
+    assert!(matches!(rig.sync.closed(), Some(Closed::Suspended { .. })));
+    // Another kind's refusal too (the fetch's, the ack's).
+    rig.sync.on_refused(RefusedCall::MembershipFetch);
+    rig.sync.on_refused(RefusedCall::ControlAck);
+    assert!(!rig.sync.take_suspension_ended());
+    rig.pass(31 * SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    rig.page(FEED, 3, &[(3, &release)]);
+    assert!(rig.open(&native()), "{:?}", rig.sync.closed());
+    assert!(
+        rig.sync.take_suspension_ended(),
+        "the suspension's end is owed through the refusals"
+    );
+    assert!(!rig.sync.take_suspension_ended(), "once");
+}
+
+/// A local link's suspension ends with its link generation: owed then
+/// too (the hold was that connection's).
+#[test]
+fn a_local_suspension_ends_with_its_link_generation() {
+    let mut rig = rig();
+    rig.sync.on_link(Some(&StationLink {
+        kind: LinkKind::Local,
+        ..link(1, ORIGIN)
+    }));
+    rig.opened();
+    rig.sync.on_suspended(SUSPENDED, false);
+    rig.sync.on_link(Some(&StationLink {
+        kind: LinkKind::Local,
+        ..link(2, ORIGIN)
+    }));
+    assert!(rig.sync.take_suspension_ended());
+    assert_eq!(rig.sync.closed(), Some(Closed::NoHeads));
+}

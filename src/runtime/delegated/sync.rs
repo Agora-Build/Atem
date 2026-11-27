@@ -546,6 +546,11 @@ pub struct FeedSync {
     /// while `suspended`; on Astation's local link while its refusal's
     /// backoff and resynchronization last).
     suspension: Option<String>,
+    /// A suspension on Astation's local link is in effect on this link
+    /// generation: its end is owed, whatever refusal or fault comes
+    /// meanwhile (the suspended Station refuses the link's calls; review
+    /// N1), at the first page asked after the latest of them that reads.
+    suspension_hold: bool,
     /// A local link's suspension ended with its resynchronization, not
     /// taken yet ([`FeedSync::take_suspension_ended`]).
     suspension_ended: bool,
@@ -623,6 +628,7 @@ impl FeedSync {
             moved: false,
             suspended: false,
             suspension: None,
+            suspension_hold: false,
             suspension_ended: false,
             in_flight: None,
             retired: std::collections::VecDeque::new(),
@@ -704,9 +710,13 @@ impl FeedSync {
         self.resync = None;
         self.refused_at = None;
         self.unanswered = false;
-        // A suspended socket keeps its text; a local link's refusal ends.
+        // A suspended socket keeps its text; a local link's suspension
+        // ends with its generation (its holds were that connection's).
         if !self.suspended {
             self.suspension = None;
+            if std::mem::take(&mut self.suspension_hold) {
+                self.suspension_ended = true;
+            }
         }
     }
 
@@ -793,6 +803,7 @@ impl FeedSync {
         } else {
             self.resync = Some(Resync::Refused);
             self.refused_at = Some(self.now);
+            self.suspension_hold = true;
         }
     }
 
@@ -1163,9 +1174,14 @@ impl FeedSync {
         // restart ends its resynchronization.
         if ask.epoch == self.epoch {
             self.resync = None;
-            // A local link's suspension ends with its resynchronization.
-            if !self.suspended && self.suspension.take().is_some() {
-                self.suspension_ended = true;
+            // A local link's suspension ends with its resynchronization:
+            // the Station serves the link again (review N1: whatever
+            // refusals came meanwhile).
+            if !self.suspended {
+                self.suspension = None;
+                if std::mem::take(&mut self.suspension_hold) {
+                    self.suspension_ended = true;
+                }
             }
         }
         let moved = self.synced != before;
@@ -1202,9 +1218,11 @@ impl FeedSync {
         }
         self.refusals += 1;
         self.note_alert(REFUSED_STATUS.into());
-        // A refusal's own reason from now on (a local link's suspension
-        // ends with it).
-        if !self.suspended {
+        // A refusal's own reason from now on, unless a local link's
+        // suspension is in effect: the suspended Station refuses the
+        // link's calls, and the suspension stays the reason and owes its
+        // end (review N1).
+        if !self.suspended && !self.suspension_hold {
             self.suspension = None;
         }
         self.resync = Some(Resync::Refused);

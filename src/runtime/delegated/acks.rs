@@ -1010,11 +1010,16 @@ impl AckBook {
     /// come first (ruling T36b, N4).
     pub fn on_refused(&mut self) {
         self.refusals += 1;
-        self.held_by_suspension = false;
-        self.held = self.link;
-        if let Some(held) = self.held {
+        // While a suspension holds a connection, a refusal is the
+        // suspension's (the suspended Station refuses the link's calls):
+        // the hold stays the suspension's, ending with it (review N1);
+        // what went on the refused connection still reads as never sent.
+        if !self.held_by_suspension {
+            self.held = self.link;
+        }
+        if let Some(refused) = self.link {
             for row in &mut self.rows {
-                if matches!(row.sent, Sent::On { link, .. } if link == held) {
+                if matches!(row.sent, Sent::On { link, .. } if link == refused) {
                     row.sent = Sent::Never;
                 }
             }
@@ -1042,15 +1047,30 @@ impl AckBook {
         }
     }
 
-    /// The Station serves `link` again after it suspended this host's
-    /// service there (Astation's local link, which stays: its feed's
-    /// resynchronization read): a suspension's hold on that connection
-    /// ends, so what it held goes now, once. A refusal's hold stays.
-    pub fn on_resumed(&mut self, link: &StationLink) {
-        if self.held_by_suspension && self.held == Some((link.link_gen, link.socket)) {
-            self.held = None;
-            self.held_by_suspension = false;
+    /// A suspension's notice for `socket` that no Station link took (its
+    /// socket gone first: review N2): what went on that socket reads as
+    /// never sent (in memory), so it goes on the next connection. Nothing
+    /// is held: nothing more can go on a gone socket.
+    pub fn on_socket_suspended(&mut self, socket: u64) {
+        self.suspensions += 1;
+        for row in &mut self.rows {
+            if matches!(row.sent, Sent::On { link: (_, s), .. } if s == socket) {
+                row.sent = Sent::Never;
+            }
         }
+    }
+
+    /// A suspension on Astation's local link ended: the Station serves the
+    /// link again (its feed's resynchronization read), or the link
+    /// generation it held ended. Its hold ends, so what it held goes now,
+    /// once (on the same connection, or the next), and a later refusal is a
+    /// refusal's again. A refusal's hold stays.
+    pub fn on_resumed(&mut self) {
+        if !self.held_by_suspension {
+            return;
+        }
+        self.held_by_suspension = false;
+        self.held = None;
     }
 
     /// The `runtime.log` lines not taken yet (rows that don't read, a

@@ -222,6 +222,11 @@ pub struct MailboxClient {
     /// resynchronization (review M2); a refusal's holds for the link
     /// generation.
     dones_held_by_suspension: bool,
+    /// A suspension on Astation's local link is in effect on this link
+    /// generation: its end is owed whatever refusal or fault comes
+    /// meanwhile (review N1), at the first page asked after the latest of
+    /// them that commits.
+    suspension_hold: bool,
     /// The host's monotonic clock at the last tick (ms).
     now: u64,
     announced: Option<MailboxHead>,
@@ -305,6 +310,7 @@ impl MailboxClient {
         self.refused_at = None;
         self.dones_refused = false;
         self.dones_held_by_suspension = false;
+        self.suspension_hold = false;
         if now.map(|(_, socket)| socket) != self.socket {
             self.moved = false;
             self.suspended = false;
@@ -343,6 +349,7 @@ impl MailboxClient {
             self.resync = Some(Resync::Suspended);
             self.refused_at = Some(self.now);
             self.epoch += 1;
+            self.suspension_hold = true;
             if !self.dones_refused {
                 self.dones_refused = true;
                 self.dones_held_by_suspension = true;
@@ -508,9 +515,10 @@ impl MailboxClient {
         self.pages += 1;
         let page = applying.page;
         if applying.epoch == self.epoch {
-            // A local link's suspension ends with its resynchronization:
-            // the dones it held go (review M2).
-            if self.resync == Some(Resync::Suspended) && self.dones_held_by_suspension {
+            // A local link's suspension ends with its resynchronization,
+            // whatever refusals or faults came meanwhile (review N1): the
+            // dones it held go (review M2).
+            if std::mem::take(&mut self.suspension_hold) && self.dones_held_by_suspension {
                 self.dones_refused = false;
                 self.dones_held_by_suspension = false;
             }
@@ -575,7 +583,12 @@ impl MailboxClient {
         self.refusals += 1;
         self.alert(Alert::DoneRefused, REFUSED_DONE.into());
         self.dones_refused = true;
-        self.dones_held_by_suspension = false;
+        // One while a suspension is in effect is the suspension's (the
+        // suspended Station refuses the link's calls): its hold stays the
+        // suspension's, ending with it (review N1).
+        if !self.suspension_hold {
+            self.dones_held_by_suspension = false;
+        }
         for id in self.live_done_ids() {
             self.retire_done(&id);
         }

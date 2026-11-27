@@ -730,11 +730,18 @@ impl FeedStore {
         }
     }
 
-    /// The Station serves `link` again after a suspension there (III.5,
-    /// [`AckBook::on_resumed`]).
-    pub fn acks_resumed(&mut self, link: &super::station::StationLink) {
+    /// A suspension's notice for `socket`, gone before a Station link took
+    /// it (III.5, [`AckBook::on_socket_suspended`]).
+    pub fn acks_socket_suspended(&mut self, socket: u64) {
         if let Some(book) = self.mem.acks.as_mut() {
-            book.on_resumed(link);
+            book.on_socket_suspended(socket);
+        }
+    }
+
+    /// A local link's suspension ended (III.5, [`AckBook::on_resumed`]).
+    pub fn acks_resumed(&mut self) {
+        if let Some(book) = self.mem.acks.as_mut() {
+            book.on_resumed();
         }
     }
 

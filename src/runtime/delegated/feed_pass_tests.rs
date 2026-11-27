@@ -1297,7 +1297,7 @@ fn a_suspension_closes_the_gate_at_once_and_names_the_text() {
                 .starts_with("revocations not yet checked")
         );
         // The link down; the App's record names the Station still.
-        rig.bridge.suspension = Some((Some(ORIGIN.to_string()), TEXT.to_string()));
+        rig.bridge.suspension = Some((Some(ORIGIN.to_string()), TEXT.to_string(), Some(1)));
         rig.bridge
             .station
             .as_mut()
@@ -1481,5 +1481,96 @@ fn a_relay_suspension_is_lifted_once_the_gate_opens_on_any_link() {
         bridge_page(&mut rig, 1, &[(1, &cover)]);
         rig.bridge.lift_suspension(&mut rig.app.service_suspension);
         assert!(rig.app.service_suspension.is_none());
+    });
+}
+
+/// Review N2 (the reviewer's probe): Astation authenticates the relay link
+/// again (the bridge's link down, its socket kept) as the Station's notice
+/// comes; the notice waits, then the Station closes the socket before the
+/// link comes back: the notice is dropped, and the ack sent on that socket
+/// still goes again on the next link.
+#[test]
+fn a_notice_dropped_with_its_socket_resets_the_acks_sent_there() {
+    use crate::app::suspension::{SuspendedOn, Suspension};
+    use crate::runtime::delegated::station::LinkKind;
+    use atem_client::control::ControlAction;
+    const TEXT: &str = "service suspended: account disabled at Agora.Build";
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let s = fed_host(&mut rig, root, &os);
+        let head = s.log.log.head();
+        bridge_heads(&mut rig, 1, head);
+        let cover = own_record(&s.log, "svc-bot", ControlAction::Cover, 1);
+        bridge_page(&mut rig, 1, &[(1, &cover)]);
+        assert_eq!(send_acks(&mut rig), [cover.record_id().to_string()]);
+        // Re-authentication: the bridge's link down, socket 1 kept.
+        rig.bridge.station.as_mut().unwrap().sync_link(
+            None,
+            1,
+            || LinkKind::Relay,
+            || Some(ORIGIN.to_string()),
+        );
+        rig.app.astation_client.socket_id_for_test(1);
+        rig.app.service_suspension = Some(Suspension {
+            text: TEXT.into(),
+            on: SuspendedOn::Relay { socket: 1 },
+            origin: Some(ORIGIN.into()),
+            notice: Some(1),
+            link_gen: 1,
+        });
+        rig.bridge.station_suspension(&rig.app);
+        assert!(rig.bridge.suspension_pending.is_some(), "waits");
+        // The Station closes socket 1.
+        rig.app.astation_client.socket_id_for_test(0);
+        rig.bridge.station_suspension(&rig.app);
+        assert!(rig.bridge.suspension_pending.is_none(), "dropped");
+        // The next socket.
+        rig.app.astation_client.socket_id_for_test(9);
+        pass_with_notice(&mut rig, 5, 9, 2_000);
+        assert_eq!(bridge_heads(&mut rig, 1, head), []);
+        assert!(
+            rig.bridge.station.as_ref().unwrap().feed.closed().is_none(),
+            "{:?}",
+            rig.bridge.station.as_ref().unwrap().feed.closed()
+        );
+        assert_eq!(
+            send_acks(&mut rig),
+            [cover.record_id().to_string()],
+            "the ack sent on the suspended socket goes again"
+        );
+        assert!(send_acks(&mut rig).is_empty(), "once");
+    });
+}
+
+/// Review N3: the `Control feeds:` line names a suspension as the gate's
+/// reason only for its own link: a relay's (a connect refused at its proof,
+/// no socket) while another link is up (here standing in for Astation's
+/// local link) leaves the gate's own reason; with no link up it names the
+/// relay's; one read on the link up now names it.
+#[test]
+fn the_control_feeds_line_names_a_suspension_only_for_its_own_link() {
+    use crate::runtime::delegated::station::LinkKind;
+    const TEXT: &str = "service suspended: account disabled at Agora.Build";
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        fed_host(&mut rig, root, &os);
+        let suspended = format!("revocations not yet checked ({ORIGIN}: {TEXT}; retrying)");
+        rig.bridge.suspension = Some((Some(ORIGIN.to_string()), TEXT.to_string(), None));
+        let line = rig.bridge.feeds_status().unwrap();
+        assert!(
+            line.starts_with("revocations not yet checked (waiting for the Station's heads)"),
+            "{line}"
+        );
+        rig.bridge.suspension = Some((Some(ORIGIN.to_string()), TEXT.to_string(), Some(1)));
+        assert!(rig.bridge.feeds_status().unwrap().starts_with(&suspended));
+        rig.bridge.suspension = Some((Some(ORIGIN.to_string()), TEXT.to_string(), None));
+        rig.bridge
+            .station
+            .as_mut()
+            .unwrap()
+            .sync_link(None, 0, || LinkKind::Routed, || None);
+        assert!(rig.bridge.feeds_status().unwrap().starts_with(&suspended));
     });
 }
