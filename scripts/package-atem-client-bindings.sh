@@ -244,6 +244,10 @@ FILES+=("$REPORT_VECTOR")
 SIGNER_VECTOR="atem-client-${VERSION}-r9-vectors-signer-report.json"
 cp designs/protocol/fixtures/r9-vectors-signer-report.json "$OUT/$SIGNER_VECTOR"
 FILES+=("$SIGNER_VECTOR")
+# A native manager's Station binding proof (delegated host-work III.5 (b)).
+BINDING_VECTOR="atem-client-${VERSION}-r9-vectors-station-binding.json"
+cp designs/protocol/fixtures/r9-vectors-station-binding.json "$OUT/$BINDING_VECTOR"
+FILES+=("$BINDING_VECTOR")
 # The Station's acknowledgment fixtures (test 48), for Station builders.
 for fixture in designs/protocol/fixtures/r9-control-ack-*.json; do
   ACK_FIXTURE="atem-client-${VERSION}-$(basename "$fixture")"

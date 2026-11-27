@@ -110,9 +110,11 @@ REPORT_VECTOR="atem-client-${VERSION}-r9-vectors-verifier-report.json"
 cp designs/protocol/fixtures/r9-vectors-verifier-report.json "$OUT/$REPORT_VECTOR"
 SIGNER_VECTOR="atem-client-${VERSION}-r9-vectors-signer-report.json"
 cp designs/protocol/fixtures/r9-vectors-signer-report.json "$OUT/$SIGNER_VECTOR"
+BINDING_VECTOR="atem-client-${VERSION}-r9-vectors-station-binding.json"
+cp designs/protocol/fixtures/r9-vectors-station-binding.json "$OUT/$BINDING_VECTOR"
 ./scripts/atem-client-source-pin.sh "$OUT/$PIN" apple-swiftpm "default (uniffi)" \
   "xcodebuild=$(xcodebuild -version | tr '\n' ' ' | sed 's/ *$//')" \
   "swift=$(swift --version 2>&1 | sed -n 1p)"
-(cd "$OUT" && shasum -a 256 "$ZIP" "atem-client-${VERSION}-atem_client_ffiFFI.h" "$PIN" "$VECTOR" "$WORK_VECTOR" "$FRAMING_VECTOR" "$FRAMING_SIZE_VECTOR" "$FRAMING_HOST_VECTOR" "$CONTROL_VECTOR" "$PUSH_VECTOR" "$WIRE_VECTOR" "$MAIL_VECTOR" "$STATION_VECTOR" "$REQUIRED_VECTOR" "$REPORT_VECTOR" "$SIGNER_VECTOR" "${ACK_FIXTURES[@]}" > "atem-client-${VERSION}-SHA256SUMS.txt")
+(cd "$OUT" && shasum -a 256 "$ZIP" "atem-client-${VERSION}-atem_client_ffiFFI.h" "$PIN" "$VECTOR" "$WORK_VECTOR" "$FRAMING_VECTOR" "$FRAMING_SIZE_VECTOR" "$FRAMING_HOST_VECTOR" "$CONTROL_VECTOR" "$PUSH_VECTOR" "$WIRE_VECTOR" "$MAIL_VECTOR" "$STATION_VECTOR" "$REQUIRED_VECTOR" "$REPORT_VECTOR" "$SIGNER_VECTOR" "$BINDING_VECTOR" "${ACK_FIXTURES[@]}" > "atem-client-${VERSION}-SHA256SUMS.txt")
 echo "Packaged into $OUT:"
 ls -l "$OUT"

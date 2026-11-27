@@ -708,6 +708,7 @@ fn manager_key(log: &Membership, signer: &str) -> Result<PublicKey, ReportRefusa
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignerReportBody {
     held: HeldBody,
+    process: [u8; PROCESS_BYTES],
     journal: JournalSummary,
 }
 
@@ -735,7 +736,7 @@ impl SignerReportBody {
 
     /// The process generation the body names ([`process_generation`]).
     pub fn process(&self) -> [u8; PROCESS_BYTES] {
-        self.held.process
+        self.process
     }
 
     /// The signer's key at the log's head, with its algorithm.
@@ -833,11 +834,11 @@ pub fn signer_report_body(
         SignLabel::SignerReport,
         Value::Object(value),
         log.head(),
-        process,
         signer_key,
     )?;
     Ok(SignerReportBody {
         held,
+        process,
         journal: summary,
     })
 }

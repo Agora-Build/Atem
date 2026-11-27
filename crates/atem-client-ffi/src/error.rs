@@ -75,8 +75,14 @@ pub enum AtemError {
     /// another Station) and `signing_failed` (the provider declined or
     /// failed). A manager's signer report (Astation #114 item 4) adds
     /// `not_a_manager`, `recovery_mismatch` and `records_mismatch` in its
-    /// own order. A new variant: an app that switches over `AtemError`
-    /// exhaustively needs a source change.
+    /// own order. A manager's Station binding proof (delegated host-work
+    /// III.5 (b)) uses `malformed`, `frozen`, `wrong_account`,
+    /// `unknown_signer`, `not_a_manager`, `bad_signature`, `stale_log`,
+    /// `fork`, `challenge_mismatch` and `expired` in its verifier's order,
+    /// and its builder adds `origin_mismatch`, `signer_mismatch` and
+    /// `binding_mismatch` (an `issuer`, `subject` or `auth_time` other than
+    /// the app was told). A new variant: an app that switches over
+    /// `AtemError` exhaustively needs a source change.
     Report { code: String, detail: String },
 }
 

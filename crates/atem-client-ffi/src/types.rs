@@ -111,6 +111,21 @@ unit_enum! {
         /// The core builds the body from the journal's own bodies
         /// (`body_json` shows it); the barrier itself is the app's.
         SignerReport,
+        /// A native manager's Station binding proof
+        /// (`atem-station-binding`, delegated host-work III.5 (b); Atem's
+        /// answer on #120 comment 7207827118): it decides which Agora.Build
+        /// account's state controls whether a Station serves this R9
+        /// account's hosts. **A fresh confirmation every time**: never the
+        /// 5-minute reuse, never in the background or a notification
+        /// extension, never reused for another body. Show the Station
+        /// (`origin`), the action (`bind`, `transfer`, `unbind`), the R9
+        /// account (`account_id`), the Agora.Build account in `subject`
+        /// (for a transfer, the old owner too, `expected_binding.owner`), and
+        /// one line: "This decides which Agora.Build account's state
+        /// controls whether <Station> serves this account's hosts." The body
+        /// is the Station's challenge, exactly (`body_json` shows it); the
+        /// core checks every field before it asks.
+        StationBinding,
     }
 }
 
@@ -148,6 +163,9 @@ unit_enum! {
         /// `atem-signer-report-v1`: a native manager's signer report
         /// (`verify_signer_report`).
         SignerReport,
+        /// `atem-station-binding-v1`: a native manager's Station binding
+        /// proof (`verify_station_binding`).
+        StationBinding,
     }
 }
 
@@ -491,6 +509,117 @@ record! {
         pub recovery: SignerReportRecovery,
         pub journal: SignerReportJournal,
         pub records: Vec<String>,
+    }
+}
+
+unit_enum! {
+    /// What a Station binding proof does (`atem-station-binding`,
+    /// delegated host-work III.5 (b)): `Bind` a never-bound, unbound or
+    /// released R9 account to `subject`; `Transfer` a bound one to
+    /// `subject`, the intended new owner; `Unbind` a bound one, `subject`
+    /// its current owner (the same proof as a bind: owner decision
+    /// 2026-11-27; Auth/Portal's agreement pending, Portal #41 comment
+    /// 7208892757).
+    pub enum BindingAction {
+        Bind,
+        Transfer,
+        Unbind,
+    }
+}
+
+data_enum! {
+    /// The service-ownership record a Station binding names
+    /// (`expected_binding`): none yet (`NeverBound`), or the record in its
+    /// state with its `binding_id` (1–128 bytes of `[A-Za-z0-9._:-]`),
+    /// `version` (1 to 2^53 − 1) and `owner`, the exact `sub` of the
+    /// Agora.Build account it names (the owner, or the owner let go). A
+    /// `Bind` names `NeverBound`, `Unbound` or `Released`; a `Transfer` and
+    /// an `Unbind` name `Bound`. `owner` in every recorded state: Atem's
+    /// proposal, for Astation's agreement. In JS: `{type: "never_bound"}` or
+    /// `{type: "bound" | "unbound" | "released", bindingId, version,
+    /// owner}`.
+    pub enum ExpectedBinding {
+        NeverBound,
+        Bound {
+            binding_id: String,
+            version: u64,
+            owner: String,
+        },
+        Unbound {
+            binding_id: String,
+            version: u64,
+            owner: String,
+        },
+        Released {
+            binding_id: String,
+            version: u64,
+            owner: String,
+        },
+    }
+}
+
+record! {
+    /// The Agora.Build sign-in a Station binding names, from the token the
+    /// Station verified: its exact `iss` (`issuer`) and `sub` (`subject`),
+    /// 1–256 bytes of printable ASCII, and its `auth_time` in Unix
+    /// **seconds**. The app hands `StationBindingRequest` what it was told:
+    /// its own token's for a bind or an unbind, and for a transfer the new
+    /// owner it was shown (Atem's proposal, for Astation's agreement).
+    /// **Never fill it from the challenge or anything the Station sent**:
+    /// take it from the app's own token, or, for a transfer, from what the
+    /// user chose before the challenge was fetched; else `binding_mismatch`
+    /// can never fire.
+    pub struct AuthClaims {
+        pub issuer: String,
+        pub subject: String,
+        pub auth_time: u64,
+    }
+}
+
+record! {
+    /// A Station binding's challenge as the Station mints and stores it, and
+    /// the body the manager signs (`station_binding_challenge`,
+    /// `parse_station_binding_challenge`): its fields but `type` and `v`
+    /// (`nonce` base64url, `genesis_hash` and `head.hash` lowercase hex,
+    /// times in ms, `auth_time` in seconds).
+    pub struct StationBindingChallenge {
+        pub action: BindingAction,
+        pub origin: String,
+        pub issuer: String,
+        pub subject: String,
+        pub auth_time: u64,
+        pub account_id: String,
+        pub genesis_hash: String,
+        pub head: LogHead,
+        pub signer: String,
+        pub expected_binding: ExpectedBinding,
+        pub nonce: String,
+        pub issued_at: u64,
+        pub expires_at: u64,
+    }
+}
+
+record! {
+    /// A verified Station binding proof (`verify_station_binding`): what it
+    /// does, who signed it (`member:<device_id>`, holding `manage` at the
+    /// verifier's head), at which head of its list (`at_head` false at an
+    /// ancestor: **the Station requires `at_head`**), for which R9 account,
+    /// which Agora.Build sign-in (`issuer`, `subject`, `auth_time`) and
+    /// which record (`expected_binding`), its `nonce` (base64url, for the
+    /// Station's single use) and `expires_at`.
+    pub struct VerifiedStationBinding {
+        pub action: BindingAction,
+        pub signer: String,
+        pub head: LogHead,
+        pub at_head: bool,
+        pub account_id: String,
+        pub genesis_hash: String,
+        pub issuer: String,
+        pub subject: String,
+        pub auth_time: u64,
+        pub expected_binding: ExpectedBinding,
+        pub nonce: String,
+        pub expires_at: u64,
     }
 }
 

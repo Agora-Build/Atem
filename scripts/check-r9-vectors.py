@@ -26,7 +26,11 @@ finish it derives from that file's rules (session-v1 R9.2, Astation #101),
 and `r9-vectors-signer-report`, the same for a native manager's signer
 report, its exported records read with a control-record reader written
 here and its set hashes recomputed from the journal's bodies (host-work-v1
-§11.1 "The signer report", Astation #114).
+§11.1 "The signer report", Astation #114), and
+`r9-vectors-station-binding`, the same for a native manager's Station
+binding proof (delegated host-work III.5 (b); its orders Atem's proposal,
+#120 comment 7207827118, for Astation's agreement), Astation's three
+posted examples included (their digests and both signatures).
 The other files'
 `expect` and each `reason` are checked by the Rust runner
 (`crates/atem-client/tests/vectors.rs`) and the binding suites.
@@ -5048,6 +5052,314 @@ def check_signer_report(file, data, report, context):
                     case.equal(f["code"], "bad_signature", f"{f['label']}: bad_signature")
 
 
+# ----------------------------------------------- r9-vectors-station-binding
+
+# A native manager's Station binding proof (delegated host-work III.5 (b);
+# Atem's answer on #120 comment 7207827118, owner decision 2026-11-27: an
+# unbind needs the same proof): the body is the Station's challenge, exactly.
+SB_FIELDS = sorted([
+    "type", "v", "action", "origin", "issuer", "subject", "auth_time", "account_id", "genesis_hash", "head",
+    "signer", "expected_binding", "nonce", "issued_at", "expires_at",
+])
+SB_RECORD_FIELDS = ["binding_id", "owner", "state", "version"]
+SB_LABEL = "atem-station-binding-v1"
+SB_VERIFY_ORDER = [
+    "malformed", "frozen", "wrong_account", "unknown_signer", "not_a_manager", "bad_signature", "stale_log", "fork",
+    "challenge_mismatch", "expired",
+]
+SB_BUILD_ORDER = [
+    "malformed", "frozen", "wrong_account", "origin_mismatch", "signer_mismatch", "unknown_signer", "not_a_manager",
+    "stale_log", "fork", "binding_mismatch", "expired",
+]
+SB_LABELS = {
+    "signed_under_verifier_report_label": VR_LABEL,
+    "signed_under_signer_report_label": "atem-signer-report-v1",
+    "signed_under_route_label": "atem-host-route-v1",
+    "signed_under_proxy_route_label": "atem-host-route-proxy-v1",
+    "signed_under_sig_c_label": "atem-ch1-client-sig-v1",
+    "signed_under_control_label": "atem-host-work-control-v1",
+    "signed_under_entry_label": "atem-membership-entry-v1",
+}
+
+
+def sb_claim_ok(v):
+    """An issuer, a subject or an owner: 1 to 256 bytes of printable ASCII."""
+    return isinstance(v, str) and 1 <= len(v.encode()) <= 256 and all(0x21 <= ord(c) <= 0x7E for c in v)
+
+
+def sb_expected_ok(o):
+    """{state: never_bound} exactly, or a record in its state with its id,
+    version and owner (owner in every recorded state: Atem's proposal)."""
+    if not isinstance(o, dict):
+        return False
+    if o.get("state") == "never_bound":
+        return sorted(o) == ["state"]
+    return (
+        sorted(o) == SB_RECORD_FIELDS and o["state"] in ("bound", "unbound", "released")
+        and isinstance(o["binding_id"], str) and re.fullmatch(OPAQUE_ID, o["binding_id"]) is not None
+        and vr_int(o["version"], 1) and sb_claim_ok(o["owner"])
+    )
+
+
+def sb_body(value):
+    """A challenge, which is also a proof's body, as the file's note writes
+    it: exactly the fifteen fields, each field's grammar, the per-action
+    rules, its jcs within 4,096 bytes; raises Refused("malformed")."""
+    if not isinstance(value, dict) or sorted(value) != SB_FIELDS or not sr_flat(value):
+        raise Refused("malformed")
+    if value["type"] != "atem-station-binding" or type(value["v"]) is not int or value["v"] != 1:
+        raise Refused("malformed")
+    head, signer, expected = value["head"], value["signer"], value["expected_binding"]
+    ok = (
+        value["action"] in ("bind", "transfer", "unbind")
+        and relay_origin_ok(value["origin"])
+        and sb_claim_ok(value["issuer"]) and sb_claim_ok(value["subject"])
+        and vr_int(value["auth_time"])
+        and isinstance(value["account_id"], str) and re.fullmatch(OPAQUE_ID, value["account_id"]) is not None
+        and isinstance(value["genesis_hash"], str) and re.fullmatch(HEX64, value["genesis_hash"]) is not None
+        and isinstance(head, dict) and sorted(head) == ["hash", "seq"] and vr_int(head["seq"], 1)
+        and isinstance(head["hash"], str) and re.fullmatch(HEX64, head["hash"]) is not None
+        and isinstance(signer, str) and signer.startswith("member:") and re.fullmatch(OPAQUE_ID, signer[7:]) is not None
+        and sb_expected_ok(expected)
+        and vr_b64u(value["nonce"], 32)
+        and vr_int(value["issued_at"]) and vr_int(value["expires_at"])
+    )
+    if not ok or not 0 < value["expires_at"] - value["issued_at"] <= VR_MAX_LEASE_MS:
+        raise Refused("malformed")
+    if value["auth_time"] * 1000 > value["issued_at"]:
+        raise Refused("malformed")
+    state, subject = expected["state"], value["subject"]
+    per_action = {
+        "bind": state in ("never_bound", "unbound", "released"),
+        "transfer": state == "bound" and subject != expected.get("owner"),
+        "unbind": state == "bound" and subject == expected.get("owner"),
+    }[value["action"]]
+    if not per_action or len(jcs(value).encode()) > MAX_BODY_BYTES:
+        raise Refused("malformed")
+    return value
+
+
+def read_sb_challenge(text):
+    """StationBindingChallenge::parse: one strict parse of at most 4,096
+    bytes, then the body's grammar."""
+    return sb_body(vr_strict(text, VR_MAX_CHALLENGE_BYTES))
+
+
+def read_sb_proof(text):
+    """A proof as the shared core reads it: strict I-JSON within 16 KiB,
+    exactly body and sig, the body a challenge. Returns (body, sig)."""
+    value = vr_strict(text, VR_MAX_OBJECT_BYTES)
+    if not isinstance(value, dict) or sorted(value) != ["body", "sig"]:
+        raise Refused("malformed")
+    try:
+        sig = b64u_decode(value["sig"])
+    except ValueError:
+        raise Refused("malformed")
+    return sb_body(value["body"]), sig
+
+
+class SbList(VrList):
+    """VrList, with a binding's signer: a current native member holding
+    manage at this list's head (its roles as set_roles last left them)."""
+
+    def manager_at_head(self, signer):
+        """(alg, public key), or Refused (unknown_signer, not_a_manager)."""
+        member = self.members.get(signer[len("member:"):])
+        if member is None or member["standing"] != "active" or member["kind"] != "native":
+            raise Refused("unknown_signer")
+        if "manage" not in member["roles"]:
+            raise Refused("not_a_manager")
+        return member["auth_key"]["alg"], b64u_decode(member["auth_key"]["pub"])
+
+    def on_chain(self, head):
+        """at_head, or Refused (stale_log beyond the list, fork off it)."""
+        if head["seq"] > len(self.hashes):
+            raise Refused("stale_log")
+        if self.hashes[head["seq"] - 1] != head["hash"]:
+            raise Refused("fork")
+        return head == self.head()
+
+
+def sb_verify(text, lst, expected, now):
+    """verify_station_binding, from the file's note: the first failure in
+    the order of Atem's answer (#120 comment 7207827118, Atem's proposal,
+    for Astation's agreement), or the verified binding."""
+    body, sig = read_sb_proof(text)
+    if lst.frozen:
+        raise Refused("frozen")
+    if body["account_id"] != lst.account_id or body["genesis_hash"] != lst.genesis_hash:
+        raise Refused("wrong_account")
+    alg, public = lst.manager_at_head(body["signer"])
+    if not verify(alg, public, sig, enc([SB_LABEL, jcs(body)])):
+        raise Refused("bad_signature")
+    at_head = lst.on_chain(body["head"])
+    if jcs(body) != jcs(expected):
+        raise Refused("challenge_mismatch")
+    if now >= expected["expires_at"]:
+        raise Refused("expired")
+    return {
+        "action": body["action"], "signer": body["signer"], "head": body["head"], "at_head": at_head,
+        "account_id": body["account_id"], "genesis_hash": body["genesis_hash"], "issuer": body["issuer"],
+        "subject": body["subject"], "auth_time": body["auth_time"], "expected_binding": body["expected_binding"],
+        "nonce": body["nonce"], "expires_at": body["expires_at"],
+    }
+
+
+def sb_build(case, lst):
+    """station_binding_request, from the file's note: the held body's jcs,
+    or Refused. The challenge is read first, as the bindings' request reads
+    the text it is handed."""
+    signer, now, claims = case["signer"], case["now_ms"], case["expected"]
+    challenge = read_sb_challenge(json.dumps(case["challenge"]))
+    if not signer.startswith("member:") or re.fullmatch(OPAQUE_ID, signer[7:]) is None:
+        raise Refused("malformed")
+    station = vr_normalize(case["station"])
+    if station is None:
+        raise Refused("malformed")
+    if sorted(claims) != ["auth_time", "issuer", "subject"] or not sb_claim_ok(claims["issuer"]) or not sb_claim_ok(claims["subject"]) or not vr_int(claims["auth_time"]):
+        raise Refused("malformed")
+    if lst.frozen:
+        raise Refused("frozen")
+    if challenge["account_id"] != lst.account_id or challenge["genesis_hash"] != lst.genesis_hash:
+        raise Refused("wrong_account")
+    if challenge["origin"] != station:
+        raise Refused("origin_mismatch")
+    if challenge["signer"] != signer:
+        raise Refused("signer_mismatch")
+    lst.manager_at_head(signer)
+    lst.on_chain(challenge["head"])
+    if any(challenge[k] != claims[k] for k in ("issuer", "subject", "auth_time")):
+        raise Refused("binding_mismatch")
+    if now >= challenge["expires_at"]:
+        raise Refused("expired")
+    return jcs(challenge)
+
+
+def check_station_binding(file, data, report, context):
+    """Every case's verdict derived here from the file's note: Astation's
+    examples (each challenge read, its signing input's digest, both
+    signatures under the posted keys, over that input only); the chain's
+    entries; each challenge text read or refused; each proof's code in the
+    order of Atem's answer (#120 comment 7207827118, Atem's proposal, for
+    Astation's agreement), or its verified fields, against log L and the case's
+    chain, the valid proofs' jcs, signing input and signature by their
+    signer's key; the builder's held bodies and refusals; and the immutable
+    request's finishes, signed here (P-256 with a fresh nonce)."""
+    keys = context["keys"]
+    mlog = context["membership_log"]
+    entries = {e["label"]: e for e in data["entries"]}
+    with report.case(file, "external") as case:
+        ext = data["external"]
+        posted = {k["alg"]: b64u_decode(k["pub"]) for k in ext["public_keys"]}
+        case.equal(sorted(posted), ["ed25519", "p256"], "an Ed25519 and a P-256 key")
+        inputs = []
+        for c in ext["cases"]:
+            try:
+                body = read_sb_challenge(json.dumps(c["challenge"]))
+                case.check(True, f"{body['action']}: its challenge reads")
+            except Refused as e:
+                case.fail(f"a posted challenge refused: {e.code}")
+                continue
+            inputs.append(enc([SB_LABEL, jcs(body)]))
+            case.equal(sha256(inputs[-1]).hex(), c["signing_input_sha256"], f"{body['action']}: the signing input's digest")
+        case.equal(sorted(c["challenge"]["action"] for c in ext["cases"]), ["bind", "transfer", "unbind"], "one example of each action")
+        for i, c in enumerate(ext["cases"]):
+            for alg in ("ed25519", "p256"):
+                sig = b64u_decode(c[f"{alg}_sig"])
+                for j, message in enumerate(inputs):
+                    case.equal(verify(alg, posted[alg], sig, message), i == j, f"case {i}'s {alg} signature over case {j}'s input")
+                case.check(not verify(alg, posted[alg], sig, enc([VR_LABEL, jcs(c["challenge"])])), f"case {i}'s {alg} signature isn't a verifier report's")
+    with report.case(file, "entries") as case:
+        check_report_entries(case, data, mlog)
+        desk = entries["SB7_add_desk"]["entry"]["body"]["member"]
+        case.equal((desk["auth_key"]["alg"], b64u_decode(desk["auth_key"]["pub"])), ("ed25519", keys.public("dev-desk", "auth")), "dev-desk's Ed25519 key")
+        case.check("manage" in desk["roles"], "dev-desk added with manage")
+        case.equal(entries["SB7_set_roles_phone"]["entry"]["body"]["roles"], ["control", "view"], "dev-phone demoted")
+        case.equal(jcs(entries["SB7_recovery_add_newmac"]["entry"]), jcs(next(v["entry"] for v in mlog["others"] if v["label"] == "R7")), "SB7_recovery_add_newmac is R7, byte for byte")
+
+    def lst(c):
+        return report_list(c, data, mlog, SbList)
+
+    for c in data["challenges"]:
+        with report.case(file, f"challenge {c['label']}") as case:
+            try:
+                case.equal(read_sb_challenge(c["text"]), c.get("fields"), "read, its fields")
+            except Refused as e:
+                case.equal(e.code, c.get("code"), "refused")
+    codes, actions = set(), set()
+    for c in data["valid"] + data["invalid"]:
+        with report.case(file, f"proof {c['label']}") as case:
+            expected = read_sb_challenge(json.dumps(c["challenge"]))
+            try:
+                verified = sb_verify(c["proof"], lst(c), expected, c["now_ms"])
+                case.equal(verified, c.get("expect"), "verified")
+                actions.add(verified["action"])
+                body = json.loads(c["proof"])["body"]
+                case.equal(jcs(body), c["jcs"], "jcs")
+                case.equal(enc([SB_LABEL, jcs(body)]).hex(), c["signing_input_hex"], "signing input")
+                name, part = c["signed_with"].split("/")
+                case.check(
+                    verify(keys.keys[name][part]["alg"], keys.public(name, part), b64u_decode(json.loads(c["proof"])["sig"]), enc([SB_LABEL, jcs(body)])),
+                    f"signed by {c['signed_with']}",
+                )
+            except Refused as e:
+                case.equal(e.code, c.get("code"), "refused")
+                codes.add(e.code)
+                proof = json.loads(c["proof"]) if e.code != "malformed" else None
+                if c["label"] == "high_s_signature":
+                    # A genuine malleation: S above n / 2, its low-S twin the
+                    # signer's valid signature.
+                    sig = b64u_decode(proof["sig"])
+                    s_ = int.from_bytes(sig[32:], "big")
+                    case.check(s_ > P256_N // 2, "S is high")
+                    twin = sig[:32] + (P256_N - s_).to_bytes(32, "big")
+                    case.check(verify("p256", keys.public("dev-phone", "auth"), twin, enc([SB_LABEL, jcs(proof["body"])])), "its low-S twin verifies")
+                if c["label"] in SB_LABELS:
+                    # A genuine relabel: the signature verifies over the other label.
+                    other = SB_LABELS[c["label"]]
+                    case.check(
+                        verify("p256", keys.public("dev-phone", "auth"), b64u_decode(proof["sig"]), enc([other, jcs(proof["body"])])),
+                        f"signed over {other}",
+                    )
+    with report.case(file, "coverage") as case:
+        case.equal(sorted(codes), sorted(SB_VERIFY_ORDER), "every verifier code")
+        case.equal(sorted(actions), ["bind", "transfer", "unbind"], "every action verifies")
+        labels = {c["label"] for c in data["valid"] + data["invalid"]}
+        for label in (
+            "bind_p256_at_head", "bind_p256_at_ancestor", "bind_ed25519_at_head", "bind_ed25519_at_ancestor",
+            "rebind_after_unbound", "rebind_after_released", "transfer_p256", "transfer_ed25519", "unbind_p256",
+            "unbind_ed25519", "demoted_manager", "pending_recovery_subject", "high_s_signature",
+            "unbound_without_owner", "released_without_owner", "transfer_to_the_current_owner", "unbind_by_another_account",
+            "auth_time_after_issued_at", "lease_zero", "lease_over_30_seconds", "account_id_space",
+        ) + tuple(SB_LABELS):
+            case.check(label in labels, f"{label} present")
+        mismatched = {c["label"] for c in data["invalid"] if c["code"] == "challenge_mismatch"}
+        case.equal(len(mismatched), 16, "each challenge field against the stored challenge")
+    build_codes = set()
+    for c in data["builder"] + data["request"]:
+        with report.case(file, f"builder {c['label']}") as case:
+            try:
+                case.equal(sb_build(c, lst(c)), c.get("body_json"), "the held body")
+            except Refused as e:
+                case.equal(e.code, c.get("code"), "refused")
+                build_codes.add(e.code)
+    with report.case(file, "builder coverage") as case:
+        case.equal(sorted(build_codes), sorted(SB_BUILD_ORDER), "every builder code")
+    for c in data["request"]:
+        with report.case(file, f"request {c['label']}") as case:
+            case.equal(c["sign_request"], {"purpose": "station_binding", "fresh_confirmation": True, "label": SB_LABEL}, "sign request")
+            held = c["challenge"]
+            name = c["key"].split("/")[0]
+            signer_alg, signer_pub = keys.keys[name]["auth"]["alg"], keys.public(name, "auth")
+            for f in c["finishes"]:
+                over = held if f["over"] == "held" else dict(held, nonce=f["over"]["nonce"])
+                sig = vr_sign(keys, f["signed_with"], enc([SB_LABEL, jcs(over)]))
+                ok = verify(signer_alg, signer_pub, sig, enc([SB_LABEL, jcs(held)]))
+                case.equal(ok, "code" not in f, f"{f['label']}: {'taken' if ok else 'refused'}")
+                if not ok:
+                    case.equal(f["code"], "bad_signature", f"{f['label']}: bad_signature")
+
+
 # ------------------------------------------- host-work/requests-v1 (task ops)
 
 # The requests naming a task (host-work-v1 §4 "Query, cancel, complete",
@@ -5346,6 +5658,7 @@ CHECKERS = [
     ("r9-vectors-mailbox-calls", check_mailbox_calls),
     ("r9-vectors-verifier-report", check_verifier_report),
     ("r9-vectors-signer-report", check_signer_report),
+    ("r9-vectors-station-binding", check_station_binding),
 ]
 
 

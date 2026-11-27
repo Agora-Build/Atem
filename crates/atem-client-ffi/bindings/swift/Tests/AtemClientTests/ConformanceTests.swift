@@ -1182,6 +1182,204 @@ final class ConformanceTests: XCTestCase {
             try reportError("bad_signature") { _ = try sign("dev-mac/auth") }
             #endif
         }
+        // A manager's Station binding proof (delegated host-work III.5 (b);
+        // Atem's answer on #120 comment 7207827118): Astation's three posted
+        // examples through the encoding exports (each challenge read, its
+        // digest, both signatures); each challenge read or refused, and a
+        // Station's fresh one; each proof verified, or refused as
+        // Report(code); each builder case as a StationBindingRequest (its
+        // body the challenge); the immutable request's finishes, signed here
+        // with CryptoKit (another body, another member: refused); and the
+        // synchronous signer through the app's provider.
+        let sbind = try load("r9-vectors-station-binding")
+        func sbindLog(_ c: [String: Any]) throws -> MembershipLog {
+            let at = HostClock(wallMs: u(c["now_ms"]), monoMs: 1000, bootId: "boot-1")
+            let entries = a(sbind["entries"]).map(o)
+            let chain = a(c["chain"]).map { label in js(entries.first { s($0["label"]) == s(label) }!["entry"]!) }
+            let log = try MembershipLog.verify(accountId: account, genesisHash: genesis, entries: l + chain, now: at)
+            if let freeze = c["freeze"] { _ = try log.extend(entries: [entry(s(freeze))], now: at) }
+            return log
+        }
+        func sbindAction(_ a: BindingAction) -> String {
+            switch a {
+            case .bind: return "bind"
+            case .transfer: return "transfer"
+            case .unbind: return "unbind"
+            }
+        }
+        func sbindExpected(_ e: ExpectedBinding) -> [String: Any] {
+            switch e {
+            case .neverBound: return ["state": "never_bound"]
+            case let .bound(bindingId, version, owner):
+                return ["state": "bound", "binding_id": bindingId, "version": version, "owner": owner]
+            case let .unbound(bindingId, version, owner):
+                return ["state": "unbound", "binding_id": bindingId, "version": version, "owner": owner]
+            case let .released(bindingId, version, owner):
+                return ["state": "released", "binding_id": bindingId, "version": version, "owner": owner]
+            }
+        }
+        func sbindChallenge(_ c: StationBindingChallenge) -> [String: Any] {
+            [
+                "type": "atem-station-binding", "v": 1, "action": sbindAction(c.action), "origin": c.origin,
+                "issuer": c.issuer, "subject": c.subject, "auth_time": c.authTime, "account_id": c.accountId,
+                "genesis_hash": c.genesisHash, "head": ["seq": c.head.seq, "hash": c.head.hash] as [String: Any],
+                "signer": c.signer, "expected_binding": sbindExpected(c.expectedBinding), "nonce": c.nonce,
+                "issued_at": c.issuedAt, "expires_at": c.expiresAt,
+            ]
+        }
+        func sbindOut(_ v: VerifiedStationBinding) -> [String: Any] {
+            [
+                "action": sbindAction(v.action), "signer": v.signer,
+                "head": ["seq": v.head.seq, "hash": v.head.hash] as [String: Any], "at_head": v.atHead,
+                "account_id": v.accountId, "genesis_hash": v.genesisHash, "issuer": v.issuer, "subject": v.subject,
+                "auth_time": v.authTime, "expected_binding": sbindExpected(v.expectedBinding), "nonce": v.nonce,
+                "expires_at": v.expiresAt,
+            ]
+        }
+        func sbindClaims(_ e: [String: Any]) -> AuthClaims {
+            AuthClaims(issuer: s(e["issuer"]), subject: s(e["subject"]), authTime: u(e["auth_time"]))
+        }
+        func sbindRequest(_ log: MembershipLog, _ c: [String: Any], _ challenge: [String: Any], _ key: String) throws -> StationBindingRequest {
+            try StationBindingRequest(log: log, challengeJson: js(challenge), signer: s(c["signer"]), origin: s(c["station"]),
+                expected: sbindClaims(o(c["expected"])), keyId: key, nowMs: u(c["now_ms"]))
+        }
+        check("station binding: Astation's examples") {
+            let external = o(sbind["external"])
+            for c in a(external["cases"]).map(o) {
+                let challenge = o(c["challenge"])
+                try eq(canon(sbindChallenge(try parseStationBindingChallenge(challengeJson: js(challenge)))), canon(challenge), s(challenge["action"]))
+                let body = utf8(try canonicalJson(json: js(challenge)))
+                let input = signingInput(label: .stationBinding, payload: body)
+                try eq(hex(Data(SHA256.hash(data: input))), s(c["signing_input_sha256"]), "digest")
+                for k in a(external["public_keys"]).map(o) {
+                    let alg = s(k["alg"])
+                    let pub = PublicKeyData(alg: alg == "ed25519" ? .ed25519 : .p256, raw: b64u(s(k["pub"])))
+                    let sig = b64u(s(c["\(alg)_sig"]))
+                    try verifySignature(key: pub, label: .stationBinding, payload: body, signature: sig)
+                    try throwsCode("bad_signature") { try verifySignature(key: pub, label: .signerReport, payload: body, signature: sig) }
+                }
+            }
+        }
+        check("station binding: challenges") {
+            for c in a(sbind["challenges"]).map(o) {
+                guard let fields = c["fields"] as? [String: Any] else {
+                    try reportError(s(c["code"])) { _ = try parseStationBindingChallenge(challengeJson: s(c["text"])) }
+                    continue
+                }
+                try eq(canon(sbindChallenge(try parseStationBindingChallenge(challengeJson: s(c["text"])))), canon(fields), s(c["label"]))
+            }
+            let g = o(o(a(sbind["valid"])[0])["challenge"])
+            let head = LogHead(seq: u(o(g["head"])["seq"]), hash: s(o(g["head"])["hash"]))
+            func fresh(_ origin: String, _ action: BindingAction, _ expected: ExpectedBinding, _ expiresAt: UInt64) throws -> String {
+                try stationBindingChallenge(action: action, origin: origin, claims: sbindClaims(g), accountId: s(g["account_id"]),
+                    genesisHash: s(g["genesis_hash"]), head: head, signer: s(g["signer"]), expectedBinding: expected,
+                    issuedAt: u(g["issued_at"]), expiresAt: expiresAt)
+            }
+            let expires = u(g["expires_at"])
+            let one = try fresh("https://Station-Dev.agora.build/", .bind, .neverBound, expires)
+            try eq(try canonicalJson(json: one), one, "canonical JSON")
+            let first = try parseStationBindingChallenge(challengeJson: one)
+            let second = try parseStationBindingChallenge(challengeJson: try fresh(s(g["origin"]), .bind, .neverBound, expires))
+            try eq(first.origin, "https://station-dev.agora.build", "the Station normalized")
+            try eq(first.nonce == second.nonce, false, "a fresh nonce each time")
+            var same = sbindChallenge(first)
+            same["nonce"] = g["nonce"]
+            try eq(canon(same), canon(g), "the vectors' bind but its nonce")
+            try reportError("malformed") { _ = try fresh(s(g["origin"]), .bind, .neverBound, expires + 1) }
+            try reportError("malformed") { _ = try fresh(s(g["origin"]), .transfer, .neverBound, expires) }
+            try reportError("malformed") {
+                _ = try fresh(s(g["origin"]), .unbind, .bound(bindingId: "bind-0001", version: 1, owner: "ab00000000000000000000000009"), expires)
+            }
+        }
+        check("station binding: proofs") {
+            for c in a(sbind["valid"]).map(o) + a(sbind["invalid"]).map(o) {
+                let verify = { try verifyStationBinding(log: try sbindLog(c), proofJson: s(c["proof"]),
+                    expectedChallengeJson: js(o(c["challenge"])), nowMs: u(c["now_ms"])) }
+                if let expect = c["expect"] as? [String: Any] {
+                    try eq(canon(sbindOut(try verify())), canon(expect), s(c["label"]))
+                } else {
+                    try reportError(s(c["code"])) { _ = try verify() }
+                }
+            }
+            var byCase: [String: [String: Any]] = [:]
+            for c in a(sbind["valid"]).map(o) + a(sbind["invalid"]).map(o) { byCase[s(c["label"])] = c }
+            try eq(s(byCase["demoted_manager"]!["code"]), "not_a_manager", "demoted_manager")
+            try eq(s(byCase["high_s_signature"]!["code"]), "bad_signature", "high_s_signature")
+            try eq(s(o(byCase["unbind_p256"]!["expect"])["action"]), "unbind", "unbind_p256")
+        }
+        check("station binding: the builder") {
+            for c in a(sbind["builder"]).map(o) + a(sbind["request"]).map(o) {
+                let build = { try sbindRequest(try sbindLog(c), c, o(c["challenge"]), "key") }
+                guard let want = c["body_json"] as? String else {
+                    try reportError(s(c["code"])) { _ = try build() }
+                    continue
+                }
+                let request = try build()
+                try eq(request.bodyJson(), want, s(c["label"]))
+                try eq(canon(sbindChallenge(request.challenge())), canon(o(c["challenge"])), "\(s(c["label"])): the challenge shown")
+            }
+        }
+        check("station binding: the immutable request") {
+            #if canImport(CryptoKit)
+            let managers = CryptoKitKeys()
+            for name in ["dev-phone", "dev-mac", "dev-desk"] {
+                let k = key(name, "auth")
+                if s(k["alg"]) == "p256" { try managers.addP256("\(name)/auth", secret: unhex(s(k["secret_hex"]))) }
+                else { try managers.addEd25519("\(name)/auth", seed: unhex(s(k["secret_hex"]))) }
+            }
+            for c in a(sbind["request"]).map(o) {
+                let log = try sbindLog(c)
+                let keyId = s(c["key"])
+                let held = try sbindRequest(log, c, o(c["challenge"]), keyId)
+                let body = held.bodyJson()
+                let sr = held.signRequest()
+                try eq(sr.purpose, .stationBinding, "purpose")
+                try eq(sr.freshConfirmation, true, "a fresh confirmation")
+                try eq(sr.label, s(o(c["sign_request"])["label"]), "label")
+                try eq(sr.keyId, keyId, "key")
+                try eq(sr.bodyJson, body, "the held body shown")
+                try eq(hex(sr.input), hex(encodeFields(fields: [utf8(sr.label), utf8(body)])), "input")
+                for f in a(c["finishes"]).map(o) {
+                    var input = sr.input
+                    if let over = f["over"] as? [String: Any] {
+                        var other = o(c["challenge"])
+                        other["nonce"] = s(over["nonce"])
+                        input = try sbindRequest(log, c, other, keyId).signRequest().input
+                    }
+                    let signer = s(f["signed_with"])
+                    let raw = try managers.sign(request: SignRequest(keyId: signer, purpose: .stationBinding,
+                        freshConfirmation: true, label: sr.label, input: input, bodyJson: nil))
+                    let sig = try managers.publicKey(keyId: signer).alg == .p256 ? lowS(raw) : raw
+                    if let code = f["code"] {
+                        try reportError(s(code)) { _ = try held.finish(signature: sig) }
+                    } else {
+                        try eq(try held.finish(signature: sig), "{\"body\":\(body),\"sig\":\"\(b64uString(sig))\"}", "\(s(c["label"])) \(s(f["label"]))")
+                    }
+                }
+                try eq(held.bodyJson(), body, "the held body never changes")
+            }
+            #endif
+        }
+        check("station binding: the synchronous signer, through the app's provider") {
+            #if canImport(CryptoKit)
+            let c = o(a(sbind["request"])[0])
+            let log = try sbindLog(c)
+            let phone = CryptoKitKeys()
+            try phone.addP256("dev-phone/auth", secret: unhex(s(key("dev-phone", "auth")["secret_hex"])))
+            try phone.addP256("dev-mac/auth", secret: unhex(s(key("dev-mac", "auth")["secret_hex"])))
+            func sign(_ keyId: String) throws -> String {
+                try signStationBinding(provider: phone, log: log, challengeJson: js(o(c["challenge"])), signer: s(c["signer"]),
+                    origin: s(c["station"]), expected: sbindClaims(o(c["expected"])), keyId: keyId, nowMs: u(c["now_ms"]))
+            }
+            let v = try verifyStationBinding(log: log, proofJson: try sign("dev-phone/auth"),
+                expectedChallengeJson: js(o(c["challenge"])), nowMs: u(c["now_ms"]))
+            try eq(v.atHead, true, "at the head")
+            try eq(phone.requests.count, 1, "one request")
+            try eq(phone.requests[0].purpose, .stationBinding, "purpose")
+            try eq(phone.requests[0].freshConfirmation, true, "a fresh confirmation")
+            try reportError("bad_signature") { _ = try sign("dev-mac/auth") }
+            #endif
+        }
         check("device-list actions: a manager signs each under a purpose that names it (R9.6 rule 4)") {
             #if canImport(CryptoKit)
             let mac = CryptoKitKeys()
@@ -2885,6 +3083,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 150)
+        XCTAssertEqual(passed, 156)
     }
 }

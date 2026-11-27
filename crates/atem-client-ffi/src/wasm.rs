@@ -160,6 +160,7 @@ fn label(name: &str) -> JsResult<SignLabelKind> {
         "host_work_control" => SignLabelKind::HostWorkControl,
         "verifier_report" => SignLabelKind::VerifierReport,
         "signer_report" => SignLabelKind::SignerReport,
+        "station_binding" => SignLabelKind::StationBinding,
         _ => return Err(bad("unknown label")),
     })
 }
@@ -716,6 +717,240 @@ pub fn sign_signer_report(
         &slot,
         &origin,
         &signer_journal(journal)?,
+        key_id,
+        ms(now_ms)?,
+    ))
+}
+
+// --------------------------------------------------- station bindings
+
+fn binding_action(name: &str) -> JsResult<crate::types::BindingAction> {
+    use crate::types::BindingAction;
+    Ok(match name {
+        "bind" => BindingAction::Bind,
+        "transfer" => BindingAction::Transfer,
+        "unbind" => BindingAction::Unbind,
+        _ => return Err(bad("action is bind, transfer or unbind")),
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct JsClaims {
+    issuer: String,
+    subject: String,
+    auth_time: f64,
+}
+
+fn auth_claims(v: JsValue) -> JsResult<crate::types::AuthClaims> {
+    only_fields(&v, &["issuer", "subject", "authTime"], "claims")?;
+    let c: JsClaims =
+        serde_wasm_bindgen::from_value(v).map_err(|_| bad("claims {issuer, subject, authTime}"))?;
+    Ok(crate::types::AuthClaims {
+        issuer: c.issuer,
+        subject: c.subject,
+        auth_time: ms(c.auth_time).map_err(|_| bad("authTime is a non-negative safe integer"))?,
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct JsExpected {
+    #[serde(rename = "type")]
+    kind: String,
+    binding_id: Option<String>,
+    version: Option<f64>,
+    owner: Option<String>,
+}
+
+fn expected_binding(v: JsValue) -> JsResult<crate::types::ExpectedBinding> {
+    use crate::types::ExpectedBinding;
+    only_fields(
+        &v,
+        &["type", "bindingId", "version", "owner"],
+        "expectedBinding",
+    )?;
+    let e: JsExpected = serde_wasm_bindgen::from_value(v)
+        .map_err(|_| bad("expectedBinding {type, bindingId?, version?, owner?}"))?;
+    if e.kind == "never_bound" {
+        if e.binding_id.is_some() || e.version.is_some() || e.owner.is_some() {
+            return Err(bad("a never_bound expectedBinding has its type alone"));
+        }
+        return Ok(ExpectedBinding::NeverBound);
+    }
+    let (Some(binding_id), Some(version), Some(owner)) = (e.binding_id, e.version, e.owner) else {
+        return Err(bad(
+            "a recorded expectedBinding has bindingId, version and owner",
+        ));
+    };
+    let version = ms(version).map_err(|_| bad("version is a positive safe integer"))?;
+    Ok(match e.kind.as_str() {
+        "bound" => ExpectedBinding::Bound {
+            binding_id,
+            version,
+            owner,
+        },
+        "unbound" => ExpectedBinding::Unbound {
+            binding_id,
+            version,
+            owner,
+        },
+        "released" => ExpectedBinding::Released {
+            binding_id,
+            version,
+            owner,
+        },
+        _ => return Err(bad("type is never_bound, bound, unbound or released")),
+    })
+}
+
+/// A Station's fresh challenge for a manager's binding proof
+/// (`station_binding::station_binding_challenge`): canonical JSON, a
+/// 32-byte nonce from `crypto.getRandomValues`; `claims` is `{issuer,
+/// subject, authTime}` (seconds), `head` `{seq, hash}`, `expectedBinding`
+/// `{type: "never_bound"}` or `{type: "bound" | "unbound" | "released",
+/// bindingId, version, owner}`. Throws `kind: "report"`, `code:
+/// "malformed"` for a field outside its grammar or the per-action rules.
+#[wasm_bindgen(js_name = stationBindingChallenge)]
+#[allow(clippy::too_many_arguments)]
+pub fn station_binding_challenge(
+    action: String,
+    origin: String,
+    claims: JsValue,
+    account_id: String,
+    genesis_hash: String,
+    head_value: JsValue,
+    signer: String,
+    expected: JsValue,
+    issued_at: f64,
+    expires_at: f64,
+) -> JsResult<String> {
+    err(crate::station_binding::station_binding_challenge(
+        binding_action(&action)?,
+        origin,
+        auth_claims(claims)?,
+        account_id,
+        genesis_hash,
+        head(head_value)?,
+        signer,
+        expected_binding(expected)?,
+        ms(issued_at)?,
+        ms(expires_at)?,
+    ))
+}
+
+/// A challenge's fields: `{action, origin, issuer, subject, authTime,
+/// accountId, genesisHash, head, signer, expectedBinding, nonce, issuedAt,
+/// expiresAt}` (`kind: "report"`, `code: "malformed"` otherwise).
+#[wasm_bindgen(js_name = parseStationBindingChallenge)]
+pub fn parse_station_binding_challenge(challenge_json: String) -> JsResult<JsValue> {
+    ok(crate::station_binding::parse_station_binding_challenge(
+        challenge_json,
+    ))
+}
+
+/// Verifies a binding proof against `log` at its head and the stored
+/// challenge (`station_binding::verify_station_binding`): `{action,
+/// signer, head, atHead, accountId, genesisHash, issuer, subject,
+/// authTime, expectedBinding, nonce, expiresAt}` (require `atHead`), or
+/// throws `kind: "report"` with the first failure's `code`.
+#[wasm_bindgen(js_name = verifyStationBinding)]
+pub fn verify_station_binding(
+    log: &MembershipLog,
+    proof_json: String,
+    expected_challenge_json: String,
+    now_ms: f64,
+) -> JsResult<JsValue> {
+    ok(crate::station_binding::verify_station_binding(
+        log.0.clone(),
+        proof_json,
+        expected_challenge_json,
+        ms(now_ms)?,
+    ))
+}
+
+/// A binding proof waiting for its signature
+/// (`station_binding::StationBindingRequest`): an immutable handle on the
+/// challenge the core checked, held as the body. A key that answers later
+/// signs `signRequest().input` after the owner's fresh confirmation and
+/// hands the signature to `finish`, which takes only a signature over the
+/// held body by its signer.
+#[wasm_bindgen]
+pub struct StationBindingRequest(crate::station_binding::StationBindingRequest);
+
+#[wasm_bindgen]
+impl StationBindingRequest {
+    #[wasm_bindgen(constructor)]
+    pub fn new(
+        log: &MembershipLog,
+        challenge_json: String,
+        signer: String,
+        origin: String,
+        expected: JsValue,
+        key_id: String,
+        now_ms: f64,
+    ) -> JsResult<StationBindingRequest> {
+        Ok(StationBindingRequest(err(
+            crate::station_binding::StationBindingRequest::build(
+                &log.0,
+                &challenge_json,
+                &signer,
+                &origin,
+                &auth_claims(expected)?,
+                key_id,
+                ms(now_ms)?,
+            ),
+        )?))
+    }
+
+    /// `{keyId, purpose: "station_binding", freshConfirmation: true, label,
+    /// input, bodyJson}`.
+    #[wasm_bindgen(js_name = signRequest)]
+    pub fn sign_request(&self) -> JsResult<JsValue> {
+        to_js(&self.0.sign_request())
+    }
+
+    /// The held body (canonical JSON): the challenge.
+    #[wasm_bindgen(js_name = bodyJson)]
+    pub fn body_json(&self) -> String {
+        self.0.body_json()
+    }
+
+    /// The challenge's fields, for the confirmation.
+    pub fn challenge(&self) -> JsResult<JsValue> {
+        to_js(&self.0.challenge())
+    }
+
+    /// The proof with `signature` (throws `kind: "report"`, `code:
+    /// "bad_signature"` for one that isn't the signer's over the held body).
+    pub fn finish(&self, signature: Vec<u8>) -> JsResult<String> {
+        err(self.0.finish(signature))
+    }
+}
+
+/// A binding proof signed at once with a key of a software store
+/// (`station_binding::sign_station_binding`; tests and tools: a native's
+/// key is never a software key).
+#[cfg(feature = "software-keys")]
+#[wasm_bindgen(js_name = signStationBinding)]
+#[allow(clippy::too_many_arguments)]
+pub fn sign_station_binding(
+    store: &SoftwareKeyStore,
+    log: &MembershipLog,
+    challenge_json: String,
+    signer: String,
+    origin: String,
+    expected: JsValue,
+    key_id: String,
+    now_ms: f64,
+) -> JsResult<String> {
+    err(crate::station_binding::sign_station_binding_with(
+        &*store.0,
+        &log.0,
+        &challenge_json,
+        &signer,
+        &origin,
+        &auth_claims(expected)?,
         key_id,
         ms(now_ms)?,
     ))

@@ -42,6 +42,10 @@
 //!   [`member_report::signer`], a native manager's signed report of its
 //!   signing journal (host-work-v1 §11.1, Astation #114 item 4), with its
 //!   immutable `SignerReportRequest`;
+//! - [`station_binding`]: a native manager's Station binding proof
+//!   (delegated host-work III.5 (b)): the Station's challenge and verifier,
+//!   the manager's synchronous signer (a fresh confirmation every time) and
+//!   its immutable `StationBindingRequest`;
 //! - [`host_work`]: a task's `result_id` (host-work-v1 §11.5), the
 //!   derivation the connection checks a `reply_query`'s reply against, and
 //!   the request reader and result correlation the connection applies;
@@ -82,6 +86,7 @@ pub mod publish;
 pub mod push;
 pub mod service;
 pub mod station;
+pub mod station_binding;
 pub mod station_route;
 pub mod types;
 #[cfg(feature = "wasm")]

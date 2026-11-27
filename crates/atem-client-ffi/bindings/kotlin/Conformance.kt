@@ -943,6 +943,176 @@ fun main(args: Array<String>) {
                 journalIn(c["journal"]), "dev-mac/auth", c["now_ms"].l().toULong())
         }
     }
+    // A manager's Station binding proof (delegated host-work III.5 (b);
+    // Atem's answer on #120 comment 7207827118): Astation's three posted
+    // examples through the encoding exports (each challenge read, its
+    // digest, both signatures); each challenge read or refused, and a
+    // Station's fresh one; each proof verified, or refused as Report(code);
+    // each builder case as a StationBindingRequest (its body the challenge);
+    // the immutable request's finishes, signed here with the JDK (another
+    // body, another member: refused); and the synchronous signer through the
+    // app's provider.
+    val sbind = load("r9-vectors-station-binding")
+    fun sbindLog(c: Any?): MembershipLog {
+        val at = HostClock(c["now_ms"].l().toULong(), 1000uL, "boot-1")
+        val chain = c["chain"].arr().map { label -> Json.write(sbind["entries"].arr().first { it["label"] == label }["entry"]) }
+        val log = MembershipLog.verify(account, genesis, l + chain, at)
+        c.obj()["freeze"]?.let { log.extend(listOf(entry(it.s())), at) }
+        return log
+    }
+    fun sbindExpected(e: ExpectedBinding): Map<String, Any?> = when (e) {
+        is ExpectedBinding.NeverBound -> mapOf("state" to "never_bound")
+        is ExpectedBinding.Bound -> mapOf("state" to "bound", "binding_id" to e.bindingId, "version" to e.version.toLong(), "owner" to e.owner)
+        is ExpectedBinding.Unbound -> mapOf("state" to "unbound", "binding_id" to e.bindingId, "version" to e.version.toLong(), "owner" to e.owner)
+        is ExpectedBinding.Released -> mapOf("state" to "released", "binding_id" to e.bindingId, "version" to e.version.toLong(), "owner" to e.owner)
+    }
+    fun sbindChallenge(c: StationBindingChallenge): Map<String, Any?> = mapOf(
+        "type" to "atem-station-binding",
+        "v" to 1L,
+        "action" to c.action.name.lowercase(),
+        "origin" to c.origin,
+        "issuer" to c.issuer,
+        "subject" to c.subject,
+        "auth_time" to c.authTime.toLong(),
+        "account_id" to c.accountId,
+        "genesis_hash" to c.genesisHash,
+        "head" to mapOf("seq" to c.head.seq.toLong(), "hash" to c.head.hash),
+        "signer" to c.signer,
+        "expected_binding" to sbindExpected(c.expectedBinding),
+        "nonce" to c.nonce,
+        "issued_at" to c.issuedAt.toLong(),
+        "expires_at" to c.expiresAt.toLong(),
+    )
+    fun sbindOut(v: VerifiedStationBinding): Map<String, Any?> = mapOf(
+        "action" to v.action.name.lowercase(),
+        "signer" to v.signer,
+        "head" to mapOf("seq" to v.head.seq.toLong(), "hash" to v.head.hash),
+        "at_head" to v.atHead,
+        "account_id" to v.accountId,
+        "genesis_hash" to v.genesisHash,
+        "issuer" to v.issuer,
+        "subject" to v.subject,
+        "auth_time" to v.authTime.toLong(),
+        "expected_binding" to sbindExpected(v.expectedBinding),
+        "nonce" to v.nonce,
+        "expires_at" to v.expiresAt.toLong(),
+    )
+    fun sbindClaims(e: Any?) = AuthClaims(e["issuer"].s(), e["subject"].s(), e["auth_time"].l().toULong())
+    fun sbindRequest(log: MembershipLog, c: Any?, challenge: Any?, key: String) =
+        StationBindingRequest(log, Json.write(challenge), c["signer"].s(), c["station"].s(), sbindClaims(c["expected"]), key, c["now_ms"].l().toULong())
+    check("station binding: Astation's examples") {
+        for (c in sbind["external"]["cases"].arr()) {
+            eq(sbindChallenge(parseStationBindingChallenge(Json.write(c["challenge"]))), c["challenge"], c["challenge"]["action"].s())
+            val body = utf8(canonicalJson(Json.write(c["challenge"])))
+            val digest = hex(MessageDigest.getInstance("SHA-256").digest(signingInput(SignLabelKind.STATION_BINDING, body)))
+            eq(digest, c["signing_input_sha256"].s(), "digest")
+            for (k in sbind["external"]["public_keys"].arr()) {
+                val alg = k["alg"].s()
+                val key = PublicKeyData(if (alg == "ed25519") KeyAlg.ED25519 else KeyAlg.P256, b64u(k["pub"].s()))
+                val sig = b64u(c["${alg}_sig"].s())
+                verifySignature(key, SignLabelKind.STATION_BINDING, body, sig)
+                throwsCode("bad_signature") { verifySignature(key, SignLabelKind.SIGNER_REPORT, body, sig) }
+            }
+        }
+    }
+    check("station binding: challenges") {
+        for (c in sbind["challenges"].arr()) {
+            val fields = c.obj()["fields"]
+            if (fields == null) reportError(c["code"].s()) { parseStationBindingChallenge(c["text"].s()) }
+            else eq(sbindChallenge(parseStationBindingChallenge(c["text"].s())), fields, c["label"].s())
+        }
+        val g = sbind["valid"][0]["challenge"]
+        val head = LogHead(g["head"]["seq"].l().toULong(), g["head"]["hash"].s())
+        fun fresh(origin: String, action: BindingAction, expected: ExpectedBinding, expiresAt: ULong) = stationBindingChallenge(
+            action, origin, sbindClaims(g), g["account_id"].s(), g["genesis_hash"].s(), head, g["signer"].s(), expected,
+            g["issued_at"].l().toULong(), expiresAt)
+        val expires = g["expires_at"].l().toULong()
+        val one = fresh("https://Station-Dev.agora.build/", BindingAction.BIND, ExpectedBinding.NeverBound, expires)
+        eq(canonicalJson(one), one, "canonical JSON")
+        val a = parseStationBindingChallenge(one)
+        eq(a.origin, "https://station-dev.agora.build", "the Station normalized")
+        if (a.nonce == parseStationBindingChallenge(fresh(g["origin"].s(), BindingAction.BIND, ExpectedBinding.NeverBound, expires)).nonce) {
+            throw AssertionError("a fresh nonce each time")
+        }
+        eq(LinkedHashMap(sbindChallenge(a)).also { it["nonce"] = g["nonce"] }, g, "the vectors' bind but its nonce")
+        reportError("malformed") { fresh(g["origin"].s(), BindingAction.BIND, ExpectedBinding.NeverBound, expires + 1uL) }
+        reportError("malformed") { fresh(g["origin"].s(), BindingAction.TRANSFER, ExpectedBinding.NeverBound, expires) }
+        reportError("malformed") {
+            fresh(g["origin"].s(), BindingAction.UNBIND, ExpectedBinding.Bound("bind-0001", 1uL, "ab00000000000000000000000009"), expires)
+        }
+    }
+    check("station binding: proofs") {
+        for (c in sbind["valid"].arr() + sbind["invalid"].arr()) {
+            val verify = { verifyStationBinding(sbindLog(c), c["proof"].s(), Json.write(c["challenge"]), c["now_ms"].l().toULong()) }
+            val expect = c.obj()["expect"]
+            if (expect != null) eq(sbindOut(verify()), expect, c["label"].s())
+            else reportError(c["code"].s()) { verify() }
+        }
+        val byCase = (sbind["valid"].arr() + sbind["invalid"].arr()).associateBy { it["label"].s() }
+        eq(byCase.getValue("demoted_manager")["code"], "not_a_manager", "demoted_manager")
+        eq(byCase.getValue("high_s_signature")["code"], "bad_signature", "high_s_signature")
+        eq(byCase.getValue("unbind_p256")["expect"]["action"], "unbind", "unbind_p256")
+    }
+    check("station binding: the builder") {
+        for (c in sbind["builder"].arr() + sbind["request"].arr()) {
+            val build = { sbindRequest(sbindLog(c), c, c["challenge"], "key") }
+            val want = c.obj()["body_json"]
+            if (want == null) {
+                reportError(c["code"].s()) { build() }
+                continue
+            }
+            val request = build()
+            eq(request.bodyJson(), want, c["label"].s())
+            eq(sbindChallenge(request.challenge()), c["challenge"], "${c["label"].s()}: the challenge shown")
+        }
+    }
+    check("station binding: the immutable request") {
+        for (c in sbind["request"].arr()) {
+            val log = sbindLog(c)
+            val key = c["key"].s()
+            val held = sbindRequest(log, c, c["challenge"], key)
+            val body = held.bodyJson()
+            val sr = held.signRequest()
+            eq(sr.purpose, SigningPurpose.STATION_BINDING, "purpose")
+            eq(sr.freshConfirmation, true, "a fresh confirmation")
+            eq(sr.label, c["sign_request"]["label"].s(), "label")
+            eq(sr.keyId, key, "key")
+            eq(sr.bodyJson, body, "the held body shown")
+            eq(hex(sr.input), hex(encodeFields(listOf(utf8(sr.label), utf8(body)))), "input")
+            for (f in c["finishes"].arr()) {
+                val input = if (f["over"] == "held") sr.input else {
+                    val other = LinkedHashMap(c["challenge"].obj()).also { it["nonce"] = f["over"]["nonce"] }
+                    sbindRequest(log, c, other, key).signRequest().input
+                }
+                val signer = f["signed_with"].s()
+                val raw = reporters.sign(SignRequest(signer, SigningPurpose.STATION_BINDING, true, sr.label, input, null))
+                val sig = if (reporters.publicKey(signer).alg == KeyAlg.P256) lowS(raw) else raw
+                val code = f.obj()["code"]
+                if (code == null) {
+                    val b64 = Base64.getUrlEncoder().withoutPadding().encodeToString(sig)
+                    eq(held.finish(sig), "{\"body\":$body,\"sig\":\"$b64\"}", "${c["label"].s()} ${f["label"].s()}")
+                } else reportError(code.s()) { held.finish(sig) }
+            }
+            eq(held.bodyJson(), body, "the held body never changes")
+        }
+    }
+    check("station binding: the synchronous signer, through the app's provider") {
+        val c = sbind["request"][0]
+        val log = sbindLog(c)
+        val keysUsed = JdkKeys()
+        val k = keys["dev-phone"]["auth"]
+        keysUsed.addP256("dev-phone/auth", unhex(k["secret_hex"].s()), unhex(k["pub_hex"].s()))
+        val proof = signStationBinding(keysUsed, log, Json.write(c["challenge"]), c["signer"].s(), c["station"].s(),
+            sbindClaims(c["expected"]), "dev-phone/auth", c["now_ms"].l().toULong())
+        val v = verifyStationBinding(log, proof, Json.write(c["challenge"]), c["now_ms"].l().toULong())
+        eq(v.atHead, true, "at the head")
+        eq(keysUsed.requests.single().purpose, SigningPurpose.STATION_BINDING, "purpose")
+        eq(keysUsed.requests.single().freshConfirmation, true, "a fresh confirmation")
+        reportError("bad_signature") {
+            signStationBinding(reporters, log, Json.write(c["challenge"]), c["signer"].s(), c["station"].s(),
+                sbindClaims(c["expected"]), "dev-mac/auth", c["now_ms"].l().toULong())
+        }
+    }
     check("device-list actions: a manager signs each under a purpose that names it (R9.6 rule 4)") {
         val mac = JdkKeys()
         mac.addP256("dev-mac/auth", unhex(keys["dev-mac"]["auth"]["secret_hex"].s()), unhex(keys["dev-mac"]["auth"]["pub_hex"].s()))

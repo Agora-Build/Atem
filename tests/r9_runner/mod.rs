@@ -131,6 +131,9 @@ pub fn not_expressible(scenario: &Value) -> Option<String> {
         (Some("vectors"), _) if name == "r9-vectors-signer-report" => {
             "a native manager's signed report of its control-record signing journal (host-work-v1 §11.1 \"The signer report\"), between a native app and the Station that minted its challenge, no host process: crates/atem-client/tests/signer_report.rs (the shared core's member_report::signer), crates/atem-client-ffi/tests/signer_report.rs (the production export) and scripts/check-r9-vectors.py".into()
         }
+        (Some("vectors"), _) if name == "r9-vectors-station-binding" => {
+            "a native manager's Station binding proof (delegated host-work III.5 (b)), between a native app and the Station that minted its challenge, no host process (hosts never see it): crates/atem-client/tests/station_binding.rs (the shared core's station_binding), crates/atem-client-ffi/tests/station_binding.rs (the production export) and scripts/check-r9-vectors.py".into()
+        }
         (Some("vectors"), _) if name == "r9-vectors-verifier-report" => {
             "a member's signed verifier report (R9.2 \"How a verifier reports itself\"), between a native app, an SDK process or a bot and the signer that minted its challenge, no host process: crates/atem-client/tests/verifier_report.rs (the shared core's member_report), crates/atem-client-ffi/tests/verifier_report.rs (the production export) and scripts/check-r9-vectors.py".into()
         }

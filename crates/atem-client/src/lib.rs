@@ -68,6 +68,14 @@
 //!   control-record signing journal, for a Station recovering from a
 //!   rollback (host-work-v1 §11.1 "The signer report", Astation #114).
 //!
+//! A Station's service ownership (delegated host-work III.5 (b)):
+//!
+//! - [`station_binding`]: a native manager's signed proof that binds,
+//!   transfers or unbinds an R9 account's Agora.Build owner at a Station
+//!   (`atem-station-binding-v1`): the Station's single-use challenge, the
+//!   manager's builder that checks every field before it asks, and the
+//!   Station's verifier against its log.
+//!
 //! Delegated host work (`designs/delegated-host-work.md`):
 //!
 //! - [`control`]: control records (`atem-host-work-control`, I.5.3), the
@@ -110,6 +118,7 @@ pub mod session;
 pub mod signed;
 #[cfg(feature = "software-keys")]
 pub mod software;
+pub mod station_binding;
 pub mod station_route;
 
 pub use domain::{SignLabel, SigningInput};

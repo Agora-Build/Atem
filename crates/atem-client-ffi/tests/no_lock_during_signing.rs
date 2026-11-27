@@ -106,6 +106,7 @@ impl AppKeyProvider for Prompting {
             atem_client::SignLabel::ChannelClient,
             atem_client::SignLabel::VerifierReport,
             atem_client::SignLabel::SignerReport,
+            atem_client::SignLabel::StationBinding,
         ]
         .into_iter()
         .find(|l| l.as_str().as_bytes() == fields[0])
@@ -368,6 +369,61 @@ fn a_signer_report_holds_no_lock() {
         WALL,
     )
     .unwrap();
+    let prompts = provider.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].fresh_confirmation);
+}
+
+/// A manager's Station binding proof (delegated host-work III.5 (b)): the
+/// challenge is checked under the log's lock, which is released before the
+/// provider asks the owner's fresh confirmation.
+#[test]
+fn a_station_binding_holds_no_lock() {
+    use atem_client_ffi::station_binding::{
+        sign_station_binding, station_binding_challenge, verify_station_binding,
+    };
+    use atem_client_ffi::types::{AuthClaims, BindingAction, ExpectedBinding};
+    let log = log_l();
+    let provider = Prompting::new();
+    let l = log.clone();
+    provider.set_probe(Box::new(move || {
+        let _ = l.head();
+        let _ = l.members();
+    }));
+    let claims = AuthClaims {
+        issuer: "https://auth.dev.agora.build".into(),
+        subject: "ab00000000000000000000000001".into(),
+        auth_time: WALL / 1000 - 600,
+    };
+    let challenge = station_binding_challenge(
+        BindingAction::Bind,
+        "https://station-dev.agora.build".into(),
+        claims.clone(),
+        ACCOUNT.into(),
+        genesis_hash().to_hex(),
+        log.head(),
+        "member:dev-phone".into(),
+        ExpectedBinding::NeverBound,
+        WALL - 1_000,
+        WALL + 20_000,
+    )
+    .unwrap();
+    let proof = sign_station_binding(
+        provider.clone(),
+        log.clone(),
+        challenge.clone(),
+        "member:dev-phone".into(),
+        "https://station-dev.agora.build".into(),
+        claims,
+        "dev-phone/auth".into(),
+        WALL,
+    )
+    .unwrap();
+    assert!(
+        verify_station_binding(log, proof, challenge, WALL)
+            .unwrap()
+            .at_head
+    );
     let prompts = provider.prompts.lock().unwrap();
     assert_eq!(prompts.len(), 1);
     assert!(prompts[0].fresh_confirmation);

@@ -801,6 +801,144 @@ check("signer report: the synchronous signer, with a software key", () => {
   reportError(() => sign("dev-mac/auth"), "bad_signature");
 });
 
+// ------------------------------------- a manager's Station binding proof
+// r9-vectors-station-binding (delegated host-work III.5 (b); Atem's answer
+// on #120 comment 7207827118): Astation's three posted examples through the
+// encoding exports (each challenge read, its digest, both signatures); each
+// challenge read or refused, and a Station's fresh one; each proof verified,
+// or refused with kind report and its code; each builder case as a
+// StationBindingRequest (its body the challenge); the immutable request's
+// finishes, signed here with Node's crypto (another body, another member:
+// refused); and the synchronous signer with a software key.
+const sbind = load("r9-vectors-station-binding");
+const sbindLog = (c) => {
+  const now = { wallMs: c.now_ms, monoMs: 1000, bootId: "boot-1" };
+  const chain = c.chain.map((label) => str(sbind.entries.find((e) => e.label === label).entry));
+  const log = m.MembershipLog.verify(ACCOUNT, GENESIS, [...L, ...chain], now);
+  if (c.freeze !== undefined) log.extend([entry(c.freeze)], now);
+  return log;
+};
+const sbindExpected = (e) =>
+  e.type === "never_bound" ? { state: "never_bound" } : { state: e.type, binding_id: e.bindingId, version: e.version, owner: e.owner };
+const sbindChallenge = (c) => ({
+  type: "atem-station-binding",
+  v: 1,
+  action: c.action,
+  origin: c.origin,
+  issuer: c.issuer,
+  subject: c.subject,
+  auth_time: c.authTime,
+  account_id: c.accountId,
+  genesis_hash: c.genesisHash,
+  head: head(c.head),
+  signer: c.signer,
+  expected_binding: sbindExpected(c.expectedBinding),
+  nonce: c.nonce,
+  issued_at: c.issuedAt,
+  expires_at: c.expiresAt,
+});
+const sbindOut = (v) => ({
+  action: v.action,
+  signer: v.signer,
+  head: head(v.head),
+  at_head: v.atHead,
+  account_id: v.accountId,
+  genesis_hash: v.genesisHash,
+  issuer: v.issuer,
+  subject: v.subject,
+  auth_time: v.authTime,
+  expected_binding: sbindExpected(v.expectedBinding),
+  nonce: v.nonce,
+  expires_at: v.expiresAt,
+});
+const sbindClaims = (e) => ({ issuer: e.issuer, subject: e.subject, authTime: e.auth_time });
+check("station binding: Astation's examples", () => {
+  for (const c of sbind.external.cases) {
+    same(sbindChallenge(m.parseStationBindingChallenge(str(c.challenge))), c.challenge, c.challenge.action);
+    const body = utf8(m.canonicalJson(str(c.challenge)));
+    eq(createHash("sha256").update(m.signingInput("station_binding", body)).digest("hex"), c.signing_input_sha256, `${c.challenge.action}: digest`);
+    for (const k of sbind.external.public_keys) {
+      const sig = b64u(c[`${k.alg}_sig`]);
+      m.verifySignature(k.alg, b64u(k.pub), "station_binding", body, sig);
+      throwsCode(() => m.verifySignature(k.alg, b64u(k.pub), "signer_report", body, sig), "bad_signature");
+    }
+  }
+});
+check("station binding: challenges", () => {
+  for (const c of sbind.challenges) {
+    if (c.fields === undefined) reportError(() => m.parseStationBindingChallenge(c.text), c.code);
+    else same(sbindChallenge(m.parseStationBindingChallenge(c.text)), c.fields, c.label);
+  }
+  const g = sbind.valid[0].challenge;
+  const fresh = (origin, action, expected, expiresAt) =>
+    m.stationBindingChallenge(action, origin, sbindClaims(g), g.account_id, g.genesis_hash, g.head, g.signer, expected, g.issued_at, expiresAt);
+  const [one, two] = [fresh("https://Station-Dev.agora.build/", "bind", { type: "never_bound" }, g.expires_at), fresh(g.origin, "bind", { type: "never_bound" }, g.expires_at)];
+  eq(m.canonicalJson(one), one, "canonical JSON");
+  const [a, b] = [m.parseStationBindingChallenge(one), m.parseStationBindingChallenge(two)];
+  eq(a.origin, "https://station-dev.agora.build", "the Station normalized");
+  if (a.nonce === b.nonce) throw new Error("a fresh nonce each time");
+  same({ ...sbindChallenge(a), nonce: g.nonce }, g, "the vectors' bind but its nonce");
+  reportError(() => fresh(g.origin, "bind", { type: "never_bound" }, g.expires_at + 1), "malformed");
+  reportError(() => fresh(g.origin, "transfer", { type: "never_bound" }, g.expires_at), "malformed");
+  reportError(() => fresh(g.origin, "unbind", { type: "bound", bindingId: "bind-0001", version: 1, owner: "ab00000000000000000000000009" }, g.expires_at), "malformed");
+});
+check("station binding: proofs", () => {
+  for (const c of [...sbind.valid, ...sbind.invalid]) {
+    const verify = () => m.verifyStationBinding(sbindLog(c), c.proof, str(c.challenge), c.now_ms);
+    if (c.expect !== undefined) same(sbindOut(verify()), c.expect, c.label);
+    else reportError(verify, c.code);
+  }
+  const byCase = Object.fromEntries([...sbind.valid, ...sbind.invalid].map((c) => [c.label, c]));
+  eq(byCase.demoted_manager.code, "not_a_manager", "demoted_manager");
+  eq(byCase.high_s_signature.code, "bad_signature", "high_s_signature");
+  eq(byCase.unbind_p256.expect.action, "unbind", "unbind_p256");
+});
+check("station binding: the builder", () => {
+  for (const c of [...sbind.builder, ...sbind.request]) {
+    const build = () => new m.StationBindingRequest(sbindLog(c), str(c.challenge), c.signer, c.station, sbindClaims(c.expected), "key", c.now_ms);
+    if (c.body_json === undefined) {
+      reportError(build, c.code);
+      continue;
+    }
+    const request = build();
+    eq(request.bodyJson(), c.body_json, c.label);
+    same(sbindChallenge(request.challenge()), c.challenge, `${c.label}: the challenge shown`);
+  }
+});
+check("station binding: the immutable request", () => {
+  for (const c of sbind.request) {
+    const log = sbindLog(c);
+    const request = (challenge) => new m.StationBindingRequest(log, str(challenge), c.signer, c.station, sbindClaims(c.expected), c.key, c.now_ms);
+    const held = request(c.challenge);
+    const body = held.bodyJson();
+    const sr = held.signRequest();
+    eq(sr.purpose, c.sign_request.purpose, "purpose");
+    eq(sr.freshConfirmation, true, "a fresh confirmation");
+    eq(sr.label, c.sign_request.label, "label");
+    eq(sr.keyId, c.key, "key");
+    eq(sr.bodyJson, body, "the held body shown");
+    eq(hex(sr.input), hex(m.encodeFields([utf8(sr.label), utf8(body)])), "input");
+    for (const f of c.finishes) {
+      const input = f.over === "held" ? sr.input : request({ ...c.challenge, nonce: f.over.nonce }).signRequest().input;
+      const sig = signWith(f.signed_with, input);
+      if (f.code === undefined) eq(held.finish(sig), `{"body":${body},"sig":"${Buffer.from(sig).toString("base64url")}"}`, `${c.label} ${f.label}`);
+      else reportError(() => held.finish(sig), f.code);
+    }
+    eq(held.bodyJson(), body, "the held body never changes");
+  }
+});
+check("station binding: the synchronous signer, with a software key", () => {
+  const c = sbind.request.find((r) => r.signer === "member:dev-phone");
+  const store = new m.SoftwareKeyStore();
+  store.insertP256("dev-phone/auth", unhex(keys["dev-phone"].auth.secret_hex));
+  store.insertP256("dev-mac/auth", unhex(keys["dev-mac"].auth.secret_hex));
+  const log = sbindLog(c);
+  const sign = (key) => m.signStationBinding(store, log, str(c.challenge), c.signer, c.station, sbindClaims(c.expected), key, c.now_ms);
+  const v = m.verifyStationBinding(log, sign(c.key), str(c.challenge), c.now_ms);
+  eq(v.atHead, true, "at the head");
+  reportError(() => sign("dev-mac/auth"), "bad_signature");
+});
+
 // ---------------------------------- delegated host work: control records
 // r9-vectors-host-work-control: every record parses and verifies on each of
 // its chains as `checks` says (or its parse refuses it, `parse_error`); the
