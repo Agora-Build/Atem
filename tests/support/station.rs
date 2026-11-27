@@ -54,6 +54,19 @@
 //!   device list, as if the link were that account's.
 //! - Bytes the shared reader refuses get no answer (kept in
 //!   [`FakeStation::sent`]).
+//! - [`FakeStation::suspend`] and [`FakeStation::restore`]: a Station that
+//!   suspends the account's service (the delegated host-work design III.5;
+//!   the `text`, the disclosure order and the host's 10 s drop are Atem's
+//!   proposal, for Astation's agreement, #120 7207832274), as the built-in
+//!   Station does for a disabled or unowned account: on a relay fake each
+//!   channel the test names is closed `service_suspended` (B-3), the
+//!   host's link gets the `service_suspended` notice (B-2) and is closed,
+//!   and every new host connection's proof is refused `service_suspended`
+//!   with the text (B-1, the relay's own: `FakeAstation::suspension`); on
+//!   Astation's local link the notice, the link kept. While suspended every
+//!   call gets its typed refusal (a mailbox call no answer), a proof that
+//!   verifies the suspension's refusal (one that doesn't its verifier
+//!   code), and no `heads` go. Built from the shared core's builders.
 //! - [`FakeStation::require_proof`]: a Station that requires the host's
 //!   fresh route proof on each link before it serves the link's calls (the
 //!   delegated host-work design I.5.8, "Which host is calling": session-v1
@@ -431,6 +444,12 @@ pub struct FakeStation {
     drop_done_results: u64,
     /// Puts the Station couldn't read (dropped unanswered, rule 3).
     puts_dropped: u64,
+    /// The account's service suspended here (III.5): the text, while it
+    /// is; the relay's refusal of new host connections (a relay fake's),
+    /// and whether the links are a relay's.
+    suspended: Option<String>,
+    relay_suspension: super::astation::Suspension,
+    relay: bool,
 }
 
 impl FakeStation {
@@ -486,7 +505,65 @@ impl FakeStation {
             drop_stored: 0,
             drop_done_results: 0,
             puts_dropped: 0,
+            suspended: None,
+            relay_suspension: astation.suspension(),
+            relay: astation.is_relay(),
         }
+    }
+
+    /// The Station suspends the account's service (the module docs; III.5):
+    /// on a relay fake the channels `channels` names are closed
+    /// `service_suspended` (B-3), the host's link gets the notice (B-2) and
+    /// is closed, and new host connections are refused at their proof
+    /// (B-1); on Astation's local link the notice, the link kept. Until
+    /// [`FakeStation::restore`].
+    pub fn suspend(&mut self, text: &str, channels: &[&str]) {
+        self.suspend_with(text, channels, true);
+    }
+
+    /// [`FakeStation::suspend`], but a relay link is left open after the
+    /// notice: a Station that doesn't close it (the host drops it).
+    pub fn suspend_leaving_the_link(&mut self, text: &str) {
+        self.suspend_with(text, &[], false);
+    }
+
+    fn suspend_with(&mut self, text: &str, channels: &[&str], close: bool) {
+        self.suspended = Some(text.to_owned());
+        if self.relay {
+            *self.relay_suspension.lock().unwrap() = Some(text.to_owned());
+        }
+        // The link served, else the fake's newest (a host whose Station
+        // calls it never served: the hook off).
+        let Some(link) = self.link.or_else(|| self.out.latest()) else {
+            return;
+        };
+        for channel in channels {
+            let close = serde_json::json!({"type": "channel", "event": "close",
+                "channel": channel, "reason": "service_suspended"});
+            self.out.send(link, close.to_string());
+        }
+        let notice = atem_client::station_notice::ServiceSuspended::new(text)
+            .expect("a valid text")
+            .to_json()
+            .to_string();
+        self.out.send(link, notice);
+        if self.relay && close {
+            self.out.close(link);
+            self.link = None;
+        }
+    }
+
+    /// The account's service again (III.5, "Re-enabling"): new host
+    /// connections are routed on their proof again, and the links' calls
+    /// served.
+    pub fn restore(&mut self) {
+        self.suspended = None;
+        *self.relay_suspension.lock().unwrap() = None;
+    }
+
+    /// The account's service is suspended here now.
+    pub fn is_suspended(&self) -> bool {
+        self.suspended.is_some()
     }
 
     /// From now on a link's calls are served only after the host proved on
@@ -1017,10 +1094,10 @@ impl FakeStation {
         }
     }
 
-    /// Whether the Station serves `link`'s calls: no proof required, or
-    /// the link's verified.
+    /// Whether the Station serves `link`'s calls: not suspended, and no
+    /// proof required, or the link's verified.
     fn serves(&self, link: u64) -> bool {
-        self.proof.is_none() || self.proved.contains(&link)
+        self.suspended.is_none() && (self.proof.is_none() || self.proved.contains(&link))
     }
 
     /// The host's `host_route` on `link`, checked against the Station's own
@@ -1041,12 +1118,15 @@ impl FakeStation {
             ),
             _ => Err(HostRouteRefusal::Malformed("no challenge on this link")),
         };
-        let reply = match &verdict {
-            Ok(route) => RelayReply::ok(route),
-            Err(refusal) => RelayReply::refused(refusal),
+        // A suspended account's proof that verified gets the suspension
+        // (III.5); one that doesn't its verifier code (least disclosure).
+        let reply = match (&verdict, &self.suspended) {
+            (Ok(_), Some(text)) => RelayReply::suspended(text).expect("a valid text"),
+            (Ok(route), None) => RelayReply::ok(route),
+            (Err(refusal), _) => RelayReply::refused(refusal),
         };
         self.out.send(link, reply.to_json().to_string());
-        let verified = verdict.is_ok();
+        let verified = verdict.is_ok() && self.suspended.is_none();
         self.proofs.push(ProofSeen {
             link,
             nonce,
@@ -1148,6 +1228,10 @@ impl FakeStation {
     fn reply(&mut self, link: u64, bytes: &str) -> Result<ToStation, RelayError> {
         // Host senders' mailbox calls (§11.5), told by their `op`: read by
         // the shared mailbox reader (one it refuses gets no answer).
+        // While suspended (III.5) a mailbox call gets no answer.
+        if mailbox_call(bytes) && self.suspended.is_some() {
+            return ToStation::decode(bytes.as_bytes());
+        }
         if mailbox_call(bytes) {
             let reply = match MailboxToStation::decode(bytes.as_bytes()) {
                 // The receiving host's own puts (its status objects back to
