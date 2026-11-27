@@ -18,9 +18,9 @@ use atem_client::control::{
 use atem_client::domain::{SIGNER_REPORT_DRAFTS, SIGNER_REPORT_RECORDS, SignLabel, SigningInput};
 use atem_client::encoding::{Hash32, b64u, enc};
 use atem_client::member_report::{
-    JournalView, MAX_GENERATION, RecoveryPlan, ReportRefusal, SIGNER_VERIFY_ORDER,
-    SignerReportChallenge, process_generation, sign_signer_report, signer_report_body,
-    verify_signer_report,
+    JournalView, MAX_GENERATION, OutOfPlan, PlanRecord, RecoveryPlan, ReportRefusal,
+    SIGNER_VERIFY_ORDER, SignerReportChallenge, process_generation, sign_signer_report,
+    signer_report_body, signer_report_plan_record, verify_signer_report,
 };
 use atem_client::membership::{
     Action, Member, MemberKind, Membership, Role, RolesChange, sign_entry,
@@ -35,6 +35,7 @@ const STATION: &str = "https://station-dev.agora.build";
 const OTHER_STATION: &str = "https://station.agora.build";
 const SLOT: &str = "astation-ios";
 const PHONE: &str = "member:dev-phone";
+const MAC: &str = "member:dev-mac";
 /// The reporter's clock: after log L's entries.
 const NOW: u64 = 1_793_264_001_000;
 const ISSUED: u64 = 1_793_264_000_000;
@@ -736,6 +737,264 @@ fn the_builder_reads_each_journal_body_strictly() {
                 .map_err(|r| r.code()),
             Err("malformed")
         );
+    }
+}
+
+/// The plan predicate (`signer_report_plan_record`, Astation's ask on #114
+/// comment 7093796254): whether a control-record body is one of the plan's
+/// records for this member and origin, typed. In the plan: this member's
+/// service `revoke` or `interrupt_running` naming the origin, or its
+/// `host:` interrupt (no origin, so at any origin). Not in the plan, in the
+/// order checked: another account, genesis, signer, then a service's stop
+/// at another origin. Refused (`malformed`): this member's cover, hold or
+/// release (reading (c), checked after the signer and before the origin),
+/// a body that isn't a control record's, and a member or origin outside
+/// its grammar.
+#[test]
+fn the_plan_predicate_judges_a_body_by_the_builders_rule() {
+    let (v, book) = (Vectors::load(), Book::load());
+    let log = log_l(&v);
+    let good = service_stop(&book, "dev-phone", REVOKE, STATION, 1);
+    let judge = |body: &str, member: &str, origin: &str| {
+        signer_report_plan_record(&log, body, member, origin).map_err(|r| r.code())
+    };
+    let edit = |f: &dyn Fn(&mut ControlBody)| {
+        let mut b = good.clone();
+        f(&mut b);
+        text(&b)
+    };
+    let out = |reason| Ok(PlanRecord::NotInPlan(reason));
+    let in_plan = Ok(PlanRecord::InPlan);
+    // In the plan.
+    for (what, body) in [
+        ("a revoke with interrupt_running", text(&good)),
+        (
+            "an interrupt_running",
+            text(&service_stop(&book, "dev-phone", INTERRUPT, STATION, 2)),
+        ),
+        (
+            "a revoke without interrupt_running",
+            edit(&|b| {
+                b.action = ControlAction::Revoke {
+                    interrupt_running: false,
+                }
+            }),
+        ),
+        (
+            "a host sender's interrupt",
+            text(&host_interrupt("dev-phone", 3)),
+        ),
+        (
+            "a body written another way",
+            serde_json::to_string_pretty(&good.to_json()).unwrap(),
+        ),
+    ] {
+        assert_eq!(judge(&body, PHONE, STATION), in_plan, "{what}");
+    }
+    // A host sender's interrupt names no origin: it is the plan's at any.
+    assert_eq!(
+        judge(&text(&host_interrupt("dev-phone", 3)), PHONE, OTHER_STATION),
+        in_plan
+    );
+    // Not in the plan, each with why.
+    assert_eq!(
+        judge(
+            &edit(&|b| b.account_id = "acct-other".into()),
+            PHONE,
+            STATION
+        ),
+        out(OutOfPlan::AnotherAccount)
+    );
+    assert_eq!(
+        judge(&edit(&|b| b.genesis_hash = Hash32([1; 32])), PHONE, STATION),
+        out(OutOfPlan::AnotherGenesis)
+    );
+    for (what, signer) in [
+        ("another member's", ControlSigner::Member("dev-mac".into())),
+        ("the service's own key's", ControlSigner::Principal),
+    ] {
+        let body = edit(&|b| b.signer = signer.clone());
+        assert_eq!(
+            judge(&body, PHONE, STATION),
+            out(OutOfPlan::AnotherSigner),
+            "{what}"
+        );
+    }
+    assert_eq!(
+        judge(&text(&good), "member:dev-mac", STATION),
+        out(OutOfPlan::AnotherSigner),
+        "asked for another member"
+    );
+    let elsewhere = edit(&|b| {
+        b.feed = Some(ControlFeed {
+            origin: OTHER_STATION.into(),
+            feed_id: FEED.into(),
+        })
+    });
+    assert_eq!(
+        judge(&elsewhere, PHONE, STATION),
+        out(OutOfPlan::AnotherOrigin)
+    );
+    assert_eq!(
+        judge(&text(&good), PHONE, OTHER_STATION),
+        out(OutOfPlan::AnotherOrigin),
+        "asked for another origin"
+    );
+    // This member's cover, hold or release is refused, never skipped, at
+    // any origin; another signer's, account's or genesis's is out first.
+    for action in [
+        ControlAction::Cover,
+        ControlAction::Hold,
+        ControlAction::Release,
+    ] {
+        let mine = edit(&|b| b.action = action);
+        assert_eq!(judge(&mine, PHONE, STATION), Err("malformed"), "{action:?}");
+        assert_eq!(
+            judge(&mine, PHONE, OTHER_STATION),
+            Err("malformed"),
+            "{action:?}"
+        );
+        let theirs = edit(&|b| {
+            b.action = action;
+            b.signer = ControlSigner::Principal;
+        });
+        assert_eq!(
+            judge(&theirs, PHONE, STATION),
+            out(OutOfPlan::AnotherSigner)
+        );
+        let other_account = edit(&|b| {
+            b.action = action;
+            b.account_id = "acct-other".into();
+        });
+        assert_eq!(
+            judge(&other_account, PHONE, STATION),
+            out(OutOfPlan::AnotherAccount)
+        );
+    }
+    // What isn't a control record's body.
+    let mut host_revoke = host_interrupt("dev-phone", 2).to_json();
+    host_revoke["action"] = json!("revoke");
+    let json_edit = |f: &dyn Fn(&mut Value)| {
+        let mut b = good.to_json();
+        f(&mut b);
+        b.to_string()
+    };
+    for (what, body) in [
+        ("not JSON", "{".to_owned()),
+        ("an array", format!("[{}]", text(&good))),
+        ("a field beyond", json_edit(&|b| b["note"] = json!("x"))),
+        ("a null", json_edit(&|b| b["about"]["by"] = Value::Null)),
+        (
+            "a duplicate key",
+            text(&good).replacen(r#""v":1"#, r#""v":1,"v":1"#, 1),
+        ),
+        ("a signed object", signed(&book, "dev-phone/auth", &good)),
+        ("a host principal's revoke", host_revoke.to_string()),
+        (
+            "over 16 KiB",
+            format!("{}{}", " ".repeat(16 * 1024), text(&good)),
+        ),
+    ] {
+        assert_eq!(judge(&body, PHONE, STATION), Err("malformed"), "{what}");
+    }
+    // The member and the origin in their grammar: `member:<id>`, the
+    // origin exactly as normalize_relay writes it.
+    for member in ["service:svc-discord", "host:host-a", "dev-phone", ""] {
+        assert_eq!(
+            judge(&text(&good), member, STATION),
+            Err("malformed"),
+            "{member}"
+        );
+    }
+    for origin in [
+        "https://Station-Dev.agora.build/",
+        "ftp://station-dev.agora.build",
+        "",
+    ] {
+        assert_eq!(
+            judge(&text(&good), PHONE, origin),
+            Err("malformed"),
+            "{origin}"
+        );
+    }
+    // Bodies only: neither the list's freeze nor the member's standing
+    // changes an answer (the builder refuses those itself).
+    let frozen = log
+        .evaluate(&[strict(v.wire("C6_mac"))], &Clock::at(NOW).now)
+        .next;
+    assert!(frozen.frozen().is_some());
+    assert_eq!(
+        signer_report_plan_record(&frozen, &text(&good), PHONE, STATION),
+        Ok(PlanRecord::InPlan)
+    );
+    let stranger = service_stop(&book, "dev-evil", REVOKE, STATION, 1);
+    assert_eq!(judge(&text(&stranger), "member:dev-evil", STATION), in_plan);
+}
+
+/// The predicate is the builder's rule: a body the builder takes in a
+/// journal set is exactly one the predicate puts in the plan, as a record
+/// and as a draft, for every body the strict reading test refuses or
+/// takes.
+#[test]
+fn the_plan_predicate_and_the_builder_agree_on_every_body() {
+    let (v, book) = (Vectors::load(), Book::load());
+    let log = log_l(&v);
+    let good = service_stop(&book, "dev-phone", REVOKE, STATION, 1);
+    let edit = |f: &dyn Fn(&mut ControlBody)| {
+        let mut b = good.clone();
+        f(&mut b);
+        text(&b)
+    };
+    let mut bodies = vec![
+        text(&good),
+        text(&service_stop(&book, "dev-phone", INTERRUPT, STATION, 2)),
+        text(&host_interrupt("dev-phone", 3)),
+        text(&host_interrupt("dev-mac", 3)),
+        edit(&|b| b.account_id = "acct-other".into()),
+        edit(&|b| b.genesis_hash = Hash32([1; 32])),
+        edit(&|b| b.signer = ControlSigner::Member("dev-mac".into())),
+        edit(&|b| b.signer = ControlSigner::Principal),
+        edit(&|b| {
+            b.feed = Some(ControlFeed {
+                origin: OTHER_STATION.into(),
+                feed_id: FEED.into(),
+            })
+        }),
+        "{".to_owned(),
+        signed(&book, "dev-phone/auth", &good),
+    ];
+    for action in [
+        ControlAction::Cover,
+        ControlAction::Hold,
+        ControlAction::Release,
+    ] {
+        bodies.push(edit(&|b| b.action = action));
+    }
+    for (challenge, station, member) in [
+        (challenge(PHONE, SLOT), STATION, PHONE),
+        (
+            SignerReportChallenge::new(MAC, SLOT, OTHER_STATION, 3, ISSUED, EXPIRES, recovery())
+                .unwrap(),
+            OTHER_STATION,
+            MAC,
+        ),
+    ] {
+        for body in &bodies {
+            let in_plan = signer_report_plan_record(&log, body, member, challenge.origin())
+                == Ok(PlanRecord::InPlan);
+            for (records, drafts) in [(vec![body.clone()], vec![]), (vec![], vec![body.clone()])] {
+                let built = signer_report_body(
+                    &log,
+                    &challenge,
+                    member,
+                    SLOT,
+                    station,
+                    &journal_of(&records, &drafts),
+                    NOW,
+                );
+                assert_eq!(built.is_ok(), in_plan, "{member} at {station}: {body}");
+            }
+        }
     }
 }
 

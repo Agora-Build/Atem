@@ -39,7 +39,11 @@
 //! service's `revoke` or `interrupt_running` naming the challenge's origin,
 //! or a host sender's `interrupt_running` (`host:<host_id>`), which names no
 //! origin: any Station of the account may carry it. A service's records at
-//! another origin aren't the plan's.
+//! another origin aren't the plan's. [`signer_report_plan_record`] exposes
+//! that rule, typed ([`PlanRecord`], [`OutOfPlan`]), so an adapter selects
+//! its records and drafts, and checks its barrier, by the builder's own
+//! rule (Astation's ask on #114 comment 7093796254): one implementation,
+//! which the builder and the verifier's export check call too.
 //!
 //! **Atem's readings, for Astation's confirmation on #114** (the agreed
 //! text leaves them open; each is fail-closed):
@@ -76,8 +80,8 @@ use serde_json::{Map, Value, json};
 
 use super::{
     Common, HeldBody, PROCESS_BYTES, ReportChallenge, ReportRefusal, Signer, check_build,
-    common_body, exact, int_field, malformed, process_generation, read_report, read_signer,
-    str_field, strict_challenge,
+    common_body, exact, int_field, malformed, origin_ok, process_generation, read_report,
+    read_signer, str_field, strict_challenge,
 };
 use crate::canonical::{self, MAX_SAFE_INTEGER, Numbers};
 use crate::control::record::{
@@ -472,6 +476,55 @@ impl JournalSummary {
     }
 }
 
+/// Whether a control-record body is one of the plan's records for a member
+/// and an origin (B2): [`signer_report_plan_record`]'s answer, the rule the
+/// builder reads a journal's bodies by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanRecord {
+    /// One of the plan's records: the builder takes it in `records` or
+    /// `drafts`, and the plan's barrier (B2) holds it: while held, the
+    /// adapter refuses to draft or sign it.
+    InPlan,
+    /// A control record outside the plan: the adapter leaves it out of this
+    /// plan's report (handed to the builder it is `malformed`), and this
+    /// plan's barrier doesn't hold it.
+    NotInPlan(OutOfPlan),
+}
+
+/// Why a control-record body isn't one of the plan's records, in the order
+/// the predicate checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutOfPlan {
+    /// Another `account_id` than the list's.
+    AnotherAccount,
+    /// Another `genesis_hash` than the list's.
+    AnotherGenesis,
+    /// Another `signer` than the member: another member, or the
+    /// principal's own key.
+    AnotherSigner,
+    /// A service's `revoke` or `interrupt_running` naming another origin.
+    AnotherOrigin,
+}
+
+impl OutOfPlan {
+    /// Every reason, in the order the predicate checks.
+    pub const ALL: [OutOfPlan; 4] = [
+        OutOfPlan::AnotherAccount,
+        OutOfPlan::AnotherGenesis,
+        OutOfPlan::AnotherSigner,
+        OutOfPlan::AnotherOrigin,
+    ];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            OutOfPlan::AnotherAccount => "another_account",
+            OutOfPlan::AnotherGenesis => "another_genesis",
+            OutOfPlan::AnotherSigner => "another_signer",
+            OutOfPlan::AnotherOrigin => "another_origin",
+        }
+    }
+}
+
 /// Who and where the plan's records are: by `member:<member>`, of this
 /// account and genesis, a service's naming `origin`.
 struct Plan<'a> {
@@ -481,30 +534,62 @@ struct Plan<'a> {
     origin: &'a str,
 }
 
+/// A journal body read strictly (strict I-JSON within 16 KiB, exactly a
+/// control-record body, R9.1's rules): the body and its `jcs`, or `None`.
+fn read_journal_body(text: &str) -> Option<(ControlBody, String)> {
+    let value =
+        canonical::parse_strict(text.as_bytes(), MAX_OBJECT_BYTES, Numbers::IntegersOnly).ok()?;
+    let (_, jcs) = check_body(&value).ok()?;
+    let body = ControlBody::from_json(&value).ok()?;
+    Some((body, jcs))
+}
+
 impl Plan<'_> {
-    /// Whether `body` is one of the plan's records (B2): this member's
-    /// `revoke` or `interrupt_running` of a service naming the origin, or
-    /// its `interrupt_running` of a host sender (no origin).
-    fn holds(&self, body: &ControlBody) -> bool {
-        body.account_id == self.account_id
-            && body.genesis_hash == self.genesis_hash
-            && matches!(&body.signer, ControlSigner::Member(id) if id == self.member)
-            && match (&body.principal, body.action, &body.feed) {
-                (
-                    ControlPrincipal::Service(_),
-                    ControlAction::Revoke { .. } | ControlAction::InterruptRunning { .. },
-                    Some(feed),
-                ) => feed.origin == self.origin,
-                (ControlPrincipal::Host(_), ControlAction::InterruptRunning { .. }, None) => true,
-                _ => false,
+    /// The plan predicate (B2), the one rule of the builder, the verifier's
+    /// export check and [`signer_report_plan_record`]. In this order: of
+    /// another account, genesis or signer, it isn't the plan's; this
+    /// member's `cover`, `hold` or `release` is refused (`malformed`:
+    /// reading (c), a native manager signs none); a service's `revoke` or
+    /// `interrupt_running` is the plan's when it names the origin, and a
+    /// host sender's `interrupt_running` (no origin) always.
+    fn judge(&self, body: &ControlBody) -> Result<PlanRecord, ReportRefusal> {
+        let out = |why| Ok(PlanRecord::NotInPlan(why));
+        if body.account_id != self.account_id {
+            return out(OutOfPlan::AnotherAccount);
+        }
+        if body.genesis_hash != self.genesis_hash {
+            return out(OutOfPlan::AnotherGenesis);
+        }
+        if !matches!(&body.signer, ControlSigner::Member(id) if id == self.member) {
+            return out(OutOfPlan::AnotherSigner);
+        }
+        match (&body.principal, body.action, &body.feed) {
+            (
+                ControlPrincipal::Service(_),
+                ControlAction::Revoke { .. } | ControlAction::InterruptRunning { .. },
+                Some(feed),
+            ) if feed.origin == self.origin => Ok(PlanRecord::InPlan),
+            (
+                ControlPrincipal::Service(_),
+                ControlAction::Revoke { .. } | ControlAction::InterruptRunning { .. },
+                Some(_),
+            ) => out(OutOfPlan::AnotherOrigin),
+            (ControlPrincipal::Host(_), ControlAction::InterruptRunning { .. }, None) => {
+                Ok(PlanRecord::InPlan)
             }
+            _ => Err(malformed("a native manager's cover, hold or release")),
+        }
+    }
+
+    /// Whether `body` is one of the plan's records ([`Plan::judge`]).
+    fn holds(&self, body: &ControlBody) -> bool {
+        matches!(self.judge(body), Ok(PlanRecord::InPlan))
     }
 
     /// Each body of a journal set read strictly as one of the plan's
-    /// records (strict I-JSON within 16 KiB, exactly a control-record
-    /// body, R9.1's rules): their digests, sorted. A body twice in the set
-    /// (its `jcs` the same, however written) or any other body is
-    /// `malformed`, naming the set.
+    /// records ([`read_journal_body`], [`Plan::judge`]): their digests,
+    /// sorted. A body twice in the set (its `jcs` the same, however
+    /// written) or any other body is `malformed`, naming the set.
     fn digests(
         &self,
         bodies: &[String],
@@ -512,11 +597,7 @@ impl Plan<'_> {
     ) -> Result<Vec<[u8; 32]>, ReportRefusal> {
         let mut digests = Vec::with_capacity(bodies.len());
         for text in bodies {
-            let value =
-                canonical::parse_strict(text.as_bytes(), MAX_OBJECT_BYTES, Numbers::IntegersOnly)
-                    .map_err(|_| malformed(set))?;
-            let (_, jcs) = check_body(&value).map_err(|_| malformed(set))?;
-            let body = ControlBody::from_json(&value).map_err(|_| malformed(set))?;
+            let (body, jcs) = read_journal_body(text).ok_or(malformed(set))?;
             if !self.holds(&body) {
                 return Err(malformed(set));
             }
@@ -524,6 +605,52 @@ impl Plan<'_> {
         }
         sorted_once(digests).ok_or(malformed(set))
     }
+}
+
+/// The plan predicate (B2; Astation's ask on #114 comment 7093796254):
+/// whether `body_json`, a control-record body as an adapter's journal
+/// holds it, is one of the plan's records for `member` (`member:<id>`) at
+/// `origin` (the challenge's, exactly as `normalize_relay` writes it), the
+/// account and genesis `log`'s. The builder reads a journal's bodies by
+/// exactly this rule: what it answers [`PlanRecord::InPlan`] the builder
+/// takes in `records` or `drafts`, anything else refuses the build
+/// (`malformed`). So an adapter selects its records and drafts, and checks
+/// its barrier before drafting or signing, by the builder's own rule.
+///
+/// The body is read as the builder reads it (strict I-JSON within 16 KiB,
+/// exactly a control-record body), then judged in this order: another
+/// account (`another_account`), genesis (`another_genesis`) or signer
+/// (`another_signer`: another member, or the principal's own key) is
+/// [`PlanRecord::NotInPlan`]; this member's `cover`, `hold` or `release`
+/// is refused (`malformed`: a native manager signs none, so the journal
+/// never holds one; never skipped); a service's `revoke` or
+/// `interrupt_running` at another origin is `another_origin`; then it is
+/// in the plan (a `host:` principal's `interrupt_running`, which names no
+/// origin, at every origin). Refused (`malformed`): `member` not
+/// `member:<id>`, `origin` not in its exact form, a body that isn't a
+/// control record's. Bodies only: the list's freeze and the member's
+/// standing (removed, demoted, never a manager) change no answer; the
+/// builder refuses those itself.
+pub fn signer_report_plan_record(
+    log: &Membership,
+    body_json: &str,
+    member: &str,
+    origin: &str,
+) -> Result<PlanRecord, ReportRefusal> {
+    let Some(Signer::Member(id)) = read_signer(member) else {
+        return Err(malformed("member"));
+    };
+    if !origin_ok(origin) {
+        return Err(malformed("origin"));
+    }
+    let (body, _) = read_journal_body(body_json).ok_or(malformed("body"))?;
+    Plan {
+        account_id: log.account_id(),
+        genesis_hash: log.genesis_hash(),
+        member: id,
+        origin,
+    }
+    .judge(&body)
 }
 
 /// `digests` sorted by bytes, or `None` when one is there twice.

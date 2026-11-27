@@ -61,9 +61,10 @@ use crate::station_route::normalize_relay;
 pub mod signer;
 
 pub use signer::{
-    JOURNAL_ID_BYTES, JournalSummary, JournalView, MAX_GENERATION, RecoveryPlan,
-    SIGNER_REPORT_TYPE, SIGNER_VERIFY_ORDER, SignerReportBody, SignerReportChallenge,
-    VerifiedSignerReport, sign_signer_report, signer_report_body, verify_signer_report,
+    JOURNAL_ID_BYTES, JournalSummary, JournalView, MAX_GENERATION, OutOfPlan, PlanRecord,
+    RecoveryPlan, SIGNER_REPORT_TYPE, SIGNER_VERIFY_ORDER, SignerReportBody, SignerReportChallenge,
+    VerifiedSignerReport, sign_signer_report, signer_report_body, signer_report_plan_record,
+    verify_signer_report,
 };
 
 /// The body's `type`.
