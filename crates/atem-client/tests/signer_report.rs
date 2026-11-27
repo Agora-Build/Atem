@@ -25,8 +25,9 @@ use atem_client::control::{
 use atem_client::domain::{SignLabel, SigningInput};
 use atem_client::encoding::{Hash32, b64u, b64u_decode, hex};
 use atem_client::member_report::{
-    JournalView, SIGNER_VERIFY_ORDER, SignerReportChallenge, VerifiedSignerReport,
-    process_generation, sign_signer_report, signer_report_body, verify_signer_report,
+    JournalView, OutOfPlan, PlanRecord, SIGNER_VERIFY_ORDER, SignerReportChallenge,
+    VerifiedSignerReport, process_generation, sign_signer_report, signer_report_body,
+    signer_report_plan_record, verify_signer_report,
 };
 use atem_client::membership::{
     Action, HostNow, Member, MemberKind, Membership, Role, RolesChange, sign_entry,
@@ -38,7 +39,7 @@ use support::{Book, Vectors, fixtures_dir, load, strict};
 
 const FILE: &str = "r9-vectors-signer-report";
 
-const NOTE: &str = "A native manager's signed report of its control-record signing journal (host-work-v1 §11.1 \"The signer report\"; Astation #114 item 4, agreed with Astation, #114 comment 7089435073), for a Station recovering from a rollback: wire {\"body\":{…},\"sig\"}, the body {type: atem-signer-report, v: 1, account_id, genesis_hash, head{seq, hash}, signer, slot, process, challenge{origin, connection, nonce, issued_at, expires_at}, recovery{generation, plan_id, candidate_feed_id, source_hash, evidence_hash}, journal{id, since, revision, records, records_hash, drafts, drafts_hash}} signed by a current native member's own auth_key (signer member:<device_id>; one that held manage at some seq of the list) over enc([\"atem-signer-report-v1\", jcs(body)]) (R9.1), under the alg the device list pins. A challenge is what the minter stores, {signer, slot, origin, connection, nonce, issued_at, expires_at, recovery}: signer member:<id>, slot and ids 1-128 bytes of [A-Za-z0-9._:-], origin exact as station_route::normalize_relay writes it, connection 1 to 2^53-1, nonce 32 bytes, process and journal.id 16 bytes (base64url, no padding), 0 < expires_at - issued_at <= 30000 ms, recovery.generation a canonical decimal string 1 to 2^63-1 (no sign, no leading zero), plan_id and candidate_feed_id UUID v4, the hashes lowercase hex SHA-256; journal.since 1 to 2^53-1, revision, records and drafts 0 to 2^53-1; a challenge text is at most 4,096 bytes, the body's jcs at most 4,096 bytes and the object at most 16 KiB; no null, no array, no kit_sig, no field beyond these at any level, no duplicate key (escaped ones included). The plan's records (B2): a control-record body (r9-vectors-host-work-control's form) this member signs (signer member:<id>), of this account and genesis, a service's revoke or interrupt_running naming the challenge's origin, or a host principal's interrupt_running (no origin). records_hash = SHA-256(enc([\"atem-signer-report-records-v1\", d1…dn])) over each record body's SHA-256(jcs(body)) (32 bytes), sorted by bytes; drafts_hash the same with \"atem-signer-report-drafts-v1\". Device lists: log L of r9-vectors-membership-log followed by `chain` (labels of `entries`), then the carriage `freeze` (a label of r9-vectors-membership-log's others) when a case names one, which freezes it; each list verified at the case's now_ms. Keys are r9-vectors-keys' (`signed_with` names <name>/<part>: auth, host_key, or recovery/sign for the kit's recovery key); dev-desk is the Ed25519 native the chain adds without manage (SR7_add_desk) and makes a manager (SR8_desk_manages). `records`: the control records the cases use, each body, its jcs and digest, and the record as its signer signed it. `challenges`: texts read by SignerReportChallenge::parse (bindings parse_signer_report_challenge): `fields` when read, else `code`. `valid` and `invalid`: verify_signer_report(list, report, the stored challenge `challenge`, the exported signed records `exported`, now_ms): `expect` is the VerifiedSignerReport (process base64url, at_head true at the list's head, false at an ancestor, journal.id base64url, records the verified records as given), or `code`, the first failure in the order malformed, frozen, wrong_account, unknown_signer, not_a_manager, bad_signature, stale_log, fork, signer_mismatch, slot_mismatch, challenge_mismatch, recovery_mismatch, records_mismatch, expired (bindings: Report{code}). records_mismatch is an exported record that isn't a signed control record of the plan by this member, one whose signature doesn't verify under its key (low S), a duplicate, or another count or records_hash than the report's: a body in signing with no saved signature is in records and can't be exported, so such a report is refused (Astation's conservative rule). A report's process is the fixed bytes \"vectors-process!\"; a builder draws its own once per loaded core (process_generation). `builder`: signer_report_body(list, challenge, signer, slot, station, journal{id, since, revision, records, drafts: the bodies' texts}, now_ms): `body_but_process` (the body it builds, but its process), or `code` (origin_mismatch when the challenge's origin isn't station normalized; malformed for a journal body that isn't one of the plan's records by this member, or one twice in a set). `request`: the immutable request (bindings SignerReportRequest): built as a builder case, its sign_request (`purpose`, `fresh_confirmation`, `label`; input = enc([label, jcs(body)]), body_json = jcs(body)), then each `finishes` entry signs with `signed_with` the input of the held body (`over: held`) or of a request for the same challenge and journal with another `slot` (`over: {slot}`), and finish gives the report, byte-equal to {\"body\":<held body>,\"sig\":<the signature, low S>}, or `code`. Consistency only: never completeness of anything outside the journal. Atem's readings, for Astation's confirmation on #114 (the agreed text leaves them open; each is fail-closed): (a) a challenge's signer is member:<id> only, a service: one malformed when read (a report body naming a service, a host, a grant or recovery is unknown_signer, as agreed); (b) the builder also takes now_ms and refuses an expired challenge; (c) a service's records of the plan are its revoke and interrupt_running only, so this member's cover, hold or release body refuses the build (malformed), never skipped; (d) one body may be both a record and a draft (only a body twice in one set is refused); (e) journal.since is compared with nothing, head.seq included.";
+const NOTE: &str = "A native manager's signed report of its control-record signing journal (host-work-v1 §11.1 \"The signer report\"; Astation #114 item 4, agreed with Astation, #114 comment 7089435073), for a Station recovering from a rollback: wire {\"body\":{…},\"sig\"}, the body {type: atem-signer-report, v: 1, account_id, genesis_hash, head{seq, hash}, signer, slot, process, challenge{origin, connection, nonce, issued_at, expires_at}, recovery{generation, plan_id, candidate_feed_id, source_hash, evidence_hash}, journal{id, since, revision, records, records_hash, drafts, drafts_hash}} signed by a current native member's own auth_key (signer member:<device_id>; one that held manage at some seq of the list) over enc([\"atem-signer-report-v1\", jcs(body)]) (R9.1), under the alg the device list pins. A challenge is what the minter stores, {signer, slot, origin, connection, nonce, issued_at, expires_at, recovery}: signer member:<id>, slot and ids 1-128 bytes of [A-Za-z0-9._:-], origin exact as station_route::normalize_relay writes it, connection 1 to 2^53-1, nonce 32 bytes, process and journal.id 16 bytes (base64url, no padding), 0 < expires_at - issued_at <= 30000 ms, recovery.generation a canonical decimal string 1 to 2^63-1 (no sign, no leading zero), plan_id and candidate_feed_id UUID v4, the hashes lowercase hex SHA-256; journal.since 1 to 2^53-1, revision, records and drafts 0 to 2^53-1; a challenge text is at most 4,096 bytes, the body's jcs at most 4,096 bytes and the object at most 16 KiB; no null, no array, no kit_sig, no field beyond these at any level, no duplicate key (escaped ones included). The plan's records (B2): a control-record body (r9-vectors-host-work-control's form) this member signs (signer member:<id>), of this account and genesis, a service's revoke or interrupt_running naming the challenge's origin, or a host principal's interrupt_running (no origin). records_hash = SHA-256(enc([\"atem-signer-report-records-v1\", d1…dn])) over each record body's SHA-256(jcs(body)) (32 bytes), sorted by bytes; drafts_hash the same with \"atem-signer-report-drafts-v1\". Device lists: log L of r9-vectors-membership-log followed by `chain` (labels of `entries`), then the carriage `freeze` (a label of r9-vectors-membership-log's others) when a case names one, which freezes it; each list verified at the case's now_ms. Keys are r9-vectors-keys' (`signed_with` names <name>/<part>: auth, host_key, or recovery/sign for the kit's recovery key); dev-desk is the Ed25519 native the chain adds without manage (SR7_add_desk) and makes a manager (SR8_desk_manages). `records`: the control records the cases use, each body, its jcs and digest, and the record as its signer signed it. `challenges`: texts read by SignerReportChallenge::parse (bindings parse_signer_report_challenge): `fields` when read, else `code`. `valid` and `invalid`: verify_signer_report(list, report, the stored challenge `challenge`, the exported signed records `exported`, now_ms): `expect` is the VerifiedSignerReport (process base64url, at_head true at the list's head, false at an ancestor, journal.id base64url, records the verified records as given), or `code`, the first failure in the order malformed, frozen, wrong_account, unknown_signer, not_a_manager, bad_signature, stale_log, fork, signer_mismatch, slot_mismatch, challenge_mismatch, recovery_mismatch, records_mismatch, expired (bindings: Report{code}). records_mismatch is an exported record that isn't a signed control record of the plan by this member, one whose signature doesn't verify under its key (low S), a duplicate, or another count or records_hash than the report's: a body in signing with no saved signature is in records and can't be exported, so such a report is refused (Astation's conservative rule). A report's process is the fixed bytes \"vectors-process!\"; a builder draws its own once per loaded core (process_generation). `builder`: signer_report_body(list, challenge, signer, slot, station, journal{id, since, revision, records, drafts: the bodies' texts}, now_ms): `body_but_process` (the body it builds, but its process), or `code` (origin_mismatch when the challenge's origin isn't station normalized; malformed for a journal body that isn't one of the plan's records by this member, or one twice in a set). `request`: the immutable request (bindings SignerReportRequest): built as a builder case, its sign_request (`purpose`, `fresh_confirmation`, `label`; input = enc([label, jcs(body)]), body_json = jcs(body)), then each `finishes` entry signs with `signed_with` the input of the held body (`over: held`) or of a request for the same challenge and journal with another `slot` (`over: {slot}`), and finish gives the report, byte-equal to {\"body\":<held body>,\"sig\":<the signature, low S>}, or `code`. `plan_predicate` (Astation's ask, #114 comment 7093796254): signer_report_plan_record(list, body, member, origin) (bindings signer_report_plan_record): whether a control-record body is one of the plan's records for member (member:<id>) at origin (the challenge's, exactly as normalize_relay writes it), the account and genesis the list's (L + `chain`, then `freeze`): `in_plan` true, or false with `reason`, in the order checked another_account, another_genesis, another_signer (another member, or the principal's own key), then another_origin (a service's revoke or interrupt_running naming another origin), or `code` malformed (this member's cover, hold or release, judged after the signer and before the origin; a body that isn't a control record's, read as the builder reads a journal's; a member that isn't member:<id>; an origin not in its exact form). The builder reads a journal's bodies by this one rule: a body in the plan is one it takes in a set, anything else refuses the build. Bodies only: the list's freeze and the member's standing change no answer. Consistency only: never completeness of anything outside the journal. Atem's readings, for Astation's confirmation on #114 (the agreed text leaves them open; each is fail-closed): (a) a challenge's signer is member:<id> only, a service: one malformed when read (a report body naming a service, a host, a grant or recovery is unknown_signer, as agreed); (b) the builder also takes now_ms and refuses an expired challenge; (c) a service's records of the plan are its revoke and interrupt_running only, so this member's cover, hold or release body refuses the build (malformed), never skipped; (d) one body may be both a record and a draft (only a body twice in one set is refused); (e) journal.since is compared with nothing, head.seq included.";
 
 const STATION: &str = "https://station-dev.agora.build";
 const OTHER_STATION: &str = "https://station.agora.build";
@@ -2220,6 +2221,267 @@ impl Gen {
         out
     }
 
+    /// The plan predicate's cases (`signer_report_plan_record`): dev-phone
+    /// at this Station on L unless a case says otherwise.
+    fn plan_cases(&self) -> Vec<PlanCase> {
+        let good = self.rec("phone_revoke").body.clone();
+        let edited = |f: &dyn Fn(&mut ControlBody)| {
+            let mut b = good.clone();
+            f(&mut b);
+            jcs(&b.to_json()).unwrap()
+        };
+        let json_edited = |f: &dyn Fn(&mut Value)| {
+            let mut b = good.to_json();
+            f(&mut b);
+            jcs(&b).unwrap()
+        };
+        let good_text = self.body("phone_revoke");
+        let elsewhere = |b: &mut ControlBody| {
+            b.feed = Some(ControlFeed {
+                origin: OTHER_STATION.into(),
+                feed_id: FEED.into(),
+            })
+        };
+        let case = |label, note, body: String, want| PlanCase {
+            label,
+            note,
+            chain: NO_CHAIN,
+            freeze: None,
+            member: PHONE,
+            origin: STATION,
+            body,
+            want,
+        };
+        let in_plan = Ok(None);
+        let out = |reason| Ok(Some(reason));
+        let malformed = Err("malformed");
+        let mut out_cases = vec![
+            case(
+                "service_revoke",
+                "dev-phone's revoke of svc-discord with interrupt_running, at this Station",
+                good_text.clone(),
+                in_plan,
+            ),
+            case(
+                "service_interrupt",
+                "dev-phone's interrupt_running of svc-discord, at this Station",
+                self.body("phone_interrupt"),
+                in_plan,
+            ),
+            case(
+                "service_revoke_draft",
+                "dev-phone's revoke without interrupt_running, at this Station (a draft's body)",
+                self.body("phone_draft"),
+                in_plan,
+            ),
+            case(
+                "host_interrupt",
+                "dev-phone's interrupt_running of the host sender host-a: no origin",
+                self.body("phone_host_interrupt"),
+                in_plan,
+            ),
+            PlanCase {
+                origin: OTHER_STATION,
+                ..case(
+                    "host_interrupt_at_another_origin",
+                    "the same host sender's interrupt asked for another Station's plan: it names no origin, so it is every origin's",
+                    self.body("phone_host_interrupt"),
+                    in_plan,
+                )
+            },
+            case(
+                "body_written_another_way",
+                "dev-phone's revoke pretty-printed: read as its jcs",
+                serde_json::to_string_pretty(&good.to_json()).unwrap(),
+                in_plan,
+            ),
+            PlanCase {
+                chain: DESK_MANAGES,
+                member: DESK,
+                ..case(
+                    "ed25519_manager",
+                    "dev-desk's (Ed25519) revoke, asked for dev-desk (L + SR7_add_desk + SR8_desk_manages)",
+                    self.body("desk_revoke"),
+                    in_plan,
+                )
+            },
+            PlanCase {
+                chain: DEMOTED,
+                ..case(
+                    "demoted_manager",
+                    "dev-phone's revoke after its roles changed to [view] (L + SR7_set_roles_phone): bodies only, the member's standing changes no answer",
+                    good_text.clone(),
+                    in_plan,
+                )
+            },
+            PlanCase {
+                freeze: Some("C6_mac"),
+                ..case(
+                    "frozen_list",
+                    "dev-phone's revoke, the list frozen by C6_mac: bodies only, a freeze changes no answer (the builder refuses it, frozen)",
+                    good_text.clone(),
+                    in_plan,
+                )
+            },
+            case(
+                "another_origin",
+                "dev-phone's revoke of svc-discord at another Station's origin: that Station's plan's",
+                self.body("phone_elsewhere"),
+                out("another_origin"),
+            ),
+            PlanCase {
+                origin: OTHER_STATION,
+                ..case(
+                    "asked_at_another_origin",
+                    "dev-phone's revoke at this Station, asked for another Station's plan",
+                    good_text.clone(),
+                    out("another_origin"),
+                )
+            },
+            case(
+                "another_member",
+                "dev-mac's revoke, asked for dev-phone",
+                self.body("mac_revoke"),
+                out("another_signer"),
+            ),
+            PlanCase {
+                member: MAC,
+                ..case(
+                    "asked_for_another_member",
+                    "dev-phone's revoke, asked for dev-mac",
+                    good_text.clone(),
+                    out("another_signer"),
+                )
+            },
+            case(
+                "service_own_key",
+                "svc-discord's own revoke (signer service:svc-discord): no member's record",
+                edited(&|b| b.signer = ControlSigner::Principal),
+                out("another_signer"),
+            ),
+            case(
+                "station_cover",
+                "the Station's cover of svc-discord, signed with its own key: another signer, judged before the action",
+                edited(&|b| {
+                    b.signer = ControlSigner::Principal;
+                    b.action = ControlAction::Cover;
+                }),
+                out("another_signer"),
+            ),
+            case(
+                "another_account",
+                "dev-phone's revoke under another account_id",
+                edited(&|b| b.account_id = "acct-other".into()),
+                out("another_account"),
+            ),
+            case(
+                "another_account_cover",
+                "dev-phone's cover under another account_id: the account is judged first",
+                edited(&|b| {
+                    b.account_id = "acct-other".into();
+                    b.action = ControlAction::Cover;
+                }),
+                out("another_account"),
+            ),
+            case(
+                "another_genesis",
+                "dev-phone's revoke under another genesis (SUB1's)",
+                edited(&|b| b.genesis_hash = self.v.hash("SUB1")),
+                out("another_genesis"),
+            ),
+            case(
+                "cover",
+                "dev-phone's cover of svc-discord: a native manager signs none, so its journal never holds one; refused, never skipped",
+                edited(&|b| b.action = ControlAction::Cover),
+                malformed,
+            ),
+            case(
+                "hold",
+                "dev-phone's hold of svc-discord",
+                edited(&|b| b.action = ControlAction::Hold),
+                malformed,
+            ),
+            case(
+                "release",
+                "dev-phone's release of svc-discord",
+                edited(&|b| b.action = ControlAction::Release),
+                malformed,
+            ),
+            case(
+                "hold_at_another_origin",
+                "dev-phone's hold at another Station's origin: the action is judged before the origin",
+                edited(&|b| {
+                    elsewhere(b);
+                    b.action = ControlAction::Hold;
+                }),
+                malformed,
+            ),
+            case(
+                "host_revoke",
+                "a host principal's revoke: no control record (its only record is interrupt_running)",
+                {
+                    let mut b = self.rec("phone_host_interrupt").body.to_json();
+                    b["action"] = json!("revoke");
+                    jcs(&b).unwrap()
+                },
+                malformed,
+            ),
+            case("not_json", "not JSON", "{".to_owned(), malformed),
+            case(
+                "signed_object",
+                "the signed record rather than its body",
+                self.record("phone_revoke"),
+                malformed,
+            ),
+            case(
+                "field_beyond",
+                "a field beyond the body's",
+                json_edited(&|b| b["note"] = json!("x")),
+                malformed,
+            ),
+            case(
+                "duplicate_key",
+                "v twice",
+                good_text.replacen(r#""v":1"#, r#""v":1,"v":1"#, 1),
+                malformed,
+            ),
+            case(
+                "text_over_16_kib",
+                "the body's text with 16 KiB of whitespace before it",
+                format!("{}{good_text}", " ".repeat(16 * 1024)),
+                malformed,
+            ),
+        ];
+        for (label, note, member) in [
+            (
+                "member_a_service",
+                "asked for service:svc-discord: a member is member:<id>",
+                "service:svc-discord",
+            ),
+            ("member_a_host", "asked for host:host-a", "host:host-a"),
+            (
+                "member_without_prefix",
+                "asked for dev-phone, without member:",
+                "dev-phone",
+            ),
+        ] {
+            out_cases.push(PlanCase {
+                member,
+                ..case(label, note, good_text.clone(), malformed)
+            });
+        }
+        out_cases.push(PlanCase {
+            origin: "https://Station-Dev.agora.build/",
+            ..case(
+                "origin_not_exact",
+                "asked for this Station written another way: the origin is the challenge's, exactly as normalize_relay writes it",
+                good_text.clone(),
+                malformed,
+            )
+        });
+        out_cases
+    }
+
     fn request_cases(&self) -> Vec<RequestCase> {
         let builds = self.build_cases();
         let take = |label: &str| builds.iter().find(|c| c.label == label).unwrap().clone();
@@ -2264,6 +2526,20 @@ impl Gen {
             },
         ]
     }
+}
+
+/// A plan-predicate case: the body judged for `member` at `origin` on L
+/// + `chain` (+ `freeze`), and the answer written here: `Ok(None)` in the
+/// plan, `Ok(Some(reason))` not in it, `Err(code)` refused.
+struct PlanCase {
+    label: &'static str,
+    note: &'static str,
+    chain: &'static [&'static str],
+    freeze: Option<&'static str>,
+    member: &'static str,
+    origin: &'static str,
+    body: String,
+    want: Result<Option<&'static str>, &'static str>,
 }
 
 /// The immutable request: a builder case and its finishes `(label,
@@ -2471,12 +2747,44 @@ fn signer_report_vectors() -> Value {
             out
         })
         .collect();
+    let plan_predicate: Vec<Value> = made
+        .plan_cases()
+        .into_iter()
+        .map(|case| {
+            let log = made.log(case.chain, case.freeze, NOW);
+            let got = signer_report_plan_record(&log, &case.body, case.member, case.origin);
+            let mut out = Map::new();
+            out.insert("label".into(), json!(case.label));
+            out.insert("note".into(), json!(case.note));
+            out.insert("chain".into(), json!(case.chain));
+            opt(&mut out, "freeze", case.freeze.map(|f| json!(f)));
+            out.insert("now_ms".into(), json!(NOW));
+            out.insert("member".into(), json!(case.member));
+            out.insert("origin".into(), json!(case.origin));
+            out.insert("body".into(), json!(case.body));
+            match (case.want, got) {
+                (Ok(None), Ok(PlanRecord::InPlan)) => {
+                    out.insert("in_plan".into(), json!(true));
+                }
+                (Ok(Some(reason)), Ok(PlanRecord::NotInPlan(why))) if why.code() == reason => {
+                    out.insert("in_plan".into(), json!(false));
+                    out.insert("reason".into(), json!(reason));
+                }
+                (Err(code), Err(e)) if e.code() == code => {
+                    out.insert("code".into(), json!(code));
+                }
+                (want, got) => panic!("{}: {want:?} written here, {got:?} given", case.label),
+            }
+            Value::Object(out)
+        })
+        .collect();
     json!({
         "name": FILE,
         "kind": "vectors",
         "requires": "r9",
         "note": NOTE,
         "entries": made.entries_json(),
+        "plan_predicate": plan_predicate,
         "records": made.records_json(),
         "challenges": challenges,
         "valid": valid,
@@ -2507,6 +2815,7 @@ fn signer_report_file_is_what_the_generator_makes() {
             "kind",
             "name",
             "note",
+            "plan_predicate",
             "records",
             "request",
             "requires",
@@ -2752,4 +3061,99 @@ fn the_immutable_request_takes_only_a_signature_over_its_held_body() {
         }
         assert_eq!(finished, 1, "{label}");
     }
+}
+
+/// The plan predicate's cases, read from the file
+/// (`signer_report_plan_record`, Astation's ask on #114 comment
+/// 7093796254): each answer, every reason among them, and the builder's
+/// agreement: a body the predicate puts in the plan is one the builder
+/// takes in a journal set, as a record and as a draft, and nothing else is.
+#[test]
+fn plan_predicate_vectors_run_through_the_shared_core() {
+    let (file, v) = (load(FILE), Vectors::load());
+    let cases = file["plan_predicate"].as_array().unwrap();
+    let mut reasons = BTreeSet::new();
+    let (mut in_plan, mut refused, mut agreed) = (0, 0, 0);
+    for case in cases {
+        let label = case["label"].as_str().unwrap();
+        let log = case_log(&v, &file, case);
+        let (body, member, origin) = (
+            case["body"].as_str().unwrap(),
+            case["member"].as_str().unwrap(),
+            case["origin"].as_str().unwrap(),
+        );
+        let got = signer_report_plan_record(&log, body, member, origin);
+        match case.get("code") {
+            Some(code) => {
+                assert_eq!(
+                    got.map(|_| ()).map_err(|e| e.code()),
+                    Err(code.as_str().unwrap()),
+                    "{label}"
+                );
+                refused += 1;
+            }
+            None => {
+                let want = match case["in_plan"].as_bool().unwrap() {
+                    true => {
+                        assert!(case.get("reason").is_none(), "{label}");
+                        in_plan += 1;
+                        PlanRecord::InPlan
+                    }
+                    false => {
+                        let reason = case["reason"].as_str().unwrap();
+                        reasons.insert(reason.to_owned());
+                        PlanRecord::NotInPlan(
+                            *OutOfPlan::ALL
+                                .iter()
+                                .find(|r| r.code() == reason)
+                                .unwrap_or_else(|| panic!("{label}: {reason}")),
+                        )
+                    }
+                };
+                assert_eq!(got, Ok(want), "{label}");
+            }
+        }
+        // The builder, for a member that may report here (a challenge for
+        // it at this origin, its list not frozen), takes the body in a set
+        // exactly when the predicate puts it in the plan.
+        let reporter = [PHONE, MAC, DESK].contains(&member) && case.get("freeze").is_none();
+        if reporter && origin_is_exact(origin) {
+            let challenge = with(challenge(member, SLOT, 3), "origin", json!(origin));
+            let wanted = case.get("code").is_none() && case["in_plan"] == true;
+            for (records, drafts) in [(vec![body], vec![]), (vec![], vec![body])] {
+                let journal = JournalView {
+                    id: *JOURNAL_ID,
+                    since: 4,
+                    revision: 1,
+                    records: records.iter().map(|t| t.to_string()).collect(),
+                    drafts: drafts.iter().map(|t| t.to_string()).collect(),
+                };
+                let built = signer_report_body(
+                    &log,
+                    &read_challenge(&challenge),
+                    member,
+                    SLOT,
+                    origin,
+                    &journal,
+                    case["now_ms"].as_u64().unwrap(),
+                );
+                assert_eq!(built.is_ok(), wanted, "{label}: the builder agrees");
+            }
+            agreed += 1;
+        }
+    }
+    assert_eq!(
+        reasons,
+        OutOfPlan::ALL.iter().map(|r| r.code().to_owned()).collect(),
+        "every reason has a vector"
+    );
+    assert!(
+        in_plan >= 5 && refused >= 5 && agreed >= 20,
+        "{in_plan} {refused} {agreed}"
+    );
+}
+
+/// An origin exactly as `normalize_relay` writes it.
+fn origin_is_exact(origin: &str) -> bool {
+    atem_client::station_route::normalize_relay(origin).as_deref() == Ok(origin)
 }

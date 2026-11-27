@@ -4637,18 +4637,53 @@ def sr_control_body(value):
     return value
 
 
+# Why a body isn't one of the plan's records, in the order the predicate
+# checks (signer_report_plan_record).
+SR_OUT_OF_PLAN = ["another_account", "another_genesis", "another_signer", "another_origin"]
+
+
+def sr_plan_record(body, lst, member, origin):
+    """The plan predicate (B2) on a control-record body as sr_control_body
+    reads it, from the file's note: None when it is one of the plan's
+    records by `member:<member>` at `origin` (a service's revoke or
+    interrupt_running naming `origin`, or a host principal's
+    interrupt_running, which names none), else why not, in the order
+    checked: another_account, another_genesis, another_signer, then
+    another_origin. This member's cover, hold or release is
+    Refused("malformed") (judged after the signer, before the origin: a
+    native manager signs none)."""
+    if body["account_id"] != lst.account_id:
+        return "another_account"
+    if body["genesis_hash"] != lst.genesis_hash:
+        return "another_genesis"
+    if body["signer"] != f"member:{member}":
+        return "another_signer"
+    if body["action"] in ("cover", "hold", "release"):
+        raise Refused("malformed")
+    if body["principal"].startswith("service:"):
+        return None if body["origin"] == origin else "another_origin"
+    return None
+
+
 def sr_of_plan(body, lst, member, origin):
-    """One of the plan's records by `member:<member>` (B2): of the list's
-    account and genesis, a service's revoke or interrupt_running naming
-    `origin`, or a host principal's interrupt_running (no origin)."""
-    return (
-        body["account_id"] == lst.account_id and body["genesis_hash"] == lst.genesis_hash
-        and body["signer"] == f"member:{member}"
-        and (
-            (body["principal"].startswith("service:") and body["action"] in ("revoke", "interrupt_running") and body["origin"] == origin)
-            or (body["principal"].startswith("host:") and body["action"] == "interrupt_running")
-        )
-    )
+    """One of the plan's records by `member:<member>` (B2): the predicate
+    answers it in the plan."""
+    try:
+        return sr_plan_record(body, lst, member, origin) is None
+    except Refused:
+        return False
+
+
+def sr_plan_predicate(c, lst):
+    """signer_report_plan_record, from the file's note: the member
+    member:<id> and the origin in its exact form (else malformed), the body
+    read as the builder reads a journal's (strict within 16 KiB, exactly a
+    control record's body, else malformed), then the predicate."""
+    m = re.fullmatch(VR_SIGNER, c["member"])
+    if m is None or m.group(1) != "member" or not relay_origin_ok(c["origin"]):
+        raise Refused("malformed")
+    body = sr_control_body(vr_strict(c["body"], VR_MAX_OBJECT_BYTES))
+    return sr_plan_record(body, lst, m.group(2), c["origin"])
 
 
 def sr_set_hash(label, digests):
@@ -4971,6 +5006,26 @@ def check_signer_report(file, data, report, context):
             case.check(label in labels, f"{label} present")
         mismatched = {c["label"] for c in data["invalid"] if c["code"] == "recovery_mismatch"}
         case.equal(len(mismatched), 5, "each recovery field mismatched")
+    reasons = set()
+    for c in data["plan_predicate"]:
+        with report.case(file, f"plan predicate {c['label']}") as case:
+            try:
+                why = sr_plan_predicate(c, lst(c))
+                got = {"in_plan": why is None} if why is None else {"in_plan": False, "reason": why}
+                case.equal(got, {k: c[k] for k in ("in_plan", "reason", "code") if k in c}, "the answer")
+                if why is not None:
+                    reasons.add(why)
+            except Refused as e:
+                case.equal(e.code, c.get("code"), "refused")
+    with report.case(file, "plan predicate coverage") as case:
+        case.equal(sorted(reasons), sorted(SR_OUT_OF_PLAN), "every reason")
+        labels = {c["label"] for c in data["plan_predicate"]}
+        for label in (
+            "service_revoke", "service_interrupt", "host_interrupt", "host_interrupt_at_another_origin",
+            "another_origin", "another_member", "another_account", "another_genesis", "cover", "hold", "release",
+            "hold_at_another_origin", "frozen_list", "demoted_manager", "origin_not_exact", "member_a_service",
+        ):
+            case.check(label in labels, f"{label} present")
     for c in data["builder"] + data["request"]:
         with report.case(file, f"builder {c['label']}") as case:
             try:
