@@ -45,8 +45,8 @@
 //! rule (Astation's ask on #114 comment 7093796254): one implementation,
 //! which the builder and the verifier's export check call too.
 //!
-//! **Atem's readings, for Astation's confirmation on #114** (the agreed
-//! text leaves them open; each is fail-closed):
+//! **Atem's readings, agreed with Astation, #114 comment 7093796254** (the
+//! agreed text left them open; each is fail-closed):
 //! - (a) a challenge's `signer` is `member:<id>` only: a `service:` one is
 //!   `malformed` when read (a report body naming a service, a host, a
 //!   grant or `recovery` is `unknown_signer`, as agreed);
