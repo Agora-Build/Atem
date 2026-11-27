@@ -22,13 +22,13 @@ use atem_client_ffi::AtemError;
 use atem_client_ffi::log::MembershipLog;
 use atem_client_ffi::member_report::signer::{
     SignerReportRequest, parse_signer_report_challenge, sign_signer_report,
-    signer_report_challenge, verify_signer_report,
+    signer_report_challenge, signer_report_plan_record, verify_signer_report,
 };
 use atem_client_ffi::member_report::verifier_report_process;
 use atem_client_ffi::provider::{AppKeyProvider, ProviderError};
 use atem_client_ffi::types::{
-    HostClock, PublicKeyData, SignRequest, SignerJournalView, SignerReportRecovery, SigningPurpose,
-    VerifiedSignerReport,
+    HostClock, PublicKeyData, SignRequest, SignerJournalView, SignerPlanRecord,
+    SignerReportRecovery, SigningPurpose, VerifiedSignerReport,
 };
 use serde_json::{Value, json};
 use support::*;
@@ -333,6 +333,53 @@ fn reports_through_the_production_binding() {
         ),
         Err(AtemError::Invalid { .. })
     ));
+}
+
+/// The plan predicate's cases through `signer_report_plan_record`: each
+/// answer typed (`InPlan`, or `NotInPlan{reason}`), or `Report{code}`;
+/// every reason among them.
+#[test]
+fn the_plan_predicate_through_the_production_binding() {
+    let file = file();
+    let mut reasons = std::collections::BTreeSet::new();
+    for case in file["plan_predicate"].as_array().unwrap() {
+        let label = case["label"].as_str().unwrap();
+        let got = signer_report_plan_record(
+            log_of(&file, case),
+            case["body"].as_str().unwrap().into(),
+            case["member"].as_str().unwrap().into(),
+            case["origin"].as_str().unwrap().into(),
+        );
+        match (case.get("code"), case.get("reason")) {
+            (Some(code), _) => assert!(
+                got.as_ref().is_err_and(report_code(code.as_str().unwrap())),
+                "{label}: {got:?}"
+            ),
+            (None, None) => {
+                assert_eq!(case["in_plan"], true, "{label}");
+                assert_eq!(got.unwrap(), SignerPlanRecord::InPlan, "{label}");
+            }
+            (None, Some(reason)) => {
+                assert_eq!(case["in_plan"], false, "{label}");
+                let reason = reason.as_str().unwrap().to_owned();
+                reasons.insert(reason.clone());
+                assert_eq!(
+                    got.unwrap(),
+                    SignerPlanRecord::NotInPlan { reason },
+                    "{label}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        reasons.into_iter().collect::<Vec<_>>(),
+        [
+            "another_account",
+            "another_genesis",
+            "another_origin",
+            "another_signer"
+        ]
+    );
 }
 
 /// The builder's cases as requests: the body the request holds, or its

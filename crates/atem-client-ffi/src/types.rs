@@ -435,6 +435,28 @@ record! {
     }
 }
 
+data_enum! {
+    /// `signer_report_plan_record`'s answer: whether a control record's
+    /// body is one of a signer report's plan's records for a member and an
+    /// origin (B2), by the rule `SignerReportRequest` reads a journal's
+    /// bodies with.
+    pub enum SignerPlanRecord {
+        /// One of the plan's records: the request takes it in `records` or
+        /// `drafts`; while the plan's barrier holds, your adapter refuses
+        /// to draft or sign it.
+        InPlan,
+        /// Not one of the plan's records: leave it out of this plan's
+        /// report (handed to the request it is `Report{malformed}`); this
+        /// plan's barrier doesn't hold it. `reason`, in the order checked:
+        /// `another_account`, `another_genesis`, `another_signer` (another
+        /// member, or the principal's own key), `another_origin` (a
+        /// service's `revoke` or `interrupt_running` naming another
+        /// origin). These reasons and their order are Atem's reading, for
+        /// Astation's confirmation (asked on Astation #114).
+        NotInPlan { reason: String },
+    }
+}
+
 record! {
     /// A signer report's `journal` as signed: the journal's `id`
     /// (base64url), `since` and `revision`, and each set's count and hash

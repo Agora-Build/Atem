@@ -15,7 +15,9 @@
 //!   to `sign_signer_report` (its own key through the app's provider), or,
 //!   when its key answers later, builds a `SignerReportRequest`, has the
 //!   input of its `sign_request()` signed and hands the signature to
-//!   `finish`.
+//!   `finish`. It selects the plan's records and drafts, and checks its
+//!   barrier before drafting or signing, with `signer_report_plan_record`:
+//!   the rule the request reads a journal's bodies by, typed.
 //!
 //! Nothing that matters comes from the caller: the head, account and
 //! genesis are the reporter's log's, the process is
@@ -30,8 +32,8 @@
 //! Five points the agreed text leaves open (a `member:`-only challenge
 //! signer, the builder's `now_ms`, a service's plan records `revoke` and
 //! `interrupt_running` only, one body both a record and a draft, `since`
-//! compared with nothing) are Atem's readings, for Astation's confirmation
-//! on #114 (the core module's doc lists them).
+//! compared with nothing) are Atem's readings, agreed with Astation on
+//! #114 comment 7093796254 (the core module's doc lists them).
 //!
 //! The report proves its signature and that the export matches it:
 //! consistency only, never completeness of anything outside the journal. A
@@ -43,8 +45,9 @@ use std::sync::Arc;
 use atem_client::KeyId;
 use atem_client::encoding::{b64u, b64u_decode_array};
 use atem_client::member_report::{
-    self as core, JOURNAL_ID_BYTES, JournalSummary, JournalView, RecoveryPlan, ReportRefusal,
-    SignerReportBody, SignerReportChallenge as CoreChallenge, VerifiedSignerReport as CoreVerified,
+    self as core, JOURNAL_ID_BYTES, JournalSummary, JournalView, PlanRecord, RecoveryPlan,
+    ReportRefusal, SignerReportBody, SignerReportChallenge as CoreChallenge,
+    VerifiedSignerReport as CoreVerified,
 };
 use atem_client::provider::KeyProvider;
 use serde_json::json;
@@ -53,7 +56,7 @@ use crate::encoding::canonical;
 use crate::error::{AtemError, Result};
 use crate::log::{MembershipLog, object_json};
 use crate::types::{
-    SignRequest, SignerJournalView, SignerReportChallenge, SignerReportJournal,
+    SignRequest, SignerJournalView, SignerPlanRecord, SignerReportChallenge, SignerReportJournal,
     SignerReportRecovery, VerifiedSignerReport,
 };
 
@@ -149,6 +152,47 @@ pub fn parse_signer_report_challenge(challenge_json: String) -> Result<SignerRep
         issued_at: c.issued_at(),
         expires_at: c.expires_at(),
         recovery: recovery_info(c.recovery()),
+    })
+}
+
+/// The plan predicate (Astation's ask, #114 comment 7093796254): whether
+/// `body_json`, a control record's body as your journal holds it, is one
+/// of the plan's records for `member` (`member:<device_id>`) at `origin`
+/// (the challenge's, exactly as `normalize_relay` writes it), the account
+/// and genesis `log`'s. It is the core's one rule, the one
+/// `SignerReportRequest` reads a journal's bodies by: a body answered
+/// `InPlan` is one the request takes in `records` or `drafts`; anything
+/// else refuses the request. So your adapter selects its records and
+/// drafts, and checks its barrier before drafting or signing, by the
+/// builder's own rule. In this order: another account, genesis or signer
+/// (another member, or the principal's own key) is `NotInPlan{reason}`;
+/// this member's `cover`, `hold` or `release` is `Report{malformed}` (a
+/// native manager signs none, so your journal never holds one; never skip
+/// it); a service's `revoke` or `interrupt_running` at another origin is
+/// `NotInPlan{another_origin}`; a `host:` principal's
+/// `interrupt_running`, which names no origin, is `InPlan` at every
+/// origin. `Report{malformed}` too for a `member` that isn't
+/// `member:<id>`, an `origin` not in its exact form, and a body that isn't
+/// a control record's (read as the request reads one). Bodies only: the
+/// list's freeze and the member's standing change no answer. Which bodies
+/// are `InPlan` is the agreed B2 rule with reading (c); Atem's reading,
+/// for Astation's confirmation (asked on Astation #114): another account,
+/// genesis or signer as `NotInPlan{reason}` (never `Report{malformed}`),
+/// the order account, genesis, signer, action, origin, and the four
+/// reason codes.
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub fn signer_report_plan_record(
+    log: Arc<MembershipLog>,
+    body_json: String,
+    member: String,
+    origin: String,
+) -> Result<SignerPlanRecord> {
+    let answer = core::signer_report_plan_record(&log.lock(), &body_json, &member, &origin)?;
+    Ok(match answer {
+        PlanRecord::InPlan => SignerPlanRecord::InPlan,
+        PlanRecord::NotInPlan(why) => SignerPlanRecord::NotInPlan {
+            reason: why.code().into(),
+        },
     })
 }
 

@@ -749,6 +749,22 @@ check("signer report: the builder", () => {
     same(body, c.body_but_process, c.label);
   }
 });
+check("signer report: the plan predicate", () => {
+  // signerReportPlanRecord: {type: "in_plan"} or {type: "not_in_plan",
+  // reason}, or kind report with its code; every reason among them.
+  const reasons = new Set();
+  for (const c of srep.plan_predicate) {
+    const judge = () => m.signerReportPlanRecord(srepLog(c), c.body, c.member, c.origin);
+    if (c.code !== undefined) {
+      reportError(judge, c.code);
+      continue;
+    }
+    const want = c.in_plan ? { type: "in_plan" } : { type: "not_in_plan", reason: c.reason };
+    same(judge(), want, c.label);
+    if (!c.in_plan) reasons.add(c.reason);
+  }
+  same([...reasons].sort(), ["another_account", "another_genesis", "another_origin", "another_signer"], "every reason");
+});
 check("signer report: the immutable request", () => {
   for (const c of srep.request) {
     const log = srepLog(c);

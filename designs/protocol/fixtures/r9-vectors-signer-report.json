@@ -7700,7 +7700,344 @@
   ],
   "kind": "vectors",
   "name": "r9-vectors-signer-report",
-  "note": "A native manager's signed report of its control-record signing journal (host-work-v1 §11.1 \"The signer report\"; Astation #114 item 4, agreed with Astation, #114 comment 7089435073), for a Station recovering from a rollback: wire {\"body\":{…},\"sig\"}, the body {type: atem-signer-report, v: 1, account_id, genesis_hash, head{seq, hash}, signer, slot, process, challenge{origin, connection, nonce, issued_at, expires_at}, recovery{generation, plan_id, candidate_feed_id, source_hash, evidence_hash}, journal{id, since, revision, records, records_hash, drafts, drafts_hash}} signed by a current native member's own auth_key (signer member:<device_id>; one that held manage at some seq of the list) over enc([\"atem-signer-report-v1\", jcs(body)]) (R9.1), under the alg the device list pins. A challenge is what the minter stores, {signer, slot, origin, connection, nonce, issued_at, expires_at, recovery}: signer member:<id>, slot and ids 1-128 bytes of [A-Za-z0-9._:-], origin exact as station_route::normalize_relay writes it, connection 1 to 2^53-1, nonce 32 bytes, process and journal.id 16 bytes (base64url, no padding), 0 < expires_at - issued_at <= 30000 ms, recovery.generation a canonical decimal string 1 to 2^63-1 (no sign, no leading zero), plan_id and candidate_feed_id UUID v4, the hashes lowercase hex SHA-256; journal.since 1 to 2^53-1, revision, records and drafts 0 to 2^53-1; a challenge text is at most 4,096 bytes, the body's jcs at most 4,096 bytes and the object at most 16 KiB; no null, no array, no kit_sig, no field beyond these at any level, no duplicate key (escaped ones included). The plan's records (B2): a control-record body (r9-vectors-host-work-control's form) this member signs (signer member:<id>), of this account and genesis, a service's revoke or interrupt_running naming the challenge's origin, or a host principal's interrupt_running (no origin). records_hash = SHA-256(enc([\"atem-signer-report-records-v1\", d1…dn])) over each record body's SHA-256(jcs(body)) (32 bytes), sorted by bytes; drafts_hash the same with \"atem-signer-report-drafts-v1\". Device lists: log L of r9-vectors-membership-log followed by `chain` (labels of `entries`), then the carriage `freeze` (a label of r9-vectors-membership-log's others) when a case names one, which freezes it; each list verified at the case's now_ms. Keys are r9-vectors-keys' (`signed_with` names <name>/<part>: auth, host_key, or recovery/sign for the kit's recovery key); dev-desk is the Ed25519 native the chain adds without manage (SR7_add_desk) and makes a manager (SR8_desk_manages). `records`: the control records the cases use, each body, its jcs and digest, and the record as its signer signed it. `challenges`: texts read by SignerReportChallenge::parse (bindings parse_signer_report_challenge): `fields` when read, else `code`. `valid` and `invalid`: verify_signer_report(list, report, the stored challenge `challenge`, the exported signed records `exported`, now_ms): `expect` is the VerifiedSignerReport (process base64url, at_head true at the list's head, false at an ancestor, journal.id base64url, records the verified records as given), or `code`, the first failure in the order malformed, frozen, wrong_account, unknown_signer, not_a_manager, bad_signature, stale_log, fork, signer_mismatch, slot_mismatch, challenge_mismatch, recovery_mismatch, records_mismatch, expired (bindings: Report{code}). records_mismatch is an exported record that isn't a signed control record of the plan by this member, one whose signature doesn't verify under its key (low S), a duplicate, or another count or records_hash than the report's: a body in signing with no saved signature is in records and can't be exported, so such a report is refused (Astation's conservative rule). A report's process is the fixed bytes \"vectors-process!\"; a builder draws its own once per loaded core (process_generation). `builder`: signer_report_body(list, challenge, signer, slot, station, journal{id, since, revision, records, drafts: the bodies' texts}, now_ms): `body_but_process` (the body it builds, but its process), or `code` (origin_mismatch when the challenge's origin isn't station normalized; malformed for a journal body that isn't one of the plan's records by this member, or one twice in a set). `request`: the immutable request (bindings SignerReportRequest): built as a builder case, its sign_request (`purpose`, `fresh_confirmation`, `label`; input = enc([label, jcs(body)]), body_json = jcs(body)), then each `finishes` entry signs with `signed_with` the input of the held body (`over: held`) or of a request for the same challenge and journal with another `slot` (`over: {slot}`), and finish gives the report, byte-equal to {\"body\":<held body>,\"sig\":<the signature, low S>}, or `code`. Consistency only: never completeness of anything outside the journal. Atem's readings, for Astation's confirmation on #114 (the agreed text leaves them open; each is fail-closed): (a) a challenge's signer is member:<id> only, a service: one malformed when read (a report body naming a service, a host, a grant or recovery is unknown_signer, as agreed); (b) the builder also takes now_ms and refuses an expired challenge; (c) a service's records of the plan are its revoke and interrupt_running only, so this member's cover, hold or release body refuses the build (malformed), never skipped; (d) one body may be both a record and a draft (only a body twice in one set is refused); (e) journal.since is compared with nothing, head.seq included.",
+  "note": "A native manager's signed report of its control-record signing journal (host-work-v1 §11.1 \"The signer report\"; Astation #114 item 4, agreed with Astation, #114 comment 7089435073), for a Station recovering from a rollback: wire {\"body\":{…},\"sig\"}, the body {type: atem-signer-report, v: 1, account_id, genesis_hash, head{seq, hash}, signer, slot, process, challenge{origin, connection, nonce, issued_at, expires_at}, recovery{generation, plan_id, candidate_feed_id, source_hash, evidence_hash}, journal{id, since, revision, records, records_hash, drafts, drafts_hash}} signed by a current native member's own auth_key (signer member:<device_id>; one that held manage at some seq of the list) over enc([\"atem-signer-report-v1\", jcs(body)]) (R9.1), under the alg the device list pins. A challenge is what the minter stores, {signer, slot, origin, connection, nonce, issued_at, expires_at, recovery}: signer member:<id>, slot and ids 1-128 bytes of [A-Za-z0-9._:-], origin exact as station_route::normalize_relay writes it, connection 1 to 2^53-1, nonce 32 bytes, process and journal.id 16 bytes (base64url, no padding), 0 < expires_at - issued_at <= 30000 ms, recovery.generation a canonical decimal string 1 to 2^63-1 (no sign, no leading zero), plan_id and candidate_feed_id UUID v4, the hashes lowercase hex SHA-256; journal.since 1 to 2^53-1, revision, records and drafts 0 to 2^53-1; a challenge text is at most 4,096 bytes, the body's jcs at most 4,096 bytes and the object at most 16 KiB; no null, no array, no kit_sig, no field beyond these at any level, no duplicate key (escaped ones included). The plan's records (B2): a control-record body (r9-vectors-host-work-control's form) this member signs (signer member:<id>), of this account and genesis, a service's revoke or interrupt_running naming the challenge's origin, or a host principal's interrupt_running (no origin). records_hash = SHA-256(enc([\"atem-signer-report-records-v1\", d1…dn])) over each record body's SHA-256(jcs(body)) (32 bytes), sorted by bytes; drafts_hash the same with \"atem-signer-report-drafts-v1\". Device lists: log L of r9-vectors-membership-log followed by `chain` (labels of `entries`), then the carriage `freeze` (a label of r9-vectors-membership-log's others) when a case names one, which freezes it; each list verified at the case's now_ms. Keys are r9-vectors-keys' (`signed_with` names <name>/<part>: auth, host_key, or recovery/sign for the kit's recovery key); dev-desk is the Ed25519 native the chain adds without manage (SR7_add_desk) and makes a manager (SR8_desk_manages). `records`: the control records the cases use, each body, its jcs and digest, and the record as its signer signed it. `challenges`: texts read by SignerReportChallenge::parse (bindings parse_signer_report_challenge): `fields` when read, else `code`. `valid` and `invalid`: verify_signer_report(list, report, the stored challenge `challenge`, the exported signed records `exported`, now_ms): `expect` is the VerifiedSignerReport (process base64url, at_head true at the list's head, false at an ancestor, journal.id base64url, records the verified records as given), or `code`, the first failure in the order malformed, frozen, wrong_account, unknown_signer, not_a_manager, bad_signature, stale_log, fork, signer_mismatch, slot_mismatch, challenge_mismatch, recovery_mismatch, records_mismatch, expired (bindings: Report{code}). records_mismatch is an exported record that isn't a signed control record of the plan by this member, one whose signature doesn't verify under its key (low S), a duplicate, or another count or records_hash than the report's: a body in signing with no saved signature is in records and can't be exported, so such a report is refused (Astation's conservative rule). A report's process is the fixed bytes \"vectors-process!\"; a builder draws its own once per loaded core (process_generation). `builder`: signer_report_body(list, challenge, signer, slot, station, journal{id, since, revision, records, drafts: the bodies' texts}, now_ms): `body_but_process` (the body it builds, but its process), or `code` (origin_mismatch when the challenge's origin isn't station normalized; malformed for a journal body that isn't one of the plan's records by this member, or one twice in a set). `request`: the immutable request (bindings SignerReportRequest): built as a builder case, its sign_request (`purpose`, `fresh_confirmation`, `label`; input = enc([label, jcs(body)]), body_json = jcs(body)), then each `finishes` entry signs with `signed_with` the input of the held body (`over: held`) or of a request for the same challenge and journal with another `slot` (`over: {slot}`), and finish gives the report, byte-equal to {\"body\":<held body>,\"sig\":<the signature, low S>}, or `code`. `plan_predicate` (Astation's ask, #114 comment 7093796254): signer_report_plan_record(list, body, member, origin) (bindings signer_report_plan_record): whether a control-record body is one of the plan's records for member (member:<id>) at origin (the challenge's, exactly as normalize_relay writes it), the account and genesis the list's (L + `chain`, then `freeze`): `in_plan` true, or false with `reason`, in the order checked another_account, another_genesis, another_signer (another member, or the principal's own key), then another_origin (a service's revoke or interrupt_running naming another origin), or `code` malformed (this member's cover, hold or release, judged after the signer and before the origin; a body that isn't a control record's, read as the builder reads a journal's; a member that isn't member:<id>; an origin not in its exact form). The builder reads a journal's bodies by this one rule: a body in the plan is one it takes in a set, anything else refuses the build. Bodies only: the list's freeze and the member's standing change no answer. Which bodies are in the plan is the agreed B2 rule with agreed reading (c); Atem's reading, for Astation's confirmation (asked on Astation #114): another account, genesis or signer not in the plan with a reason (never malformed), the order account, genesis, signer, action, origin, and the four reason codes. Consistency only: never completeness of anything outside the journal. Atem's readings, agreed with Astation, #114 comment 7093796254 (the agreed text left them open; each is fail-closed): (a) a challenge's signer is member:<id> only, a service: one malformed when read (a report body naming a service, a host, a grant or recovery is unknown_signer, as agreed); (b) the builder also takes now_ms and refuses an expired challenge; (c) a service's records of the plan are its revoke and interrupt_running only, so this member's cover, hold or release body refuses the build (malformed), never skipped; (d) one body may be both a record and a draft (only a body twice in one set is refused); (e) journal.since is compared with nothing, head.seq included.",
+  "plan_predicate": [
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "in_plan": true,
+      "label": "service_revoke",
+      "member": "member:dev-phone",
+      "note": "dev-phone's revoke of svc-discord with interrupt_running, at this Station",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"interrupt_running\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793263940002,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000002\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "in_plan": true,
+      "label": "service_interrupt",
+      "member": "member:dev-phone",
+      "note": "dev-phone's interrupt_running of svc-discord, at this Station",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793263940004,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000004\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "in_plan": true,
+      "label": "service_revoke_draft",
+      "member": "member:dev-phone",
+      "note": "dev-phone's revoke without interrupt_running, at this Station (a draft's body)",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\"},\"account_id\":\"acct-test-1\",\"action\":\"interrupt_running\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793263940003,\"principal\":\"host:host-a\",\"record_id\":\"00000000-0000-4000-8000-000000000003\",\"revoke_seq\":7,\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "in_plan": true,
+      "label": "host_interrupt",
+      "member": "member:dev-phone",
+      "note": "dev-phone's interrupt_running of the host sender host-a: no origin",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\"},\"account_id\":\"acct-test-1\",\"action\":\"interrupt_running\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793263940003,\"principal\":\"host:host-a\",\"record_id\":\"00000000-0000-4000-8000-000000000003\",\"revoke_seq\":7,\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "in_plan": true,
+      "label": "host_interrupt_at_another_origin",
+      "member": "member:dev-phone",
+      "note": "the same host sender's interrupt asked for another Station's plan: it names no origin, so it is every origin's",
+      "now_ms": 1793264001000,
+      "origin": "https://station.agora.build"
+    },
+    {
+      "body": "{\n  \"about\": {\n    \"by\": \"owner\",\n    \"integration_id\": \"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"\n  },\n  \"account_id\": \"acct-test-1\",\n  \"action\": \"revoke\",\n  \"feed_id\": \"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\n  \"genesis_hash\": \"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\n  \"interrupt_running\": true,\n  \"issued_at\": 1793263940001,\n  \"origin\": \"https://station-dev.agora.build\",\n  \"principal\": \"service:svc-discord\",\n  \"principal_key\": \"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\n  \"record_id\": \"00000000-0000-4000-8000-000000000001\",\n  \"signer\": \"member:dev-phone\",\n  \"type\": \"atem-host-work-control\",\n  \"v\": 1\n}",
+      "chain": [],
+      "in_plan": true,
+      "label": "body_written_another_way",
+      "member": "member:dev-phone",
+      "note": "dev-phone's revoke pretty-printed: read as its jcs",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940007,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000007\",\"signer\":\"member:dev-desk\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [
+        "SR7_add_desk",
+        "SR8_desk_manages"
+      ],
+      "in_plan": true,
+      "label": "ed25519_manager",
+      "member": "member:dev-desk",
+      "note": "dev-desk's (Ed25519) revoke, asked for dev-desk (L + SR7_add_desk + SR8_desk_manages)",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [
+        "SR7_set_roles_phone"
+      ],
+      "in_plan": true,
+      "label": "demoted_manager",
+      "member": "member:dev-phone",
+      "note": "dev-phone's revoke after its roles changed to [view] (L + SR7_set_roles_phone): bodies only, the member's standing changes no answer",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "freeze": "C6_mac",
+      "in_plan": true,
+      "label": "frozen_list",
+      "member": "member:dev-phone",
+      "note": "dev-phone's revoke, the list frozen by C6_mac: bodies only, a freeze changes no answer (the builder refuses it, frozen)",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940001,\"origin\":\"https://station.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "in_plan": false,
+      "label": "another_origin",
+      "member": "member:dev-phone",
+      "note": "dev-phone's revoke of svc-discord at another Station's origin: that Station's plan's",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build",
+      "reason": "another_origin"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "in_plan": false,
+      "label": "asked_at_another_origin",
+      "member": "member:dev-phone",
+      "note": "dev-phone's revoke at this Station, asked for another Station's plan",
+      "now_ms": 1793264001000,
+      "origin": "https://station.agora.build",
+      "reason": "another_origin"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "in_plan": false,
+      "label": "another_member",
+      "member": "member:dev-phone",
+      "note": "dev-mac's revoke, asked for dev-phone",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build",
+      "reason": "another_signer"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "in_plan": false,
+      "label": "asked_for_another_member",
+      "member": "member:dev-mac",
+      "note": "dev-phone's revoke, asked for dev-mac",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build",
+      "reason": "another_signer"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "in_plan": false,
+      "label": "service_own_key",
+      "member": "member:dev-phone",
+      "note": "svc-discord's own revoke (signer service:svc-discord): no member's record",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build",
+      "reason": "another_signer"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "in_plan": false,
+      "label": "station_cover",
+      "member": "member:dev-phone",
+      "note": "the Station's cover of svc-discord, signed with its own key: another signer, judged before the action",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build",
+      "reason": "another_signer"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-other\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "in_plan": false,
+      "label": "another_account",
+      "member": "member:dev-phone",
+      "note": "dev-phone's revoke under another account_id",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build",
+      "reason": "another_account"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-other\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "in_plan": false,
+      "label": "another_account_cover",
+      "member": "member:dev-phone",
+      "note": "dev-phone's cover under another account_id: the account is judged first",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build",
+      "reason": "another_account"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"f9244b1b5b4f4eb1ff4aaebad021a0a66ab1a3164762673cb71bba6c74541b94\",\"interrupt_running\":true,\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "in_plan": false,
+      "label": "another_genesis",
+      "member": "member:dev-phone",
+      "note": "dev-phone's revoke under another genesis (SUB1's)",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build",
+      "reason": "another_genesis"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "code": "malformed",
+      "label": "cover",
+      "member": "member:dev-phone",
+      "note": "dev-phone's cover of svc-discord: a native manager signs none, so its journal never holds one; refused, never skipped",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"hold\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "code": "malformed",
+      "label": "hold",
+      "member": "member:dev-phone",
+      "note": "dev-phone's hold of svc-discord",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"release\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "code": "malformed",
+      "label": "release",
+      "member": "member:dev-phone",
+      "note": "dev-phone's release of svc-discord",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"hold\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793263940001,\"origin\":\"https://station.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "code": "malformed",
+      "label": "hold_at_another_origin",
+      "member": "member:dev-phone",
+      "note": "dev-phone's hold at another Station's origin: the action is judged before the origin",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793263940003,\"principal\":\"host:host-a\",\"record_id\":\"00000000-0000-4000-8000-000000000003\",\"revoke_seq\":7,\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "code": "malformed",
+      "label": "host_revoke",
+      "member": "member:dev-phone",
+      "note": "a host principal's revoke: no control record (its only record is interrupt_running)",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build"
+    },
+    {
+      "body": "{",
+      "chain": [],
+      "code": "malformed",
+      "label": "not_json",
+      "member": "member:dev-phone",
+      "note": "not JSON",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build"
+    },
+    {
+      "body": "{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"dbiU7uX2HbtKDaMmORgf7CGD3FX-G4ZLkO8lYb3fO00nZ5uaC9nnJDZMi9hrm_R7UBYio1Il9ypg6ZqUJfmQWQ\"}",
+      "chain": [],
+      "code": "malformed",
+      "label": "signed_object",
+      "member": "member:dev-phone",
+      "note": "the signed record rather than its body",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940001,\"note\":\"x\",\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "code": "malformed",
+      "label": "field_beyond",
+      "member": "member:dev-phone",
+      "note": "a field beyond the body's",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1,\"v\":1}",
+      "chain": [],
+      "code": "malformed",
+      "label": "duplicate_key",
+      "member": "member:dev-phone",
+      "note": "v twice",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build"
+    },
+    {
+      "body": "                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                {\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "code": "malformed",
+      "label": "text_over_16_kib",
+      "member": "member:dev-phone",
+      "note": "the body's text with 16 KiB of whitespace before it",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "code": "malformed",
+      "label": "member_a_service",
+      "member": "service:svc-discord",
+      "note": "asked for service:svc-discord: a member is member:<id>",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "code": "malformed",
+      "label": "member_a_host",
+      "member": "host:host-a",
+      "note": "asked for host:host-a",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "code": "malformed",
+      "label": "member_without_prefix",
+      "member": "dev-phone",
+      "note": "asked for dev-phone, without member:",
+      "now_ms": 1793264001000,
+      "origin": "https://station-dev.agora.build"
+    },
+    {
+      "body": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793263940001,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "chain": [],
+      "code": "malformed",
+      "label": "origin_not_exact",
+      "member": "member:dev-phone",
+      "note": "asked for this Station written another way: the origin is the challenge's, exactly as normalize_relay writes it",
+      "now_ms": 1793264001000,
+      "origin": "https://Station-Dev.agora.build/"
+    }
+  ],
   "records": [
     {
       "body": {
