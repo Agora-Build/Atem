@@ -451,7 +451,8 @@ data_enum! {
         /// `another_account`, `another_genesis`, `another_signer` (another
         /// member, or the principal's own key), `another_origin` (a
         /// service's `revoke` or `interrupt_running` naming another
-        /// origin).
+        /// origin). These reasons and their order are Atem's reading, for
+        /// Astation's confirmation (asked on Astation #114).
         NotInPlan { reason: String },
     }
 }

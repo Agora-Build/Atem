@@ -613,10 +613,11 @@ pub fn verify_signer_report(
 /// `member` (`member:<id>`) at `origin` (exact), by the rule
 /// `SignerReportRequest` reads a journal's bodies with: `{type: "in_plan"}`
 /// or `{type: "not_in_plan", reason}` (`another_account`,
-/// `another_genesis`, `another_signer`, `another_origin`), or throws
-/// `kind: "report"`, `code: "malformed"` (this member's cover, hold or
-/// release; a body that isn't a control record's; a member or origin
-/// outside its grammar).
+/// `another_genesis`, `another_signer`, `another_origin`; the reasons and
+/// their order Atem's reading, for Astation's confirmation, asked on
+/// Astation #114), or throws `kind: "report"`, `code: "malformed"` (this
+/// member's cover, hold or release; a body that isn't a control record's;
+/// a member or origin outside its grammar).
 #[wasm_bindgen(js_name = signerReportPlanRecord)]
 pub fn signer_report_plan_record(
     log: &MembershipLog,

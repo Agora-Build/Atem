@@ -1868,7 +1868,15 @@ core builds only the primitive.
   `malformed`. What it puts in the plan is exactly what the builder takes
   in `records` or `drafts`; anything else refuses the build. Bodies only:
   the list's freeze and the member's standing change no answer (the
-  builder refuses those itself).
+  builder refuses those itself). Which bodies are in the plan is the
+  agreed B2 rule with the agreed reading on the plan's records above;
+  three points of the typed answer are **Atem's reading, for Astation's
+  confirmation (asked on Astation #114)**: a body of another account,
+  genesis or signer is **not in the plan** with a reason, never
+  `malformed` (the builder refuses it either way); the order account,
+  genesis, signer, action, origin (so another member's cover is
+  `another_signer`, this member's own `malformed`); and the four reason
+  codes.
 - **The verifier**, `verify_signer_report(log, report, expected_challenge,
   exported_records[], now_ms)`, reads membership at the verifier's head;
   the first failure is the code, in this order: `malformed`, `frozen`,

@@ -174,7 +174,12 @@ pub fn parse_signer_report_challenge(challenge_json: String) -> Result<SignerRep
 /// origin. `Report{malformed}` too for a `member` that isn't
 /// `member:<id>`, an `origin` not in its exact form, and a body that isn't
 /// a control record's (read as the request reads one). Bodies only: the
-/// list's freeze and the member's standing change no answer.
+/// list's freeze and the member's standing change no answer. Which bodies
+/// are `InPlan` is the agreed B2 rule with reading (c); Atem's reading,
+/// for Astation's confirmation (asked on Astation #114): another account,
+/// genesis or signer as `NotInPlan{reason}` (never `Report{malformed}`),
+/// the order account, genesis, signer, action, origin, and the four
+/// reason codes.
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 pub fn signer_report_plan_record(
     log: Arc<MembershipLog>,
