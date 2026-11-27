@@ -111,6 +111,21 @@ unit_enum! {
         /// The core builds the body from the journal's own bodies
         /// (`body_json` shows it); the barrier itself is the app's.
         SignerReport,
+        /// A native manager's Station binding proof
+        /// (`atem-station-binding`, delegated host-work III.5 (b); Atem's
+        /// answer on #120 comment 7207827118): it decides which Agora.Build
+        /// account's state controls whether a Station serves this R9
+        /// account's hosts. **A fresh confirmation every time**: never the
+        /// 5-minute reuse, never in the background or a notification
+        /// extension, never reused for another body. Show the Station
+        /// (`origin`), the action (`bind`, `transfer`, `unbind`), the R9
+        /// account (`account_id`), the Agora.Build account in `subject`
+        /// (for a transfer, the old owner too, `expected_binding.owner`), and
+        /// one line: "This decides which Agora.Build account's state
+        /// controls whether <Station> serves this account's hosts." The body
+        /// is the Station's challenge, exactly (`body_json` shows it); the
+        /// core checks every field before it asks.
+        StationBinding,
     }
 }
 
@@ -148,6 +163,9 @@ unit_enum! {
         /// `atem-signer-report-v1`: a native manager's signer report
         /// (`verify_signer_report`).
         SignerReport,
+        /// `atem-station-binding-v1`: a native manager's Station binding
+        /// proof (`verify_station_binding`).
+        StationBinding,
     }
 }
 

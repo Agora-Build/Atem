@@ -52,6 +52,12 @@ pub enum SignLabel {
     /// 7089435073): a native manager's signed report of its control-record
     /// signing journal, for a Station's recovery from a rollback.
     SignerReport,
+    /// `atem-station-binding` bodies (`station_binding`; delegated
+    /// host-work design III.5 (b) "Creating it", Atem's answer on #120
+    /// comment 7207827118): a native manager's signed proof that binds,
+    /// transfers or unbinds an R9 account's Agora.Build owner at a
+    /// Station. The body is the Station's challenge, exactly.
+    StationBinding,
 }
 
 impl SignLabel {
@@ -72,6 +78,7 @@ impl SignLabel {
             SignLabel::Result => "atem-result-v1",
             SignLabel::VerifierReport => "atem-verifier-report-v1",
             SignLabel::SignerReport => "atem-signer-report-v1",
+            SignLabel::StationBinding => "atem-station-binding-v1",
         }
     }
 
@@ -90,6 +97,7 @@ impl SignLabel {
             "atem-result" => Some(SignLabel::Result),
             "atem-verifier-report" => Some(SignLabel::VerifierReport),
             "atem-signer-report" => Some(SignLabel::SignerReport),
+            "atem-station-binding" => Some(SignLabel::StationBinding),
             _ => None,
         }
     }
@@ -172,7 +180,7 @@ mod tests {
 
     /// Every label, in one list. The match fails to compile until a new
     /// label is listed here too, so the distinctness test covers it.
-    const LABELS: [SignLabel; 15] = [
+    const LABELS: [SignLabel; 16] = [
         SignLabel::MembershipEntry,
         SignLabel::RecoveryCosign,
         SignLabel::BrowserGrant,
@@ -188,6 +196,7 @@ mod tests {
         SignLabel::HostRouteProxy,
         SignLabel::VerifierReport,
         SignLabel::SignerReport,
+        SignLabel::StationBinding,
     ];
 
     const fn listed(label: SignLabel) -> usize {
@@ -207,6 +216,7 @@ mod tests {
             SignLabel::HostRouteProxy => 12,
             SignLabel::VerifierReport => 13,
             SignLabel::SignerReport => 14,
+            SignLabel::StationBinding => 15,
         }
     }
 
@@ -277,6 +287,25 @@ mod tests {
         assert_eq!(SignLabel::SignerReport.as_str(), "atem-signer-report-v1");
         assert_eq!(SIGNER_REPORT_RECORDS, "atem-signer-report-records-v1");
         assert_eq!(SIGNER_REPORT_DRAFTS, "atem-signer-report-drafts-v1");
+    }
+
+    /// A native manager's Station binding proof (delegated host-work III.5
+    /// (b)): its own body type and label, distinct from every report,
+    /// route, channel, control and membership label
+    /// (`every_domain_string_is_distinct`).
+    #[test]
+    fn the_station_binding_has_its_own_label() {
+        assert_eq!(
+            SignLabel::of_body_type("atem-station-binding"),
+            Some(SignLabel::StationBinding)
+        );
+        assert_eq!(
+            SignLabel::StationBinding.as_str(),
+            "atem-station-binding-v1"
+        );
+        // Neither the label nor a near spelling is another body's type.
+        assert_eq!(SignLabel::of_body_type("atem-station-binding-v1"), None);
+        assert_eq!(SignLabel::of_body_type("atem-station-binding-2"), None);
     }
 
     #[test]

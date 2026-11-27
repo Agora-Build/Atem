@@ -495,6 +495,36 @@ mod tests {
         assert!(matches!(parse(&sealed), Err(Error::Malformed(_))));
     }
 
+    /// A Station binding proof (delegated host-work III.5 (b)) has no
+    /// array at all: its body is the Station's challenge, every field a
+    /// string, an integer or an object; nothing sits beside it but `sig`.
+    #[test]
+    fn a_station_binding_takes_no_array() {
+        let proof = |extra: Value| {
+            let mut body = json!({"type": "atem-station-binding", "v": 1, "action": "bind"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            json!({"body": body, "sig": "AA"})
+        };
+        let object = parse(&proof(json!({}))).unwrap();
+        assert_eq!(object.label(), SignLabel::StationBinding);
+        for extra in [
+            json!({"subject": ["a"]}),
+            json!({"head": {"seq": []}}),
+            json!({"expected_binding": {"state": []}}),
+        ] {
+            assert_eq!(parse(&proof(extra)), Err(Error::ArrayNotCanonical));
+        }
+        let mut kit = proof(json!({}));
+        kit["kit_sig"] = json!("AA");
+        assert_eq!(parse(&kit), Err(Error::KitSigUnexpected));
+        let mut sealed = proof(json!({}));
+        sealed["enc"] = json!("AA");
+        sealed["ct"] = json!("AA");
+        assert!(matches!(parse(&sealed), Err(Error::Malformed(_))));
+    }
+
     /// A verifier report's one array is its inventory's `actions`, a set
     /// (R9.2 "How a verifier reports itself"); none may sit elsewhere.
     #[test]

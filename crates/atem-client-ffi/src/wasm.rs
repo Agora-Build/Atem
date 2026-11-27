@@ -160,6 +160,7 @@ fn label(name: &str) -> JsResult<SignLabelKind> {
         "host_work_control" => SignLabelKind::HostWorkControl,
         "verifier_report" => SignLabelKind::VerifierReport,
         "signer_report" => SignLabelKind::SignerReport,
+        "station_binding" => SignLabelKind::StationBinding,
         _ => return Err(bad("unknown label")),
     })
 }
