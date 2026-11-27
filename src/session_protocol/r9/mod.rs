@@ -1178,7 +1178,20 @@ impl R9Host {
                 self.open(channel, transport, parts);
                 Vec::new()
             }
-            Event::Close { channel, .. } => self.router_closed(&channel, parts),
+            Event::Close { channel, reason } => {
+                // A reason of the router's own is named in runtime.log
+                // (R9.7a; a suspension's, the delegated host-work design
+                // III.5); any other reads as a plain router close.
+                if let Some(why) = reason
+                    .as_deref()
+                    .filter(|r| envelope::reason::ROUTER.contains(r))
+                    && self.chans.contains_key(&channel)
+                {
+                    self.input_log
+                        .log(mono, || format!("the router closed a channel ({why})"));
+                }
+                self.router_closed(&channel, parts)
+            }
             Event::Frame { channel, frame } => {
                 if !self.chans.contains_key(&channel) {
                     self.unknown_frame(&channel, parts.now.host.mono_ms);

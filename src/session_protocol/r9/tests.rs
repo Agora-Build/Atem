@@ -1140,6 +1140,38 @@ fn attachments_are_fenced_alone_and_a_principal_together() {
     assert_eq!(rig.list("phone").len(), 2);
 }
 
+/// The built-in Station closing every channel routed to a host whose
+/// account's service it suspended (the delegated host-work design III.5:
+/// `close{reason:"service_suspended"}`, R9.7a's router reasons; Atem's
+/// proposal, for Astation's agreement, #120 7207832274): as any router
+/// close, only that channel's attachment is fenced, with one runtime.log
+/// line naming the reason; the other channel and the host's state stay.
+#[test]
+fn a_router_close_for_a_suspended_service_fences_only_its_channel() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.connect("phone", phone());
+    rig.advance(1000);
+    rig.connect("bot-1", bot());
+    let lines = rig.engine.input_lines_written();
+    let gens = rig.rt.host.control_gens();
+    rig.envelope_in(&envelope::close(
+        "phone",
+        Some(envelope::reason::SERVICE_SUSPENDED),
+    ));
+    assert_eq!(rig.engine.status().attachments, 1);
+    assert_eq!(rig.list("bot-1"), vec![SID.to_string()]);
+    assert_eq!(rig.engine.input_lines_written(), lines + 1);
+    // Nothing else moved: no principal fenced.
+    assert_eq!(rig.rt.host.control_gens(), gens);
+    rig.advance(1000);
+    rig.connect("phone-2", phone());
+    assert_eq!(rig.list("phone-2").len(), 2);
+    // A plain router close names nothing (no line).
+    rig.envelope_in(&envelope::close("phone-2", Some("client_gone")));
+    assert_eq!(rig.engine.input_lines_written(), lines + 1);
+}
+
 /// A service a control record revoked (delegated host-work design I.5.5
 /// step 2, the runtime's `effects`): its attachments are fenced through §H
 /// (`control_gen` raised, each closed after `unauthorized`, `revoked`), its

@@ -30,6 +30,14 @@ pub mod reason {
     pub const MALFORMED: &str = "malformed";
     pub const HANDSHAKE_FAILED: &str = "handshake_failed";
     pub const EXPIRED: &str = "expired";
+    /// The router's: the built-in Station closes every channel routed to a
+    /// host whose account's service it suspended (the delegated host-work
+    /// design III.5; Atem's proposal, for Astation's agreement, #120
+    /// 7207832274).
+    pub const SERVICE_SUSPENDED: &str = "service_suspended";
+    /// The reasons a router's own `close` names (any other valid one reads
+    /// as a plain router close): `too_large` and `service_suspended`.
+    pub const ROUTER: [&str; 2] = [TOO_LARGE, SERVICE_SUSPENDED];
 }
 
 /// The router's label of the channel's route (logged, never trusted).
