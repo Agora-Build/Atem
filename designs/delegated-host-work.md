@@ -3126,7 +3126,7 @@ it (a), and the R9 accounts bound to it (b):
   routed link the host retires every live Station call on the socket, closes the gate at once and drops the socket
   itself if the Station hasn't closed it within 10 s; the next connect waits 30 s, the normal connect loop's pace after
   a suspension; Astation's local link stays, the notice taken there as a refusal of every call kind whose holds end
-  once the Station serves the link again. `atem status`: `Relay: not connected (service suspended: <text>;
+  once the Station serves the link again, whatever refusals the suspended Station sent meanwhile. `atem status`: `Relay: not connected (service suspended: <text>;
   retrying)`, the text as sent when it begins `service suspended:`, else prefixed (Atem's reading, for Astation's
   agreement), and with `host.delegated` `Control feeds: revocations not yet checked (<origin>: service suspended:
   <text>; retrying)`. **The `text` field, the disclosure order and the 10 s drop are Atem's proposal, for

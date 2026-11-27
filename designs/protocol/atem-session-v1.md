@@ -3832,7 +3832,7 @@ What the host does:
 | B-1 on a relay link (its own proof's verdict, once, as above) | the connect fails: no route, no Astation authentication on that socket (an authentication waiting for Astation's reply ends there); the text recorded; the next attempt 30 s after it, the normal connect loop's pace after a suspension, never at once; one runtime.log line per text an hour (`relay: service suspended: <text>; retrying`), at most 4 such lines an hour in all |
 | B-1 through Astation's `:8080` proxy (`host.delegated`) | as every refusal there: the link stays, the Station refuses its calls, its gate stays closed; the text recorded |
 | B-2 on a relay or routed link | the text recorded with its socket; with `host.delegated`, every live Station call on that socket retired (the control sync, the device-list fetch, the mailbox's syncs and dones, the puts; the acknowledgments sent on any connection of that socket go again on the next link), the origin's gate closed at once, nothing more asked on that socket and nothing read on it reopening the gate; if the Station hasn't closed the socket within 10 s the host drops it; the next attempt 30 s later, the normal connect loop's pace after a suspension (even when the link had been up for more than 10 s), never at once |
-| B-2 on Astation's local link | as a Station refusal of every call kind (`host.delegated`: retired, the gate closed, the 30 s backoff, acknowledgments held on that connection and mailbox dones held); the text recorded; the link (Astation's) stays; once the Station serves the link again (the resynchronization asked after the backoff reads) those holds end, and what they held goes, once |
+| B-2 on Astation's local link | as a Station refusal of every call kind (`host.delegated`: retired, the gate closed, the 30 s backoff, acknowledgments held on that connection and mailbox dones held); the text recorded; the link (Astation's) stays; the suspended Station keeps announcing its `heads` and refuses each call, and those refusals are the suspension's (the holds stay the suspension's, and its text the gate's reason); once the Station serves the link again (the first page asked after the latest refusal's backoff that reads) or the link generation ends, the holds end, and what they held goes, once |
 | B-3 | as any router close: only that channel's attachment fenced, a runtime.log line naming the reason |
 
 It is a service outage, never a revocation: no fence, revoke, unpair,
@@ -3850,9 +3850,15 @@ session bookkeeping, not trust.) Delegated tasks: queued ones wait
 host's Station link by its socket, whatever the link's generation (a
 suspension is the socket's): one read in the same tick as the link is
 installed or Astation authenticates it again still applies before
-anything of that socket is read or acknowledged. Station messages read in
-the same pass before the notice are dropped with it (fail closed: their
-records are read again from the unmoved cursor after the restore).
+anything of that socket is read or acknowledged. A notice whose socket
+closes before any Station link took it (Astation authenticating the link
+again at that moment) still makes what was acknowledged on that socket go
+again on the next link. On a relay or routed link, Station messages read
+in the same pass before the notice are dropped with it (fail closed:
+their records are read again from the unmoved cursor after the restore);
+on Astation's local link they are neutralized the same way (a page's call
+retired, a fetch result unasked, a `heads` asking nothing in the
+backoff).
 
 **`atem status`** shows `Relay: not connected (service suspended:
 <text>; retrying)`, and on a link still up the text inside its
@@ -3861,10 +3867,12 @@ suspended:` (III.5's texts do), otherwise with `service suspended: `
 before it (**Atem's reading, for Astation's agreement, #120
 7207832274**). With `host.delegated` on it also shows `Control feeds:
 revocations not yet checked (<origin>: service suspended: <text>;
-retrying)`. `Authorization` keeps its rules. The text clears:
+retrying)`, as the gate's reason only while no Station link is up or for
+the link the suspension came on (never a relay's as the local link's
+reason). `Authorization` keeps its rules. The text clears:
 - at the next `host_route_ok` or Astation authentication on a relay link;
-- one read on the local link, also when that link ends or its proof is
-  accepted;
+- one read on the local link, also at the next local connect or when its
+  proof is accepted;
 - with `host.delegated`, any (the relay's too) once the Station serves the
   host again: its feed gate open, on whatever link.
 

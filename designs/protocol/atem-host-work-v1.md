@@ -3029,9 +3029,13 @@ host's call on the link with exactly one of:
   connection on that socket counts as the suspended one. On Astation's
   local link, which stays, it is taken as a refusal of every call kind
   (this list's rules, its 30 s backoff included), except that its holds end
-  with the suspension: once the page asked after the backoff reads (the
-  Station serving the link again), the acknowledgments it held on that
-  connection go, once, and so do the mailbox's dones. Nothing durable moves
+  with the suspension: the suspended Station's refusals meanwhile are the
+  suspension's, and once the first page asked after the latest of them
+  reads (the Station serving the link again), or the link generation ends,
+  the acknowledgments it held on that connection go, once, and so do the
+  mailbox's dones. A notice whose socket closed before the host's Station
+  link took it still makes the acknowledgments sent on that socket go
+  again on the next link. Nothing durable moves
   (no cursor, reset mark, control part, owed done or identity), and `atem
   status` names the Station's text: `Control feeds: revocations not yet
   checked (<origin>: service suspended: <text>; retrying)`.
