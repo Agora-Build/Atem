@@ -1200,6 +1200,13 @@ final class ConformanceTests: XCTestCase {
             if let freeze = c["freeze"] { _ = try log.extend(entries: [entry(s(freeze))], now: at) }
             return log
         }
+        func sbindAction(_ a: BindingAction) -> String {
+            switch a {
+            case .bind: return "bind"
+            case .transfer: return "transfer"
+            case .unbind: return "unbind"
+            }
+        }
         func sbindExpected(_ e: ExpectedBinding) -> [String: Any] {
             switch e {
             case .neverBound: return ["state": "never_bound"]
@@ -1213,7 +1220,7 @@ final class ConformanceTests: XCTestCase {
         }
         func sbindChallenge(_ c: StationBindingChallenge) -> [String: Any] {
             [
-                "type": "atem-station-binding", "v": 1, "action": "\(c.action)", "origin": c.origin,
+                "type": "atem-station-binding", "v": 1, "action": sbindAction(c.action), "origin": c.origin,
                 "issuer": c.issuer, "subject": c.subject, "auth_time": c.authTime, "account_id": c.accountId,
                 "genesis_hash": c.genesisHash, "head": ["seq": c.head.seq, "hash": c.head.hash] as [String: Any],
                 "signer": c.signer, "expected_binding": sbindExpected(c.expectedBinding), "nonce": c.nonce,
@@ -1222,7 +1229,7 @@ final class ConformanceTests: XCTestCase {
         }
         func sbindOut(_ v: VerifiedStationBinding) -> [String: Any] {
             [
-                "action": "\(v.action)", "signer": v.signer,
+                "action": sbindAction(v.action), "signer": v.signer,
                 "head": ["seq": v.head.seq, "hash": v.head.hash] as [String: Any], "at_head": v.atHead,
                 "account_id": v.accountId, "genesis_hash": v.genesisHash, "issuer": v.issuer, "subject": v.subject,
                 "auth_time": v.authTime, "expected_binding": sbindExpected(v.expectedBinding), "nonce": v.nonce,
