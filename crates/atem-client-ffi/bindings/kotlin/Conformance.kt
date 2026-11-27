@@ -874,6 +874,23 @@ fun main(args: Array<String>) {
             eq(body, want, c["label"].s())
         }
     }
+    check("signer report: the plan predicate") {
+        // signerReportPlanRecord: InPlan or NotInPlan(reason), or
+        // Report(code); every reason among them.
+        val reasons = sortedSetOf<String>()
+        for (c in srep["plan_predicate"].arr()) {
+            val judge = { signerReportPlanRecord(srepLog(c), c["body"].s(), c["member"].s(), c["origin"].s()) }
+            val code = c.obj()["code"]
+            if (code != null) {
+                reportError(code.s()) { judge() }
+                continue
+            }
+            val want = if (c["in_plan"] == true) SignerPlanRecord.InPlan else SignerPlanRecord.NotInPlan(c["reason"].s())
+            eq(judge(), want, c["label"].s())
+            if (c["in_plan"] != true) reasons.add(c["reason"].s())
+        }
+        eq(reasons.toList(), listOf("another_account", "another_genesis", "another_origin", "another_signer"), "every reason")
+    }
     check("signer report: the immutable request") {
         for (c in srep["request"].arr()) {
             val log = srepLog(c)

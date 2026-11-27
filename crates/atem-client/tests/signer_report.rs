@@ -2529,8 +2529,9 @@ impl Gen {
 }
 
 /// A plan-predicate case: the body judged for `member` at `origin` on L
-/// + `chain` (+ `freeze`), and the answer written here: `Ok(None)` in the
-/// plan, `Ok(Some(reason))` not in it, `Err(code)` refused.
+/// followed by `chain` (then `freeze`), and the answer written here:
+/// `Ok(None)` in the plan, `Ok(Some(reason))` not in it, `Err(code)`
+/// refused.
 struct PlanCase {
     label: &'static str,
     note: &'static str,

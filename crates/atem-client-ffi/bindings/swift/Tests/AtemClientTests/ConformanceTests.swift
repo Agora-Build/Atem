@@ -1099,6 +1099,24 @@ final class ConformanceTests: XCTestCase {
                 try eq(canon(body), canon(want), s(c["label"]))
             }
         }
+        check("signer report: the plan predicate") {
+            // signerReportPlanRecord: .inPlan or .notInPlan(reason:), or
+            // Report(code); every reason among them.
+            var reasons = Set<String>()
+            for c in a(srep["plan_predicate"]).map(o) {
+                let judge = { try signerReportPlanRecord(log: try srepLog(c), bodyJson: s(c["body"]),
+                    member: s(c["member"]), origin: s(c["origin"])) }
+                if let code = c["code"] {
+                    try reportError(s(code)) { _ = try judge() }
+                    continue
+                }
+                let inPlan = (c["in_plan"] as? Bool) == true
+                let want: SignerPlanRecord = inPlan ? .inPlan : .notInPlan(reason: s(c["reason"]))
+                try eq(try judge() == want, true, s(c["label"]))
+                if !inPlan { reasons.insert(s(c["reason"])) }
+            }
+            try eq(reasons.sorted(), ["another_account", "another_genesis", "another_origin", "another_signer"], "every reason")
+        }
         check("signer report: the immutable request") {
             #if canImport(CryptoKit)
             let reporters = CryptoKitKeys()
@@ -2867,6 +2885,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 149)
+        XCTAssertEqual(passed, 150)
     }
 }

@@ -608,6 +608,30 @@ pub fn verify_signer_report(
     ))
 }
 
+/// The plan predicate (`member_report::signer::signer_report_plan_record`):
+/// whether a control record's body is one of the plan's records for
+/// `member` (`member:<id>`) at `origin` (exact), by the rule
+/// `SignerReportRequest` reads a journal's bodies with: `{type: "in_plan"}`
+/// or `{type: "not_in_plan", reason}` (`another_account`,
+/// `another_genesis`, `another_signer`, `another_origin`), or throws
+/// `kind: "report"`, `code: "malformed"` (this member's cover, hold or
+/// release; a body that isn't a control record's; a member or origin
+/// outside its grammar).
+#[wasm_bindgen(js_name = signerReportPlanRecord)]
+pub fn signer_report_plan_record(
+    log: &MembershipLog,
+    body_json: String,
+    member: String,
+    origin: String,
+) -> JsResult<JsValue> {
+    ok(crate::member_report::signer::signer_report_plan_record(
+        log.0.clone(),
+        body_json,
+        member,
+        origin,
+    ))
+}
+
 /// A signer report waiting for its signature
 /// (`member_report::signer::SignerReportRequest`): an immutable handle on
 /// the body the core built from the journal (`{id, since, revision,
