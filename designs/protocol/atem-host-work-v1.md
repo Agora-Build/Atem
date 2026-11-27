@@ -3024,12 +3024,17 @@ host's call on the link with exactly one of:
   origin's gate at once, asks nothing more on that socket and lets nothing
   read on it reopen the gate, and sends the acknowledgments it sent on that
   connection again on the next ("Acknowledgments" below); it drops the
-  socket itself if the Station hasn't within 10 s. On Astation's local link,
-  which stays, it is taken as a refusal of every call kind (this list's
-  rules, its 30 s backoff included). Nothing durable moves (no cursor, reset
-  mark, control part, owed done or identity), and `atem status` names the
-  Station's text: `Control feeds: revocations not yet checked (<origin>:
-  service suspended: <text>; retrying)`.
+  socket itself if the Station hasn't within 10 s. The notice is matched to
+  the link by its socket, whatever the link's generation, and every
+  connection on that socket counts as the suspended one. On Astation's
+  local link, which stays, it is taken as a refusal of every call kind
+  (this list's rules, its 30 s backoff included), except that its holds end
+  with the suspension: once the page asked after the backoff reads (the
+  Station serving the link again), the acknowledgments it held on that
+  connection go, once, and so do the mailbox's dones. Nothing durable moves
+  (no cursor, reset mark, control part, owed done or identity), and `atem
+  status` names the Station's text: `Control feeds: revocations not yet
+  checked (<origin>: service suspended: <text>; retrying)`.
 
 A native token alone never fetches or acknowledges another host's feeds,
 results or mailbox, and Astation proxies no credentials to an arbitrary
