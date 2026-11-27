@@ -1980,15 +1980,21 @@ core builds only the primitive.
     verifying head (`verify_control` valid, its signer a current manager
     there); (b) it is in its author's final verified report (in
     `records`, exported signed, no `records_mismatch`); (c) it has the
-    original's **stop intent**: every body field equal but `signer` (a
-    current manager), `record_id` (a fresh UUID v4, never the original's)
-    and `issued_at` (display only for a native's record), so
+    original's **stop intent** (**corrected in Astation #114 (Atem's
+    comment after 7207806862)**): every body field equal but `signer` (a
+    current manager), `record_id` (a fresh UUID v4, never the
+    original's), `issued_at` (display only for a native's record) and a
+    service's `feed_id`, which is either the original's feed or the
+    plan's candidate feed of the same origin (a current manager's stop
+    may name any feed of the origin, so both forms are valid). So
     `account_id`, `genesis_hash`, `principal`, `principal_key`, `action`
-    (and `interrupt_running` on a revoke), a service's `origin` and
-    `feed_id` (the original's old feed, which a current manager's stop
-    may name, so the copy depends on no plan), a host principal's
-    `revoke_seq`, and `about` (design I.5.4's "the same body, a new
-    `record_id`", made precise); (d) the final snapshot is `Consistent`,
+    (and `interrupt_running` on a revoke), a service's `origin` (always
+    the original's), a host principal's `revoke_seq`, and `about` are the
+    original's (design I.5.4's "the same body, a new `record_id`", made
+    precise). The vectors have both forms: `M8_revoke_resigned_a2` and
+    `M11_interrupt_resigned_a2` name the candidate feed (`N3`, `N9`,
+    `Q32`), `M4_revoke_resigned` the original's feed (`D8`); (d) the
+    final snapshot is `Consistent`,
     no `stop_not_resigned` for the original. A shared helper for (c)
     (`check_resigned_copy`, with vectors) is offered, not built;
   - a moved head needs the copy verified again at the new head, which
@@ -2188,7 +2194,8 @@ first, a revoked one's hold and a held unrevoked one's hold with no
 cover (`cover_not_first`), a removed unrevoked one outside `covered` (on
 `E7`, for which `S1_cover` and `M2_interrupt` gain their verdicts) and a
 current manager's copy of a removed manager's revoke for an uncovered
-principal.
+principal (`M4_revoke_resigned`, the copy naming the original's feed;
+`N3`'s `M8_revoke_resigned_a2` names the candidate feed).
 `scripts/check-r9-vectors.py` derives each snapshot case's answer and
 `in_force` from the records' verdicts on its chain, with no state
 machine, and checks every code is exercised.

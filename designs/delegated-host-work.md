@@ -954,14 +954,16 @@ identity, `account_id` and `genesis_hash` (R9.2), carried as push hints carry th
   current manager and that manager's fresh confirmation, every native control record the removed manager signed that
   the hosts haven't all applied: `revoke` and `interrupt_running` for a service, `interrupt_running` for a host
   principal (the same body, a new `record_id`: **Atem's reading, for Astation's agreement (Astation #114, comment
-  7207806862)**, every body field equal but `signer`, `record_id` and `issued_at`, the original's old `feed_id`
-  included; host-work-v1 §11.1, "A current manager's copy of a former manager's stop"). It learns which from the
-  hosts' acknowledgments: the Station's per-host reports for feeds, and the per-record results of `control_records`
-  (II.3.1). Astation alerts the owner to re-sign. **Changed after Astation's review:** only a per-record application
-  result of `applied` counts, never a cursor (I.5.8), and the alert stays until every covered host reports the
-  re-signed record applied. **Owner decision 2026-11-07:** a host sender's revoke and readmit need no re-signing: they
-  are device-list entries, and an entry stays valid after its signer is removed, since R9.2 checks the signer at the
-  entry's own `seq`.
+  7207806862; corrected in Astation #114, Atem's comment after it)**, every body field equal but `signer`,
+  `record_id`, `issued_at` and a service's `feed_id`, which names either the original's feed or the plan's candidate
+  feed of the same origin, `origin` always the original's, as the vectors' `M8_revoke_resigned_a2`,
+  `M11_interrupt_resigned_a2` and `M4_revoke_resigned` do; host-work-v1 §11.1, "A current manager's copy of a former
+  manager's stop"). It learns which from the hosts' acknowledgments: the Station's per-host reports for feeds, and the
+  per-record results of `control_records` (II.3.1). Astation alerts the owner to re-sign. **Changed after Astation's
+  review:** only a per-record application result of `applied` counts, never a cursor (I.5.8), and the alert stays
+  until every covered host reports the re-signed record applied. **Owner decision 2026-11-07:** a host sender's revoke
+  and readmit need no re-signing: they are device-list entries, and an entry stays valid after its signer is removed,
+  since R9.2 checks the signer at the entry's own `seq`.
 - **The edges.** A record a host has already applied stays applied after its signer is removed: a revoke stays final.
   Until the re-signing happens, an unapplied native control record is not in force on the hosts that hadn't applied
   it.
