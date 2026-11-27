@@ -30,6 +30,19 @@
 //!
 //! Only a verified proof gives a route. A query-string `atem_id`, the room
 //! code, a login or an old pairing never does; nothing falls back.
+//!
+//! A Station that doesn't serve the route's account (the delegated
+//! host-work design III.5: an account disabled at Agora.Build, or no
+//! Agora.Build owner at this Station) refuses a proof **that verified**
+//! with its own code, `service_suspended`, and a `text` the host shows
+//! ([`RelayReply::Suspended`], built by [`RelayReply::suspended`]): a
+//! Station refusal, never a verifier code ([`verify_host_route`] never
+//! returns it, and [`REFUSAL_CODES`] stay the verifier's ten), so a proof
+//! that doesn't verify gets its verifier code and no unverified connection
+//! learns an account's service state (least disclosure, D26). The `text`
+//! and that order are **Atem's proposal, for Astation's agreement (#120
+//! 7207832274)**. The open link's notice of the same is
+//! [`crate::station_notice`].
 use serde_json::{Map, Value, json};
 
 use crate::canonical::{self, Numbers};
@@ -144,6 +157,17 @@ fn relay_message(
     op: &str,
     fields: &[&str],
 ) -> std::result::Result<Map<String, Value>, HostRouteRefusal> {
+    let o = relay_object(bytes, op)?;
+    exact_fields(&o, fields)?;
+    Ok(o)
+}
+
+/// Strict parse of a relay message of `op` (`type` `relay`, `v: 1`), at
+/// most [`MAX_MESSAGE_BYTES`]; its other fields unchecked.
+fn relay_object(
+    bytes: &[u8],
+    op: &str,
+) -> std::result::Result<Map<String, Value>, HostRouteRefusal> {
     let value =
         canonical::parse_strict(bytes, MAX_MESSAGE_BYTES, Numbers::IntegersOnly).map_err(|e| {
             match e {
@@ -163,11 +187,19 @@ fn relay_message(
     if o.get("v").and_then(Value::as_u64) != Some(1) {
         return Err(malformed("v"));
     }
+    Ok(o)
+}
+
+/// Exactly `fields` beside `type`, `op` and `v`.
+fn exact_fields(
+    o: &Map<String, Value>,
+    fields: &[&str],
+) -> std::result::Result<(), HostRouteRefusal> {
     let known = |k: &str| ["type", "op", "v"].contains(&k) || fields.contains(&k);
     if o.len() != 3 + fields.len() || !o.keys().all(|k| known(k)) {
         return Err(malformed("fields"));
     }
-    Ok(o)
+    Ok(())
 }
 
 // ------------------------------------------------------------ challenge
@@ -353,7 +385,8 @@ pub fn host_route_message(proof: &SignedObject) -> Value {
 
 // ------------------------------------------------------- relay replies
 
-/// The refusal codes, by `code()` (a `host_route_refused` names one).
+/// The verifier's refusal codes, by `code()` (a `host_route_refused` names
+/// one, with no `text`).
 pub const REFUSAL_CODES: [&str; 10] = [
     "malformed",
     "frozen",
@@ -367,15 +400,55 @@ pub const REFUSAL_CODES: [&str; 10] = [
     "atem_id_mismatch",
 ];
 
+/// A Station's refusal of a proof that verified: the account's service is
+/// suspended at this Station (the delegated host-work design III.5).
+pub const SERVICE_SUSPENDED: &str = "service_suspended";
+
+/// The Station's own refusal codes (never the verifier's): a
+/// `host_route_refused` naming one carries a `text`
+/// ([`RelayReply::Suspended`]).
+pub const STATION_REFUSAL_CODES: [&str; 1] = [SERVICE_SUSPENDED];
+
+/// A Station's `text` (a suspension's) is 1 to this many bytes of UTF-8.
+pub const MAX_SERVICE_TEXT_BYTES: usize = 256;
+
+/// Whether `text` is a Station's text a host may show (`atem status`,
+/// runtime.log): 1 to [`MAX_SERVICE_TEXT_BYTES`] bytes of UTF-8 with no
+/// character of General Category Cc, Cf, Zl or Zp (the pinned Unicode
+/// data's), so no terminal escape, bidi control or line break reaches a
+/// terminal. **Atem's proposal, for Astation's agreement (#120
+/// 7207832274).**
+pub fn service_text_ok(text: &str) -> bool {
+    use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
+    !text.is_empty()
+        && text.len() <= MAX_SERVICE_TEXT_BYTES
+        && !text.chars().any(|c| {
+            matches!(
+                c.general_category(),
+                GeneralCategory::Control
+                    | GeneralCategory::Format
+                    | GeneralCategory::LineSeparator
+                    | GeneralCategory::ParagraphSeparator
+            )
+        })
+}
+
 /// The relay's answer to a proof: `host_route_ok` once it verified it
 /// (the route is the host's), or `host_route_refused` with the
-/// verifier's code (the relay closes the connection after it).
+/// verifier's code, or with the Station's `service_suspended` and its text
+/// for a proof that verified (the relay closes the connection after
+/// either).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayReply {
     /// `{"type":"relay","op":"host_route_ok","v":1,"host_id","head":{"seq","hash"}}`.
     Ok { host_id: String, head: Head },
-    /// `{"type":"relay","op":"host_route_refused","v":1,"code"}`.
+    /// `{"type":"relay","op":"host_route_refused","v":1,"code"}`: one of
+    /// the verifier's [`REFUSAL_CODES`].
     Refused { code: String },
+    /// `{"type":"relay","op":"host_route_refused","v":1,"code":
+    /// "service_suspended","text"}`: the Station doesn't serve the route's
+    /// account; `text` is [`service_text_ok`]'s.
+    Suspended { text: String },
 }
 
 impl RelayReply {
@@ -394,17 +467,32 @@ impl RelayReply {
         }
     }
 
+    /// The Station's `host_route_refused` with `service_suspended` for a
+    /// proof that verified, its `text` [`service_text_ok`]'s (else
+    /// `Malformed("text")`).
+    pub fn suspended(text: &str) -> Result<Self> {
+        if !service_text_ok(text) {
+            return Err(Error::Malformed("text"));
+        }
+        Ok(RelayReply::Suspended {
+            text: text.to_owned(),
+        })
+    }
+
     pub fn to_json(&self) -> Value {
         match self {
             RelayReply::Ok { host_id, head } => json!({"type": "relay", "op": "host_route_ok",
                 "v": 1, "host_id": host_id, "head": head.to_json()}),
             RelayReply::Refused { code } => json!({"type": "relay", "op": "host_route_refused",
                 "v": 1, "code": code}),
+            RelayReply::Suspended { text } => json!({"type": "relay", "op": "host_route_refused",
+                "v": 1, "code": SERVICE_SUSPENDED, "text": text}),
         }
     }
 
-    /// Exactly one of the two replies (strict I-JSON, exact fields, a
-    /// known refusal code); `None` for any other relay message.
+    /// Exactly one of the two replies (strict I-JSON, exact fields per
+    /// code: a verifier code alone, `service_suspended` with its `text`);
+    /// `None` for any other relay message.
     pub fn parse(bytes: &[u8]) -> Option<std::result::Result<Self, HostRouteRefusal>> {
         let op = serde_json::from_slice::<Value>(bytes)
             .ok()?
@@ -422,21 +510,38 @@ impl RelayReply {
                             .ok_or(malformed("head"))?,
                     })
                 }),
-            "host_route_refused" => {
-                relay_message(bytes, "host_route_refused", &["code"]).and_then(|o| {
-                    let code = o
-                        .get("code")
-                        .and_then(Value::as_str)
-                        .filter(|c| REFUSAL_CODES.contains(c))
-                        .ok_or(malformed("code"))?;
-                    Ok(RelayReply::Refused {
-                        code: code.to_owned(),
-                    })
-                })
-            }
+            "host_route_refused" => refused_reply(bytes),
             _ => return None,
         })
     }
+}
+
+/// A `host_route_refused`: a verifier code with exactly `code`, or
+/// `service_suspended` with exactly `code` and `text` (a valid one).
+fn refused_reply(bytes: &[u8]) -> std::result::Result<RelayReply, HostRouteRefusal> {
+    let o = relay_object(bytes, "host_route_refused")?;
+    let code = o
+        .get("code")
+        .and_then(Value::as_str)
+        .ok_or(malformed("code"))?;
+    if REFUSAL_CODES.contains(&code) {
+        exact_fields(&o, &["code"])?;
+        return Ok(RelayReply::Refused {
+            code: code.to_owned(),
+        });
+    }
+    if code != SERVICE_SUSPENDED {
+        return Err(malformed("code"));
+    }
+    exact_fields(&o, &["code", "text"])?;
+    let text = o
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|t| service_text_ok(t))
+        .ok_or(malformed("text"))?;
+    Ok(RelayReply::Suspended {
+        text: text.to_owned(),
+    })
 }
 
 // --------------------------------------------------------- verification

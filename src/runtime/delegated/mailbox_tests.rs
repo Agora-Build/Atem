@@ -613,3 +613,94 @@ fn only_a_skipped_request_cancel_or_complete_holds_the_gate() {
     c.on_heads(head(MAILBOX, 5));
     assert_eq!(c.reset_due().as_deref(), Some(MAILBOX));
 }
+
+/// The delegated host-work design III.5: the Station's `service_suspended`
+/// on a relay or routed link retires every live mailbox call (their
+/// answers drained; the owed dones go again) and nothing more is synced or
+/// marked done on that socket, whatever its link generation; a link on a
+/// new socket syncs and marks done again. On Astation's local link (which
+/// stays) as a refusal of both calls: nothing before a `heads` past the
+/// backoff, no done more on this link generation.
+#[test]
+fn a_suspension_retires_every_mailbox_call() {
+    let mut c = client(10 * SEC, Some((MAILBOX, 2)));
+    owing(&mut c, (MAILBOX, 2), [1]);
+    c.on_heads(head(MAILBOX, 3));
+    let out = c.take_outgoing();
+    let (sync, done) = (out.sync[0].clone(), out.dones[0].clone());
+    c.on_suspended(true);
+    assert_eq!(c.on_page(Ok(page(&sync, 3, 3))), PageCheck::Drained);
+    assert_eq!(c.on_done_result(answer(&done)), None);
+    assert_eq!(
+        c.closed().as_deref(),
+        Some("the Station suspended this host's service")
+    );
+    c.tick(60 * SEC);
+    c.on_heads(head(MAILBOX, 3));
+    c.on_link(Some(&link(2, 1)));
+    c.on_heads(head(MAILBOX, 3));
+    assert_eq!(c.take_outgoing(), Outgoing::default(), "the same socket");
+    c.on_link(Some(&link(3, 2)));
+    c.on_heads(head(MAILBOX, 3));
+    let out = c.take_outgoing();
+    assert_eq!((out.sync.len(), positions(&out.dones)), (1, vec![1]));
+
+    // The local link.
+    let mut c = client(10 * SEC, Some((MAILBOX, 2)));
+    owing(&mut c, (MAILBOX, 2), [1]);
+    c.on_heads(head(MAILBOX, 3));
+    assert_eq!(c.take_outgoing().sync.len(), 1);
+    c.on_suspended(false);
+    assert_eq!(
+        c.closed().as_deref(),
+        Some("the Station suspended this host's service; retrying")
+    );
+    c.tick(20 * SEC);
+    c.on_heads(head(MAILBOX, 3));
+    assert_eq!(c.take_outgoing(), Outgoing::default(), "the backoff");
+    c.tick(41 * SEC);
+    c.on_heads(head(MAILBOX, 3));
+    let out = c.take_outgoing();
+    assert_eq!(out.sync.len(), 1, "asked again after the backoff");
+    assert!(
+        out.dones.is_empty(),
+        "no done before the Station serves the link"
+    );
+    // Review M2: the page asked after the backoff reads: the dones go
+    // again on the same link generation.
+    commit(&mut c, page(&out.sync[0], 3, 3));
+    owing(&mut c, (MAILBOX, 3), [1]);
+    assert_eq!(positions(&c.take_outgoing().dones), vec![1]);
+}
+
+/// Review N1 (the reviewer's probe): on Astation's local link the
+/// suspended Station refuses the sync asked after the backoff (and a done
+/// in flight); the done hold stays owed to end, and the page asked after
+/// the refusal's backoff that commits ends it.
+#[test]
+fn a_sync_refusal_during_a_local_suspension_keeps_the_done_hold_owed() {
+    let mut c = client(10 * SEC, Some((MAILBOX, 2)));
+    owing(&mut c, (MAILBOX, 2), [1]);
+    c.on_heads(head(MAILBOX, 3));
+    assert_eq!(c.take_outgoing().sync.len(), 1);
+    c.on_suspended(false);
+    c.tick(41 * SEC);
+    c.on_heads(head(MAILBOX, 3));
+    let out = c.take_outgoing();
+    assert_eq!(out.sync.len(), 1, "asked after the backoff");
+    // The Station, still suspended, refuses it, and a done.
+    c.on_sync_refused();
+    c.on_done_refused();
+    c.tick(72 * SEC);
+    c.on_heads(head(MAILBOX, 3));
+    let out = c.take_outgoing();
+    assert_eq!(out.sync.len(), 1, "asked after the refusal's backoff");
+    assert!(out.dones.is_empty(), "held");
+    commit(&mut c, page(&out.sync[0], 3, 3));
+    owing(&mut c, (MAILBOX, 3), [1]);
+    assert_eq!(
+        positions(&c.take_outgoing().dones),
+        vec![1],
+        "the hold ended with the Station serving the link"
+    );
+}

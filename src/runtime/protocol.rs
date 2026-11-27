@@ -462,6 +462,11 @@ pub struct RuntimeStatus {
     /// (§R9.7b): no Astation authenticated it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub routed: bool,
+    /// The Station's suspension of this host's service, as `atem status`
+    /// shows it (`service suspended: <text>`; the delegated host-work
+    /// design III.5, `app/suspension.rs`), until it is lifted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspended: Option<String>,
     /// The link has a session attachment (a verified pairing).
     #[serde(default)]
     pub attachment: bool,

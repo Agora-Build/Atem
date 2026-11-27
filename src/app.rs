@@ -3,6 +3,7 @@ pub mod op_route;
 mod reauth;
 mod relay_only;
 mod station_route;
+pub mod suspension;
 #[cfg(test)]
 mod session_tests;
 
@@ -169,6 +170,16 @@ pub struct App {
     /// The unreadable pairing record error last logged by the connect loop
     /// (logged again only when it changes).
     pub pairing_unreadable: Option<String>,
+    /// The Station's suspension of this host's service, as last read (the
+    /// delegated host-work design III.5; `app/suspension.rs`): shown by
+    /// `atem status`; never a trust or state change.
+    pub service_suspension: Option<suspension::Suspension>,
+    /// The 10 s drop of a relay or routed link a suspension came on.
+    pub suspension_drop: Option<suspension::SuspensionDrop>,
+    /// The Station's `service_suspended` notices read in this run.
+    suspension_notices: u64,
+    /// One runtime.log line per suspension text an hour.
+    suspension_lines: suspension::Lines,
     /// How many times the connect loop logged it (tests).
     #[cfg(test)]
     pub pairing_unreadable_logged: usize,
@@ -218,6 +229,10 @@ impl App {
             relay_only_drop: None,
             station_routing: station_route::Routing::default(),
             pairing_unreadable: None,
+            service_suspension: None,
+            suspension_drop: None,
+            suspension_notices: 0,
+            suspension_lines: suspension::Lines::default(),
             #[cfg(test)]
             pairing_unreadable_logged: 0,
         };
@@ -544,6 +559,7 @@ impl App {
 
             // Local unavailable or not allowed: the paired Astation's
             // identity room on the relay (no pairing, no relay connection).
+            let mut suspended = None;
             if let Some(relay_code) = room {
                 let mut relay_client = crate::websocket_client::AstationClient::new()
                     .with_profile(src)
@@ -556,8 +572,34 @@ impl App {
                         let _ = tx.send(Ok((relay_client, Some(relay_code))));
                         return;
                     }
+                    // The Station suspended this host's service (III.5):
+                    // the App records its text (`app/suspension.rs`).
+                    Err(error)
+                        if error
+                            .downcast_ref::<crate::websocket_client::ServiceSuspendedError>()
+                            .is_some() =>
+                    {
+                        suspended = Some(error);
+                    }
                     Err(error) => note(error),
                 }
+            }
+            // The suspension first, carrying the local link's session
+            // advice, if any, for a pairing or unlock waiting for the link
+            // (review L10).
+            if let Some(error) = suspended {
+                let error = match session_problem
+                    .map(crate::runtime::ops::session_advice)
+                    .and_then(|advice| {
+                        advice
+                            .downcast_ref::<crate::runtime::ops::SessionAdvice>()
+                            .map(|a| a.0.clone())
+                    }) {
+                    Some(advice) => error.context(crate::runtime::ops::SessionAdvice(advice)),
+                    None => error,
+                };
+                let _ = tx.send(Err(error));
+                return;
             }
 
             let _ = tx.send(Err(match session_problem {
@@ -588,6 +630,8 @@ impl App {
                     self.astation_routed_at = Some(Instant::now());
                     self.astation_link_gen += 1;
                     self.astation_connect_error = None;
+                    // `host_route_ok` on a relay link (III.5).
+                    self.suspension_lifted();
                     self.pairing_code = code;
                     self.rebuild_menu();
                     eprintln!("atem runtime: r9: relay route held (no Astation)");
@@ -617,6 +661,16 @@ impl App {
                     self.astation_link_gen += 1;
                     self.astation_connect_error = None;
                     self.pairing_unreadable = None;
+                    // Astation authenticated a relay link: a suspension is
+                    // lifted; a local link keeps a relay's record and
+                    // takes what its own connect read (III.5).
+                    match self.astation_client.via() {
+                        Some(crate::websocket_client::LinkVia::Local) => {
+                            let read = self.astation_client.take_connect_suspension();
+                            self.local_link_suspension(read);
+                        }
+                        _ => self.suspension_lifted(),
+                    }
                     self.pairing_code = code;
                     self.rebuild_menu();
                     self.status_message = Some("Connected to Astation".to_string());
@@ -646,6 +700,13 @@ impl App {
                             }
                         }
                         self.status_message = Some(format!("Astation: {text}"));
+                    } else if let Some(suspended) =
+                        error.downcast_ref::<crate::websocket_client::ServiceSuspendedError>()
+                    {
+                        // III.5: the text for `atem status`; the usual 30 s
+                        // retry, set above.
+                        self.pairing_unreadable = None;
+                        self.suspended_at_connect(suspended);
                     } else {
                         self.pairing_unreadable = None;
                         self.status_message = Some(
@@ -677,6 +738,26 @@ impl App {
     }
 
     pub async fn handle_astation_message(&mut self, message: AstationMessage) {
+        // The Station's suspension of this host's service (III.5), on any
+        // link, re-authenticating or not: recorded, never an operation's.
+        let message = match message {
+            AstationMessage::ServiceSuspended(text) => {
+                self.service_suspended(text);
+                return;
+            }
+            AstationMessage::HostRouteSuspended(text) => {
+                // A verdict counts once, at connect; one on an open link
+                // (a relay that answered late) ends it as a refusal does.
+                let shown = suspension::shown(&text);
+                self.service_suspended(text);
+                if self.astation_routed && !self.astation_connected {
+                    self.drop_astation_link(format!("{shown}; retrying"));
+                    self.astation_reconnect_at = Some(Instant::now() + suspension::RETRY_AFTER);
+                }
+                return;
+            }
+            message => message,
+        };
         if self.intercept_astation_reauth(&message).await {
             return;
         }
@@ -890,6 +971,7 @@ impl App {
             self.handle_astation_message(message).await;
             message_count += 1;
         }
+        self.check_suspension_drop();
         self.check_astation_reauth_deadline();
         self.check_relay_only_drop();
         self.check_station_switch();
@@ -899,10 +981,12 @@ impl App {
         // it takes), so a reply just before the close (a `deviceVerified`
         // before the Station's 1013) is never dropped with the client.
         if self.astation_routed && self.astation_client.is_ws_closed() {
-            // The routed link dropped: reconnect as today.
+            // The routed link dropped: reconnect as today (after 30 s once
+            // the Station suspended this host's service on it, III.5).
+            let socket = self.astation_client.socket_id();
             self.astation_routed = false;
             self.astation_client = crate::websocket_client::AstationClient::new();
-            self.astation_reconnect_at = Some(self.routed_retry_at());
+            self.astation_reconnect_at = Some(self.suspension_retry_at(socket, self.routed_retry_at()));
             self.status_message = Some("The relay route dropped — reconnecting…".to_string());
         }
         if self.astation_connected && self.astation_client.is_ws_closed() {
@@ -911,16 +995,20 @@ impl App {
             // under the new device list: no short-link backoff for it.
             let reproof = self.verify_hold.is_some()
                 && self.astation_client.peer_close_code() == Some(REPROOF_CLOSE);
+            let socket = self.astation_client.socket_id();
             self.astation_connected = false;
             self.on_astation_disconnect();
             self.astation_client = crate::websocket_client::AstationClient::new();
             self.rebuild_menu();
-            // A short-lived link backs off instead of flickering repeatedly.
-            self.astation_reconnect_at = Some(if reproof {
+            // A short-lived link backs off instead of flickering repeatedly;
+            // so does one the Station suspended this host's service on
+            // (III.5: after 30 s, never at once).
+            let at = if reproof {
                 Instant::now()
             } else {
                 self.connected_retry_at()
-            });
+            };
+            self.astation_reconnect_at = Some(self.suspension_retry_at(socket, at));
             self.status_message = Some("Astation disconnected — reconnecting…".to_string());
         }
 

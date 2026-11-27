@@ -76,6 +76,11 @@ pub enum RouteResult {
     Routed { host_id: String, head: Head },
     /// `host_route_refused` with the verifier's code.
     Refused(String),
+    /// `host_route_refused` with the Station's `service_suspended` and its
+    /// text (the delegated host-work design III.5): the proof verified and
+    /// the Station doesn't serve the route's account. The host shows the
+    /// text and retries; never a revocation, no R9 state changes.
+    Suspended(String),
 }
 
 /// Whether the host answers a challenge now.
@@ -563,7 +568,7 @@ impl LinkRoute {
         // A verdict counts only for this link's own proof, once.
         let what = match &reply {
             RelayReply::Ok { .. } => "ok",
-            RelayReply::Refused { .. } => "refused",
+            RelayReply::Refused { .. } | RelayReply::Suspended { .. } => "refused",
         };
         match self.carrier {
             // A local link: the proof of its current authentication's.
@@ -602,6 +607,19 @@ impl LinkRoute {
                     self.log_reply(&format!("refused: {code}"));
                 }
                 return Some(RouteResult::Refused(code));
+            }
+            // The Station's own refusal: the text goes to `atem status`
+            // and the App's hourly line, never this one.
+            RelayReply::Suspended { text } => {
+                self.judged();
+                if self.carrier == Carrier::Local {
+                    self.log_reply(
+                        "refused through Astation's local link: service_suspended; the link stays, and the Station refuses its calls",
+                    );
+                } else {
+                    self.log_reply("refused: service_suspended");
+                }
+                return Some(RouteResult::Suspended(text));
             }
             RelayReply::Ok { host_id, head } => (host_id, head),
         };
@@ -874,6 +892,44 @@ mod tests {
             .to_json()
             .to_string();
         assert_eq!(r8.on_reply(&refused), None);
+    }
+
+    /// The delegated host-work design III.5 (Atem's proposal, for
+    /// Astation's agreement, #120 7207832274): a Station's
+    /// `service_suspended` refusal is this link's verdict as any refusal
+    /// is (only after its own proof, once), with its text; a malformed one
+    /// (no text, a verifier code with a text) is no verdict. Through
+    /// Astation's local link the same, for the authentication's proof.
+    #[test]
+    fn a_suspension_is_the_verdict_on_the_links_own_proof_with_its_text() {
+        let mut log = TestLog::genesis("acct-1", &secret("route astation"));
+        log.add_host("host-1", 1, &secret("route host"));
+        let text = "service suspended: account disabled at Agora.Build";
+        let suspended = RelayReply::suspended(text).unwrap().to_json().to_string();
+        let challenge = || HostChallenge::new(ROOM).to_json().to_string();
+        let mut link = LinkRoute::new(ready(&log), ROOM, "atem-x");
+        assert_eq!(link.on_reply(&suspended), None, "no proof sent yet");
+        assert!(link.answer(&challenge()).is_some());
+        let no_text =
+            r#"{"type":"relay","op":"host_route_refused","v":1,"code":"service_suspended"}"#;
+        assert_eq!(link.on_reply(no_text), None, "malformed");
+        let with_text =
+            r#"{"type":"relay","op":"host_route_refused","v":1,"code":"fork","text":"x"}"#;
+        assert_eq!(link.on_reply(with_text), None, "malformed");
+        assert_eq!(
+            link.on_reply(&suspended),
+            Some(RouteResult::Suspended(text.into()))
+        );
+        assert_eq!(link.on_reply(&suspended), None, "one verdict");
+        assert!(!link.routed_ok_flag().load(Ordering::SeqCst));
+
+        let mut local = LinkRoute::local(ready(&log), ROOM, "atem-x");
+        local.authenticated();
+        assert!(local.answer(&challenge()).is_some());
+        assert_eq!(
+            local.on_reply(&suspended),
+            Some(RouteResult::Suspended(text.into()))
+        );
     }
 
     /// Through Astation's `:8080` proxy (design I.5.8; Atem's reading of

@@ -33,6 +33,25 @@
 //! `control_sync_result` (peeked leniently, so a page that isn't strict
 //! JSON is still known as one): that page is a Station fault the sync
 //! answers ([`Inbound::Page`] with the reader's error).
+//!
+//! **The Station's suspension** of this host's service (the delegated
+//! host-work design III.5, its `service_suspended` notice, which the App
+//! reads and the bridge hands over, matched by socket, before anything
+//! else of its pass reads that socket: [`Station::on_suspended`]). On a
+//! relay or routed link (which the Station closes after it): every live
+//! call on the socket is retired (the sync's, the fetch's, the mailbox's
+//! syncs and dones, the puts; the acknowledgments the bridge's book sent on
+//! any connection of that socket go again on the next link), the origin's
+//! gates close at once, and nothing more is asked on that socket, nor does
+//! anything read on it reopen a gate, until a link on a new socket. Station
+//! messages read in the same pass before the notice are dropped with it
+//! (fail closed: the cursor didn't move, so their records are read again
+//! after the restore). On Astation's local link (which stays): as a
+//! refusal of every call kind, its 30-second backoff included, its
+//! acknowledgment and done holds ending once the Station serves the link
+//! again. Never a trust or state change (no cursor, mark, fence or
+//! identity moves). **Atem's proposal, for Astation's agreement (#120
+//! 7207832274).**
 use super::fetch::{DeviceListFetch, FetchApply};
 use super::mailbox::MailboxClient;
 use super::puts::PutClient;
@@ -164,6 +183,13 @@ pub struct Station {
     logged: [Option<u64>; 3],
     /// Messages the shared reader refused.
     unread: u64,
+    /// The socket of a relay or routed link the Station suspended this
+    /// host's service on (III.5): nothing read on it counts any more.
+    suspended: Option<u64>,
+    /// The Station's suspensions read, and the messages read after one on
+    /// its socket (dropped).
+    suspensions: u64,
+    after_suspension: u64,
 }
 
 fn slot(call: RefusedCall) -> usize {
@@ -263,8 +289,9 @@ impl Station {
         deferred: Option<u64>,
     ) -> Option<MembershipFetch> {
         self.now = now_mono;
-        // Nothing on a socket of another identity's association.
-        if self.feed.moved_socket().is_some() {
+        // Nothing on a socket of another identity's association, or one
+        // the Station suspended this host's service on (III.5).
+        if self.feed.socket_ended() {
             return None;
         }
         self.fetch.tick(now_mono, applied.as_ref(), deferred)
@@ -279,7 +306,13 @@ impl Station {
         applied: Option<Head>,
         deferred: Option<u64>,
     ) -> Inbound {
-        if self.link.is_none() {
+        let Some(link) = self.link.as_ref() else {
+            return Inbound::Nothing;
+        };
+        // Nothing read on a socket the Station suspended this host's
+        // service on reopens anything (III.5).
+        if self.suspended == Some(link.socket) {
+            self.after_suspension += 1;
             return Inbound::Nothing;
         }
         // The mailbox's messages only with `host.senders`.
@@ -314,7 +347,7 @@ impl Station {
                 }
                 // Another identity's association: nothing fetched, no head
                 // announced for the gate.
-                let moved = self.feed.moved_socket().is_some();
+                let moved = self.feed.socket_ended();
                 let fetch = applied
                     .filter(|_| !moved)
                     .and_then(|applied| self.fetch.on_heads(&heads.membership, &applied, deferred));
@@ -376,6 +409,29 @@ impl Station {
         }
     }
 
+    /// The Station suspended this host's service on the link (III.5; the
+    /// module docs): a relay or routed link's socket ends its association,
+    /// Astation's local link takes it as a refusal of every call kind.
+    /// Whether there was a link to apply it to.
+    pub fn on_suspended(&mut self, text: &str) -> bool {
+        let Some(link) = self.link.clone() else {
+            return false;
+        };
+        self.suspensions += 1;
+        let socket_ends = link.kind != LinkKind::Local;
+        self.feed.on_suspended(text, socket_ends);
+        self.mailbox.on_suspended(socket_ends);
+        self.puts.on_suspended(socket_ends);
+        if socket_ends {
+            // The fetch in flight is carried nowhere; its pacing kept.
+            self.fetch = self.fetch.next_generation();
+            self.suspended = Some(link.socket);
+        } else {
+            self.fetch.on_refused();
+        }
+        true
+    }
+
     /// For the state dump.
     pub fn dump(&self) -> Value {
         json!({
@@ -389,6 +445,8 @@ impl Station {
                 "control_ack": self.refusals[2],
             },
             "unread": self.unread,
+            "suspensions": self.suspensions,
+            "after_suspension": self.after_suspension,
             "feed": self.feed.dump(),
             "mailbox": self.senders.then(|| self.mailbox.dump()),
             "puts": self.senders.then(|| self.puts.dump()),
@@ -505,6 +563,83 @@ mod tests {
         assert_eq!(s.link().unwrap().origin.as_deref(), Some("https://s.test"));
         s.sync_link(None, 0, || LinkKind::Relay, || None);
         assert!(s.link().is_none());
+    }
+
+    const TEXT: &str = "service suspended: account disabled at Agora.Build";
+
+    /// The delegated host-work design III.5 (Atem's proposal, for
+    /// Astation's agreement, #120 7207832274): the Station's
+    /// `service_suspended` on a routed (or relay) link retires the fetch in
+    /// flight (its result is carried nowhere), and nothing read on that
+    /// socket counts any more (a `heads` asks nothing, announces nothing);
+    /// a link on a new socket fetches again. With no link nothing applies.
+    #[test]
+    fn a_suspension_ends_a_relay_sockets_calls() {
+        let mut s = Station::new();
+        assert!(!s.on_suspended(TEXT), "no link");
+        up(&mut s, 1);
+        assert_eq!(
+            fetched(s.receive(&heads(5), Some(head(3)), None)),
+            Some(MembershipFetch { after: 3 })
+        );
+        assert!(s.on_suspended(TEXT));
+        assert_eq!(s.dump()["fetch"]["in_flight"], Value::Null);
+        assert!(s.feed.socket_ended());
+        let result = MembershipFetchResult {
+            head: head(5),
+            entries: Vec::new(),
+        }
+        .to_json()
+        .unwrap()
+        .to_string();
+        assert_eq!(s.receive(&result, Some(head(3)), None), Inbound::Nothing);
+        assert_eq!(s.receive(&heads(6), Some(head(3)), None), Inbound::Nothing);
+        assert_eq!(s.dump()["after_suspension"], 2);
+        assert_eq!(s.fetch.part().announced, None);
+        assert_eq!(s.tick(100_000, Some(head(3)), None), None);
+        // A new socket: fetched again.
+        s.sync_link(
+            Some(2),
+            2,
+            || LinkKind::Routed,
+            || Some("https://s.test".into()),
+        );
+        assert!(!s.feed.socket_ended());
+        s.tick(101_000, Some(head(3)), None);
+        assert_eq!(
+            fetched(s.receive(&heads(6), Some(head(3)), None)),
+            Some(MembershipFetch { after: 3 })
+        );
+        assert_eq!(s.dump()["suspensions"], 1);
+    }
+
+    /// III.5 on Astation's local link (which stays): as a refusal of every
+    /// call kind; the fetch in flight retired, none asked before the
+    /// backoff ends, then fetched again on the same link.
+    #[test]
+    fn a_suspension_on_the_local_link_is_a_refusal() {
+        let mut s = Station::new();
+        s.sync_link(
+            Some(1),
+            1,
+            || LinkKind::Local,
+            || Some("https://s.test".into()),
+        );
+        s.tick(1_000, Some(head(3)), None);
+        assert_eq!(
+            fetched(s.receive(&heads(5), Some(head(3)), None)),
+            Some(MembershipFetch { after: 3 })
+        );
+        assert!(s.on_suspended(TEXT));
+        assert_eq!(s.dump()["fetch"]["in_flight"], Value::Null);
+        assert!(!s.feed.socket_ended());
+        s.tick(2_000, Some(head(3)), None);
+        assert_eq!(fetched(s.receive(&heads(5), Some(head(3)), None)), None);
+        s.tick(1_000 + 31_000, Some(head(3)), None);
+        assert_eq!(
+            fetched(s.receive(&heads(5), Some(head(3)), None)),
+            Some(MembershipFetch { after: 3 })
+        );
     }
 
     /// The host identity in trust generation `host_trust_gen`.

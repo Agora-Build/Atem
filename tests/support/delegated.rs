@@ -140,6 +140,11 @@ impl Dev {
         }
     }
 
+    /// Its channel's routing handle (R9.7a).
+    pub fn handle(&self) -> &str {
+        &self.handle
+    }
+
     pub fn request(&mut self, r: &mut Router, data: Value) -> Value {
         let id = self.send(r, data);
         self.wait(r, |v| v["re"] == id.as_str())

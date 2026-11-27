@@ -2747,3 +2747,157 @@ fn the_hosts_deadline_is_the_stations_30_s_and_a_5_s_grace() {
     rig.answer(&b, 4, &[(4, &hold)]);
     assert!(rig.open(&native()));
 }
+
+const SUSPENDED: &str = "service suspended: account disabled at Agora.Build";
+
+/// The delegated host-work design III.5 (Atem's proposal, for Astation's
+/// agreement, #120 7207832274): the Station's `service_suspended` on a
+/// relay or routed link. The live call is retired (its page drained when
+/// it comes), the gate closes at once with the Station's text, and nothing
+/// more is asked or applied on that socket: its `heads` and the pass ask
+/// nothing, a new link generation on it neither. Nothing durable moves
+/// (the cursor and the standings stay). A link on a new socket reads on
+/// from the committed cursor, never from 0, and only that read opens the
+/// gate.
+#[test]
+fn a_suspension_on_a_relay_socket_ends_its_association_until_a_new_socket() {
+    let mut rig = rig();
+    let (_cover, _hold) = rig.opened();
+    let release = rig.record(FEED, ControlAction::Release);
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    let continuation = rig.last();
+    rig.sync.on_suspended(SUSPENDED, true);
+    assert!(rig.sync.socket_ended());
+    assert_eq!(rig.sync.moved_socket(), None, "never an identity change");
+    assert_eq!(rig.sync.dump()["in_flight"], Value::Null, "retired");
+    let closed = Closed::Suspended {
+        origin: ORIGIN.into(),
+        text: SUSPENDED.into(),
+    };
+    assert_eq!(rig.sync.closed(), Some(closed.clone()));
+    assert_eq!(
+        closed.text(),
+        format!("{ORIGIN}: service suspended: account disabled at Agora.Build; retrying")
+    );
+    assert!(!rig.open(&native()));
+    let drained = rig.drained();
+    let synced = rig.answer(&continuation, 3, &[(3, &release)]);
+    assert!(synced.applied.is_empty());
+    assert_eq!(synced.next, None);
+    assert_eq!(rig.drained(), drained + 1);
+    assert_eq!(rig.cursor(), Some((FEED.to_string(), 2)), "nothing moved");
+    assert!(rig.feeds.standing(BOT).held);
+    rig.pass(2 * SEC);
+    assert!(rig.heads(FEED, 3).is_empty());
+    assert!(rig.pass(40 * SEC).is_empty());
+    rig.sync.on_link(Some(&link(2, ORIGIN)));
+    assert_eq!(rig.sync.closed(), Some(closed), "the same socket");
+    assert!(rig.heads(FEED, 3).is_empty());
+    // A new socket: read on from the cursor.
+    rig.sync.on_link(Some(&link_on(3, 2, ORIGIN)));
+    assert!(!rig.sync.socket_ended());
+    assert_eq!(rig.sync.closed(), Some(Closed::NoHeads));
+    rig.pass(2 * SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    let synced = rig.page(FEED, 3, &[(3, &release)]);
+    assert_eq!(synced.applied.len(), 1);
+    assert!(rig.open(&native()), "{:?}", rig.sync.closed());
+    assert_eq!(rig.sync.dump()["suspensions"], 1);
+}
+
+/// III.5 on Astation's local link, which the suspension keeps: as a
+/// refusal of the sync (its live call retired, the gate closed, nothing
+/// asked before a `heads` past the 30-second backoff), its status the
+/// Station's text; the page asked after the backoff reads and opens the
+/// gate, and the text goes with the resynchronization.
+#[test]
+fn a_suspension_on_the_local_link_is_a_refusal_with_the_stations_text() {
+    let mut rig = rig();
+    rig.sync.on_link(Some(&StationLink {
+        kind: LinkKind::Local,
+        ..link(1, ORIGIN)
+    }));
+    let (_cover, _hold) = rig.opened();
+    rig.pass(SEC);
+    let release = rig.record(FEED, ControlAction::Release);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    rig.sync.on_suspended(SUSPENDED, false);
+    assert!(!rig.sync.socket_ended(), "the link stays");
+    assert_eq!(rig.sync.dump()["in_flight"], Value::Null, "retired");
+    assert_eq!(
+        rig.sync.closed(),
+        Some(Closed::Suspended {
+            origin: ORIGIN.into(),
+            text: SUSPENDED.into(),
+        })
+    );
+    rig.pass(10 * SEC);
+    assert!(rig.heads(FEED, 3).is_empty(), "within the backoff");
+    rig.pass(25 * SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    rig.page(FEED, 3, &[(3, &release)]);
+    assert!(rig.open(&native()), "{:?}", rig.sync.closed());
+    // A refusal later names its own reason, not the old suspension's.
+    rig.sync.on_refused(RefusedCall::ControlSync);
+    assert_eq!(rig.sync.closed(), Some(Closed::Refused));
+}
+
+/// Review N1 (the reviewer's probe): on Astation's local link the
+/// suspended Station refuses the call asked after the backoff; the
+/// suspension stays the gate's reason and its end stays owed, and the page
+/// asked after the refusal's backoff that reads ends it.
+#[test]
+fn a_refusal_during_a_local_suspension_keeps_its_end() {
+    let mut rig = rig();
+    rig.sync.on_link(Some(&StationLink {
+        kind: LinkKind::Local,
+        ..link(1, ORIGIN)
+    }));
+    let (_cover, _hold) = rig.opened();
+    rig.pass(SEC);
+    let release = rig.record(FEED, ControlAction::Release);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    rig.sync.on_suspended(SUSPENDED, false);
+    rig.pass(35 * SEC);
+    assert_eq!(
+        rig.heads(FEED, 3),
+        [sync_call(FEED, 2)],
+        "after the backoff"
+    );
+    // The Station, still suspended, refuses it.
+    rig.sync.on_refused(RefusedCall::ControlSync);
+    assert!(matches!(rig.sync.closed(), Some(Closed::Suspended { .. })));
+    // Another kind's refusal too (the fetch's, the ack's).
+    rig.sync.on_refused(RefusedCall::MembershipFetch);
+    rig.sync.on_refused(RefusedCall::ControlAck);
+    assert!(!rig.sync.take_suspension_ended());
+    rig.pass(31 * SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    rig.page(FEED, 3, &[(3, &release)]);
+    assert!(rig.open(&native()), "{:?}", rig.sync.closed());
+    assert!(
+        rig.sync.take_suspension_ended(),
+        "the suspension's end is owed through the refusals"
+    );
+    assert!(!rig.sync.take_suspension_ended(), "once");
+}
+
+/// A local link's suspension ends with its link generation: owed then
+/// too (the hold was that connection's).
+#[test]
+fn a_local_suspension_ends_with_its_link_generation() {
+    let mut rig = rig();
+    rig.sync.on_link(Some(&StationLink {
+        kind: LinkKind::Local,
+        ..link(1, ORIGIN)
+    }));
+    rig.opened();
+    rig.sync.on_suspended(SUSPENDED, false);
+    rig.sync.on_link(Some(&StationLink {
+        kind: LinkKind::Local,
+        ..link(2, ORIGIN)
+    }));
+    assert!(rig.sync.take_suspension_ended());
+    assert_eq!(rig.sync.closed(), Some(Closed::NoHeads));
+}

@@ -722,6 +722,29 @@ impl FeedStore {
         }
     }
 
+    /// The Station suspended this host's service on `link` (III.5,
+    /// [`AckBook::on_suspended`]).
+    pub fn acks_suspended(&mut self, link: &super::station::StationLink) {
+        if let Some(book) = self.mem.acks.as_mut() {
+            book.on_suspended(link);
+        }
+    }
+
+    /// A suspension's notice for `socket`, gone before a Station link took
+    /// it (III.5, [`AckBook::on_socket_suspended`]).
+    pub fn acks_socket_suspended(&mut self, socket: u64) {
+        if let Some(book) = self.mem.acks.as_mut() {
+            book.on_socket_suspended(socket);
+        }
+    }
+
+    /// A local link's suspension ended (III.5, [`AckBook::on_resumed`]).
+    pub fn acks_resumed(&mut self) {
+        if let Some(book) = self.mem.acks.as_mut() {
+            book.on_resumed();
+        }
+    }
+
     /// The acknowledgments' state, for the state dump (debug builds).
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub fn acks_dump(&self) -> Option<Value> {

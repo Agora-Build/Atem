@@ -3118,6 +3118,22 @@ it (a), and the R9 accounts bound to it (b):
   connect loop) and treats it as a service outage, never as a revocation: no R9 state changes and nothing is fenced.
   How Astation shows it is its call.
 
+  **Built on Atem's side (2026-11-27), in release builds, not behind the hook** (owner decision 2026-11-27; the
+  Station's enforcement stays Astation's to build). The forms and the host's behaviour are session-v1 R9.7b's
+  "Service suspended" (and R9.7a's router reasons): the route refusal is a Station refusal sent only for a proof that
+  verified, never a verifier code, with a required `text` (1 to 256 bytes of UTF-8, no character of General Category
+  Cc, Cf, Zl or Zp); the open-link notice the same `text`, at most 1 KiB; the channels' router close. On a relay or
+  routed link the host retires every live Station call on the socket, closes the gate at once and drops the socket
+  itself if the Station hasn't closed it within 10 s; the next connect waits 30 s, the normal connect loop's pace after
+  a suspension; Astation's local link stays, the notice taken there as a refusal of every call kind whose holds end
+  once the Station serves the link again, whatever refusals the suspended Station sent meanwhile. `atem status`: `Relay: not connected (service suspended: <text>;
+  retrying)`, the text as sent when it begins `service suspended:`, else prefixed (Atem's reading, for Astation's
+  agreement), and with `host.delegated` `Control feeds: revocations not yet checked (<origin>: service suspended:
+  <text>; retrying)`. **The `text` field, the disclosure order and the 10 s drop are Atem's proposal, for
+  Astation's agreement (#120 7207832274).** Shared core: `atem_client::host_route::RelayReply::Suspended` and
+  `atem_client::station_notice`; vectors `r9-vectors-host-route` (`relay_replies`, `service_suspended`) and
+  `r9-envelope-vectors`; tests `tests/service_suspended_binary.rs`.
+
 On the hosts, running turns continue. Queued delegated remote tasks wait behind the closed gate, since no heads
 arrive. No R9 state changes. Agora.Build gains no ability to decrypt a message or forge a record. The account's
 integrations are paused as today (I.5, `hold` records).

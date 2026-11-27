@@ -176,7 +176,23 @@ impl App {
             self.astation_client.local_route_ignored(text);
             return;
         }
-        let _ = self.astation_client.local_route_message(text);
+        let verdict = self.astation_client.local_route_message(text);
+        self.local_route_verdict(verdict);
+    }
+
+    /// The local route's verdict on its proof, if one counted: the
+    /// Station's `service_suspended` refusal (III.5) records its text, the
+    /// link kept; an ok lifts one read on the local link.
+    pub(super) fn local_route_verdict(
+        &mut self,
+        verdict: Option<crate::session_protocol::r9::route::RouteResult>,
+    ) {
+        use crate::session_protocol::r9::route::RouteResult;
+        match verdict {
+            Some(RouteResult::Suspended(text)) => self.local_route_suspended(text),
+            Some(RouteResult::Routed { .. }) => self.local_route_ok(),
+            _ => {}
+        }
     }
 
     /// A relay message dropped unread (over its bound, or past this pass's

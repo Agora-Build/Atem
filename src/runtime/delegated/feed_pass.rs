@@ -506,11 +506,12 @@ impl HostBridge {
     /// its fence ran.
     pub(crate) fn acks_due(&self) -> Vec<DueAck> {
         // None on a link whose association is another identity's (§11.4
-        // "An identity change"): its acks wait for the next link.
+        // "An identity change"), or whose socket the Station suspended
+        // this host's service on (III.5): its acks wait for the next link.
         if self
             .station
             .as_ref()
-            .is_some_and(|station| station.feed.moved_socket().is_some())
+            .is_some_and(|station| station.feed.socket_ended())
         {
             return Vec::new();
         }
@@ -621,6 +622,110 @@ impl HostBridge {
     pub(crate) fn ack_refused(&mut self) {
         if let Feeds::Loaded(feeds) = &mut self.work.feeds {
             feeds.acks_refused();
+        }
+    }
+
+    /// The App's record of a `service_suspended` notice (the delegated
+    /// host-work design III.5), taken once (its number) and applied to the
+    /// Station link on the socket it came on, whatever that link's
+    /// generation (a suspension is the socket's): its calls retired and its
+    /// gates closed ([`super::station::Station::on_suspended`]), and the
+    /// book's acknowledgments of every connection on that socket sent
+    /// again on the next ([`HostBridge::acks_suspended`]). The bridge asks
+    /// at the start of its pass, before anything of it reads the link or
+    /// dispatches (the link as the last pass left it), and again right
+    /// after it synced the link (one the App installed or authenticated
+    /// again in the same tick as the notice), before the pass reads the
+    /// Station's messages. A notice waits while the Station link isn't on
+    /// its socket yet and the App's link still is; it is dropped only once
+    /// neither is (the socket gone), the book's acknowledgments sent on
+    /// that socket still read as never sent, so they go again on the next
+    /// link (review N2). With no Station link (the hook off) it does
+    /// nothing.
+    pub(crate) fn station_suspension(&mut self, app: &crate::app::App) {
+        if let Some(s) = app.service_suspension.as_ref()
+            && let (Some(notice), Some(socket)) = (s.notice, s.socket())
+            && notice > self.suspension_applied
+        {
+            self.suspension_applied = notice;
+            self.suspension_pending = Some((socket, s.text.clone()));
+        }
+        let Some((socket, text)) = self.suspension_pending.clone() else {
+            return;
+        };
+        let Some(station) = self.station.as_mut() else {
+            self.suspension_pending = None;
+            return;
+        };
+        if station.link().is_none_or(|l| l.socket != socket) {
+            if app.astation_client.socket_id() != socket {
+                // The socket gone before a Station link took the notice
+                // (review N2): what was acknowledged on it goes again on the
+                // next link.
+                self.suspension_pending = None;
+                if let Feeds::Loaded(feeds) = &mut self.work.feeds {
+                    feeds.acks_socket_suspended(socket);
+                }
+            }
+            return;
+        }
+        self.suspension_pending = None;
+        station.on_suspended(&text);
+        self.acks_suspended();
+        self.publish_feed_gates();
+        self.refresh_fetch_view();
+    }
+
+    /// Review M3: whatever suspension the App recorded (the relay's at a
+    /// connect or on an open link, or the local link's) is lifted once the
+    /// Station serves this host again: its feed gate open, on whatever link
+    /// (a local link's open gate says the account is served again), unless
+    /// a notice still waits for its link.
+    pub(crate) fn lift_suspension(
+        &mut self,
+        recorded: &mut Option<crate::app::suspension::Suspension>,
+    ) {
+        if recorded.is_some()
+            && self.suspension_pending.is_none()
+            && self
+                .station
+                .as_ref()
+                .is_some_and(|station| station.feed.closed().is_none())
+        {
+            *recorded = None;
+            self.suspension = None;
+        }
+    }
+
+    /// A local link's suspension ended (the delegated host-work design
+    /// III.5; reviews M2, N1): the Station served the link's feed again
+    /// (the resynchronization read after the latest refusal's backoff,
+    /// whatever refusals came during the suspension), or its link
+    /// generation ended, so the book's hold ends
+    /// ([`super::acks::AckBook::on_resumed`]). The mailbox ends its own done
+    /// hold with its own resynchronization.
+    pub(crate) fn station_resumed(&mut self) {
+        let Some(station) = self.station.as_mut() else {
+            return;
+        };
+        if !station.feed.take_suspension_ended() {
+            return;
+        }
+        if let Feeds::Loaded(feeds) = &mut self.work.feeds {
+            feeds.acks_resumed();
+        }
+    }
+
+    /// The Station suspended this host's service on its link (the
+    /// delegated host-work design III.5): the book takes nothing as
+    /// delivered, sends nothing more on that connection, and what went on
+    /// it goes again on the next ([`super::acks::AckBook::on_suspended`]).
+    pub(crate) fn acks_suspended(&mut self) {
+        let Some(link) = self.station.as_ref().and_then(|s| s.link()).cloned() else {
+            return;
+        };
+        if let Feeds::Loaded(feeds) = &mut self.work.feeds {
+            feeds.acks_suspended(&link);
         }
     }
 
@@ -1003,7 +1108,28 @@ impl HostBridge {
         let view = self.start_view();
         let list = view.list.as_ref();
         let deferred = list.is_some_and(|l| l.deferred.is_some());
-        let gate = if deferred {
+        // The Station's suspension of this host's service (the delegated
+        // host-work design III.5), while the gate is closed: its origin and
+        // text, as the gate's reason only with no Station link up (the
+        // relay refused or closed) or when it came on the link up now
+        // (review N3: a relay's is never the local link's reason).
+        let suspended = self.suspension.as_ref().filter(|(_, _, socket)| {
+            station.feed.closed().is_some()
+                && station
+                    .link()
+                    .is_none_or(|l| socket.is_some_and(|s| s == l.socket))
+        });
+        let gate = if let Some((origin, text, _)) = suspended {
+            let origin = origin
+                .as_deref()
+                .or(station.feed.own())
+                .unwrap_or("the Station");
+            format!(
+                "{} ({origin}: {}; retrying)",
+                crate::runtime::delegated::details::REVOCATIONS_NOT_YET_CHECKED,
+                crate::app::suspension::shown(text)
+            )
+        } else if deferred {
             crate::runtime::delegated::details::DEVICE_LIST_UPDATE_PENDING.to_string()
         } else if let Some(closed) = station.feed.closed() {
             format!(

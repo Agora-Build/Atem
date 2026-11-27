@@ -3010,6 +3010,35 @@ host's call on the link with exactly one of:
   the association and resynchronizes. The transport may still fence or
   close an invalid or superseded link; a refusal creates no authority for
   it.
+- **A suspension isn't a call refusal** (the delegated host-work design
+  III.5; session-v1 R9.7b "Service suspended"; **Atem's proposal, for
+  Astation's agreement, #120 7207832274**). The built-in Station that
+  doesn't serve an account (disabled at Agora.Build, or no Agora.Build
+  owner at this Station) never answers that host's calls with `forbidden`:
+  it refuses the host's route proof with `host_route_refused{code:
+  "service_suspended", text}`, and on an open link sends
+  `{"type":"relay","op":"service_suspended","v":1,"text"}` and closes the
+  link (a relay or routed one). On a relay or routed link the host retires
+  every live Station call on that socket (the `control_sync` by its id, the
+  `membership_fetch`, the mailbox's syncs and dones, the puts), closes the
+  origin's gate at once, asks nothing more on that socket and lets nothing
+  read on it reopen the gate, and sends the acknowledgments it sent on that
+  connection again on the next ("Acknowledgments" below); it drops the
+  socket itself if the Station hasn't within 10 s. The notice is matched to
+  the link by its socket, whatever the link's generation, and every
+  connection on that socket counts as the suspended one. On Astation's
+  local link, which stays, it is taken as a refusal of every call kind
+  (this list's rules, its 30 s backoff included), except that its holds end
+  with the suspension: the suspended Station's refusals meanwhile are the
+  suspension's, and once the first page asked after the latest of them
+  reads (the Station serving the link again), or the link generation ends,
+  the acknowledgments it held on that connection go, once, and so do the
+  mailbox's dones. A notice whose socket closed before the host's Station
+  link took it still makes the acknowledgments sent on that socket go
+  again on the next link. Nothing durable moves
+  (no cursor, reset mark, control part, owed done or identity), and `atem
+  status` names the Station's text: `Control feeds: revocations not yet
+  checked (<origin>: service suspended: <text>; retrying)`.
 
 A native token alone never fetches or acknowledges another host's feeds,
 results or mailbox, and Astation proxies no credentials to an arbitrary

@@ -69,6 +69,9 @@ pub struct PutClient {
     /// mailbox.
     announced: bool,
     moved: bool,
+    /// The Station suspended this host's service on the link's socket, a
+    /// relay or routed one (III.5): as `moved`, nothing more put on it.
+    suspended: bool,
     now: u64,
     live: Vec<Live>,
     retired: VecDeque<String>,
@@ -93,6 +96,7 @@ impl PutClient {
         self.announced = false;
         if now.map(|(_, socket)| socket) != self.link.map(|(_, socket)| socket) {
             self.moved = false;
+            self.suspended = false;
         }
         self.link = now;
     }
@@ -100,7 +104,7 @@ impl PutClient {
     /// A `heads` on the link, announcing this host's mailbox or not.
     /// Nothing counts on a socket whose identity moved.
     pub fn on_heads(&mut self, mailbox: bool) {
-        if self.link.is_some() && !self.moved {
+        if self.link.is_some() && !self.moved && !self.suspended {
             self.announced = mailbox;
         }
     }
@@ -108,7 +112,7 @@ impl PutClient {
     /// Whether puts may go on this link: its latest `heads` announced this
     /// host's mailbox (rule 1), and its identity hasn't moved.
     pub fn announced(&self) -> bool {
-        self.link.is_some() && !self.moved && self.announced
+        self.link.is_some() && !self.moved && !self.suspended && self.announced
     }
 
     /// The host's identity changed on the live link: every live put
@@ -117,6 +121,19 @@ impl PutClient {
         self.retire_all();
         self.announced = false;
         self.moved = true;
+    }
+
+    /// The Station suspended this host's service on the link (the
+    /// delegated host-work design III.5): every live put retired (its row
+    /// goes again on a later link), none until a `heads` announces this
+    /// host's mailbox again; `socket_ends` (a relay or routed link):
+    /// nothing more put on that socket.
+    pub fn on_suspended(&mut self, socket_ends: bool) {
+        self.retire_all();
+        self.announced = false;
+        if socket_ends {
+            self.suspended = true;
+        }
     }
 
     /// The pass's monotonic time: a put unanswered for 35 s is retired.
@@ -146,7 +163,7 @@ impl PutClient {
     /// store to refuse.
     pub fn take(&mut self, due: Vec<Due>, place: Place) -> Vec<MailboxPut> {
         let mut out = Vec::new();
-        if self.link.is_none() || self.moved || !self.announced {
+        if self.link.is_none() || self.moved || self.suspended || !self.announced {
             return out;
         }
         for row in due {
@@ -255,6 +272,7 @@ impl PutClient {
             "unsolicited": self.unsolicited,
             "announced": self.announced,
             "identity_moved": self.moved,
+            "suspended": self.suspended,
         })
     }
 }

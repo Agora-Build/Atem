@@ -59,7 +59,19 @@ pub struct FakeAstation {
     links: Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<Cmd>>>>,
     /// Where the host's Station calls go once a fake Station took them.
     station: StationTap,
+    /// A relay fake ([`FakeAstation::start_relay`]), not Astation's local
+    /// link.
+    relay: bool,
+    /// While set (a fake Station's `suspend`), every new host connection
+    /// of a relay fake gets `host_challenge` and, for its proof,
+    /// `host_route_refused` with `service_suspended` and this text, then
+    /// the close (the delegated host-work design III.5, B-1).
+    suspension: Suspension,
 }
+
+/// A relay fake's refusal of every new host connection with
+/// `service_suspended` and its text (III.5), while set.
+pub type Suspension = Arc<Mutex<Option<String>>>;
 
 /// The host's Station calls (host-work-v1 §11.4: `control_sync`,
 /// `control_ack`, `membership_fetch`; §11.5: `mailbox_sync`,
@@ -92,6 +104,13 @@ impl LinkSender {
     /// The newest link the fake took (connection numbers only grow).
     pub fn latest(&self) -> Option<u64> {
         self.0.lock().unwrap().keys().max().copied()
+    }
+
+    /// Closes `link` (as [`FakeAstation::close`]).
+    pub fn close(&self, link: u64) {
+        if let Some(tx) = self.0.lock().unwrap().remove(&link) {
+            let _ = tx.send(Cmd::Close);
+        }
     }
 }
 
@@ -138,7 +157,20 @@ impl FakeAstation {
             auth,
             links,
             station,
+            relay: false,
+            suspension: Suspension::default(),
         }
+    }
+
+    /// A relay fake ([`FakeAstation::start_relay`]).
+    pub fn is_relay(&self) -> bool {
+        self.relay
+    }
+
+    /// The relay's suspension of new host connections (III.5's B-1), which
+    /// a fake Station sets and clears.
+    pub fn suspension(&self) -> Suspension {
+        self.suspension.clone()
     }
 
     pub fn send(&self, link: u64, text: String) {
@@ -436,6 +468,11 @@ pub enum Reply {
     /// carries what the test sends (a pairing-code room's link, which
     /// answers no challenge, gets the pairing introduction from the test).
     Serve,
+    /// `host_route_refused` with `service_suspended` and this text after
+    /// the proof, then the relay closes (the delegated host-work design
+    /// III.5, B-1): every connection's while [`FakeAstation::suspension`]
+    /// is set.
+    Suspended(String),
     /// The room's owner is in the room (carrier A): `host_challenge`, then
     /// Astation's `auth_required` at once (before any verdict). Atem's
     /// `auth` is answered as `auth` says. `ok`: once both the proof and the
@@ -483,6 +520,8 @@ impl FakeAstation {
         let station: StationTap = Arc::default();
         let tap = station.clone();
         let plan = Arc::new(plan);
+        let suspension = Suspension::default();
+        let suspended = suspension.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -508,7 +547,12 @@ impl FakeAstation {
                     let n = next;
                     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
                     shared.lock().unwrap().insert(n, cmd_tx);
-                    let reply = plan(n);
+                    // A suspended account's host gets the Station's refusal
+                    // of its proof, whatever the plan (III.5).
+                    let reply = match suspended.lock().unwrap().clone() {
+                        Some(text) => Reply::Suspended(text),
+                        None => plan(n),
+                    };
                     tokio::spawn(relay_link(
                         n,
                         stream,
@@ -529,6 +573,8 @@ impl FakeAstation {
                 auth,
                 links,
                 station,
+                relay: true,
+                suspension,
             },
             relay,
         )
@@ -692,6 +738,15 @@ async fn relay_link(
             let _ = socket
                 .send(Message::Text(ok_message(&host_id, &head)))
                 .await;
+            let _ = socket.close(None).await;
+            let _ = relay.send(RelayEvent::Closed(n));
+            return;
+        }
+        Reply::Suspended(text) => {
+            let refused = atem_client::host_route::RelayReply::suspended(&text)
+                .expect("a valid text")
+                .to_json();
+            let _ = socket.send(Message::Text(refused.to_string())).await;
             let _ = socket.close(None).await;
             let _ = relay.send(RelayEvent::Closed(n));
             return;

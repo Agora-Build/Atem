@@ -14,7 +14,9 @@ ephemeral to the same bytes). It derives no verifier's verdict, but for
 `r9-vectors-host-envelope`, whose every check's verdict and reason it
 derives from the bytes, and `r9-vectors-host-route`'s refusals across the
 two kinds of proof (relay and proxy), which follow from a proof's type and
-signature, the device list and the receiver (II.4.2's checks 1
+signature, and its relay replies and `service_suspended` notices, read with
+readers written here from R9.7b and the delegated host-work design III.5,
+the device list and the receiver (II.4.2's checks 1
 to 6 and II.4.4's, written here from host-work-v1 §11.5), and
 `r9-vectors-mailbox-calls`, whose refusal codes and scenario outcomes,
 answers and states it derives with readers and a model of the Station's
@@ -4135,6 +4137,142 @@ def check_host_route(file, data, report, context):
     with report.case(file, "proxy coverage") as case:
         case.equal(sorted(v["label"] for v in proxy["valid"]), sorted(relay_bodies), "every valid relay case has its proxy case")
         case.equal(codes, {(v, c) for v in ROUTE_KINDS for c in ("malformed", "bad_signature")}, "each verifier refuses the other kind and a relabelled proof")
+    check_route_replies(file, data, report)
+
+
+# The relay's verdicts on a proof (R9.7b) and the Station's notice on an open
+# host link (the delegated host-work design III.5), read here from the
+# contract: a verifier code alone, or the Station's `service_suspended` with
+# a required `text` (1 to 256 bytes of UTF-8, no character of General
+# Category Cc, Cf, Zl or Zp; Atem's proposal, for Astation's agreement, #120
+# 7207832274).
+ROUTE_REFUSAL_CODES = [
+    "malformed", "frozen", "wrong_account", "unknown_host", "bad_signature",
+    "stale_log", "fork", "nonce_mismatch", "room_mismatch", "atem_id_mismatch",
+]
+STATION_ROUTE_REFUSALS = ["service_suspended"]
+ROUTE_MESSAGE_MAX = 16 * 1024
+SERVICE_TEXT_MAX = 256
+SERVICE_NOTICE_MAX = 1024
+
+
+def service_text_ok(text):
+    """A Station's text a host shows: 1-256 bytes of UTF-8, no Cc, Cf, Zl
+    (U+2028) or Zp (U+2029) character."""
+    return (
+        isinstance(text, str)
+        and 1 <= len(text.encode("utf-8")) <= SERVICE_TEXT_MAX
+        and not any(is_control(c) or is_format(c) or c in "\u2028\u2029" for c in text)
+    )
+
+
+def relay_object(text, op, bound):
+    """A strict relay message of `op` (type relay, v 1) within `bound`
+    bytes; raises Refused with the shared core's codes (too_large,
+    not_strict_json, malformed)."""
+    if len(text.encode("utf-8")) > bound:
+        raise Refused("too_large")
+    try:
+        o = relay_parse(text)
+    except ValueError:
+        raise Refused("not_strict_json")
+    if not isinstance(o, dict) or o.get("type") != "relay" or o.get("op") != op:
+        raise Refused("malformed")
+    if type(o.get("v")) is not int or o["v"] != 1:
+        raise Refused("malformed")
+    return o
+
+
+def route_reply(text):
+    """host_route_ok or host_route_refused, exactly: ("ok", host_id, head),
+    ("refused", code) or ("suspended", text); raises Refused("malformed")
+    (R9.7b: every bad reply is malformed)."""
+    try:
+        value = json.loads(text)
+    except ValueError:
+        raise Refused("malformed")
+    if not isinstance(value, dict):
+        raise Refused("malformed")
+    op = value.get("op")
+    try:
+        o = relay_object(text, op, ROUTE_MESSAGE_MAX)
+    except Refused:
+        raise Refused("malformed")
+    if op == "host_route_ok":
+        head = o.get("head")
+        ok = (
+            set(o) == {"type", "op", "v", "host_id", "head"}
+            and isinstance(o["host_id"], str) and 1 <= len(o["host_id"].encode()) <= 256
+            and isinstance(head, dict) and set(head) == {"seq", "hash"}
+            and type(head["seq"]) is int and head["seq"] >= 1
+            and isinstance(head["hash"], str) and re.fullmatch(r"[0-9a-f]{64}", head["hash"]) is not None
+        )
+        if not ok:
+            raise Refused("malformed")
+        return ("ok", o["host_id"], head)
+    if op != "host_route_refused":
+        raise Refused("malformed")
+    code = o.get("code")
+    if code in ROUTE_REFUSAL_CODES:
+        if set(o) != {"type", "op", "v", "code"}:
+            raise Refused("malformed")
+        return ("refused", code)
+    if code in STATION_ROUTE_REFUSALS:
+        if set(o) != {"type", "op", "v", "code", "text"} or not service_text_ok(o["text"]):
+            raise Refused("malformed")
+        return ("suspended", o["text"])
+    raise Refused("malformed")
+
+
+def service_notice(text):
+    """The open link's service_suspended notice, exactly: its text; raises
+    Refused (too_large over 1024 bytes as received, not_strict_json,
+    malformed)."""
+    o = relay_object(text, "service_suspended", SERVICE_NOTICE_MAX)
+    if set(o) != {"type", "op", "v", "text"} or not service_text_ok(o["text"]):
+        raise Refused("malformed")
+    return o["text"]
+
+
+def check_route_replies(file, data, report):
+    """Every relay reply's verdict and every service_suspended notice's,
+    from the readers above: a valid case reads to its `expect`, an invalid
+    one is refused with its code; a verifier code never carries a text, and
+    service_suspended is no verifier code."""
+    replies = data["relay_replies"]
+    for vector in replies["valid"]:
+        with report.case(file, f"relay reply {vector['label']}") as case:
+            got = route_reply(json.dumps(vector["message"], ensure_ascii=False))
+            expect = vector["expect"]
+            if got[0] == "ok":
+                case.equal((got[1], got[2]), (expect["host_id"], expect["head"]), "host_id and head")
+            elif got[0] == "refused":
+                case.equal((got[1], "text" in expect), (expect["code"], False), "a verifier code, no text")
+            else:
+                case.equal(("service_suspended", got[1]), (expect["code"], expect["text"]), "service_suspended and its text")
+    for vector in replies["invalid"]:
+        with report.case(file, f"relay reply {vector['label']}") as case:
+            try:
+                route_reply(vector["text"])
+                case.check(False, "refused")
+            except Refused as refused:
+                case.equal(refused.code, "malformed", "refused malformed")
+    with report.case(file, "relay reply coverage") as case:
+        case.check(not set(STATION_ROUTE_REFUSALS) & set(ROUTE_REFUSAL_CODES), "service_suspended is no verifier code")
+        kinds = {route_reply(json.dumps(v["message"]))[0] for v in replies["valid"]}
+        case.equal(kinds, {"ok", "refused", "suspended"}, "an ok, a verifier code and a suspension")
+    notices = data["service_suspended"]
+    for vector in notices["valid"]:
+        with report.case(file, f"service_suspended {vector['label']}") as case:
+            text = vector["text"] if "text" in vector else json.dumps(vector["message"], ensure_ascii=False)
+            case.equal(service_notice(text), vector["expect"]["text"], "its text")
+    for vector in notices["invalid"]:
+        with report.case(file, f"service_suspended {vector['label']}") as case:
+            try:
+                service_notice(vector["text"])
+                case.check(False, "refused")
+            except Refused as refused:
+                case.equal(refused.code, vector["code"], "the refusal's code")
 
 
 # ------------------------------------------------ r9-vectors-verifier-report

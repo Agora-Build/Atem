@@ -945,9 +945,84 @@
         "label": "refused_duplicate_key",
         "reason": "code twice (strict I-JSON)",
         "text": "{\"code\":\"stale_log\",\"code\":\"fork\",\"op\":\"host_route_refused\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "label": "suspended_no_text",
+        "reason": "service_suspended without its text",
+        "text": "{\"code\":\"service_suspended\",\"op\":\"host_route_refused\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "label": "suspended_empty_text",
+        "reason": "an empty text",
+        "text": "{\"code\":\"service_suspended\",\"op\":\"host_route_refused\",\"text\":\"\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "label": "suspended_text_257_bytes",
+        "reason": "a text of 257 bytes",
+        "text": "{\"code\":\"service_suspended\",\"op\":\"host_route_refused\",\"text\":\"\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9a\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "label": "suspended_text_c0",
+        "reason": "a C0 control (U+0007, Cc)",
+        "text": "{\"code\":\"service_suspended\",\"op\":\"host_route_refused\",\"text\":\"bell\\u0007\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "label": "suspended_text_esc",
+        "reason": "a terminal escape (U+001B, Cc)",
+        "text": "{\"code\":\"service_suspended\",\"op\":\"host_route_refused\",\"text\":\"a\\u001b[2Jb\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "label": "suspended_text_newline",
+        "reason": "a line feed (U+000A, Cc)",
+        "text": "{\"code\":\"service_suspended\",\"op\":\"host_route_refused\",\"text\":\"line\\nbreak\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "label": "suspended_text_c1",
+        "reason": "a C1 control (U+0085, Cc)",
+        "text": "{\"code\":\"service_suspended\",\"op\":\"host_route_refused\",\"text\":\"a\\u0085b\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "label": "suspended_text_bidi_override",
+        "reason": "a bidi override (U+202E, Cf)",
+        "text": "{\"code\":\"service_suspended\",\"op\":\"host_route_refused\",\"text\":\"a\\u202eb\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "label": "suspended_text_zero_width",
+        "reason": "a zero-width space (U+200B, Cf)",
+        "text": "{\"code\":\"service_suspended\",\"op\":\"host_route_refused\",\"text\":\"a\\u200bb\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "label": "suspended_text_line_separator",
+        "reason": "a line separator (U+2028, Zl)",
+        "text": "{\"code\":\"service_suspended\",\"op\":\"host_route_refused\",\"text\":\"a\\u2028b\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "label": "suspended_text_paragraph_separator",
+        "reason": "a paragraph separator (U+2029, Zp)",
+        "text": "{\"code\":\"service_suspended\",\"op\":\"host_route_refused\",\"text\":\"a\\u2029b\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "label": "suspended_text_not_a_string",
+        "reason": "a text that isn't a string",
+        "text": "{\"code\":\"service_suspended\",\"op\":\"host_route_refused\",\"text\":7,\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "label": "verifier_code_with_text",
+        "reason": "a verifier code carries no text",
+        "text": "{\"code\":\"stale_log\",\"op\":\"host_route_refused\",\"text\":\"service suspended: account disabled at Agora.Build\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "label": "suspended_unknown_field",
+        "reason": "a field beyond code and text",
+        "text": "{\"code\":\"service_suspended\",\"extra\":1,\"op\":\"host_route_refused\",\"text\":\"service suspended: account disabled at Agora.Build\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "label": "suspended_duplicate_key",
+        "reason": "text twice (strict I-JSON)",
+        "text": "{\"code\":\"service_suspended\",\"op\":\"host_route_refused\",\"text\":\"a\",\"text\":\"b\",\"type\":\"relay\",\"v\":1}"
       }
     ],
-    "note": "The relay's reply after verifying a proof: host_route_ok (the verified host_id and the proof's head) or host_route_refused (one of the verifier's codes; the relay closes the connection after it). Strictly parsed; `invalid` texts are refused as malformed.",
+    "note": "The relay's reply after verifying a proof: host_route_ok (the verified host_id and the proof's head), host_route_refused with one of the verifier's codes and no other field, or the Station's host_route_refused with code service_suspended and a required text (1 to 256 bytes of UTF-8, no character of General Category Cc, Cf, Zl or Zp) for a proof that verified, when the Station doesn't serve the route's account (the delegated host-work design III.5; never a verifier code: verify_host_route never returns it, so an unverified connection learns nothing of an account's service state). The relay closes the connection after any refusal. Strictly parsed; `invalid` texts are refused as malformed. The service_suspended form, its text and that order are Atem's proposal, for Astation's agreement (#120 7207832274).",
     "valid": [
       {
         "expect": {
@@ -980,10 +1055,206 @@
           "type": "relay",
           "v": 1
         }
+      },
+      {
+        "expect": {
+          "code": "service_suspended",
+          "text": "service suspended: account disabled at Agora.Build"
+        },
+        "label": "refused_service_suspended",
+        "message": {
+          "code": "service_suspended",
+          "op": "host_route_refused",
+          "text": "service suspended: account disabled at Agora.Build",
+          "type": "relay",
+          "v": 1
+        }
+      },
+      {
+        "expect": {
+          "code": "service_suspended",
+          "text": "service suspended: no Agora.Build owner at this Station"
+        },
+        "label": "refused_service_suspended_no_owner",
+        "message": {
+          "code": "service_suspended",
+          "op": "host_route_refused",
+          "text": "service suspended: no Agora.Build owner at this Station",
+          "type": "relay",
+          "v": 1
+        }
+      },
+      {
+        "expect": {
+          "code": "service_suspended",
+          "text": "\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9"
+        },
+        "label": "refused_service_suspended_256_bytes",
+        "message": {
+          "code": "service_suspended",
+          "op": "host_route_refused",
+          "text": "\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9",
+          "type": "relay",
+          "v": 1
+        },
+        "note": "a text of exactly 256 bytes (128 two-byte characters)"
       }
     ]
   },
   "requires": "r9",
+  "service_suspended": {
+    "invalid": [
+      {
+        "code": "malformed",
+        "label": "no_text",
+        "reason": "no text",
+        "text": "{\"op\":\"service_suspended\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "code": "malformed",
+        "label": "empty_text",
+        "reason": "an empty text",
+        "text": "{\"op\":\"service_suspended\",\"text\":\"\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "code": "malformed",
+        "label": "text_257_bytes",
+        "reason": "a text of 257 bytes",
+        "text": "{\"op\":\"service_suspended\",\"text\":\"\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9a\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "code": "malformed",
+        "label": "text_c0",
+        "reason": "a C0 control (Cc)",
+        "text": "{\"op\":\"service_suspended\",\"text\":\"bell\\u0007\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "code": "malformed",
+        "label": "text_esc",
+        "reason": "a terminal escape (Cc)",
+        "text": "{\"op\":\"service_suspended\",\"text\":\"a\\u001b[2Jb\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "code": "malformed",
+        "label": "text_c1",
+        "reason": "a C1 control (Cc)",
+        "text": "{\"op\":\"service_suspended\",\"text\":\"a\\u0085b\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "code": "malformed",
+        "label": "text_bidi_override",
+        "reason": "a bidi override (Cf)",
+        "text": "{\"op\":\"service_suspended\",\"text\":\"a\\u202eb\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "code": "malformed",
+        "label": "text_line_separator",
+        "reason": "a line separator (Zl)",
+        "text": "{\"op\":\"service_suspended\",\"text\":\"a\\u2028b\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "code": "malformed",
+        "label": "text_paragraph_separator",
+        "reason": "a paragraph separator (Zp)",
+        "text": "{\"op\":\"service_suspended\",\"text\":\"a\\u2029b\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "code": "malformed",
+        "label": "text_not_a_string",
+        "reason": "a text that isn't a string",
+        "text": "{\"op\":\"service_suspended\",\"text\":7,\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "code": "malformed",
+        "label": "text_zero_width",
+        "reason": "a zero-width space (Cf)",
+        "text": "{\"op\":\"service_suspended\",\"text\":\"a\\u200bb\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "code": "malformed",
+        "label": "text_byte_order_mark",
+        "reason": "a byte order mark (Cf)",
+        "text": "{\"op\":\"service_suspended\",\"text\":\"\\ufeffa\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "code": "malformed",
+        "label": "v2",
+        "reason": "v is not 1",
+        "text": "{\"op\":\"service_suspended\",\"text\":\"t\",\"type\":\"relay\",\"v\":2}"
+      },
+      {
+        "code": "malformed",
+        "label": "unknown_field",
+        "reason": "a field beyond type/op/v/text",
+        "text": "{\"code\":\"service_suspended\",\"op\":\"service_suspended\",\"text\":\"t\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "code": "malformed",
+        "label": "not_relay",
+        "reason": "type is not relay",
+        "text": "{\"op\":\"service_suspended\",\"text\":\"t\",\"type\":\"channel\",\"v\":1}"
+      },
+      {
+        "code": "not_strict_json",
+        "label": "duplicate_key",
+        "reason": "text twice",
+        "text": "{\"op\":\"service_suspended\",\"text\":\"a\",\"text\":\"b\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "code": "too_large",
+        "label": "over_the_bound",
+        "reason": "1025 bytes as received",
+        "text": "{\"op\":\"service_suspended\",\"text\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"type\":\"relay\",\"v\":1}                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        "
+      }
+    ],
+    "note": "The Station's notice on a host's open link (the delegated host-work design III.5): {\"type\":\"relay\",\"op\":\"service_suspended\",\"v\":1,\"text\"}, exactly these fields, strict I-JSON, at most 1024 bytes as received, its text of the same grammar as host_route_refused's (1 to 256 bytes of UTF-8, no character of General Category Cc, Cf, Zl or Zp). Relay-originated only, never forwarded between room members; on a relay or routed host link the Station sends it after closing the host's channels (close{reason: service_suspended}, R9.7a), then closes the socket. `valid` cases parse to `expect` and rebuild to `message` (`text` cases are raw bytes); `invalid` ones are refused with `code` (the shared core's error code: malformed, not_strict_json or too_large). Atem's proposal, for Astation's agreement (#120 7207832274).",
+    "valid": [
+      {
+        "expect": {
+          "text": "service suspended: account disabled at Agora.Build"
+        },
+        "label": "account_disabled",
+        "message": {
+          "op": "service_suspended",
+          "text": "service suspended: account disabled at Agora.Build",
+          "type": "relay",
+          "v": 1
+        }
+      },
+      {
+        "expect": {
+          "text": "service suspended: no Agora.Build owner at this Station"
+        },
+        "label": "no_owner",
+        "message": {
+          "op": "service_suspended",
+          "text": "service suspended: no Agora.Build owner at this Station",
+          "type": "relay",
+          "v": 1
+        }
+      },
+      {
+        "expect": {
+          "text": "\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9"
+        },
+        "label": "text_256_bytes",
+        "message": {
+          "op": "service_suspended",
+          "text": "\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9",
+          "type": "relay",
+          "v": 1
+        }
+      },
+      {
+        "expect": {
+          "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "label": "at_the_bound",
+        "note": "1024 bytes as received (trailing whitespace counts)",
+        "text": "{\"op\":\"service_suspended\",\"text\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"type\":\"relay\",\"v\":1}                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       "
+      }
+    ]
+  },
   "valid": [
     {
       "chain": [],

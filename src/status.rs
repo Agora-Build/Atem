@@ -651,19 +651,32 @@ pub fn runtime_lines(look: &Look, hhmm: impl Fn(u64) -> String) -> (Line, Line, 
     } else {
         "not authorized (Astation connected but no session hello yet)".into()
     };
+    // The Station's suspension of this host's service (the delegated
+    // host-work design III.5), as the runtime shows it.
+    let suspended = status.suspended.as_deref();
+    let note = |parts: &[Option<&str>]| {
+        let parts: Vec<&str> = parts.iter().flatten().copied().collect();
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", parts.join("; "))
+        }
+    };
     let relay = match (status.astation || status.reauthenticating, status.transport) {
-        (false, Some(Transport::Relay)) if status.routed => match &status.relay {
-            Some(label) => format!("routed via relay ({label}; no Astation)"),
-            None => "routed via relay (no Astation)".into(),
-        },
-        (true, Some(Transport::Relay)) => match &status.relay {
-            Some(label) => format!("connected via relay ({label})"),
-            None => "connected via relay".into(),
-        },
-        (true, Some(Transport::Local)) => "connected locally".into(),
-        (true, None) => "connected".into(),
-        (false, _) if status.retrying => "not connected (retrying)".into(),
-        (false, _) => "not connected".into(),
+        (false, Some(Transport::Relay)) if status.routed => format!(
+            "routed via relay{}",
+            note(&[status.relay.as_deref(), Some("no Astation"), suspended])
+        ),
+        (true, Some(Transport::Relay)) => format!(
+            "connected via relay{}",
+            note(&[status.relay.as_deref(), suspended])
+        ),
+        (true, Some(Transport::Local)) => format!("connected locally{}", note(&[suspended])),
+        (true, None) => format!("connected{}", note(&[suspended])),
+        (false, _) if status.retrying => {
+            format!("not connected{}", note(&[suspended, Some("retrying")]))
+        }
+        (false, _) => format!("not connected{}", note(&[suspended])),
     };
     (
         Line::new(authorization),
@@ -2078,6 +2091,64 @@ pub(crate) mod tests {
                 "r9 routed (no Astation)",
                 "routed via relay (station.agora.build as Genie-dc1649f-956631ec; no Astation)"
             ]
+        );
+    }
+
+    /// The delegated host-work design III.5 (Atem's proposal, for
+    /// Astation's agreement, #120 7207832274): the Station's suspension of
+    /// this host's service on the Relay line, its text as the Station sent
+    /// it; Authorization keeps its rules.
+    #[test]
+    fn a_suspended_service_is_shown_on_the_relay_line() {
+        const TEXT: &str = "service suspended: account disabled at Agora.Build";
+        let retrying = RuntimeStatus {
+            retrying: true,
+            suspended: Some(TEXT.into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            lines(&running(retrying))[..2],
+            [
+                "not authorized (Astation not connected)",
+                "not connected (service suspended: account disabled at Agora.Build; retrying)"
+            ]
+        );
+        let idle = RuntimeStatus {
+            suspended: Some(TEXT.into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            lines(&running(idle))[1],
+            "not connected (service suspended: account disabled at Agora.Build)"
+        );
+        // Astation's local link, which the suspension keeps.
+        let local = RuntimeStatus {
+            suspended: Some(TEXT.into()),
+            ..connected(Transport::Local)
+        };
+        assert_eq!(
+            lines(&running(local))[1],
+            "connected locally (service suspended: account disabled at Agora.Build)"
+        );
+        // A relay or routed link the Station hasn't closed yet.
+        let relay = RuntimeStatus {
+            suspended: Some(TEXT.into()),
+            ..connected(Transport::Relay)
+        };
+        assert_eq!(
+            lines(&running(relay))[1],
+            "connected via relay (station.agora.build as Genie-dc1649f-956631ec; service suspended: account disabled at Agora.Build)"
+        );
+        let routed = RuntimeStatus {
+            astation: false,
+            attachment: false,
+            routed: true,
+            suspended: Some(TEXT.into()),
+            ..connected(Transport::Relay)
+        };
+        assert_eq!(
+            lines(&running(routed))[1],
+            "routed via relay (station.agora.build as Genie-dc1649f-956631ec; no Astation; service suspended: account disabled at Agora.Build)"
         );
     }
 
