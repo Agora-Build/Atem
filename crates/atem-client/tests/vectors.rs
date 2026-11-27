@@ -262,6 +262,7 @@ fn every_vectors_file_has_a_runner() {
             "r9-vectors-recovery.json",
             "r9-vectors-required-verifier.json", // tests/required_verifier.rs
             "r9-vectors-signer-report.json",     // tests/signer_report.rs
+            "r9-vectors-station-binding.json",   // tests/station_binding.rs
             "r9-vectors-station-calls.json",
             "r9-vectors-verifier-report.json", // tests/verifier_report.rs
         ],
