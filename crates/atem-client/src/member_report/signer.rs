@@ -518,6 +518,7 @@ impl OutOfPlan {
         OutOfPlan::AnotherOrigin,
     ];
 
+    /// The reason's code, as the bindings and the vectors write it.
     pub fn code(self) -> &'static str {
         match self {
             OutOfPlan::AnotherAccount => "another_account",
@@ -580,7 +581,7 @@ impl Plan<'_> {
             (ControlPrincipal::Host(_), ControlAction::InterruptRunning { .. }, None) => {
                 Ok(PlanRecord::InPlan)
             }
-            _ => Err(malformed("a native manager's cover, hold or release")),
+            _ => Err(malformed("body.action")),
         }
     }
 

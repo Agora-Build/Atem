@@ -1627,17 +1627,18 @@ tasks keep running. That is why coverage ends only with a stop the
 snapshot carries, or with the device list. It also removes #114's R3
 deadlock for a revoked service: a carried stop needs no `U_p` (R4), a
 fresh cover does. The snapshot checker below is unchanged (`covered` is
-its caller's input); the `snapshots` vectors' `D` cases give each row
-but the last, which is `I5`'s (a covered principal with no cover). A
-Station's own revoke signed anew is still held to the mark
-(`not_above_mark`), so for an R3-fenced principal whose retained revoke
-was lost the stop comes from a current manager (no change proposed:
-Astation #147's external ceiling makes `U_p` known going forward). An
-optional input, `provisioned` (the services the Station provisioned at O
-and hasn't handed over), with a code `coverage_dropped` for one in it
-that is neither covered, revoked by the snapshot nor removed at the
-verifying head, would make the rule mechanical for a Station's
-assembler: offered, not built.
+its caller's input); the `snapshots` vectors' `D` cases give each row's
+main form, not the first row's hold or release signed anew after its
+cover nor item 1's revokes signed anew, and the last row is `I5`'s (a
+covered principal with no cover). A Station's own revoke signed anew is
+still held to the mark (`not_above_mark`), so for an R3-fenced principal
+whose retained revoke was lost the stop comes from a current manager (no
+change proposed: Astation #147's external ceiling makes `U_p` known
+going forward). An optional input, `provisioned` (the services the
+Station provisioned at O and hasn't handed over), with a code
+`coverage_dropped` for one in it that is neither covered, revoked by the
+snapshot nor removed at the verifying head, would make the rule
+mechanical for a Station's assembler: offered, not built.
 
 **A replacement feed after a rollback** (Astation #114, items 2 and 6). A
 Station that recovers from a rollback publishes a replacement feed: a new
@@ -2061,7 +2062,7 @@ ordering can't stop a key holder. The Station's duties:
     mark and never bypasses it.
 - A Station re-issues covers only for principals it currently covers
   ("Which principals a Station currently covers" above: **Atem's reading,
-  for Astation's agreement**).
+  for Astation's agreement (Astation #114, comment 7207811340)**).
 - A Station that hands an integration over stops signing for it, and the
   key leaves with it (or the integration is created again as a new
   principal).
@@ -2194,16 +2195,18 @@ or more per code, and consistent ones, item 2's retained stop among
 them), each with its inputs, `expect` and `in_force`: the stops in force
 after the retained records, after the snapshot alone and after both.
 (**New with the coverage reading above, for Astation's agreement,
-Astation #114 comment 7207811340.**) The `D` cases give each of its rows
-but the last (`I5`'s): a revoked service outside `covered` with its
-retained revoke carried (the Station's own, a current manager's), one
-revoked before any cover, a revoked one kept in `covered` with its cover
-first, a revoked one's hold and a held unrevoked one's hold with no
-cover (`cover_not_first`), a removed unrevoked one outside `covered` (on
-`E7`, for which `S1_cover` and `M2_interrupt` gain their verdicts) and a
-current manager's copy of a removed manager's revoke for an uncovered
-principal (`M4_revoke_resigned`, the copy naming the original's feed;
-`N3`'s `M8_revoke_resigned_a2` names the candidate feed).
+Astation #114 comment 7207811340.**) The `D` cases give its rows' main
+forms (not the first row's hold signed anew after its cover, nor item
+1's revokes signed anew; the last row is `I5`'s): a revoked service
+outside `covered` with its retained revoke carried (the Station's own, a
+current manager's), one revoked before any cover, a revoked one kept in
+`covered` with its cover first, a revoked one's hold and a held
+unrevoked one's hold with no cover (`cover_not_first`), a removed
+unrevoked one outside `covered` (on `E7`, for which `S1_cover` and
+`M2_interrupt` gain their verdicts) and a current manager's copy of a
+removed manager's revoke for an uncovered principal
+(`M4_revoke_resigned`, the copy naming the original's feed; `N3`'s
+`M8_revoke_resigned_a2` names the candidate feed).
 `scripts/check-r9-vectors.py` derives each snapshot case's answer and
 `in_force` from the records' verdicts on its chain, with no state
 machine, and checks every code is exercised.
