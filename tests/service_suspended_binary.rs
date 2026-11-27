@@ -376,9 +376,12 @@ impl Rig {
     /// journal's device-list files, the host trust generation and its
     /// floor, the host's `host_channel_key`, the pairing record, the
     /// session journal's principals; with the hook, the control parts, the
-    /// feeds' cursors and the reset marks; with `host.senders`, the
-    /// mailbox's cursor and owed dones. (The acknowledgments' book is reset
-    /// in memory by design: its rows go again.)
+    /// feeds' cursors and the reset marks; with `host.senders`, the host
+    /// encryption key and its record, the mailbox's cursor and owed dones
+    /// and the outbox rows (their tables checked to exist); the session
+    /// journal's refusal list, lease-epoch floors and runtime epoch. (The
+    /// acknowledgments' book is reset in memory by design: its rows go
+    /// again.)
     fn kept(&self) -> Value {
         let config = self.sandbox.config();
         let read = |path: &Path| std::fs::read(path).ok().map(hex);
@@ -407,6 +410,27 @@ impl Rig {
             .map(Result::unwrap)
             .collect()
         };
+        // With `host.senders` its tables and key exist: a typo in a table's
+        // name would compare nothing.
+        if self.senders {
+            let db = self.db();
+            for table in [
+                "mailbox_cursor",
+                "mailbox_dones",
+                "mail_outbox",
+                "remote_deliveries",
+            ] {
+                let found: i64 = db
+                    .query_row(
+                        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                        [table],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(found, 1, "{table}");
+            }
+            assert!(config.join("pairing/host_enc_key").exists());
+        }
         let dump = self.dump();
         let membership_files: Vec<Option<String>> = [
             "pairing/membership.carriage",
@@ -419,6 +443,13 @@ impl Rig {
             "runtime/journal/membership_deferred",
             "runtime/journal/membership_fault",
             "runtime/journal/frozen_genesis",
+            // The host encryption key and its record (`host.senders`).
+            "pairing/host_enc_key",
+            "pairing/host_enc_generated",
+            // The session journal beyond its principals.
+            "runtime/journal/refused",
+            "runtime/journal/floors",
+            "runtime/journal/runtime_epoch",
         ]
         .iter()
         .map(|f| read(&config.join(f)))
@@ -442,6 +473,8 @@ impl Rig {
             "control_unread": rows("SELECT * FROM control_unread"),
             "mailbox_cursor": rows("SELECT * FROM mailbox_cursor"),
             "mailbox_dones": rows("SELECT * FROM mailbox_dones"),
+            "mail_outbox": rows("SELECT * FROM mail_outbox"),
+            "remote_deliveries": rows("SELECT * FROM remote_deliveries"),
         })
     }
 }
@@ -691,11 +724,15 @@ fn a_router_close_for_a_suspended_service_fences_only_its_channel() {
     assert_eq!(rig.kept(), kept);
 }
 
-/// III.5 on Astation's local link with `host.delegated`: the Station's
-/// notice there keeps the link (no reconnect), the gate closes as for a
-/// refusal of every call kind, both status lines show the text, and
-/// nothing of the host's state moves. Restored, the host asks again after
-/// the 30 s backoff on its clock, the gate opens and the text is gone.
+/// III.5 on Astation's local link with `host.delegated` and
+/// `host.senders`: the Station's notice there keeps the link (no
+/// reconnect), the gate closes as for a refusal of every call kind (the
+/// acks on that connection and the mailbox's dones held), both status lines
+/// show the text, and nothing of the host's state moves. The suspended
+/// Station keeps announcing its heads and refuses the calls the host asks
+/// past the backoff; the holds stay. Restored, the host asks again after
+/// the backoff on its clock, the gate opens, the text is gone and the holds
+/// end: the held ack goes once on the same link, the dones may go.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
@@ -717,6 +754,18 @@ fn on_the_local_link_a_suspension_keeps_the_link() {
     // As a refusal of every call kind: the acks and the dones held.
     assert_eq!(rig.dump()["station"]["acks"]["held"], true);
     assert_eq!(mailbox(&rig)["dones_refused"], true);
+    // The suspended Station still announces its heads and refuses each
+    // call (review N1): past the backoff the host asks again, and its
+    // control sync and mailbox sync are refused; the holds stay.
+    rig.clock.add_mono(31_000);
+    rig.within("calls refused while suspended", || {
+        let station = rig.dump()["station"].clone();
+        station["refusals"]["control_sync"].as_u64() >= Some(1)
+            && station["mailbox"]["refusals"].as_u64() >= Some(1)
+    });
+    assert_eq!(rig.dump()["station"]["acks"]["held"], true);
+    assert_eq!(mailbox(&rig)["dones_refused"], true);
+    assert_eq!(rig.acks_naming(&cover), 1);
     rig.status_line("Relay:", &format!("connected locally ({SHOWN})"));
     rig.status_line(
         "Control feeds:",
@@ -739,12 +788,10 @@ fn on_the_local_link_a_suspension_keeps_the_link() {
     };
     assert_eq!(without_pairing(rig.kept()), without_pairing(kept));
     rig.station().restore();
-    // The backoff on the host's clock, then the full sync.
+    // The refusal's backoff on the host's clock, then the full sync.
     rig.clock.add_mono(31_000);
     rig.within("the gate open again", || rig.gate_open());
-    // The text is lifted with the Station serving the link again (the
-    // Control feeds line's alert summary still names it as the run's
-    // latest alert).
+    // The text is lifted with the Station serving the link again.
     rig.within("the text lifted", || {
         rig.status_value("Relay:") == "connected locally"
     });

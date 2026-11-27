@@ -63,10 +63,11 @@
 //!   host's link gets the `service_suspended` notice (B-2) and is closed,
 //!   and every new host connection's proof is refused `service_suspended`
 //!   with the text (B-1, the relay's own: `FakeAstation::suspension`); on
-//!   Astation's local link the notice, the link kept. While suspended every
-//!   call gets its typed refusal (a mailbox call no answer), a proof that
-//!   verifies the suspension's refusal (one that doesn't its verifier
-//!   code), and no `heads` go. Built from the shared core's builders.
+//!   Astation's local link the notice, the link kept. While suspended the
+//!   Station still announces its `heads`, every call gets its typed
+//!   refusal (a mailbox sync or done too; a put no answer), and a proof
+//!   that verifies gets the suspension's refusal (one that doesn't its
+//!   verifier code). Built from the shared core's builders.
 //! - [`FakeStation::require_proof`]: a Station that requires the host's
 //!   fresh route proof on each link before it serves the link's calls (the
 //!   delegated host-work design I.5.8, "Which host is calling": session-v1
@@ -1076,8 +1077,10 @@ impl FakeStation {
                 self.challenge(link);
             }
         }
-        // No `heads` before the link's proof, when one is required.
-        if !self.serves(link) {
+        // No `heads` before the link's proof, when one is required (while
+        // suspended they go on: a suspended account's link still hears
+        // the Station, which refuses its calls).
+        if !self.announces(link) {
             return;
         }
         let due = self.last_heads.is_none_or(|at| at.elapsed() >= HEARTBEAT);
@@ -1089,15 +1092,21 @@ impl FakeStation {
     /// The Station's own `heads`, on the served link if there is one (and
     /// it proved its host, when [`FakeStation::require_proof`] says so).
     fn send_heads(&mut self) {
-        if self.link.is_some_and(|link| self.serves(link)) {
+        if self.link.is_some_and(|link| self.announces(link)) {
             self.heads_now();
         }
     }
 
-    /// Whether the Station serves `link`'s calls: not suspended, and no
-    /// proof required, or the link's verified.
+    /// Whether the Station announces its `heads` on `link`: no proof
+    /// required, or the link's verified (suspended or not).
+    fn announces(&self, link: u64) -> bool {
+        self.proof.is_none() || self.proved.contains(&link)
+    }
+
+    /// Whether the Station serves `link`'s calls: not suspended, and it
+    /// announces there.
     fn serves(&self, link: u64) -> bool {
-        self.suspended.is_none() && (self.proof.is_none() || self.proved.contains(&link))
+        self.suspended.is_none() && self.announces(link)
     }
 
     /// The host's `host_route` on `link`, checked against the Station's own
@@ -1227,11 +1236,9 @@ impl FakeStation {
     /// Answers the host's call `bytes` (already in `sent`) on `link`.
     fn reply(&mut self, link: u64, bytes: &str) -> Result<ToStation, RelayError> {
         // Host senders' mailbox calls (§11.5), told by their `op`: read by
-        // the shared mailbox reader (one it refuses gets no answer).
-        // While suspended (III.5) a mailbox call gets no answer.
-        if mailbox_call(bytes) && self.suspended.is_some() {
-            return ToStation::decode(bytes.as_bytes());
-        }
+        // the shared mailbox reader (one it refuses gets no answer). While
+        // suspended (III.5) a sync or a done gets its typed refusal and a
+        // put no answer (`mailbox_reply`).
         if mailbox_call(bytes) {
             let reply = match MailboxToStation::decode(bytes.as_bytes()) {
                 // The receiving host's own puts (its status objects back to
@@ -1908,7 +1915,7 @@ impl Pump {
                     let mut station = station.lock().unwrap_or_else(|e| e.into_inner());
                     station.serve_latest();
                     if last.elapsed() >= Duration::from_secs(1) {
-                        if station.link.is_some_and(|link| station.serves(link)) {
+                        if station.link.is_some_and(|link| station.announces(link)) {
                             station.heads_now();
                         }
                         last = Instant::now();
