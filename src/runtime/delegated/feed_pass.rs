@@ -626,36 +626,87 @@ impl HostBridge {
     }
 
     /// The App's record of a `service_suspended` notice (the delegated
-    /// host-work design III.5), applied once, at the start of a pass, to
-    /// the Station link it came on (its link generation and socket, as the
-    /// last pass left the link): its calls retired and its gates closed
-    /// ([`super::station::Station::on_suspended`]), and the book's
-    /// acknowledgments on that connection sent again on the next
-    /// ([`HostBridge::acks_suspended`]). A notice for another link, or
-    /// with no Station link (the hook off), does nothing.
+    /// host-work design III.5), taken once (its number) and applied to the
+    /// Station link on the socket it came on, whatever that link's
+    /// generation (a suspension is the socket's): its calls retired and its
+    /// gates closed ([`super::station::Station::on_suspended`]), and the
+    /// book's acknowledgments of every connection on that socket sent
+    /// again on the next ([`HostBridge::acks_suspended`]). The bridge asks
+    /// at the start of its pass, before anything of it reads the link or
+    /// dispatches (the link as the last pass left it), and again right
+    /// after it synced the link (one the App installed or authenticated
+    /// again in the same tick as the notice), before the pass reads the
+    /// Station's messages. A notice waits while the Station link isn't on
+    /// its socket yet and the App's link still is; it is dropped only once
+    /// neither is (the socket gone, nothing of it left to retire). With no
+    /// Station link (the hook off) it does nothing.
     pub(crate) fn station_suspension(&mut self, app: &crate::app::App) {
-        let Some(s) = app.service_suspension.as_ref() else {
-            return;
-        };
-        let Some(notice) = s.notice else {
-            return;
-        };
-        if notice <= self.suspension_applied {
-            return;
+        if let Some(s) = app.service_suspension.as_ref()
+            && let (Some(notice), Some(socket)) = (s.notice, s.socket())
+            && notice > self.suspension_applied
+        {
+            self.suspension_applied = notice;
+            self.suspension_pending = Some((socket, s.text.clone()));
         }
-        self.suspension_applied = notice;
+        let Some((socket, text)) = self.suspension_pending.clone() else {
+            return;
+        };
         let Some(station) = self.station.as_mut() else {
+            self.suspension_pending = None;
             return;
         };
-        let on_link = station
-            .link()
-            .is_some_and(|l| Some(l.socket) == s.socket() && l.link_gen == s.link_gen);
-        if !on_link || !station.on_suspended(&s.text) {
+        if station.link().is_none_or(|l| l.socket != socket) {
+            if app.astation_client.socket_id() != socket {
+                self.suspension_pending = None;
+            }
             return;
         }
+        self.suspension_pending = None;
+        station.on_suspended(&text);
         self.acks_suspended();
         self.publish_feed_gates();
         self.refresh_fetch_view();
+    }
+
+    /// Review M3: whatever suspension the App recorded (the relay's at a
+    /// connect or on an open link, or the local link's) is lifted once the
+    /// Station serves this host again: its feed gate open, on whatever link
+    /// (a local link's open gate says the account is served again), unless
+    /// a notice still waits for its link.
+    pub(crate) fn lift_suspension(
+        &mut self,
+        recorded: &mut Option<crate::app::suspension::Suspension>,
+    ) {
+        if recorded.is_some()
+            && self.suspension_pending.is_none()
+            && self
+                .station
+                .as_ref()
+                .is_some_and(|station| station.feed.closed().is_none())
+        {
+            *recorded = None;
+            self.suspension = None;
+        }
+    }
+
+    /// A local link's suspension ended (the delegated host-work design
+    /// III.5; review M2): the Station served the link's feed again (the
+    /// resynchronization read after the backoff), so the book's hold on
+    /// that connection ends ([`super::acks::AckBook::on_resumed`]). The
+    /// mailbox ends its own done hold with its own resynchronization.
+    pub(crate) fn station_resumed(&mut self) {
+        let Some(station) = self.station.as_mut() else {
+            return;
+        };
+        if !station.feed.take_suspension_ended() {
+            return;
+        }
+        let Some(link) = station.link().cloned() else {
+            return;
+        };
+        if let Feeds::Loaded(feeds) = &mut self.work.feeds {
+            feeds.acks_resumed(&link);
+        }
     }
 
     /// The Station suspended this host's service on its link (the

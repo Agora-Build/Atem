@@ -546,6 +546,9 @@ pub struct FeedSync {
     /// while `suspended`; on Astation's local link while its refusal's
     /// backoff and resynchronization last).
     suspension: Option<String>,
+    /// A local link's suspension ended with its resynchronization, not
+    /// taken yet ([`FeedSync::take_suspension_ended`]).
+    suspension_ended: bool,
     /// The live call (ruling C1b-a).
     in_flight: Option<Ask>,
     /// The ids of the calls retired, the latest [`RETIRED_KEPT`]: their
@@ -620,6 +623,7 @@ impl FeedSync {
             moved: false,
             suspended: false,
             suspension: None,
+            suspension_ended: false,
             in_flight: None,
             retired: std::collections::VecDeque::new(),
             unanswered: false,
@@ -777,11 +781,9 @@ impl FeedSync {
         if self.link_gen.is_none() {
             return;
         }
+        // Not a sync alert (review L9): the App logs it, once per text an
+        // hour, and the gate's reason names it.
         self.suspensions += 1;
-        self.note_alert(format!(
-            "the Station suspended this host's service ({})",
-            crate::app::suspension::shown(text)
-        ));
         self.retire_live();
         self.epoch += 1;
         self.suspension = Some(text.to_owned());
@@ -792,6 +794,13 @@ impl FeedSync {
             self.resync = Some(Resync::Refused);
             self.refused_at = Some(self.now);
         }
+    }
+
+    /// Whether a local link's suspension ended since the last call (the
+    /// Station served its feed again: the resynchronization asked after the
+    /// backoff read), for the holds that end with it (review M2).
+    pub fn take_suspension_ended(&mut self) -> bool {
+        std::mem::take(&mut self.suspension_ended)
     }
 
     /// Whether nothing more is asked or applied on the link's socket: its
@@ -1155,8 +1164,8 @@ impl FeedSync {
         if ask.epoch == self.epoch {
             self.resync = None;
             // A local link's suspension ends with its resynchronization.
-            if !self.suspended {
-                self.suspension = None;
+            if !self.suspended && self.suspension.take().is_some() {
+                self.suspension_ended = true;
             }
         }
         let moved = self.synced != before;

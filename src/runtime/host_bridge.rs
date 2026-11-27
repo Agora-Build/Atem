@@ -737,8 +737,11 @@ pub struct HostBridge {
     /// (the delegated host-work design III.5), as the last pass read it:
     /// its origin and text, for the `Control feeds:` line.
     suspension: Option<(Option<String>, String)>,
-    /// The App's last `service_suspended` notice the Station link took.
+    /// The App's last `service_suspended` notice the Station link took,
+    /// and one taken but not applied yet (its socket and text): the
+    /// Station link isn't on that socket yet.
     suspension_applied: u64,
+    suspension_pending: Option<(u64, String)>,
     /// Fetch results not carried because an entry didn't read back (never
     /// expected: they came from the strict reader).
     unconverted_fetches: u64,
@@ -1006,6 +1009,7 @@ impl HostBridge {
             station: None,
             suspension: None,
             suspension_applied: 0,
+            suspension_pending: None,
             unconverted_fetches: 0,
             pairing,
             host_key,
@@ -2131,6 +2135,11 @@ impl HostBridge {
                 app.drop_astation_link("The Astation pairing changed; the link was dropped".into());
             }
         }
+        // III.5: the Station's suspension the App read is applied to the
+        // Station link on its socket before this pass dispatches anything
+        // or takes the link as it is now (the Station closes it right
+        // after the notice).
+        self.station_suspension(app);
         let client = &app.astation_client;
         let mut cx = Cx { client, sessions };
         self.sync_link(app_link(app), &mut cx);
@@ -2154,12 +2163,12 @@ impl HostBridge {
             #[cfg(debug_assertions)]
             self.drive_pass(&mut cx);
         }
-        // III.5: the Station's suspension the App read is applied to the
-        // Station link it came on before this pass takes the link as it
-        // is now (the Station closes it right after).
-        self.station_suspension(app);
         self.sync_r9_link(r9_app_link(app), &mut cx);
         self.sync_station_link(app);
+        // A notice for a link this pass just synced (installed or
+        // authenticated again in the notice's tick): applied before the
+        // pass reads the Station's messages on it.
+        self.station_suspension(app);
         // The services' r9 admission as the control state stands, before
         // any `hello` of this pass (ruling T35c).
         self.sync_services(&mut cx);
@@ -2203,20 +2212,10 @@ impl HostBridge {
             }
             let station = self.r9.take_station_messages();
             self.station_pass(station, &mut cx);
-            // III.5: a suspension read on Astation's local link is lifted
-            // once the Station serves that link again (its feed gate open).
-            if app
-                .service_suspension
-                .as_ref()
-                .is_some_and(crate::app::suspension::Suspension::local)
-                && self
-                    .station
-                    .as_ref()
-                    .is_some_and(|station| station.feed.closed().is_none())
-            {
-                app.service_suspension = None;
-                self.suspension = None;
-            }
+            // III.5: a local link's suspension ended with its feed's
+            // resynchronization: the acknowledgments' hold ends with it.
+            self.station_resumed();
+            self.lift_suspension(&mut app.service_suspension);
             for (link_gen, handle, why) in overflow {
                 if Some(link_gen) == self.r9_link {
                     let effects = self.r9_call(|r9, parts| r9.refuse_unread(&handle, why, parts));

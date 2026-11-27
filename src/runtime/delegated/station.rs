@@ -36,16 +36,20 @@
 //!
 //! **The Station's suspension** of this host's service (the delegated
 //! host-work design III.5, its `service_suspended` notice, which the App
-//! reads and the bridge hands over before anything else of its pass reads
-//! the link: [`Station::on_suspended`]). On a relay or routed link
-//! (which the Station closes after it): every live call on the socket is
-//! retired (the sync's, the fetch's, the mailbox's syncs and dones, the
-//! puts; the acknowledgments the bridge's book holds go again on the next
-//! link), the origin's gates close at once, and nothing more is asked on
-//! that socket, nor does anything read on it reopen a gate, until a link
-//! on a new socket. On Astation's local link
-//! (which stays): as a refusal of every call kind, its 30-second backoff
-//! included. Never a trust or state change (no cursor, mark, fence or
+//! reads and the bridge hands over, matched by socket, before anything
+//! else of its pass reads that socket: [`Station::on_suspended`]). On a
+//! relay or routed link (which the Station closes after it): every live
+//! call on the socket is retired (the sync's, the fetch's, the mailbox's
+//! syncs and dones, the puts; the acknowledgments the bridge's book sent on
+//! any connection of that socket go again on the next link), the origin's
+//! gates close at once, and nothing more is asked on that socket, nor does
+//! anything read on it reopen a gate, until a link on a new socket. Station
+//! messages read in the same pass before the notice are dropped with it
+//! (fail closed: the cursor didn't move, so their records are read again
+//! after the restore). On Astation's local link (which stays): as a
+//! refusal of every call kind, its 30-second backoff included, its
+//! acknowledgment and done holds ending once the Station serves the link
+//! again. Never a trust or state change (no cursor, mark, fence or
 //! identity moves). **Atem's proposal, for Astation's agreement (#120
 //! 7207832274).**
 use super::fetch::{DeviceListFetch, FetchApply};

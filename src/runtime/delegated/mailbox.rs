@@ -218,6 +218,10 @@ pub struct MailboxClient {
     /// relay or routed one (III.5): as `moved`, nothing more on it.
     suspended: bool,
     suspensions: u64,
+    /// `dones_refused` is a local link's suspension's, which ends with its
+    /// resynchronization (review M2); a refusal's holds for the link
+    /// generation.
+    dones_held_by_suspension: bool,
     /// The host's monotonic clock at the last tick (ms).
     now: u64,
     announced: Option<MailboxHead>,
@@ -300,6 +304,7 @@ impl MailboxClient {
         self.resync = None;
         self.refused_at = None;
         self.dones_refused = false;
+        self.dones_held_by_suspension = false;
         if now.map(|(_, socket)| socket) != self.socket {
             self.moved = false;
             self.suspended = false;
@@ -323,7 +328,8 @@ impl MailboxClient {
     /// (a relay or routed link): nothing more is synced or marked done on
     /// that socket, as after an identity change. Else (Astation's local
     /// link) as a refusal of both calls: no sync before a `heads` past the
-    /// backoff, no done more on this link generation.
+    /// backoff, and no done until the page asked after it reads (the
+    /// Station serving the link again).
     pub fn on_suspended(&mut self, socket_ends: bool) {
         if self.link_gen.is_none() {
             return;
@@ -337,7 +343,10 @@ impl MailboxClient {
             self.resync = Some(Resync::Suspended);
             self.refused_at = Some(self.now);
             self.epoch += 1;
-            self.dones_refused = true;
+            if !self.dones_refused {
+                self.dones_refused = true;
+                self.dones_held_by_suspension = true;
+            }
         }
     }
 
@@ -499,6 +508,12 @@ impl MailboxClient {
         self.pages += 1;
         let page = applying.page;
         if applying.epoch == self.epoch {
+            // A local link's suspension ends with its resynchronization:
+            // the dones it held go (review M2).
+            if self.resync == Some(Resync::Suspended) && self.dones_held_by_suspension {
+                self.dones_refused = false;
+                self.dones_held_by_suspension = false;
+            }
             self.resync = None;
         }
         if page.through > page.after {
@@ -560,6 +575,7 @@ impl MailboxClient {
         self.refusals += 1;
         self.alert(Alert::DoneRefused, REFUSED_DONE.into());
         self.dones_refused = true;
+        self.dones_held_by_suspension = false;
         for id in self.live_done_ids() {
             self.retire_done(&id);
         }

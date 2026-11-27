@@ -662,5 +662,13 @@ fn a_suspension_retires_every_mailbox_call() {
     c.on_heads(head(MAILBOX, 3));
     let out = c.take_outgoing();
     assert_eq!(out.sync.len(), 1, "asked again after the backoff");
-    assert!(out.dones.is_empty(), "no done more on this link generation");
+    assert!(
+        out.dones.is_empty(),
+        "no done before the Station serves the link"
+    );
+    // Review M2: the page asked after the backoff reads: the dones go
+    // again on the same link generation.
+    commit(&mut c, page(&out.sync[0], 3, 3));
+    owing(&mut c, (MAILBOX, 3), [1]);
+    assert_eq!(positions(&c.take_outgoing().dones), vec![1]);
 }

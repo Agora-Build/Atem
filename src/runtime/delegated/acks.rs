@@ -582,6 +582,10 @@ pub struct AckBook {
     refusals: u64,
     /// The Station's suspensions of this host's service (III.5).
     suspensions: u64,
+    /// `held` is a suspension's on Astation's local link, which ends when
+    /// the Station serves that link again ([`AckBook::on_resumed`]); a
+    /// refusal's holds for its connection.
+    held_by_suspension: bool,
     /// Rows that don't read, or that the shared writer wouldn't take: kept
     /// on disk as they are, never sent (review m6).
     unreadable: u64,
@@ -1006,6 +1010,7 @@ impl AckBook {
     /// come first (ruling T36b, N4).
     pub fn on_refused(&mut self) {
         self.refusals += 1;
+        self.held_by_suspension = false;
         self.held = self.link;
         if let Some(held) = self.held {
             for row in &mut self.rows {
@@ -1016,20 +1021,35 @@ impl AckBook {
         }
     }
 
-    /// The Station suspended this host's service on `link` (the delegated
-    /// host-work design III.5, its `service_suspended`): as after a
-    /// refusal, but for that connection whatever the last ack's was:
-    /// nothing more goes on it, and what went on it reads as never sent (in
-    /// memory), so it goes on the next connection that takes it. Nothing
-    /// is taken as delivered.
+    /// The Station suspended this host's service on `link`'s socket (the
+    /// delegated host-work design III.5, its `service_suspended`): as after
+    /// a refusal, but for every connection on that socket (a
+    /// re-authentication's generations too), whatever the last ack's was:
+    /// nothing more goes on `link`, and what went on that socket reads as
+    /// never sent (in memory), so it goes on the next connection that takes
+    /// it. Nothing is taken as delivered. On Astation's local link the hold
+    /// ends when the Station serves the link again
+    /// ([`AckBook::on_resumed`]).
     pub fn on_suspended(&mut self, link: &StationLink) {
         let held = (link.link_gen, link.socket);
         self.suspensions += 1;
         self.held = Some(held);
+        self.held_by_suspension = true;
         for row in &mut self.rows {
-            if matches!(row.sent, Sent::On { link, .. } if link == held) {
+            if matches!(row.sent, Sent::On { link: (_, socket), .. } if socket == held.1) {
                 row.sent = Sent::Never;
             }
+        }
+    }
+
+    /// The Station serves `link` again after it suspended this host's
+    /// service there (Astation's local link, which stays: its feed's
+    /// resynchronization read): a suspension's hold on that connection
+    /// ends, so what it held goes now, once. A refusal's hold stays.
+    pub fn on_resumed(&mut self, link: &StationLink) {
+        if self.held_by_suspension && self.held == Some((link.link_gen, link.socket)) {
+            self.held = None;
+            self.held_by_suspension = false;
         }
     }
 

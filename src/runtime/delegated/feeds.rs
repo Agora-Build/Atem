@@ -730,6 +730,14 @@ impl FeedStore {
         }
     }
 
+    /// The Station serves `link` again after a suspension there (III.5,
+    /// [`AckBook::on_resumed`]).
+    pub fn acks_resumed(&mut self, link: &super::station::StationLink) {
+        if let Some(book) = self.mem.acks.as_mut() {
+            book.on_resumed(link);
+        }
+    }
+
     /// The acknowledgments' state, for the state dump (debug builds).
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub fn acks_dump(&self) -> Option<Value> {
