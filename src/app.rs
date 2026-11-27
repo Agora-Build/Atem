@@ -559,6 +559,7 @@ impl App {
 
             // Local unavailable or not allowed: the paired Astation's
             // identity room on the relay (no pairing, no relay connection).
+            let mut suspended = None;
             if let Some(relay_code) = room {
                 let mut relay_client = crate::websocket_client::AstationClient::new()
                     .with_profile(src)
@@ -578,11 +579,27 @@ impl App {
                             .downcast_ref::<crate::websocket_client::ServiceSuspendedError>()
                             .is_some() =>
                     {
-                        let _ = tx.send(Err(error));
-                        return;
+                        suspended = Some(error);
                     }
                     Err(error) => note(error),
                 }
+            }
+            // The suspension first, carrying the local link's session
+            // advice, if any, for a pairing or unlock waiting for the link
+            // (review L10).
+            if let Some(error) = suspended {
+                let error = match session_problem
+                    .map(crate::runtime::ops::session_advice)
+                    .and_then(|advice| {
+                        advice
+                            .downcast_ref::<crate::runtime::ops::SessionAdvice>()
+                            .map(|a| a.0.clone())
+                    }) {
+                    Some(advice) => error.context(crate::runtime::ops::SessionAdvice(advice)),
+                    None => error,
+                };
+                let _ = tx.send(Err(error));
+                return;
             }
 
             let _ = tx.send(Err(match session_problem {
@@ -731,10 +748,9 @@ impl App {
             AstationMessage::HostRouteSuspended(text) => {
                 // A verdict counts once, at connect; one on an open link
                 // (a relay that answered late) ends it as a refusal does.
-                let socket = self.astation_client.socket_id();
+                let shown = suspension::shown(&text);
                 self.service_suspended(text);
-                if self.astation_client.socket_id() == socket && self.astation_routed && !self.astation_connected {
-                    let shown = self.service_suspension.as_ref().map(suspension::Suspension::shown).unwrap_or_default();
+                if self.astation_routed && !self.astation_connected {
                     self.drop_astation_link(format!("{shown}; retrying"));
                     self.astation_reconnect_at = Some(Instant::now() + suspension::RETRY_AFTER);
                 }

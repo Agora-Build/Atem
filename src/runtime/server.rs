@@ -1680,11 +1680,13 @@ impl Server {
                 && (app.astation_connect_rx.is_some() || app.astation_reconnect_at.is_some()),
             reauthenticating: connected && app.astation_reauth.is_some(),
             routed,
-            // III.5: the Station's suspension of this host's service.
-            suspended: app
-                .service_suspension
-                .as_ref()
-                .map(crate::app::suspension::Suspension::shown),
+            // III.5: the Station's suspension of this host's service; the
+            // relay's, while the local link is up, as its last answer.
+            suspended: app.service_suspension.as_ref().map(|s| {
+                s.status_text(
+                    connected && matches!(app.astation_client.via(), Some(LinkVia::Local)),
+                )
+            }),
             attachment: link.as_ref().is_some_and(|l| l.attachment),
             welcomed: link.as_ref().and_then(|l| l.welcomed.clone()),
             refused: link.as_ref().and_then(|l| l.refused.clone()),

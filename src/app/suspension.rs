@@ -27,12 +27,20 @@
 //!   nor a route-proof reconnect: no R9 state moves.
 //!
 //! `atem status` shows the text on its `Relay:` line (`not connected
-//! (service suspended: <text>; retrying)`), and with `host.delegated` on
-//! its `Control feeds:` line too. The text clears at the next
-//! `host_route_ok` or Astation authentication on a relay link; one read on
-//! the local link also when that link ends, its route proof is accepted,
-//! or (with `host.delegated`) the Station serves its calls again.
-//! runtime.log gets one line per text an hour.
+//! (service suspended: <text>; retrying)`; the text as sent when it begins
+//! `service suspended:`, else prefixed, [`shown`]), and with
+//! `host.delegated` on its `Control feeds:` line too. The text clears at
+//! the next `host_route_ok` or Astation authentication on a relay link; one
+//! read on the local link also when that link ends or its route proof is
+//! accepted; with `host.delegated`, any once the Station serves the host
+//! again (its feed gate open, on whatever link). With the hook off, a
+//! relay's text while Astation's local link is up is shown as the relay's
+//! last answer ([`Suspension::status_text`]). runtime.log gets one line per
+//! text an hour, at most four an hour in all.
+//!
+//! The next connect after a suspension waits 30 s, the normal connect
+//! loop's pace after a suspension, even when the link it came on had been
+//! up for more than 10 s (an immediate reconnect is a sure refusal).
 //!
 //! The `text` field, the disclosure order and the 10 s drop are **Atem's
 //! proposal, for Astation's agreement (#120 7207832274)**.
@@ -80,6 +88,19 @@ pub struct Suspension {
 }
 
 impl Suspension {
+    /// What `atem status` shows of it with the App's link up locally or
+    /// not (`local_link`): the text ([`shown`]); one the relay gave, shown
+    /// while Astation's local link is up, as the relay's last answer (a
+    /// local link says nothing of the relay's service; review M3): `the
+    /// relay last answered: service suspended: <text>`.
+    pub fn status_text(&self, local_link: bool) -> String {
+        if local_link && !self.local() {
+            format!("the relay last answered: {}", self.shown())
+        } else {
+            self.shown()
+        }
+    }
+
     /// The socket it was read on (none at a connect).
     pub fn socket(&self) -> Option<u64> {
         match self.on {
@@ -99,38 +120,79 @@ impl Suspension {
     }
 }
 
-/// `service suspended: <text>`, or the text alone when it already says so
-/// (III.5's texts begin with it: "service suspended: account disabled at
-/// Agora.Build").
+/// The Station's `text` as `atem status` shows it: as sent when it begins
+/// `service suspended:` (III.5's texts do: "service suspended: account
+/// disabled at Agora.Build"), otherwise with `service suspended: ` before
+/// it. Exact, case-sensitive. **Atem's reading, for Astation's agreement
+/// (#120 7207832274).**
 pub fn shown(text: &str) -> String {
-    if text.starts_with("service suspended") {
+    if text.starts_with("service suspended:") {
         text.to_owned()
     } else {
         format!("service suspended: {text}")
     }
 }
 
-/// The runtime.log line's limit: one per text an hour.
+/// At most this many suspension lines an hour in all (review L4), then one
+/// line saying how many more were suppressed.
+const LINES_AN_HOUR: u32 = 4;
+
+/// The runtime.log line's limit: one per text an hour, and at most
+/// [`LINES_AN_HOUR`] in all.
 #[derive(Debug, Default)]
 pub struct Lines {
     logged: VecDeque<(String, Instant)>,
+    /// The hour's window, its lines, the lines suppressed in it.
+    window: Option<Instant>,
+    in_window: u32,
+    suppressed: u64,
+}
+
+/// What [`Lines::due`] says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Due {
+    /// Not now.
+    Skip,
+    /// The line goes, after one naming how many an earlier window
+    /// suppressed (0: none).
+    Log { suppressed: u64 },
 }
 
 impl Lines {
     /// Whether a line about `text` is due at `now` (counted when it is).
-    fn due(&mut self, text: &str, now: Instant) -> bool {
-        if let Some((_, at)) = self.logged.iter_mut().find(|(t, _)| t == text) {
-            if now.duration_since(*at) < LINE_EVERY {
-                return false;
+    fn due(&mut self, text: &str, now: Instant) -> Due {
+        let known = self.logged.iter().position(|(t, _)| t == text);
+        if let Some(i) = known
+            && now.duration_since(self.logged[i].1) < LINE_EVERY
+        {
+            return Due::Skip;
+        }
+        let mut carried = 0;
+        if self
+            .window
+            .is_none_or(|start| now.duration_since(start) >= LINE_EVERY)
+        {
+            self.window = Some(now);
+            self.in_window = 0;
+            carried = std::mem::take(&mut self.suppressed);
+        }
+        if self.in_window >= LINES_AN_HOUR {
+            self.suppressed += 1;
+            return Due::Skip;
+        }
+        self.in_window += 1;
+        match known {
+            Some(i) => self.logged[i].1 = now,
+            None => {
+                if self.logged.len() >= LINES_KEPT {
+                    self.logged.pop_front();
+                }
+                self.logged.push_back((text.to_owned(), now));
             }
-            *at = now;
-            return true;
         }
-        if self.logged.len() >= LINES_KEPT {
-            self.logged.pop_front();
+        Due::Log {
+            suppressed: carried,
         }
-        self.logged.push_back((text.to_owned(), now));
-        true
     }
 }
 
@@ -200,7 +262,13 @@ impl App {
 
     fn record_suspension(&mut self, suspension: Suspension) {
         let shown = suspension.shown();
-        if self.suspension_lines.due(&suspension.text, Instant::now()) {
+        if let Due::Log { suppressed } = self.suspension_lines.due(&suspension.text, Instant::now())
+        {
+            if suppressed > 0 {
+                eprintln!(
+                    "atem runtime: … {suppressed} more service_suspended line(s) suppressed (at most {LINES_AN_HOUR} an hour)"
+                );
+            }
             if suspension.local() {
                 eprintln!(
                     "atem runtime: the Station, through Astation's local link: {shown}; the link stays (no trust or state change)"
@@ -269,12 +337,11 @@ impl App {
         eprintln!(
             "atem runtime: the Station didn't close this host's link within 10 s of its service_suspended; dropping it"
         );
-        let shown = self
-            .service_suspension
-            .as_ref()
-            .map(Suspension::shown)
-            .unwrap_or_else(|| shown(""));
-        self.drop_astation_link(format!("{shown}; retrying"));
+        let reason = match &self.service_suspension {
+            Some(s) => format!("{}; retrying", s.shown()),
+            None => "The Station suspended this host's service; retrying".to_string(),
+        };
+        self.drop_astation_link(reason);
         self.astation_reconnect_at = Some(Instant::now() + RETRY_AFTER);
     }
 
@@ -298,6 +365,10 @@ impl App {
 mod tests {
     use super::*;
 
+    /// The status rule (Atem's reading, for Astation's agreement): the
+    /// text as sent when it begins `service suspended:`, exactly; else
+    /// prefixed. A relay's record while the local link is up is shown as
+    /// the relay's last answer (review M3).
     #[test]
     fn the_text_is_shown_once_prefixed() {
         assert_eq!(
@@ -308,22 +379,75 @@ mod tests {
             shown("account disabled"),
             "service suspended: account disabled"
         );
+        for other in ["Service suspended: x", "service suspended (x)"] {
+            assert_eq!(shown(other), format!("service suspended: {other}"));
+        }
+        let record = |on| Suspension {
+            text: "service suspended: account disabled at Agora.Build".into(),
+            on,
+            origin: None,
+            notice: None,
+            link_gen: 1,
+        };
+        assert_eq!(
+            record(SuspendedOn::Connect).status_text(true),
+            "the relay last answered: service suspended: account disabled at Agora.Build"
+        );
+        assert_eq!(
+            record(SuspendedOn::Relay { socket: 1 }).status_text(false),
+            "service suspended: account disabled at Agora.Build"
+        );
+        assert_eq!(
+            record(SuspendedOn::Local { socket: 1 }).status_text(true),
+            "service suspended: account disabled at Agora.Build"
+        );
+    }
+
+    fn logs(due: Due) -> bool {
+        matches!(due, Due::Log { .. })
     }
 
     #[test]
     fn one_line_per_text_an_hour_and_a_bounded_memory() {
         let mut lines = Lines::default();
         let t0 = Instant::now();
-        assert!(lines.due("a", t0));
-        assert!(!lines.due("a", t0 + Duration::from_secs(59 * 60)));
-        assert!(lines.due("b", t0 + Duration::from_secs(1)), "another text");
-        assert!(lines.due("a", t0 + LINE_EVERY));
-        for i in 0..LINES_KEPT {
-            lines.due(&format!("t{i}"), t0 + LINE_EVERY);
+        assert!(logs(lines.due("a", t0)));
+        assert!(!logs(lines.due("a", t0 + Duration::from_secs(59 * 60))));
+        assert!(
+            logs(lines.due("b", t0 + Duration::from_secs(1))),
+            "another text"
+        );
+        assert!(logs(lines.due("a", t0 + LINE_EVERY)));
+        // Each in a window of its own (the hour's cap aside).
+        let at = |i: u32| t0 + (i + 2) * LINE_EVERY;
+        for i in 0..LINES_KEPT as u32 {
+            assert!(logs(lines.due(&format!("t{i}"), at(i))));
         }
         assert_eq!(lines.logged.len(), LINES_KEPT);
-        // "a" was forgotten: due again at once.
-        assert!(lines.due("a", t0 + LINE_EVERY));
+        // "a" was forgotten: due again at once, though logged within the
+        // hour of the last "t".
+        assert!(logs(lines.due("a", at(LINES_KEPT as u32 - 1))));
+    }
+
+    /// Review L4: texts that change each time are capped at four lines an
+    /// hour in all; the next window's first line says how many went
+    /// unlogged.
+    #[test]
+    fn at_most_four_lines_an_hour_whatever_the_texts() {
+        let mut lines = Lines::default();
+        let t0 = Instant::now();
+        let logged = (0..10)
+            .filter(|i| logs(lines.due(&format!("t{i}"), t0 + Duration::from_secs(*i))))
+            .count();
+        assert_eq!(logged, LINES_AN_HOUR as usize);
+        assert_eq!(
+            lines.due("next", t0 + LINE_EVERY),
+            Due::Log { suppressed: 6 }
+        );
+        assert_eq!(
+            lines.due("next 2", t0 + LINE_EVERY),
+            Due::Log { suppressed: 0 }
+        );
     }
 
     fn app_on(socket: u64) -> App {
@@ -464,6 +588,64 @@ mod tests {
             app.status_message.as_deref(),
             Some("service suspended: account disabled at Agora.Build; retrying")
         );
+    }
+
+    /// Review L10: a suspension that carries the local link's session
+    /// advice records the text and keeps the advice for a waiting
+    /// operation.
+    #[test]
+    fn a_refused_connect_keeps_the_local_links_session_advice() {
+        let _profile = crate::test_profile::temp();
+        let mut app = App::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.astation_connect_rx = Some(rx);
+        let error = anyhow::Error::new(ServiceSuspendedError {
+            text: TEXT.into(),
+            origin: None,
+        })
+        .context(crate::runtime::ops::SessionAdvice("the advice".into()));
+        tx.send(Err(error)).ok().unwrap();
+        app.poll_astation_connect();
+        assert!(app.service_suspension.is_some());
+        assert_eq!(app.astation_connect_error.as_deref(), Some("the advice"));
+    }
+
+    /// Review L7: the local route's verdicts in the App: the Station's
+    /// suspension of the proxy proof records the local link's text, the
+    /// link kept; its `host_route_ok` lifts it; a relay's record survives an
+    /// ok of the local link's (it says nothing of the relay).
+    #[test]
+    fn the_local_routes_verdicts_record_and_lift_the_local_text() {
+        use crate::session_protocol::r9::route::RouteResult;
+        let _profile = crate::test_profile::temp();
+        let mut app = linked(LinkVia::Local, 3);
+        app.local_route_verdict(Some(RouteResult::Suspended(TEXT.into())));
+        assert_eq!(
+            app.service_suspension.as_ref().map(|s| s.on),
+            Some(SuspendedOn::Local { socket: 3 })
+        );
+        assert!(app.astation_connected, "the link stays");
+        assert!(app.suspension_drop.is_none());
+        let routed = RouteResult::Routed {
+            host_id: "host".into(),
+            head: atem_client::membership::Head {
+                seq: 1,
+                hash: atem_client::encoding::Hash32([0; 32]),
+            },
+        };
+        app.local_route_verdict(Some(routed.clone()));
+        assert!(app.service_suspension.is_none());
+        app.service_suspension = Some(Suspension {
+            text: TEXT.into(),
+            on: SuspendedOn::Connect,
+            origin: None,
+            notice: None,
+            link_gen: 0,
+        });
+        app.local_route_verdict(Some(routed));
+        assert!(app.service_suspension.is_some(), "the relay's record stays");
+        app.local_route_verdict(None);
+        assert!(app.service_suspension.is_some());
     }
 
     #[test]

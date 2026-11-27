@@ -1581,7 +1581,11 @@ impl AstationClient {
                             // The Station's notice on the open link (the
                             // delegated host-work design III.5), read strictly
                             // here; one the reader refuses is dropped, counted.
-                            None if atem_client::station_notice::is_service_suspended(&text) => {
+                            // Told by its top-level names with no tree
+                            // (`peek`, review L3).
+                            None if crate::session_protocol::r9::peek::relay_op(&text, |op| {
+                                op == atem_client::station_notice::OP_SERVICE_SUSPENDED
+                            }) => {
                                 match atem_client::station_notice::ServiceSuspended::parse(text.as_bytes()) {
                                     Ok(notice) => Some(AstationMessage::ServiceSuspended(notice.text().to_owned())),
                                     Err(error) => {
@@ -1985,6 +1989,13 @@ impl AstationClient {
             if self.route_wait.as_ref().is_some_and(|w| w.hand_over && w.verdict == Some(true)) {
                 return Ok(());
             }
+            // III.5: the Station suspended this host's service meanwhile: a
+            // relay link's connect fails (never a pairing on that socket).
+            if self.route_wait.is_some()
+                && let Some(text) = &self.connect_suspension
+            {
+                return Err(anyhow!("the Station suspended this host's service ({text})"));
+            }
             if challenge.transport == "loopback" {
                 return match response {
                     Some(AuthResponse::Authenticated) => self.guarded(|| Ok(())),
@@ -2325,18 +2336,24 @@ impl AstationClient {
                         wait.verdict = Some(false);
                         continue;
                     }
+                    // The connect is doomed (III.5): no more waiting for
+                    // Astation's reply (review L6).
                     AstationMessage::HostRouteSuspended(ref text) => {
                         wait.verdict = Some(false);
                         self.connect_suspension = Some(text.clone());
-                        continue;
+                        return Ok(None);
                     }
                     _ => {}
                 }
             }
             // The delegated host-work design III.5: the Station's notice
-            // while Astation authenticates the link is the connect's.
+            // while Astation authenticates the link is the connect's, and
+            // ends a relay link's wait (Astation's local link stays).
             if let AstationMessage::ServiceSuspended(text) = &msg {
                 self.connect_suspension = Some(text.clone());
+                if self.route_wait.is_some() {
+                    return Ok(None);
+                }
                 continue;
             }
             if let Some((response, saved)) = self.auth_response_saving(&msg, astation_id, save)? {
