@@ -1160,6 +1160,24 @@
       },
       {
         "code": "malformed",
+        "label": "text_not_a_string",
+        "reason": "a text that isn't a string",
+        "text": "{\"op\":\"service_suspended\",\"text\":7,\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "code": "malformed",
+        "label": "text_zero_width",
+        "reason": "a zero-width space (Cf)",
+        "text": "{\"op\":\"service_suspended\",\"text\":\"a\\u200bb\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "code": "malformed",
+        "label": "text_byte_order_mark",
+        "reason": "a byte order mark (Cf)",
+        "text": "{\"op\":\"service_suspended\",\"text\":\"\\ufeffa\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "code": "malformed",
         "label": "v2",
         "reason": "v is not 1",
         "text": "{\"op\":\"service_suspended\",\"text\":\"t\",\"type\":\"relay\",\"v\":2}"

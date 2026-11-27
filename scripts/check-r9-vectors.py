@@ -4188,9 +4188,12 @@ def route_reply(text):
     ("refused", code) or ("suspended", text); raises Refused("malformed")
     (R9.7b: every bad reply is malformed)."""
     try:
-        op = json.loads(text).get("op")
+        value = json.loads(text)
     except ValueError:
         raise Refused("malformed")
+    if not isinstance(value, dict):
+        raise Refused("malformed")
+    op = value.get("op")
     try:
         o = relay_object(text, op, ROUTE_MESSAGE_MAX)
     except Refused:
