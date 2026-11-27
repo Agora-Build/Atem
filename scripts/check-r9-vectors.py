@@ -28,8 +28,9 @@ report, its exported records read with a control-record reader written
 here and its set hashes recomputed from the journal's bodies (host-work-v1
 §11.1 "The signer report", Astation #114), and
 `r9-vectors-station-binding`, the same for a native manager's Station
-binding proof (delegated host-work III.5 (b)), Astation's three posted
-examples included (their digests and both signatures).
+binding proof (delegated host-work III.5 (b); its orders Atem's proposal,
+#120 comment 7207827118, for Astation's agreement), Astation's three
+posted examples included (their digests and both signatures).
 The other files'
 `expect` and each `reason` are checked by the Rust runner
 (`crates/atem-client/tests/vectors.rs`) and the binding suites.
@@ -5181,7 +5182,8 @@ class SbList(VrList):
 
 def sb_verify(text, lst, expected, now):
     """verify_station_binding, from the file's note: the first failure in
-    the agreed order, or the verified binding."""
+    the order of Atem's answer (#120 comment 7207827118, Atem's proposal,
+    for Astation's agreement), or the verified binding."""
     body, sig = read_sb_proof(text)
     if lst.frozen:
         raise Refused("frozen")
@@ -5205,8 +5207,10 @@ def sb_verify(text, lst, expected, now):
 
 def sb_build(case, lst):
     """station_binding_request, from the file's note: the held body's jcs,
-    or Refused."""
-    signer, now, challenge, claims = case["signer"], case["now_ms"], case["challenge"], case["expected"]
+    or Refused. The challenge is read first, as the bindings' request reads
+    the text it is handed."""
+    signer, now, claims = case["signer"], case["now_ms"], case["expected"]
+    challenge = read_sb_challenge(json.dumps(case["challenge"]))
     if not signer.startswith("member:") or re.fullmatch(OPAQUE_ID, signer[7:]) is None:
         raise Refused("malformed")
     station = vr_normalize(case["station"])
@@ -5236,7 +5240,8 @@ def check_station_binding(file, data, report, context):
     examples (each challenge read, its signing input's digest, both
     signatures under the posted keys, over that input only); the chain's
     entries; each challenge text read or refused; each proof's code in the
-    agreed order, or its verified fields, against log L and the case's
+    order of Atem's answer (#120 comment 7207827118, Atem's proposal, for
+    Astation's agreement), or its verified fields, against log L and the case's
     chain, the valid proofs' jcs, signing input and signature by their
     signer's key; the builder's held bodies and refusals; and the immutable
     request's finishes, signed here (P-256 with a fresh nonce)."""
