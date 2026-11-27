@@ -298,3 +298,91 @@ fn a_proxy_proof_is_its_own_kind_and_never_a_relay_route() {
         Err(HostRouteRefusal::BadSignature)
     );
 }
+
+/// `service_suspended` (the delegated host-work design III.5; its `text`
+/// and the disclosure order are Atem's proposal, for Astation's agreement,
+/// #120 7207832274): a Station's refusal of a proof that verified, not a
+/// verifier code. It carries a required `text` (1 to 256 bytes of UTF-8,
+/// no Cc, Cf, Zl or Zp), and a verifier code carries none.
+#[test]
+fn a_service_suspended_refusal_carries_its_text_and_is_no_verifier_code() {
+    use atem_client::host_route::{
+        MAX_SERVICE_TEXT_BYTES, REFUSAL_CODES, RelayReply, SERVICE_SUSPENDED,
+        STATION_REFUSAL_CODES, service_text_ok,
+    };
+    let text = "service suspended: account disabled at Agora.Build";
+    let reply = RelayReply::suspended(text).unwrap();
+    assert_eq!(
+        reply,
+        RelayReply::Suspended {
+            text: text.to_owned()
+        }
+    );
+    assert_eq!(
+        reply.to_json(),
+        json!({"type": "relay", "op": "host_route_refused", "v": 1,
+               "code": "service_suspended", "text": text})
+    );
+    let wire = reply.to_json().to_string();
+    assert_eq!(RelayReply::parse(wire.as_bytes()), Some(Ok(reply)));
+    // A Station's code, never the verifier's.
+    assert_eq!(STATION_REFUSAL_CODES, [SERVICE_SUSPENDED]);
+    assert!(!REFUSAL_CODES.contains(&SERVICE_SUSPENDED));
+
+    // The text's grammar: bytes, not characters.
+    assert_eq!(MAX_SERVICE_TEXT_BYTES, 256);
+    assert!(service_text_ok("x"));
+    assert!(service_text_ok(&"a".repeat(256)));
+    assert!(!service_text_ok(&"a".repeat(257)));
+    assert!(service_text_ok(&"é".repeat(128)));
+    assert!(!service_text_ok(&format!("{}a", "é".repeat(128))));
+    assert!(service_text_ok("服务已暂停: 账户已停用"));
+    for bad in [
+        "",
+        "a\u{1b}[31mred",
+        "a\u{0}b",
+        "line\nbreak",
+        "a\tb",
+        "a\u{7f}b",
+        "a\u{85}b",
+        "a\u{202e}b",
+        "a\u{200b}b",
+        "\u{feff}a",
+        "a\u{2028}b",
+        "a\u{2029}b",
+    ] {
+        assert!(!service_text_ok(bad), "{bad:?}");
+        assert!(RelayReply::suspended(bad).is_err(), "{bad:?}");
+    }
+
+    // Read strictly: per code, exactly its fields.
+    let refused =
+        |fields: &str| format!(r#"{{"type":"relay","op":"host_route_refused","v":1,{fields}}}"#);
+    for bad in [
+        refused(r#""code":"service_suspended""#),
+        refused(r#""code":"service_suspended","text":"""#),
+        refused(&format!(
+            r#""code":"service_suspended","text":"{}""#,
+            "a".repeat(257)
+        )),
+        refused(r#""code":"service_suspended","text":"a\u001bb""#),
+        refused(&format!(
+            r#""code":"service_suspended","text":"a{}b""#,
+            '\u{202e}'
+        )),
+        refused(&format!(
+            r#""code":"service_suspended","text":"a{}b""#,
+            '\u{2028}'
+        )),
+        refused(r#""code":"service_suspended","text":7"#),
+        refused(r#""code":"stale_log","text":"service suspended""#),
+        refused(r#""code":"service_suspended","text":"t","extra":1"#),
+        refused(r#""code":"service_suspended","text":"t","text":"u""#),
+    ] {
+        let parsed = RelayReply::parse(bad.as_bytes());
+        assert!(
+            matches!(parsed, Some(Err(ref e)) if e.code() == "malformed"),
+            "{bad}: {parsed:?}"
+        );
+    }
+}

@@ -57,7 +57,10 @@
 //! The relay route (§R9.7b):
 //!
 //! - [`host_route`]: the host route proof a host signs for the relay's
-//!   challenge, and the relay's verifier against its log.
+//!   challenge, and the relay's verifier against its log; a Station's
+//!   `service_suspended` refusal of a proof that verified;
+//! - [`station_notice`]: a Station's `service_suspended` notice on a
+//!   host's open link (the delegated host-work design III.5).
 //!
 //! A verifier that isn't a host (R9.2 "How a verifier reports itself"):
 //!
@@ -119,6 +122,7 @@ pub mod signed;
 #[cfg(feature = "software-keys")]
 pub mod software;
 pub mod station_binding;
+pub mod station_notice;
 pub mod station_route;
 
 pub use domain::{SignLabel, SigningInput};

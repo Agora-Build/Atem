@@ -3259,7 +3259,16 @@ fn host_route() {
                 assert_eq!(host_id, s(&case["expect"], "host_id"));
                 assert_eq!(head.to_json(), case["expect"]["head"]);
             }
-            RelayReply::Refused { code } => assert_eq!(code, s(&case["expect"], "code")),
+            RelayReply::Refused { code } => {
+                assert_eq!(code, s(&case["expect"], "code"));
+                assert!(case["expect"].get("text").is_none(), "{label}");
+            }
+            RelayReply::Suspended { text } => {
+                assert_eq!(s(&case["expect"], "code"), "service_suspended", "{label}");
+                assert_eq!(text, s(&case["expect"], "text"), "{label}");
+                // The Station's builder makes the same bytes.
+                assert_eq!(RelayReply::suspended(text).unwrap(), reply, "{label}");
+            }
         }
         run.pass(format!("relay reply {label}: parsed, rebuilt"));
     }
@@ -3267,11 +3276,47 @@ fn host_route() {
         let label = s(case, "label");
         let parsed = atem_client::host_route::RelayReply::parse(s(case, "text").as_bytes());
         assert!(
-            matches!(parsed, Some(Err(ref e)) if e.code() == "malformed")
-                || (label == "refused_duplicate_key" && !matches!(parsed, Some(Ok(_)))),
+            matches!(parsed, Some(Err(ref e)) if e.code() == "malformed"),
             "{label}: {parsed:?}"
         );
         run.pass(format!("relay reply {label}: refused"));
+    }
+    // The Station's notice on an open link (III.5; Atem's proposal, for
+    // Astation's agreement, #120 7207832274).
+    let notices = run.get("service_suspended");
+    for case in notices["valid"].as_array().unwrap() {
+        use atem_client::station_notice::ServiceSuspended;
+        let label = s(case, "label");
+        let bytes = match case.get("text") {
+            Some(text) => text.as_str().unwrap().to_owned(),
+            None => case["message"].to_string(),
+        };
+        let notice = ServiceSuspended::parse(bytes.as_bytes())
+            .unwrap_or_else(|e| panic!("service_suspended {label}: {e:?}"));
+        assert_eq!(notice.text(), s(&case["expect"], "text"), "{label}");
+        if let Some(message) = case.get("message") {
+            assert_eq!(notice.to_json(), *message, "{label}");
+        }
+        assert_eq!(
+            ServiceSuspended::new(notice.text()).unwrap(),
+            notice,
+            "{label}"
+        );
+        run.pass(format!("service_suspended {label}: parsed, rebuilt"));
+    }
+    for case in notices["invalid"].as_array().unwrap() {
+        let label = s(case, "label");
+        let parsed =
+            atem_client::station_notice::ServiceSuspended::parse(s(case, "text").as_bytes());
+        assert_eq!(
+            parsed.as_ref().map_err(|e| e.code()),
+            Err(s(case, "code")),
+            "service_suspended {label}: {parsed:?}"
+        );
+        run.pass(format!(
+            "service_suspended {label}: refused {}",
+            s(case, "code")
+        ));
     }
     run.finish();
 }
