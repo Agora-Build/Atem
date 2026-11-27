@@ -102,7 +102,7 @@ impl Host {
         let config = sandbox.config();
         write_verified_pairing(&config, ACCOUNT, id, 1);
         write_pin(&config, log, id, 1, &secret(seed));
-        write_enc_key(&config, &secret(enc));
+        SenderHost::write_enc_key(&config, 1, &secret(enc));
         let fake = sandbox.dir.path().join("fake");
         let launched_fake = sandbox.dir.path().join("launched-fake");
         let launched_cwd = sandbox.home.join("launched");
@@ -468,30 +468,6 @@ impl Drop for Host {
         drop(self.pump.take());
         self.gone();
     }
-}
-
-/// Writes `config`'s host encryption key for trust generation 1 from
-/// `secret` (X25519) and its record of generated key ids, as the runtime
-/// makes them at the pin (`pairing/host_enc_key`, `host_enc_generated`):
-/// the key the test's device list signs for the host.
-fn write_enc_key(config: &std::path::Path, secret: &[u8; 32]) {
-    use atem_client::encoding::b64u;
-    let mut keys = atem_client::SoftwareKeys::new();
-    let id = atem_client::KeyId::new("enc");
-    keys.insert_x25519(id.clone(), secret);
-    let public = atem_client::KeyProvider::public_key(&keys, &id).unwrap();
-    let kid = atem_client::keys::enc_kid(&public).unwrap();
-    let pairing = config.join("pairing");
-    private(
-        &pairing.join("host_enc_key"),
-        &json!({"v": 1, "host_trust_gen": 1, "secret": b64u(secret),
-                "pub": b64u(public.as_32().unwrap())})
-        .to_string(),
-    );
-    private(
-        &pairing.join("host_enc_generated"),
-        &json!({"v": 1, "host_trust_gen": 1, "kids": [kid]}).to_string(),
-    );
 }
 
 /// The two hosts, their shared device list, and the courier between their
@@ -1033,4 +1009,250 @@ fn with_the_hook_off_a_send_reaches_no_other_host() {
             host.id
         );
     }
+}
+
+/// The device list's head a host's runtime holds (its state dump).
+fn list_head(host: &Host) -> u64 {
+    std::fs::read(host.sandbox.dir.path().join("state.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v["membership"]["head"]["seq"].as_u64())
+        .unwrap_or(0)
+}
+
+/// A host's encryption key file (`pairing/host_enc_key`).
+fn key_file(host: &Host) -> Value {
+    std::fs::read(host.sandbox.config().join("pairing/host_enc_key"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(Value::Null)
+}
+
+/// The `enc_kid` (hex) of a key file slot's public half.
+fn kid_of_slot(slot: &Value) -> String {
+    let public = atem_client::encoding::b64u_decode(slot["pub"].as_str().unwrap()).unwrap();
+    atem_client::keys::enc_kid(
+        &atem_client::PublicKey::new(atem_client::Alg::X25519, &public).unwrap(),
+    )
+    .unwrap()
+}
+
+/// The `enc_kid`s of the envelopes A put for message `id`.
+fn put_kids(pair: &Pair, id: &str) -> Vec<String> {
+    use atem_client::host_mail::mailbox::MailboxToStation;
+    pair.a
+        .station()
+        .mailbox_calls()
+        .into_iter()
+        .filter_map(|(_, call)| match call {
+            MailboxToStation::Put(put) => put
+                .mail()
+                .ok()
+                .filter(|(_, body)| body.id == id)
+                .map(|(_, body)| body.enc_kid),
+            _ => None,
+        })
+        .collect()
+}
+
+/// B's manager (the Mac, on a channel to B) asks B for a new key
+/// (`host_enc_key_new`), twice under one `request_id` (the second a retry
+/// after a lost answer): both answers name B's one pending key, each
+/// echoing its own request. Its `host_enc_key` entry drafted from the
+/// answer, `retire_previous` as given, is signed into the test's list and
+/// given to B's Station only: B applies it, A's list stays behind (A still
+/// seals to B's old key, as a sender whose list is behind does).
+fn rotate_b(pair: &mut Pair, retire_previous: bool) -> String {
+    let answer = new_key_of_b(pair);
+    let new = publish_to_b(pair, &answer, retire_previous);
+    let head = pair.log.log.head().seq;
+    pair.b.within("B's list applies the rotation", || {
+        list_head(&pair.b) == head
+            && key_file(&pair.b)["current"]["pub"].is_string()
+            && kid_of_slot(&key_file(&pair.b)["current"]) == new
+    });
+    assert!(list_head(&pair.a) < head, "A's list is behind");
+    new
+}
+
+/// B's manager's `host_enc_key_new`, asked twice under one `request_id`
+/// (the second a retry after a lost answer): both answers name the one
+/// pending key B wrote, each echoing its own request.
+fn new_key_of_b(pair: &mut Pair) -> atem_client::session::r9::HostEncKey {
+    use support::delegated::{Dev, HostIds};
+    use support::r9::Router;
+    let old = kid_of_slot(&key_file(&pair.b)["current"]);
+    let request_id = support::delegated::uuid();
+    let ids = HostIds {
+        account: ACCOUNT,
+        host: B,
+    };
+    let mut r = Router::on(&pair.b.astation, pair.b.link);
+    let mut mac = Dev::new(&mut r, ids, &pair.log, MAC, false);
+    let mut answers = Vec::new();
+    for _ in 0..2 {
+        let answer = mac.request(
+            &mut r,
+            json!({"op": "host_enc_key_new", "request_id": request_id}),
+        );
+        assert_eq!(answer["op"], "host_enc_key", "{answer}");
+        assert_eq!(answer["state"], "pending", "{answer}");
+        assert_eq!(answer["request_id"], json!(request_id), "{answer}");
+        answers.push(atem_client::session::r9::HostEncKey::from_data(&answer).unwrap());
+    }
+    assert_eq!(answers[0].enc_key, answers[1].enc_key, "one pending key");
+    let new = atem_client::keys::enc_kid(&answers[0].enc_key).unwrap();
+    assert_ne!(new, old);
+    assert_eq!(kid_of_slot(&key_file(&pair.b)["pending"]), new);
+    answers.remove(0)
+}
+
+/// The manager drafts and signs the rotation to `answer`'s key; only B's
+/// Station has it: the new key's id.
+fn publish_to_b(
+    pair: &mut Pair,
+    answer: &atem_client::session::r9::HostEncKey,
+    retire_previous: bool,
+) -> String {
+    let action = answer.action(retire_previous, 0).unwrap();
+    pair.log.append(MAC, action);
+    pair.b.station().set_log(&pair.log);
+    atem_client::keys::enc_kid(&answer.enc_key).unwrap()
+}
+
+/// A real crash point (review L7): B's runtime is SIGKILLed after its
+/// device list committed the rotation's entry and before its key file
+/// followed it (`crash_before_enc_key_promotion`). The key file then holds
+/// the new key still pending and the entry's stamp. Restarted, B promotes
+/// it with the old key's window from that stamp (never restarted at the
+/// restart), and A's mail in flight to the old key opens.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_HOST_CLOCK hooks"
+)]
+fn a_kill_after_the_list_commit_keeps_the_stamps_window() {
+    let mut pair = Pair::start(Hook::On, "");
+    let old = kid_of_slot(&key_file(&pair.b)["current"]);
+    let answer = new_key_of_b(&mut pair);
+    std::fs::write(pair.b.faults().join("crash_before_enc_key_promotion"), "").unwrap();
+    let new = publish_to_b(&mut pair, &answer, false);
+    let deadline = std::time::Instant::now() + WAIT;
+    let child = pair.b.runtime.as_mut().unwrap();
+    while child.try_wait().unwrap().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "B never reached the crash point"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        pair.b
+            .runtime_log()
+            .contains("killed after the device list committed a host_enc_key entry"),
+    );
+    let file = key_file(&pair.b);
+    assert_eq!(kid_of_slot(&file["current"]), old, "{file}");
+    assert_eq!(kid_of_slot(&file["pending"]), new, "{file}");
+    let stamp = file["applied"]["d_ms"]
+        .as_u64()
+        .expect("stamped before the commit");
+    pair.b.gone();
+    pair.b.start_again();
+    pair.b.within("B follows its list after the restart", || {
+        let file = key_file(&pair.b);
+        file["current"]["pub"].is_string() && kid_of_slot(&file["current"]) == new
+    });
+    let file = key_file(&pair.b);
+    assert_eq!(kid_of_slot(&file["previous"]), old, "{file}");
+    assert_eq!(
+        file["previous"]["applied_d_ms"], stamp,
+        "the stamp's window"
+    );
+    let id = pair.send(1, &format!("atem:{B}"), "HS_AFTER_THE_KILL", false);
+    let task = pair.b.task_of(&id);
+    support::delegated::in_turn(&pair.b, &task, "HS_AFTER_THE_KILL");
+    assert_eq!(put_kids(&pair, &id).first(), Some(&old));
+    support::delegated::complete_turn(&pair.b, &task);
+}
+
+/// The routine rotation of the receiving host's key (agreed with Astation
+/// on 2026-11-23, #120 comment 7089435308), between two real hosts: B's
+/// manager gets a pending key over its channel, the entry lands in B's
+/// list, B promotes it at once and keeps the old key as its previous one
+/// (stamped at the commit). A, its list behind, seals to B's old key: B
+/// still opens that mail, and its agent runs the task. Once A's list has
+/// the entry, A's next message is sealed to the new key and opens too.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_HOST_CLOCK hooks"
+)]
+fn a_routine_rotation_still_opens_mail_in_flight_to_the_old_key() {
+    let mut pair = Pair::start(Hook::On, "");
+    let old = kid_of_slot(&key_file(&pair.b)["current"]);
+    let new = rotate_b(&mut pair, false);
+    let file = key_file(&pair.b);
+    assert_eq!(kid_of_slot(&file["previous"]), old, "{file}");
+    assert!(file["previous"]["applied_d_ms"].is_u64(), "{file}");
+    // In flight: A's list still names the old key.
+    let id = pair.send(1, &format!("atem:{B}"), "HS_OLD_KEY", false);
+    let task = pair.b.task_of(&id);
+    support::delegated::in_turn(&pair.b, &task, "HS_OLD_KEY");
+    assert_eq!(put_kids(&pair, &id).first(), Some(&old));
+    support::delegated::complete_turn(&pair.b, &task);
+    // A's list catches up: new mail uses the new key.
+    pair.a.station().set_log(&pair.log);
+    let head = pair.log.log.head().seq;
+    pair.a.within("A's list applies the rotation", || {
+        list_head(&pair.a) == head
+    });
+    let id = pair.send(2, &format!("atem:{B}"), "HS_NEW_KEY", false);
+    let task = pair.b.task_of(&id);
+    support::delegated::in_turn(&pair.b, &task, "HS_NEW_KEY");
+    assert_eq!(put_kids(&pair, &id).first(), Some(&new));
+    support::delegated::complete_turn(&pair.b, &task);
+}
+
+/// A compromise rotation (`retire_previous`): B erases its old key when it
+/// applies the entry. A, its list behind, seals to the old key: B refuses
+/// that mail (`enc_key_not_accepted`, no task), and A never re-seals it
+/// (each put of it names the old key). Once A's list has the entry, new
+/// mail is sealed to the new key and opens.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_HOST_CLOCK hooks"
+)]
+fn a_retire_previous_rotation_refuses_mail_in_flight_to_the_old_key() {
+    let mut pair = Pair::start(Hook::On, "");
+    let old = kid_of_slot(&key_file(&pair.b)["current"]);
+    let new = rotate_b(&mut pair, true);
+    let file = key_file(&pair.b);
+    assert!(file.get("previous").is_none(), "{file}");
+    let record: Value = serde_json::from_slice(
+        &std::fs::read(pair.b.sandbox.config().join("pairing/host_enc_generated")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["retired"], json!([old]), "{record}");
+    let id = pair.send(1, &format!("atem:{B}"), "HS_REFUSED_OLD_KEY", false);
+    pair.b.within("A's envelope refused", || {
+        pair.b
+            .count("mailbox_refused", "reason='enc_key_not_accepted'")
+            == 1
+    });
+    assert!(pair.b.tasks_of(&id).is_empty(), "no task");
+    let kids = put_kids(&pair, &id);
+    assert!(!kids.is_empty());
+    assert!(kids.iter().all(|k| *k == old), "never re-sealed: {kids:?}");
+    pair.a.station().set_log(&pair.log);
+    let head = pair.log.log.head().seq;
+    pair.a.within("A's list applies the rotation", || {
+        list_head(&pair.a) == head
+    });
+    let id = pair.send(2, &format!("atem:{B}"), "HS_NEW_KEY_AFTER", false);
+    let task = pair.b.task_of(&id);
+    support::delegated::in_turn(&pair.b, &task, "HS_NEW_KEY_AFTER");
+    assert_eq!(put_kids(&pair, &id).first(), Some(&new));
+    support::delegated::complete_turn(&pair.b, &task);
 }

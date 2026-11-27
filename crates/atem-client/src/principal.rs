@@ -138,10 +138,12 @@ pub enum Need {
     /// `native` member holding `control`, the members that get approval
     /// hints. A service never does, whatever its ops, nor a browser.
     Alerts,
-    /// `host_enc_key_get` (delegated host work, II.4.1, feature
-    /// `host.senders`): a `native` member; the host also checks `manage` at
-    /// its current head when it handles the request, as for the host
-    /// policy (the answer drafts a device-list entry only a manager signs).
+    /// `host_enc_key_get` and `host_enc_key_new` (delegated host work,
+    /// II.4.1, and the routine rotation agreed with Astation on 2026-11-23,
+    /// feature `host.senders`): a `native` member; the host also checks
+    /// `manage` at its current head when it handles the request, as for the
+    /// host policy (the answer drafts a device-list entry only a manager
+    /// signs).
     HostEncKey,
 }
 
@@ -175,7 +177,7 @@ impl Need {
             ("session", "host_policy_set" | "host_policy_get") => Need::HostPolicy,
             ("session", "control_records") => Need::ControlRecords,
             ("session", "alert_list") => Need::Alerts,
-            ("session", "host_enc_key_get") => Need::HostEncKey,
+            ("session", "host_enc_key_get" | "host_enc_key_new") => Need::HostEncKey,
             ("session", "host_profiles" | "host_launch" | "host_launch_query") => {
                 Need::Op(Op::Launch)
             }

@@ -1501,8 +1501,14 @@ fn state_json_round_trips() {
             new: (1_800_000_000_000, None),
             at_ms: 1_800_000_000_000,
         }),
+        epoch: Some("e-1".into()),
     };
     let text = state.to_json();
+    assert!(text.contains(r#""epoch":"e-1""#));
+    // A record an older build wrote has no epoch: it reads as none.
+    let older = text.replace(r#","epoch":"e-1""#, "");
+    assert_ne!(older, text);
+    assert_eq!(ClockState::from_json(&older).expect("reads").epoch(), None);
     assert!(text.contains(
         r#""last_change":{"kind":"repaired","old":[1800000120000,1800000000100],"new":[1800000000000,null],"at_ms":1800000000000}"#
     ));

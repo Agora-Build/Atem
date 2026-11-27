@@ -108,6 +108,9 @@ pub struct HostCore {
 
 /// The X25519 key the stand-in host vouches for (`host_enc_key_get`).
 pub const HOST_ENC_PUB: [u8; 32] = [0x5a; 32];
+/// The pending X25519 key the stand-in host hands out to every
+/// `host_enc_key_new` (one pending key per generation).
+pub const HOST_ENC_PENDING_PUB: [u8; 32] = [0x6b; 32];
 
 fn uuid(n: u64) -> String {
     format!("aaaaaaaa-0000-4000-8000-{n:012x}")
@@ -820,19 +823,33 @@ impl HostConn {
                     }
                     return vec![result.to_json().to_string().into_bytes()];
                 }
-                Some("host_enc_key_get") => {
+                Some(op @ ("host_enc_key_get" | "host_enc_key_new")) => {
                     // A stand-in for the real host: a manager gets this
-                    // host's encryption key for its trust generation, with
-                    // the host's `enc_sig` by its `host_channel_key`.
+                    // host's encryption key for its trust generation (for a
+                    // new key, its one pending key, with the request's
+                    // `request_id`), with the host's `enc_sig` by its
+                    // `host_channel_key`.
                     use atem_client::membership::sign_host_enc_key;
-                    use atem_client::session::r9::{HostEncKey, HostEncKeyGet};
-                    if HostEncKeyGet::decode(plain).is_err() {
-                        return vec![error(code::INVALID_REQUEST, None)];
-                    }
+                    use atem_client::session::r9::{HostEncKey, HostEncKeyGet, HostEncKeyNew};
+                    let request_id = if op == "host_enc_key_new" {
+                        match HostEncKeyNew::decode(plain) {
+                            Ok(request) => Some(request.request_id),
+                            Err(_) => return vec![error(code::INVALID_REQUEST, None)],
+                        }
+                    } else {
+                        if HostEncKeyGet::decode(plain).is_err() {
+                            return vec![error(code::INVALID_REQUEST, None)];
+                        }
+                        None
+                    };
                     if !core.holds_manage(&authority) {
                         return vec![error(code::FORBIDDEN, None)];
                     }
-                    let enc_pub = HOST_ENC_PUB;
+                    let enc_pub = if request_id.is_some() {
+                        HOST_ENC_PENDING_PUB
+                    } else {
+                        HOST_ENC_PUB
+                    };
                     let enc_sig = sign_host_enc_key(
                         &core.keys,
                         &core.host_key,
@@ -846,6 +863,7 @@ impl HostConn {
                     let mut answer = HostEncKey {
                         id: uuid(0x9005),
                         re: id.clone(),
+                        request_id,
                         host_id: core.host_id.clone(),
                         host_trust_gen: core.trust_gen,
                         enc_key: atem_client::PublicKey::new(atem_client::Alg::X25519, &enc_pub)

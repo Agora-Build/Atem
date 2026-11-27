@@ -4,7 +4,8 @@
 //! (`ClientConnection::on_accept`), a browser grant, an entry and a K-backup
 //! entry. Before the fix, the grant and the handshake held the log's lock
 //! through the prompt and a UI thread reading the log blocked. The same
-//! native handshake also checks `WelcomeInfo.verifier`.
+//! native handshake also checks `WelcomeInfo.verifier` and
+//! `send_host_enc_key_new`.
 // The provider-taking calls are the UniFFI layer's (default feature).
 #![cfg(feature = "uniffi")]
 
@@ -469,4 +470,57 @@ fn a_browser_grant_and_entries_hold_no_lock() {
         .collect();
     use atem_client_ffi::types::SigningPurpose::*;
     assert_eq!(purposes, vec![BrowserGrant, Remove, KeyBackup]);
+}
+
+/// `ClientConnection::send_host_enc_key_new` (the routine rotation of a
+/// host's encryption key, agreed with Astation on 2026-11-23): refused by a
+/// host that doesn't advertise `host.senders`; to one that does, the
+/// pending key's answer arrives as a `session` family event echoing the
+/// request's `id` and `request_id`, and a retry under the same
+/// `request_id` gets the same key. It shares this file's native handshake.
+#[test]
+fn send_host_enc_key_new_through_the_binding() {
+    use atem_client::session::host_work::SENDERS_FEATURE;
+    use atem_client::session::r9::HostEncKey;
+    use atem_client_ffi::types::ClientEvent;
+    const REQUEST: &str = "aaaaaaaa-0000-4000-8000-0000000000c9";
+    let attach = |senders: bool| {
+        let log = log_l();
+        let mut core = host_core();
+        if senders {
+            core.welcome_override = Some(|w| w.features.push(SENDERS_FEATURE.into()));
+        }
+        let mut host = HostConn::new(&mut core);
+        let conn = phone();
+        let init = conn.start(log.clone(), 1_000).unwrap();
+        let accept = host.on_frame(&mut core, &init).frames.remove(0);
+        let finish = conn
+            .on_accept(accept, log.clone(), Prompting::new(), 1_000)
+            .unwrap();
+        let first = host.on_frame(&mut core, &finish).frames.remove(0);
+        conn.on_welcome(first, log, 1_000).unwrap();
+        (core, host, conn)
+    };
+    let (_, _, conn) = attach(false);
+    assert!(conn.send_host_enc_key_new(REQUEST.into(), 1_000).is_err());
+    let (mut core, mut host, conn) = attach(true);
+    let mut keys = Vec::new();
+    for _ in 0..2 {
+        let out = conn.send_host_enc_key_new(REQUEST.into(), 1_000).unwrap();
+        let reply = host.on_frame(&mut core, &out.frame).frames.remove(0);
+        let events = conn.on_frame(reply, 1_000).unwrap();
+        let [ClientEvent::Family { family, op, json }] = events.as_slice() else {
+            panic!("one family event: {events:?}");
+        };
+        assert_eq!(
+            (family.as_str(), op.as_deref()),
+            ("session", Some("host_enc_key"))
+        );
+        let data: serde_json::Value = serde_json::from_str(json).unwrap();
+        // The whole message, as the family's envelope carries it.
+        let answer = HostEncKey::from_data(&data["data"]).expect("a host_enc_key");
+        assert!(answer.answers_new(&out.id, REQUEST, "host-a", 1));
+        keys.push(answer.enc_key);
+    }
+    assert_eq!(keys[0], keys[1], "the same pending key");
 }

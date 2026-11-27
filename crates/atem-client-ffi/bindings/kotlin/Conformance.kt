@@ -498,8 +498,9 @@ fun main(args: Array<String>) {
             (body["action"] == "host_sender_revoke" && body["interrupt_running"] !is Boolean) ||
             v.obj()["reason"] in setOf<Any?>("unknown_field", "array_not_canonical")
     }
-    check("device-list actions: the builders reproduce the vectors; check_change advises on a redundant revoke or readmit and a reused key") {
+    check("device-list actions: the builders reproduce the vectors; check_change advises on a redundant revoke or readmit and a reused key; change_advisories on an early second rotation") {
         var built = 0
+        var advised = 0
         for (v in delegated.filter { fiveActions.contains(it["entry"]["body"]["action"].s()) }) {
             val label = v["label"].s()
             val body = v["entry"]["body"]
@@ -522,8 +523,19 @@ fun main(args: Array<String>) {
                 else -> null
             }
             eq(log.checkChange(action, signedAt), want, "$label check_change")
+            // change_advisories: check_change's refusal, else
+            // previous_key_window for a host_enc_key of a host whose previous
+            // key isn't retired and was replaced by an entry signed less
+            // than 24 h before.
+            val hostId = body.obj()["host_id"] as? String
+            val previous = if (body["action"].s() == "host_enc_key" && want == null && hostId != null) log.hostEncKey(hostId)?.previous?.takeIf { !it.retired } else null
+            val replacedAt = previous?.let { p -> (mlog["log"].arr().map { it["label"].s() } + strs(v["chain"])).map { byLabel.getValue(it)["entry"]["body"] }.first { it["seq"].l().toULong() == p.replacedAtSeq }["signed_at"].l().toULong() }
+            val window = if (previous != null && signedAt < replacedAt!! + 86_400_000uL) listOf(ChangeAdvisoryInfo.PreviousKeyWindow(hostId!!, previous.key.encKid, previous.replacedAtSeq, replacedAt)) else emptyList()
+            eq(log.changeAdvisories(action, signedAt), ChangeReviewInfo(want, window), "$label change_advisories")
+            advised += window.size
         }
         check(built >= 38) { "$built built" }
+        check(advised >= 1) { "$advised advised" }
     }
     check("device-list actions: shapes the verifier refuses by itself") {
         val two = listOf("host-a", "host-b")

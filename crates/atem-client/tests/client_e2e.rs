@@ -2156,6 +2156,194 @@ mod host_enc_key_get {
     }
 }
 
+/// `host_enc_key_new` (the routine rotation of a host's encryption key,
+/// agreed with Astation on 2026-11-23, #120 comment 7089435308): a native
+/// manager asks the host for a new, pending key. Sent only to a host that
+/// advertised `host.senders`; its answer taken only for that request (its
+/// `id` and `request_id`), from that host at its trust generation, never
+/// a get's answer, and never as one.
+mod host_enc_key_new {
+    use super::*;
+    use atem_client::membership::{Action, check_change, verify_host_enc_sig};
+    use atem_client::session::host_work::SENDERS_FEATURE;
+    use atem_client::session::r9::{HostEncKey, host_enc_key_get, host_enc_key_new};
+    use support::host::HOST_ENC_PENDING_PUB;
+
+    const MINE: &str = "aaaaaaaa-0000-4000-8000-0000000000f8";
+    const RETRY: &str = "aaaaaaaa-0000-4000-8000-0000000000f9";
+
+    fn advertise_senders(world: &World) {
+        world.core.lock().unwrap().welcome_override =
+            Some(|w| w.features.push(SENDERS_FEATURE.into()));
+    }
+
+    fn answer_of(events: &[Event]) -> Option<HostEncKey> {
+        events.iter().find_map(|e| match e {
+            Event::Family(f) => f
+                .data
+                .as_ref()
+                .filter(|d| d["op"] == "host_enc_key")
+                .map(|d| HostEncKey::from_data(d).expect("a host_enc_key")),
+            _ => None,
+        })
+    }
+
+    /// Without `host.senders` advertised, nothing is sealed.
+    #[test]
+    fn client_refuses_without_feature() {
+        let world = World::new(&L);
+        let now = || world.mono();
+        let mac = Device::native(&world, "dev-mac", world.log(&L));
+        let mut wire = world.tcp();
+        let mut attached = mac.connect(&mut wire).unwrap();
+        assert_eq!(
+            attached.send_host_enc_key_new(MINE, now()).err(),
+            Some(ConnectError::Request("host feature not available"))
+        );
+        assert_eq!(
+            attached.send(&host_enc_key_new(RETRY, MINE), now()).err(),
+            Some(ConnectError::Request("host feature not available"))
+        );
+        assert_eq!(list(&mut attached, &mut wire, now()), vec![SES_A, SES_B]);
+    }
+
+    /// Two managers (here the Mac and a retry under a fresh `id`) get the
+    /// same pending key, each answer echoing its own request; the key's
+    /// `enc_sig` verifies and drafts a rotation the drafting guard takes.
+    #[test]
+    fn each_answer_echoes_its_own_request() {
+        let world = World::new(&L);
+        let now = || world.mono();
+        advertise_senders(&world);
+        let log = world.log(&L);
+        let mac = Device::native(&world, "dev-mac", log.clone());
+        let mut wire = world.tcp();
+        let mut attached = mac.connect(&mut wire).unwrap();
+        let (id, frame) = attached.send_host_enc_key_new(MINE, now()).unwrap();
+        let events = exchange(&mut attached, &mut wire, &frame, now(), |e| {
+            answer_of(e).is_some()
+        });
+        let first = answer_of(&events).unwrap();
+        let w = attached.welcome().clone();
+        assert!(first.answers_new(&id, MINE, &w.atem_device_id, w.host_trust_gen));
+        assert_eq!(first.enc_key.as_bytes(), HOST_ENC_PENDING_PUB);
+        let host = log.host(&first.host_id).unwrap();
+        assert_eq!(
+            verify_host_enc_sig(
+                &host.host_key,
+                log.account_id(),
+                &log.genesis_hash(),
+                &first.host_id,
+                first.host_trust_gen,
+                &HOST_ENC_PENDING_PUB,
+                &first.enc_sig,
+            ),
+            Ok(())
+        );
+        let action = first.action(false, WALL).unwrap();
+        assert!(matches!(action, Action::HostEncKey { .. }));
+        assert_eq!(check_change(&log, &action, WALL), Ok(()));
+        // A retry of the same change under a fresh id (a lost answer), the
+        // generic `send` checked like the method.
+        let message = host_enc_key_new(RETRY, MINE);
+        let frame = attached.send(&message, now()).unwrap();
+        assert_eq!(
+            attached.send(&message, now()).err(),
+            Some(ConnectError::Request("duplicate host enc key id"))
+        );
+        let mut bad = message.clone();
+        bad["data"]["request_id"] = json!("not-a-uuid");
+        assert_eq!(
+            attached.send(&bad, now()).err(),
+            Some(ConnectError::Request("not a host_enc_key_new message"))
+        );
+        let events = exchange(&mut attached, &mut wire, &frame, now(), |e| {
+            answer_of(e).is_some()
+        });
+        let again = answer_of(&events).unwrap();
+        assert!(again.answers_new(RETRY, MINE, &w.atem_device_id, w.host_trust_gen));
+        assert_eq!(again.enc_key, first.enc_key);
+        // Another manager's request: the same key, its own ids echoed.
+        let phone = Device::native(&world, "dev-phone", log);
+        let mut wire = world.tcp();
+        let mut other = phone.connect(&mut wire).unwrap();
+        let theirs = "aaaaaaaa-0000-4000-8000-0000000000fa";
+        let (id, frame) = other.send_host_enc_key_new(theirs, now()).unwrap();
+        let events = exchange(&mut other, &mut wire, &frame, now(), |e| {
+            answer_of(e).is_some()
+        });
+        let answer = answer_of(&events).unwrap();
+        assert!(answer.answers_new(&id, theirs, &w.atem_device_id, w.host_trust_gen));
+        assert_eq!(answer.enc_key, first.enc_key);
+    }
+
+    /// An answer whose `request_id` isn't the request's, a get's answer to a
+    /// new request and a new key's answer to a get are malformed host
+    /// messages.
+    #[test]
+    fn an_answer_to_another_request_is_refused() {
+        type Rewrite = fn(&mut HostEncKey);
+        let cases: [(Rewrite, bool, &str); 3] = [
+            (
+                |a| a.request_id = Some("aaaaaaaa-0000-4000-8000-0000000000f1".into()),
+                true,
+                "another request_id",
+            ),
+            (|a| a.request_id = None, true, "a get's answer"),
+            (
+                |a| a.request_id = Some(MINE.into()),
+                false,
+                "a new key's answer to a get",
+            ),
+        ];
+        for (rewrite, new, why) in cases {
+            let world = World::new(&L);
+            let now = || world.mono();
+            advertise_senders(&world);
+            world.core.lock().unwrap().host_enc_key_override = Some(rewrite);
+            let mac = Device::native(&world, "dev-mac", world.log(&L));
+            let mut wire = world.tcp();
+            let mut attached = mac.connect(&mut wire).unwrap();
+            let frame = if new {
+                attached.send_host_enc_key_new(MINE, now()).unwrap().1
+            } else {
+                attached.send_host_enc_key_get(now()).unwrap().1
+            };
+            wire.send(&frame);
+            let reply = wire.recv().expect("a reply");
+            assert_eq!(
+                attached.on_frame(&reply, now()).err(),
+                Some(ConnectError::Malformed("unbound host enc key")),
+                "{why}"
+            );
+        }
+    }
+
+    /// A pending new request's `id` is busy in every request map, and a
+    /// get's in this one: one id, one pending request.
+    #[test]
+    fn its_id_is_one_pending_request() {
+        let world = World::new(&L);
+        let now = || world.mono();
+        advertise_senders(&world);
+        let mac = Device::native(&world, "dev-mac", world.log(&L));
+        let mut wire = world.tcp();
+        let mut attached = mac.connect(&mut wire).unwrap();
+        attached
+            .send(&host_enc_key_new(RETRY, MINE), now())
+            .unwrap();
+        assert_eq!(
+            attached.send(&host_enc_key_get(RETRY), now()).err(),
+            Some(ConnectError::Request("duplicate host enc key id"))
+        );
+        attached.send(&host_enc_key_get(MINE), now()).unwrap();
+        assert_eq!(
+            attached.send(&host_enc_key_new(MINE, RETRY), now()).err(),
+            Some(ConnectError::Request("duplicate host enc key id"))
+        );
+    }
+}
+
 /// `work_interrupt` and `work_resolve` (delegated host-work design I.4.5)
 /// on the client: host-work requests of `host.delegated`, sent only to a
 /// host that advertised it, read as the host reads them, and tracked until

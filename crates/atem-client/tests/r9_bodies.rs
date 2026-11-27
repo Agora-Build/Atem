@@ -569,6 +569,12 @@ fn one_authority_check_per_request() {
         need("session", json!({"op": "host_enc_key_get"})),
         Need::HostEncKey
     );
+    // So is `host_enc_key_new` (the routine rotation, agreed with Astation
+    // on 2026-11-23): the same need, `manage` checked by the host.
+    assert_eq!(
+        need("session", json!({"op": "host_enc_key_new"})),
+        Need::HostEncKey
+    );
     assert_eq!(
         bot.authorize(Need::HostEncKey, None),
         Err(Denied::Forbidden),

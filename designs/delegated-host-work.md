@@ -2035,11 +2035,19 @@ gives all of that.
 **Built:** the `host_enc_key` entry in the shared core's verifier, `enc_sig` and its check (step 3); behind the
 debug-only hook (`host.senders`), the host's key, `pairing/host_enc_key`, made with the device list's pin and at a
 start of a pinned host that holds none for its generation, the record of the key ids it made
-(`pairing/host_enc_generated`, written before a key is handed out), and `host_enc_key_get` (session-v1 R9.14 item 8).
+(`pairing/host_enc_generated`, written before a key is handed out), and `host_enc_key_get` (session-v1 R9.14 item 8);
+and the routine rotation (agreed with Astation on 2026-11-23, #120 comment 7089435308): a manager's
+`host_enc_key_new` gets the same key on a retry under its `request_id`, else the one key no entry has set (the host's
+current key while unset, else a pending one), made durable before the answer; the host stamps when it applied each
+entry that makes a key it holds the previous one, its key file follows the committed list entry by entry (a key no
+entry has set is never erased), it keeps the old key 24 h on the delegated clock (erased at once with
+`retire_previous`, when that time can't be established, or after a repair, a lowering or a fresh start of that clock), records every
+retired key so none comes back, and accepts only the keys its committed list holds (host-work-v1 §11.5, "The routine
+rotation of a host's key"; session-v1 R9.13 item 8, R9.14 item 8); `check_change_advisories` reports
+`previous_key_window` before a second rotation within 24 h of the first.
 **Not built:** the key in the ceremony (the amendment below): Atem's side is draft PR #176, held until Astation's
-native ceremony is ready (#120 comment 6938206284), so a key gets its entry only through `host_enc_key_get` and a
-manager's own fresh confirmation; and a new key on request, for rotation and `retire_previous` (an open point,
-session-v1 R9.13 item 8). Signing the entry is Astation's, behind the signing gate.
+native ceremony is ready (#120 comment 6938206284), so a key gets its entry only through `host_enc_key_get` or
+`host_enc_key_new` and a manager's own fresh confirmation. Signing the entry is Astation's, behind the signing gate.
 
 **No host key can receive HPKE today** (session-v1 R9.2, R9.3, R9.6; account-trust §2 lists only the native
 devices' keys):
@@ -2155,9 +2163,11 @@ with the sealed part beside it.
    **Amended after agreement, 2026-11-10 (agreed with Astation, 2026-11-11, #120 comment 6810116314).** The current trust generation is the host's own, from its
    pairing, never one read from its device list, which may lag behind its own new `add_host`. When `signed_at_head.seq`
    is beyond this host's head, a key it doesn't accept waits (below): its own new `host_enc_key` may be among the
-   entries it lacks. A key the host generated and handed out but whose `host_enc_key` its own list hasn't applied yet
-   should be accepted too: a sender whose list already has the entry seals to it, and the mail then opens at once
-   instead of waiting. **Amended for step 4, agreed with Astation.** Only a key the host made waits. The host keeps
+   entries it lacks. **Amended by the rotation's agreement (Astation, 2026-11-23, #120 comment 7089435308):
+   committed-list authority**, replacing the earlier advice to accept such a key too: a key the host generated and
+   handed out but whose `host_enc_key` its own list hasn't applied yet (a rotation's pending key, or its first key
+   before its entry) is not an accepted key; mail sealed to it waits for the host's list to apply the entry, and opens
+   then (host-work-v1 §11.5, "The recipient's keys"). **Amended for step 4, agreed with Astation.** Only a key the host made waits. The host keeps
    the id of every key it made in its current trust generation, recorded durably before it hands the key out (II.4.1),
    and passes them with the ids of the keys it accepts: a key whose id is missing has its mail refused for good. Every
    `host_enc_key` entry for the host carries the host's own `enc_sig`, so no entry it lacks can make any other key one
@@ -3527,7 +3537,8 @@ real Station and Astation can show.
   or done refused in the reference mailbox's vectors only. Joint: the real Station refusing another link.
 - **32.** No binary; host_effects_tests.rs (`a_readmit_and_a_new_key_change_nothing`), and each key change alone in
   the host-envelope vectors (a re-verification, a rotation with and without `retire_previous`, a removal, a readmit).
-  Joint: a real `atem unpair`, then `atem pair`, and a key rotation (a new key on request isn't built).
+  Joint: a real `atem unpair`, then `atem pair`, and a key rotation (a new key on request is built behind the hook:
+  `host_enc_key_new`, host-work-v1 §11.5).
 - **33.** `mail::a_reply_from_a_host_revoked_meanwhile_is_kept_as_data`; a result from a host the row didn't go to in
   the host-envelope vectors; results_tests.rs for an ungranted host, one that moved in the list and a route without
   results. Not shown in a test: a result after its return grant ended. Joint: results through the real Station.

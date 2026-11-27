@@ -62,8 +62,8 @@ pub mod stored;
 pub mod wait;
 
 pub use capacity::{
-    Capacity, CapacityLevel, ChangeRefusal, NEARLY_FULL_PERCENT, SERVICE_CHANGE_MIN_INTERVAL_MS,
-    check_change,
+    Capacity, CapacityLevel, ChangeAdvisory, ChangeRefusal, NEARLY_FULL_PERCENT,
+    SERVICE_CHANGE_MIN_INTERVAL_MS, check_change, check_change_advisories,
 };
 pub use draft::{check_body, draft_on, sign_entry, sign_entry_cosigned};
 pub use entry::{

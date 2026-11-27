@@ -261,6 +261,14 @@ pub struct ClockState {
     /// The latest repair or lowering (§11.6: `runtime.log` keeps every one,
     /// `atem status` shows it): a new one replaces it.
     last_change: Option<Change>,
+    /// This record's own epoch, drawn by `HostClock` each time the clock
+    /// starts afresh (no record, a record read as none, a damaged one started
+    /// afresh) and kept with the record ever after (none in a record an
+    /// older build wrote). A fresh start lowers `D` with no repair or
+    /// lowering recorded; the epoch tells it apart (host senders' key
+    /// stamps, host-work-v1 §11.5, the routine rotation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    epoch: Option<String>,
 }
 
 /// A repair or a lowering, as `atem status` shows it.
@@ -531,6 +539,16 @@ impl ClockState {
     /// The latest repair or lowering, for `atem status`.
     pub fn last_change(&self) -> Option<&Change> {
         self.last_change.as_ref()
+    }
+
+    /// The record's epoch (see the field).
+    pub fn epoch(&self) -> Option<&str> {
+        self.epoch.as_deref()
+    }
+
+    /// A fresh start's epoch.
+    pub fn set_epoch(&mut self, epoch: String) {
+        self.epoch = Some(epoch);
     }
 
     /// A forward jump's anchor is pending: `H` (and so `D`) may be lowered

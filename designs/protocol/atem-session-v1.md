@@ -4744,18 +4744,19 @@ sets versus sequences (R9.2). Still open:
    an older backup. Astation's clients should reconnect a manager
    promptly when a host reports held; services and view-only devices
    wait.
-8. **A new host encryption key on request** (planned, delegated host work;
-   R9.14 item 8). `host_enc_key_get` returns the key a host holds, and a
-   host makes one only at pairing, at `atem pair verify` and at the first
-   start of a build that knows it. The agreed design's rotation within a
-   trust generation (II.4.1), its answer to `enc_key_reused`, and its
-   compromise remedy (`retire_previous`) need a way to ask the host for a
-   new key: a flag on the op, or a local command. Proposed on 2026-11-22
-   (#120 comment 7086542274: a separate op, `host_enc_key_new`) and agreed
-   with Astation on 2026-11-23 (#120 comment 7089435308), being built;
-   asked for on 2026-11-20 (#120 comment 7028723996; R9.14 item 8).
+8. **A new host encryption key on request** (delegated host work; R9.14
+   item 8). `host_enc_key_get` returns the key a host holds, and a host
+   makes one only at pairing, at `atem pair verify` and at the first start
+   of a build that knows it. The agreed design's rotation within a trust
+   generation (II.4.1), its answer to `enc_key_reused`, and its compromise
+   remedy (`retire_previous`) needed a way to ask the host for a new key.
+   Asked for on 2026-11-20 (#120 comment 7028723996), proposed on
+   2026-11-22 (#120 comment 7086542274: a separate op, `host_enc_key_new`)
+   and agreed with Astation on 2026-11-23 (#120 comment 7089435308):
+   **built behind the debug-only hook** (R9.14 item 8; host-work-v1 §11.5,
+   "The routine rotation of a host's key").
 
-### R9.14 Delegated host work (items 1-7 and item 8's `host_enc_key_get` built behind a debug-only hook; not advertised by release builds)
+### R9.14 Delegated host work (items 1-7 and item 8's `host_enc_key_get` and `host_enc_key_new` built behind a debug-only hook; not advertised by release builds)
 
 The delegated host-work design ([../delegated-host-work.md](../delegated-host-work.md),
 agreed revision 6b, I.7) revises session-v1 so that Atem runs a delegated
@@ -5192,26 +5193,74 @@ below. Item 8's request stays open.
          `bad_enc_sig`).
        - A relay or a channel can't offer a key the host didn't vouch for
          in this generation.
-     - **Agreed with Astation on 2026-11-23 (#120 comment 7089435308),
-       being built: a separate op `host_enc_key_new`** (proposed in #120
-       comment 7086542274), how a manager asks a
-       host for a *new* key. Astation (2026-11-20, #120 comment 7028723996):
-       routine rotation stays a separate, unresolved operation; this op is
-       no rotation, and in-place re-verification is no way to one; the
-       proposal must define the manager's request, the owner's
-       confirmation, the refusal of a reused key, the publication order and
-       the old key's retention and retirement.
-       - **What needs it.** The agreed design relies on a new key for a
-         routine rotation (II.4.1), after `enc_key_reused`, and after a
-         suspected compromise (`retire_previous`, VI "Plain host keys";
-         VII.B test 32).
-       - **Today a host makes a key** only at pairing, at `atem pair
-         verify` (which voids the old one anyway) and at the first start
-         of a build that knows the key. This op returns the key the host
-         holds.
-       - **What it would take:** rotation within a trust generation needs
-         a request flag (for example `rotate: true`, made by a manager) or
-         a local command.
+     - **`host_enc_key_new`** (agreed with Astation on 2026-11-23, #120
+       comment 7089435308, on Atem's proposal in #120 comment
+       7086542274; **built behind the hook**): how a manager asks a host
+       for a *new* key, for a routine rotation (II.4.1), after
+       `enc_key_reused`, and after a suspected compromise
+       (`retire_previous`, VI "Plain host keys"; VII.B test 32).
+
+       ```json
+       {"type":"session","data":{"v":1,"op":"host_enc_key_new","id":"<UUID v4>","request_id":"<UUID v4>"}}
+       {"type":"session","data":{"v":1,"op":"host_enc_key","id":"<UUID v4>","re":"<the request's id>",
+         "request_id":"<the request's request_id>","state":"pending",
+         "host_id":"host-a","host_trust_gen":2,
+         "enc_key":{"alg":"x25519","pub":"<b64u, 32 bytes>"},"enc_sig":"<b64u, 64 bytes>"}}
+       ```
+
+       Both have exactly these fields, strict (`atem_client::session::r9::
+       {host_enc_key_new, HostEncKeyNew, HostEncKey}`: the answer is
+       `host_enc_key`'s with `request_id` and `state` both or neither,
+       `state` only `pending`; a get's answer has neither).
+       - **Who may ask**, as for `host_enc_key_get`: native members
+         holding `manage` at the host's head, checked on every request and
+         retry; the channel refuses services and browsers before decoding
+         (`Need::HostEncKey`).
+       - **A retry under the same `request_id` gets the same key**, before
+         or after an entry set it (the host records the last 64 requests it
+         answered, written with the key before the answer; a request past
+         them is a new one: **Atem's reading, for Astation's
+         confirmation**). `state: "pending"` names a key handed out for a
+         rotation, on a retry after an entry set it too (**Atem's reading,
+         for Astation's confirmation**); whether the list holds it by now
+         is for the manager's own log to say (no other wire value).
+       - **One key no entry has set, per trust generation.** A new request
+         gets the host's current key while no entry has set it (**Atem's
+         reading, for Astation's confirmation**: a stale `host_enc_key_get`
+         answer then names the key the host will promote), else the pending
+         key, else a fresh one made pending; every answer echoes its own
+         request's `id` (`re`) and `request_id`. The key is kept with no
+         expiry until an entry sets it or its generation goes; never
+         replaced or minted in the background. While the list has committed
+         the entry setting the pending key and the host hasn't followed it
+         yet, a new request is `busy`, `host encryption key unavailable`
+         (**Atem's reading, for Astation's confirmation**).
+       - **Before the answer**: a fresh key's `enc_kid` is neither in the
+         host's record nor among the keys the committed list set for it
+         since its `add_host`; the request (and a fresh key's id) is
+         appended to the record and synced; then a fresh key is written
+         pending into the key file, one atomic replace (a key already held
+         is synced). Any write that fails is `busy`, `host encryption key
+         unavailable`, nothing handed out.
+       - **The client** (`Attached::send_host_enc_key_new(request_id, …)`,
+         the bindings' `ClientConnection::send_host_enc_key_new`; the
+         generic `send` checks a hand-built one the same way) takes an
+         answer only for the request it echoes (both ids), from the
+         channel's host at its trust generation, never a get's answer for
+         it nor the other way round (`unbound host enc key`). Before asking
+         the owner, the manager verifies `enc_sig` and runs `check_change`
+         and `check_change_advisories` (`previous_key_window`: the host's
+         previous key isn't retired and was replaced by an entry signed
+         less than 24 h earlier, so this rotation cuts its window short; an
+         advisory with an explicit confirmation, never a refusal; in every
+         binding as `change_advisories`, which returns `check_change`'s
+         refusal with it).
+       - **What the host does with the entry** (the key file following the
+         committed list entry by entry, the stamp, the 24 h window on the
+         delegated clock and what ends it early, retirement and the record
+         of retired keys, the receiver's view following the committed list
+         only, mail in flight and results back under `retire_previous`):
+         host-work-v1 §11.5, "The routine rotation of a host's key".
        - Listed in R9.13 (item 8).
 
 **Errors and details (additions).** Receipt details: `withdrawn by the
@@ -5226,7 +5275,10 @@ is not advertised` (item 8, while unadvertised).
 **Tests and fixtures.**
 - **The shapes:** `fixtures/r9-vectors-delegated-wire.json`, valid and
   refused, for `host_enc_key_get`, `host_enc_key` (its binding verified
-  against log L) and receipts with and without provenance. The shared
+  against log L), `host_enc_key_new` and its pending answer (its binding
+  verified too), the exchanges of two managers and a retry getting one
+  pending key, each answer echoing its own request, and receipts with and
+  without provenance. The shared
   core's runner and the independent checker read it, and the binding
   packages ship it.
 - **The shared core's own tests:** `receipt_provenance.rs` (every
@@ -5249,6 +5301,24 @@ is not advertised` (item 8, while unadvertised).
   (`host_senders_hand_a_manager_the_host_encryption_key`: the real
   runtime makes the key at start, a manager gets it, a restart keeps
   it).
+- **`host_enc_key_new` and the rotation:** the shared core's
+  `session::r9` unit tests, `client_e2e.rs`'s `host_enc_key_new` module
+  (each answer echoing its own request, two managers and a retry one
+  key, unbound answers refused) and `membership_host_enc_key.rs`
+  (`previous_key_window`); the host's `host_enc_tests.rs` (`op`: a manager
+  and a retry and a second manager one pending key, others `forbidden`,
+  `busy` on a failed write, main's refusal with the hook off) and
+  `host_enc_rotation_tests.rs` (each crash point: after the record and
+  before `pending`, after `pending` and before the answer, after the
+  list's commit and before the promotion with and without its stamp,
+  mid-retirement; the window on `D`, the clock below the application, an
+  early second rotation, `retire_previous`, a voided generation, no
+  retired key coming back); the bridge's `host_key_tests.rs` (sleep and a
+  clock set back on the delegated clock, mail in flight opened or
+  refused through the mailbox); and `tests/host_senders_binary.rs` (two
+  real hosts: a routine rotation opens mail in flight to the old key, a
+  `retire_previous` one refuses it and the sender never re-seals it, new
+  mail uses the new key).
 - **Scenario fixtures for items 1 to 7:** `fixtures/r9-delegated-*.json`
   (`provenance`, `start-check-withdraws`, `withdrawal-refusal-list`,
   `host-interrupt`, `recovery-withdrawn`,

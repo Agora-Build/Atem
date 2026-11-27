@@ -870,6 +870,21 @@ impl ClientConnection {
         }
     }
 
+    /// `host_enc_key_new` (feature `host.senders`; the routine rotation of
+    /// a host's encryption key, agreed with Astation on 2026-11-23): a
+    /// native manager asks the host for a new, pending key. Keep
+    /// `request_id` (a UUID v4) for a retry after a lost answer, which gets
+    /// the same pending key, as does any other manager's request while it
+    /// is pending. The answer, a `host_enc_key` with this request's `id`
+    /// (`re`) and `request_id` and `state: "pending"`, arrives as a
+    /// `session` `Family` event; verify its `enc_sig` with
+    /// `verify_host_enc_sig`, then run `check_change` and
+    /// `change_advisories` (`previous_key_window`) before the owner's fresh
+    /// confirmation.
+    pub fn send_host_enc_key_new(&self, request_id: String, now_ms: u64) -> Result<Outgoing> {
+        self.request(|a| a.send_host_enc_key_new(&request_id, now_ms))
+    }
+
     /// `membership{entries}`: entries carried on the open channel (a new
     /// entry, a veto); the host answers `membership_head`.
     pub fn send_membership(&self, entries: Vec<String>, now_ms: u64) -> Result<Outgoing> {

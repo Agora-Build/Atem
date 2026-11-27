@@ -435,6 +435,7 @@ impl AwaitWelcome {
             host_work: HashMap::new(),
             control_records: HashMap::new(),
             host_enc_key: HashSet::new(),
+            host_enc_key_new: HashMap::new(),
             host_policy: HostPolicyTracker::new(&welcome, false),
             channel: self.channel,
             authorization_deadline: now_ms + lifetime,
@@ -566,6 +567,9 @@ pub struct Attached {
     control_records: HashMap<String, Vec<String>>,
     /// `host_enc_key_get` requests awaiting their answers, by `id`.
     host_enc_key: HashSet<String>,
+    /// `host_enc_key_new` requests awaiting their answers: the request's
+    /// `id` and its `request_id`.
+    host_enc_key_new: HashMap<String, String>,
     channel: Channel,
     welcome: Welcome,
     host_head: HostHead,
@@ -697,9 +701,10 @@ impl Attached {
     }
 
     /// Any session-family message the app built (terminal-v1, chat-v1). Host
-    /// work ops, `control_records` and `host_enc_key_get` are checked first,
-    /// as their own methods check them: against the features the host
-    /// advertised, with their request tracked until the host answers.
+    /// work ops, `control_records`, `host_enc_key_get` and `host_enc_key_new`
+    /// are checked first, as their own methods check them: against the
+    /// features the host advertised, with their request tracked until the
+    /// host answers.
     pub fn send(&mut self, message: &Value, now_ms: u64) -> Result<Vec<u8>, ConnectError> {
         let data = &message["data"];
         if message["type"] == "session" && data["op"] == "control_records" {
@@ -707,6 +712,9 @@ impl Attached {
         }
         if message["type"] == "session" && data["op"] == "host_enc_key_get" {
             return self.send_host_enc_key_get_message(message, now_ms);
+        }
+        if message["type"] == "session" && data["op"] == "host_enc_key_new" {
+            return self.send_host_enc_key_new_message(message, now_ms);
         }
         if message["type"] == "session"
             && matches!(
@@ -756,13 +764,14 @@ impl Attached {
     }
 
     /// Whether `id` names a request still waiting for its answer, in any of
-    /// the three request maps (host work, `control_records`,
-    /// `host_enc_key_get`): one id is one pending request, so an
+    /// the request maps (host work, `control_records`, `host_enc_key_get`,
+    /// `host_enc_key_new`): one id is one pending request, so an
     /// `error{re}` can only ever name one.
     fn id_pending(&self, id: &str) -> bool {
         self.host_work.contains_key(id)
             || self.control_records.contains_key(id)
             || self.host_enc_key.contains(id)
+            || self.host_enc_key_new.contains_key(id)
     }
 
     /// `list`: the registry snapshot (and subscribes to changes).
@@ -1116,11 +1125,63 @@ impl Attached {
         if self.id_pending(&request.id) {
             return Err(ConnectError::Request("duplicate host enc key id"));
         }
-        if self.host_enc_key.len() >= 64 {
+        if self.host_enc_key.len() + self.host_enc_key_new.len() >= 64 {
             return Err(ConnectError::Request("too many host enc key requests"));
         }
         let frame = self.seal(message, now_ms)?;
         self.host_enc_key.insert(request.id);
+        Ok(frame)
+    }
+
+    /// `host_enc_key_new`: a native manager asks the host for a new, pending
+    /// encryption key, to draft a `host_enc_key` entry that rotates the
+    /// current one ([`crate::session::r9::host_enc_key_new`]; agreed with
+    /// Astation on 2026-11-23, #120 comment 7089435308). `request_id` (a
+    /// UUID v4) is the change's: keep it for a retry after a lost answer,
+    /// which gets the same pending key, as does any other manager's request
+    /// while that key is pending. Only to a host that advertised
+    /// `host.senders` ("host feature not available" otherwise: nothing is
+    /// sealed). The answer, a `host_enc_key` echoing this request's `id` and
+    /// `request_id` with `state: "pending"`, of this channel's host at its
+    /// trust generation, arrives as a `session` [`Event::Family`] message
+    /// (read it with [`crate::session::r9::HostEncKey::from_data`]). Verify
+    /// its `enc_sig` against the manager's own log, and run `check_change`
+    /// and `check_change_advisories`, before asking the owner.
+    pub fn send_host_enc_key_new(
+        &mut self,
+        request_id: &str,
+        now_ms: u64,
+    ) -> Result<(String, Vec<u8>), ConnectError> {
+        let id = new_id();
+        let frame = self.send(
+            &crate::session::r9::host_enc_key_new(&id, request_id),
+            now_ms,
+        )?;
+        Ok((id, frame))
+    }
+
+    /// A `host_enc_key_new` message, however it was built: read as the host
+    /// reads it, sent only to a host that advertised `host.senders` and
+    /// tracked (its `id` and `request_id`) until its answer comes.
+    fn send_host_enc_key_new_message(
+        &mut self,
+        message: &Value,
+        now_ms: u64,
+    ) -> Result<Vec<u8>, ConnectError> {
+        let senders = crate::session::host_work::SENDERS_FEATURE;
+        if !self.welcome.features.iter().any(|f| f == senders) {
+            return Err(ConnectError::Request("host feature not available"));
+        }
+        let request = crate::session::r9::HostEncKeyNew::decode(message.to_string().as_bytes())
+            .map_err(ConnectError::Request)?;
+        if self.id_pending(&request.id) {
+            return Err(ConnectError::Request("duplicate host enc key id"));
+        }
+        if self.host_enc_key.len() + self.host_enc_key_new.len() >= 64 {
+            return Err(ConnectError::Request("too many host enc key requests"));
+        }
+        let frame = self.seal(message, now_ms)?;
+        self.host_enc_key_new.insert(request.id, request.request_id);
         Ok(frame)
     }
 
@@ -1193,12 +1254,22 @@ impl Attached {
             }
             Incoming::HostEncKey(answer) => {
                 let w = &self.welcome;
-                let bound = self.host_enc_key.contains(&answer.re)
-                    && answer.answers(&answer.re, &w.atem_device_id, w.host_trust_gen);
+                // A get's answer for a get, a new key's for that new
+                // request (its `request_id` too).
+                let bound = match &answer.request_id {
+                    None => {
+                        self.host_enc_key.contains(&answer.re)
+                            && answer.answers(&answer.re, &w.atem_device_id, w.host_trust_gen)
+                    }
+                    Some(_) => self.host_enc_key_new.get(&answer.re).is_some_and(|asked| {
+                        answer.answers_new(&answer.re, asked, &w.atem_device_id, w.host_trust_gen)
+                    }),
+                };
                 if !bound {
                     return Err(ConnectError::Malformed("unbound host enc key"));
                 }
                 self.host_enc_key.remove(&answer.re);
+                self.host_enc_key_new.remove(&answer.re);
                 return Ok(vec![Event::Family(FamilyMessage {
                     family: "session".into(),
                     data: Some(answer.to_json()["data"].clone()),
@@ -1211,6 +1282,7 @@ impl Attached {
                     self.host_work.remove(re);
                     self.control_records.remove(re);
                     self.host_enc_key.remove(re);
+                    self.host_enc_key_new.remove(re);
                 }
                 // r8's machines see r8's errors (a lease request's refusal).
                 if let Ok(Envelope::Session(msg)) = wire::decode(&plain) {

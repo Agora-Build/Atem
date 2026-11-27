@@ -954,11 +954,81 @@ impl HostEncKeyGet {
     }
 }
 
+/// `host_enc_key_new{id, request_id}` (C→H, feature [`SENDERS_FEATURE`];
+/// the routine rotation of a host's encryption key, agreed with Astation on
+/// 2026-11-23, #120 comment 7089435308): a native manager asks the host for
+/// a *new* key, to draft a `host_enc_key` entry that rotates the one the
+/// device list holds. The host answers one [`HostEncKey`] with this
+/// request's `request_id` and `state: "pending"`: the key the host made for
+/// a rotation (or its own key no entry has set yet), at most one such key
+/// at a time; whether the device list holds it by now is for the manager's
+/// own log to say. Any request while that key isn't set, from this manager
+/// or another, gets it; a retry under the same `request_id` gets the same
+/// key, before or after an entry set it (the host keeps a bounded record of
+/// the `request_id`s it answered). Only native members holding `manage` at
+/// the host's head get it, checked at every request and retry, as for
+/// [`host_enc_key_get`], which stays a pure read. `request_id` is a UUID v4
+/// the answer echoes.
+///
+/// [`SENDERS_FEATURE`]: crate::session::host_work::SENDERS_FEATURE
+pub fn host_enc_key_new(id: &str, request_id: &str) -> Value {
+    session(json!({"v": 1, "op": "host_enc_key_new", "id": id, "request_id": request_id}))
+}
+
+/// A `host_enc_key_new` as the host reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostEncKeyNew {
+    pub id: String,
+    pub request_id: String,
+}
+
+impl HostEncKeyNew {
+    /// Reads a received plaintext, strictly (I-JSON, no duplicate keys):
+    /// exactly `{"type":"session","data":{"v":1,"op":"host_enc_key_new",
+    /// "id":<UUID v4>,"request_id":<UUID v4>}}`. `Err` is a short reason,
+    /// fit for the error's `detail`.
+    pub fn decode(plain: &[u8]) -> Result<Self, &'static str> {
+        const SHAPE: &str = "not a host_enc_key_new message";
+        let root = StrictValue::parse(plain, MAX_PLAINTEXT).map_err(|_| "not strict JSON")?;
+        let value = root.value();
+        let data = value
+            .as_object()
+            .filter(|o| o.len() == 2 && value["type"] == "session")
+            .and_then(|_| value["data"].as_object())
+            .filter(|d| {
+                d.len() == 4
+                    && d.get("v").and_then(Value::as_u64) == Some(1)
+                    && d.get("op").and_then(Value::as_str) == Some("host_enc_key_new")
+            })
+            .ok_or(SHAPE)?;
+        let uuid = |k: &str| {
+            data.get(k)
+                .and_then(Value::as_str)
+                .filter(|s| is_uuid_v4(s))
+                .map(str::to_owned)
+                .ok_or(SHAPE)
+        };
+        Ok(HostEncKeyNew {
+            id: uuid("id")?,
+            request_id: uuid("request_id")?,
+        })
+    }
+}
+
+/// The one state a `host_enc_key_new`'s answer names: a key the host
+/// handed out for a rotation, no entry having set it when the host first
+/// answered for it; a retry's answer keeps it after an entry set the key
+/// (no other wire value: the manager's own log says whether it is set;
+/// Atem's reading, for Astation's confirmation, host-work-v1 §11.5).
+pub const HOST_ENC_KEY_PENDING: &str = "pending";
+
 /// `host_enc_key{re, host_id, host_trust_gen, enc_key, enc_sig}` (H→C): the
-/// answer to one `host_enc_key_get`. The host's X25519 key for its current
-/// trust generation and the host's `enc_sig` over it, by its `host_key`
-/// (the newest `add_host`'s), in the `host_enc_key` entry's own forms: what
-/// a manager needs to draft the entry ([`HostEncKey::action`]). The binding
+/// answer to one `host_enc_key_get`, and with `request_id` and `state:
+/// "pending"` the answer to one `host_enc_key_new`. The host's X25519 key
+/// for its current trust generation (its current key, or for a new key its
+/// pending one) and the host's `enc_sig` over it, by its `host_key` (the
+/// newest `add_host`'s), in the `host_enc_key` entry's own forms: what a
+/// manager needs to draft the entry ([`HostEncKey::action`]). The binding
 /// verifies on its own, so the channel needs no trust: the device-list
 /// verifier checks it against the chain (`bad_enc_sig`,
 /// `host_trust_gen_not_current`), and `check_change` says first when the
@@ -966,8 +1036,12 @@ impl HostEncKeyGet {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostEncKey {
     pub id: String,
-    /// The `id` of the `host_enc_key_get` it answers.
+    /// The `id` of the `host_enc_key_get` or `host_enc_key_new` it answers.
     pub re: String,
+    /// A `host_enc_key_new`'s answer: that request's `request_id` (on the
+    /// wire with `state: "pending"`, [`HOST_ENC_KEY_PENDING`]). `None` for a
+    /// `host_enc_key_get`'s answer, which carries neither field.
+    pub request_id: Option<String>,
     /// The host's `atem_device_id` (its `host_id` in the device list).
     pub host_id: String,
     pub host_trust_gen: u64,
@@ -981,7 +1055,8 @@ pub struct HostEncKey {
 impl HostEncKey {
     /// Reads a `host_enc_key`'s `data`: exactly its fields, UUID v4 ids, an
     /// id-grammar `host_id`, a generation of 1 or more, an X25519 key and a
-    /// 64-byte signature.
+    /// 64-byte signature; for a `host_enc_key_new`'s answer also a UUID v4
+    /// `request_id` and `state: "pending"`, both or neither.
     pub fn from_data(data: &Value) -> Result<Self, &'static str> {
         let o = data.as_object().ok_or("data")?;
         if o.get("op").and_then(Value::as_str) != Some("host_enc_key") {
@@ -990,11 +1065,6 @@ impl HostEncKey {
         if o.get("v").and_then(Value::as_u64) != Some(1) {
             return Err("v");
         }
-        // `v`, `op`, `id`, `re`, `host_id`, `host_trust_gen`, `enc_key`,
-        // `enc_sig`.
-        if o.len() != 8 {
-            return Err("fields");
-        }
         let uuid = |k: &'static str| -> Result<String, &'static str> {
             o.get(k)
                 .and_then(Value::as_str)
@@ -1002,6 +1072,19 @@ impl HostEncKey {
                 .map(str::to_owned)
                 .ok_or(k)
         };
+        let request_id = match (o.get("request_id"), o.get("state")) {
+            (None, None) => None,
+            (Some(_), Some(state)) if state.as_str() == Some(HOST_ENC_KEY_PENDING) => {
+                Some(uuid("request_id")?)
+            }
+            (_, Some(_)) => return Err("state"),
+            (Some(_), None) => return Err("request_id"),
+        };
+        // `v`, `op`, `id`, `re`, `host_id`, `host_trust_gen`, `enc_key`,
+        // `enc_sig`, and a new key's `request_id` and `state`.
+        if o.len() != 8 + 2 * usize::from(request_id.is_some()) {
+            return Err("fields");
+        }
         let host_id = o
             .get("host_id")
             .and_then(Value::as_str)
@@ -1026,6 +1109,7 @@ impl HostEncKey {
         Ok(HostEncKey {
             id: uuid("id")?,
             re: uuid("re")?,
+            request_id,
             host_id,
             host_trust_gen,
             enc_key,
@@ -1035,18 +1119,43 @@ impl HostEncKey {
 
     /// The wire message.
     pub fn to_json(&self) -> Value {
-        session(
+        let mut message = session(
             json!({"v": 1, "op": "host_enc_key", "id": self.id, "re": self.re,
             "host_id": self.host_id, "host_trust_gen": self.host_trust_gen,
             "enc_key": self.enc_key.to_json(), "enc_sig": b64u(&self.enc_sig)}),
-        )
+        );
+        if let Some(request_id) = &self.request_id {
+            message["data"]["request_id"] = json!(request_id);
+            message["data"]["state"] = json!(HOST_ENC_KEY_PENDING);
+        }
+        message
     }
 
-    /// Whether this answers the request `request_id` on a channel to
-    /// `host_id` at `host_trust_gen` (the welcome's `atem_device_id` and
-    /// `host_trust_gen`): a key of another host or generation is no answer.
+    /// Whether this answers the `host_enc_key_get` whose `id` is
+    /// `request_id` on a channel to `host_id` at `host_trust_gen` (the
+    /// welcome's `atem_device_id` and `host_trust_gen`): a key of another
+    /// host or generation is no answer, nor is a new key's answer.
     pub fn answers(&self, request_id: &str, host_id: &str, host_trust_gen: u64) -> bool {
-        self.re == request_id && self.host_id == host_id && self.host_trust_gen == host_trust_gen
+        self.request_id.is_none()
+            && self.re == request_id
+            && self.host_id == host_id
+            && self.host_trust_gen == host_trust_gen
+    }
+
+    /// Whether this answers the `host_enc_key_new{id, request_id}` sent on a
+    /// channel to `host_id` at `host_trust_gen`: both of that request's
+    /// ids echoed, from that host at that generation.
+    pub fn answers_new(
+        &self,
+        id: &str,
+        request_id: &str,
+        host_id: &str,
+        host_trust_gen: u64,
+    ) -> bool {
+        self.request_id.as_deref() == Some(request_id)
+            && self.re == id
+            && self.host_id == host_id
+            && self.host_trust_gen == host_trust_gen
     }
 
     /// The `host_enc_key` action a manager drafts from it
@@ -1091,7 +1200,8 @@ pub enum Incoming {
     HostPolicyChanged(Box<crate::session::host_policy::HostPolicyChanged>),
     /// A `control_records_result` (H→C).
     ControlRecordsResult(ControlRecordsResult),
-    /// A `host_enc_key` (H→C), the answer to `host_enc_key_get`.
+    /// A `host_enc_key` (H→C), the answer to `host_enc_key_get` or
+    /// `host_enc_key_new`.
     HostEncKey(Box<HostEncKey>),
     /// Any other message (r8's session ops, terminal-v1, chat-v1).
     Other,
@@ -1663,6 +1773,7 @@ mod tests {
                 host_trust_gen: 2,
                 enc_key: PublicKey::new(Alg::X25519, &[9u8; 32]).unwrap(),
                 enc_sig: vec![7u8; 64],
+                request_id: None,
             }
         }
 
@@ -1790,6 +1901,117 @@ mod tests {
             refused(&|d| d["enc_sig"] = json!(b64u(&[7u8; 63])));
             refused(&|d| d["enc_sig"] = json!(b64u(&[7u8; 65])));
             refused(&|d| d["enc_sig"] = json!("not base64url!"));
+            // A get's answer carries no `request_id` nor `state`.
+            refused(&|d| d["state"] = json!("pending"));
+            refused(&|d| d["request_id"] = json!(NEW_REQUEST));
+        }
+
+        const NEW_REQUEST: &str = "aaaaaaaa-0000-4000-8000-0000000000e3";
+
+        fn pending() -> HostEncKey {
+            HostEncKey {
+                request_id: Some(NEW_REQUEST.into()),
+                ..answer()
+            }
+        }
+
+        /// `host_enc_key_new{id, request_id}` and its answer, the `host_enc_key`
+        /// of a pending key (routine rotation, agreed with Astation on
+        /// 2026-11-23, #120 comment 7089435308): the get's answer with this
+        /// request's `request_id` and `state: "pending"`.
+        #[test]
+        fn host_enc_key_new_round_trip() {
+            let request = host_enc_key_new(ID, NEW_REQUEST);
+            assert_eq!(
+                request,
+                json!({"type": "session", "data": {"v": 1, "op": "host_enc_key_new",
+                    "id": ID, "request_id": NEW_REQUEST}})
+            );
+            assert_eq!(
+                HostEncKeyNew::decode(&bytes(&request)),
+                Ok(HostEncKeyNew {
+                    id: ID.into(),
+                    request_id: NEW_REQUEST.into()
+                })
+            );
+            let sent = pending().to_json();
+            assert_eq!(
+                sent["data"],
+                json!({"v": 1, "op": "host_enc_key", "id": REPLY, "re": ID,
+                    "request_id": NEW_REQUEST, "state": "pending",
+                    "host_id": "host-a", "host_trust_gen": 2,
+                    "enc_key": {"alg": "x25519", "pub": b64u(&[9u8; 32])},
+                    "enc_sig": b64u(&[7u8; 64])})
+            );
+            let read = parse_answer(&sent["data"]).unwrap();
+            assert_eq!(read, pending());
+            // It answers exactly the `host_enc_key_new` it echoes, from the
+            // channel's host at its generation; never a get.
+            assert!(read.answers_new(ID, NEW_REQUEST, "host-a", 2));
+            assert!(!read.answers_new(ID, REPLY, "host-a", 2));
+            assert!(!read.answers_new(REPLY, NEW_REQUEST, "host-a", 2));
+            assert!(!read.answers_new(ID, NEW_REQUEST, "host-b", 2));
+            assert!(!read.answers_new(ID, NEW_REQUEST, "host-a", 1));
+            assert!(!read.answers(ID, "host-a", 2), "no get's answer");
+            assert!(!answer().answers_new(ID, NEW_REQUEST, "host-a", 2));
+            // It drafts the entry as a get's answer does.
+            assert_eq!(
+                read.action(true, 1).unwrap(),
+                answer().action(true, 1).unwrap()
+            );
+        }
+
+        /// The request is read as strictly as a get: exactly `v`, `op`, `id`
+        /// and `request_id`, both UUID v4.
+        #[test]
+        fn the_new_request_is_read_strictly() {
+            let good = host_enc_key_new(ID, NEW_REQUEST);
+            let refused = |f: &dyn Fn(&mut Value)| {
+                let mut m = good.clone();
+                f(&mut m);
+                assert!(HostEncKeyNew::decode(&bytes(&m)).is_err(), "{m}");
+            };
+            refused(&|m| m["data"]["extra"] = json!(1));
+            refused(&|m| m["data"]["v"] = json!(2));
+            refused(&|m| m["data"]["op"] = json!("host_enc_key_get"));
+            for field in ["id", "request_id"] {
+                refused(&|m| m["data"][field] = json!("not-a-uuid"));
+                refused(&|m| m["data"][field] = json!("6ba7b810-9dad-51d1-80b4-00c04fd430c8"));
+                refused(&|m| m["data"][field] = json!(null));
+                refused(&|m| {
+                    m["data"].as_object_mut().unwrap().remove(field);
+                });
+            }
+            refused(&|m| m["type"] = json!("terminal"));
+            let dup = format!(
+                r#"{{"type":"session","data":{{"v":1,"op":"host_enc_key_new","id":"{ID}","request_id":"{NEW_REQUEST}","request_id":"{REPLY}"}}}}"#
+            );
+            assert!(HostEncKeyNew::decode(dup.as_bytes()).is_err());
+            // A get is no new request, nor the other way round.
+            assert!(HostEncKeyNew::decode(&bytes(&host_enc_key_get(ID))).is_err());
+            assert!(HostEncKeyGet::decode(&bytes(&good)).is_err());
+        }
+
+        /// The pending answer: `request_id` and `state` both or neither, the
+        /// state `pending` only.
+        #[test]
+        fn the_pending_answer_is_read_strictly() {
+            let good = pending().to_json()["data"].clone();
+            let refused = |f: &dyn Fn(&mut Value)| {
+                let mut d = good.clone();
+                f(&mut d);
+                assert!(parse_answer(&d).is_err(), "{d}");
+            };
+            for field in ["request_id", "state"] {
+                refused(&|d| {
+                    d.as_object_mut().unwrap().remove(field);
+                });
+                refused(&|d| d[field] = json!(null));
+            }
+            refused(&|d| d["state"] = json!("current"));
+            refused(&|d| d["state"] = json!("Pending"));
+            refused(&|d| d["request_id"] = json!("not-a-uuid"));
+            refused(&|d| d["extra"] = json!(1));
         }
     }
 

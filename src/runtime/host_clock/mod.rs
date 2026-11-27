@@ -115,6 +115,83 @@ fn system_reading() -> Option<OsReading> {
     }
 }
 
+/// The delegated clock as last observed, for a reading taken later without
+/// the clock itself (`HostClock::snapshot`): host senders' key stamps (a
+/// device-list commit made between two passes) read `D` fresh from it,
+/// with the latest repair or lowering the record keeps.
+#[derive(Clone)]
+pub struct ClockSnapshot {
+    state: ClockState,
+    read: Reader,
+    last: Option<OsReading>,
+}
+
+impl std::fmt::Debug for ClockSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClockSnapshot")
+            .field("change", &self.change())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ClockSnapshot {
+    /// `D` at a reading taken now (the last reading observed when the
+    /// hook's file has none; none without either).
+    pub fn d_ms(&self) -> Option<u64> {
+        let r = (self.read)().or_else(|| self.last.clone())?;
+        Some(self.state.deadline_ms(&r))
+    }
+
+    /// The latest repair or lowering the record keeps (§11.6): `D` just
+    /// after it.
+    pub fn change(&self) -> Option<u64> {
+        self.state.last_change().map(|c| c.at_ms)
+    }
+
+    /// The clock's mark ([`mark_of`]).
+    pub fn mark(&self) -> u64 {
+        mark_of(&self.state)
+    }
+}
+
+/// The clock's mark: 64 bits of SHA-256 over its record's epoch (drawn at
+/// every fresh start) and its latest repair or lowering, whole. Two
+/// readings share it only when no fresh start, repair or lowering came
+/// between them, the three ways `D` is lowered beyond the follow-downs (a
+/// fresh start: a damaged record started afresh, a record read as none).
+/// Host senders' key stamps keep it (host-work-v1 §11.5, the routine
+/// rotation: a mark that differs at a check retires the previous key at
+/// once).
+pub fn mark_of(state: &ClockState) -> u64 {
+    use sha2::Digest;
+    let bytes = serde_json::to_vec(&(state.epoch(), state.last_change()))
+        .expect("the clock's mark serializes");
+    let digest = sha2::Sha256::digest(&bytes);
+    u64::from_be_bytes(digest[..8].try_into().expect("8 bytes"))
+}
+
+/// A fresh start's epoch (`ClockState::set_epoch`).
+fn new_epoch() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// `D` and the clock's mark at a runtime's start, before the host-work
+/// store opens (the device list's replay of a carriage record at its open):
+/// the clock's record read from the store at `state` (read only) and a
+/// reading taken now, observed as `HostClock` observes one (its
+/// follow-downs included: re-review I1), so `D` is the one the first pass
+/// reads. None without a store, a record, a readable record or a reading.
+pub fn start_reading(state: &std::path::Path) -> Option<(u64, u64)> {
+    start_reading_at(state, &system_reading()?)
+}
+
+/// [`start_reading`] at the reading `r`.
+fn start_reading_at(state: &std::path::Path, r: &OsReading) -> Option<(u64, u64)> {
+    let value = Store::clock_at(state).ok()??;
+    let next = parse(&value).ok()?.observe(r).next;
+    Some((next.deadline_ms(r), mark_of(&next)))
+}
+
 /// What became of a Station's `station_time` ([`HostClock::station_time`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StationTime {
@@ -173,8 +250,11 @@ impl HostClock {
 
     fn with_reader(store: &Store, read: Reader) -> Self {
         let last = read();
+        // A fresh start's epoch, replaced by the record's when one reads.
+        let mut state = ClockState::default();
+        state.set_epoch(new_epoch());
         let mut clock = HostClock {
-            state: ClockState::default(),
+            state,
             last,
             read,
             saved: None,
@@ -206,6 +286,7 @@ impl HostClock {
         match found {
             Ok(None) => {
                 if self.damaged.take().is_some() {
+                    self.state.set_epoch(new_epoch());
                     log("its record reads as none now; it starts afresh".into());
                 }
             }
@@ -331,6 +412,7 @@ impl HostClock {
         match &self.damaged {
             Some(d) if d.aside && r.synced == Synced::Yes => {
                 self.damaged = None;
+                self.state.set_epoch(new_epoch());
                 log(
                     "starts afresh at a synchronized reading; its damaged record stays kept aside"
                         .into(),
@@ -414,6 +496,7 @@ impl HostClock {
             None => verdict(self.persist(store, &r)),
             Some(true) if within_cap => {
                 self.damaged = None;
+                self.state.set_epoch(new_epoch());
                 log(format!(
                     "starts afresh at the Station time {} from {origin} (the wall clock read {}); its damaged record stays kept aside",
                     utc(station_time_ms),
@@ -458,6 +541,16 @@ impl HostClock {
             return Some(if d.aside { DAMAGED } else { DAMAGED_UNKEPT }.to_string());
         }
         status_text(&self.state, self.last.as_ref()?, cfg!(target_os = "macos"))
+    }
+
+    /// The clock as last observed, for a reading taken later (none while its
+    /// record is damaged).
+    pub fn snapshot(&self) -> Option<ClockSnapshot> {
+        self.damaged.is_none().then(|| ClockSnapshot {
+            state: self.state.clone(),
+            read: self.read.clone(),
+            last: self.last.clone(),
+        })
     }
 
     /// A forward jump's anchor is pending (§11.6 "Automatic repair"): `D`
