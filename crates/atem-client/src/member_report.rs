@@ -124,9 +124,15 @@ const CHALLENGE_FIELDS: [&str; 7] = [
     "expires_at",
 ];
 
-/// Why a report, a challenge or a build is refused. `code()` is the
-/// stable name; the verifiers' codes come in [`VERIFY_ORDER`] and
-/// [`SIGNER_VERIFY_ORDER`].
+/// Why a report, a binding proof, a challenge or a build is refused.
+/// `code()` is the stable name; the verifiers' codes come in
+/// [`VERIFY_ORDER`] and [`SIGNER_VERIFY_ORDER`], and a Station binding's
+/// in [`BINDING_VERIFY_ORDER`] (its verifier) and [`BINDING_BUILD_ORDER`]
+/// (the manager's builder; both Atem's proposal, for Astation's
+/// agreement, #120 comment 7207827118).
+///
+/// [`BINDING_VERIFY_ORDER`]: crate::station_binding::BINDING_VERIFY_ORDER
+/// [`BINDING_BUILD_ORDER`]: crate::station_binding::BINDING_BUILD_ORDER
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReportRefusal {
     /// Not exactly a report or a challenge (strict I-JSON, exact fields at
@@ -142,8 +148,12 @@ pub enum ReportRefusal {
     /// `signer` isn't a current native member (`member:`) or a current
     /// service (`service:`) at the log's head: removed or never added,
     /// pending, `recovery`, a host, a grant, or a member of the other kind.
-    /// A signer report's and a Station binding's: anything but a current
-    /// native member.
+    /// A signer report's: anything but a current native member. A Station
+    /// binding's: a `member:` that isn't a current native member (removed
+    /// or never added, pending, `recovery`, a service named as a member);
+    /// any other kind (`service:`, `host:`, `browser:`) is outside its
+    /// grammar, `member:<device_id>` only, and so `Malformed`, unlike the
+    /// reports (Atem's reading of that grammar).
     UnknownSigner,
     /// A signer report's signer is a current native member that never
     /// held `manage` at any `seq` of the log; a Station binding's doesn't
@@ -580,10 +590,10 @@ fn signer_key(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HeldBody {
     label: SignLabel,
-    pub(crate) value: Value,
-    pub(crate) jcs: String,
-    pub(crate) head: Head,
-    pub(crate) signer_key: PublicKey,
+    value: Value,
+    jcs: String,
+    head: Head,
+    signer_key: PublicKey,
 }
 
 impl HeldBody {
@@ -610,6 +620,21 @@ impl HeldBody {
 
     pub(crate) fn signing_input(&self) -> SigningInput {
         SigningInput::new(self.label, self.jcs.as_bytes())
+    }
+
+    /// The body object, read only.
+    pub(crate) fn value(&self) -> &Value {
+        &self.value
+    }
+
+    /// `jcs(body)`, read only.
+    pub(crate) fn jcs(&self) -> &str {
+        &self.jcs
+    }
+
+    /// The signer's key, with its algorithm.
+    pub(crate) fn signer_key(&self) -> &PublicKey {
+        &self.signer_key
     }
 
     /// The signed object: this body with `sig` (P-256 64-byte `r‖s`,

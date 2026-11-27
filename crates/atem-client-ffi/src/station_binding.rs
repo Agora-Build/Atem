@@ -4,14 +4,16 @@
 //! account's Agora.Build owner at a Station. It decides which Agora.Build
 //! account's state controls whether that Station serves the account's
 //! hosts; an unbind needs the same proof as a bind (owner decision
-//! 2026-11-27).
+//! 2026-11-27; Auth/Portal's agreement pending, Portal #41 comment
+//! 7208892757).
 //!
 //! - **The Station** mints the whole body, a single-use challenge, with
 //!   `station_binding_challenge` (a fresh nonce; canonical JSON: store it,
 //!   carry it) and verifies the answer with `verify_station_binding`
 //!   against its log at its current head and the challenge it stored: a
 //!   `VerifiedStationBinding` (**require `at_head`**), or `Report{code}`
-//!   with the first failure in the agreed order. Its token checks, the
+//!   with the first failure in the order of Atem's answer (#120 comment
+//!   7207827118, for Astation's agreement). Its token checks, the
 //!   nonce's single use, a transfer's consent and the commit-time recheck
 //!   stay its own.
 //! - **The manager's app** reads the challenge it received
@@ -24,7 +26,16 @@
 //! The request takes nothing that matters from its caller: the body is the
 //! challenge, and the core checks every field first against the app's
 //! log, its own `member:` id, its configured Station and the Agora.Build
-//! sign-in it was told (`AuthClaims`). The provider sees purpose
+//! sign-in it was told (`AuthClaims`). **Never fill `expected` from the
+//! challenge or anything the Station sent**: take it from the app's own
+//! token, or, for a transfer, from what the user chose before the
+//! challenge was fetched; else `binding_mismatch` can never fire. The
+//! request takes no intended action: before it prompts, the app compares
+//! the challenge's `action` (and, for a transfer, its
+//! `expected_binding.owner`) with what the user started. A `service:`,
+//! `host:` or `browser:` signer is `Report{malformed}` (the grammar is
+//! `member:<device_id>` only), unlike the reports' `unknown_signer`. The
+//! provider sees purpose
 //! `StationBinding`: **a fresh confirmation every time**, never the
 //! 5-minute reuse, never in the background; an owner who cancels gives
 //! `signing_failed`. Show the Station (`origin`), the action, the R9
@@ -34,10 +45,11 @@
 //! <Station> serves this account's hosts." Fetch the challenge right before
 //! the prompt: its lease is at most 30 s.
 //!
-//! Two points are Atem's proposals, for Astation's agreement: `owner` is
-//! named in the `unbound` and `released` states too, and a transfer's
+//! Three points are Atem's proposals, for Astation's agreement: `owner` is
+//! named in the `unbound` and `released` states too; a transfer's
 //! `subject` is compared with the `subject` the app supplies (the new owner
-//! it was shown), as every action's is.
+//! it was shown), as every action's is; and both refusal orders are those
+//! of Atem's answer.
 use std::sync::Arc;
 
 use atem_client::KeyId;
@@ -222,7 +234,7 @@ pub fn parse_station_binding_challenge(challenge_json: String) -> Result<Station
 /// A binding proof waiting for its signature (an immutable handle). Built
 /// from the app's log, the challenge it received, its own identity
 /// (`signer`), its configured Station (`origin`), the Agora.Build sign-in
-/// it was told (`expected`), the key that will sign (`key_id`) and its
+/// it was told (`expected`, never filled from the challenge), the key that will sign (`key_id`) and its
 /// clock: the core checks the challenge then and holds it as the body.
 /// `sign_request()` is what the key signs (purpose `StationBinding`, a
 /// fresh confirmation, built inside the core from the held body);

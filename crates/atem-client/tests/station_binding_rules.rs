@@ -253,6 +253,37 @@ fn a_manager_signs_each_action_and_the_station_verifies_it() {
     }
 }
 
+/// A head whose `seq` is beyond the safe integers is the head's own
+/// malformed part, minted or read.
+#[test]
+fn a_head_beyond_the_safe_integers_is_malformed() {
+    let v = Vectors::load();
+    let log = log_l(&v);
+    let head = Head {
+        seq: atem_client::canonical::MAX_SAFE_INTEGER + 1,
+        hash: log.head().hash,
+    };
+    assert_eq!(
+        StationBindingChallenge::new(
+            BindingAction::Bind,
+            STATION,
+            &claims(OWNER_A),
+            log.account_id(),
+            log.genesis_hash(),
+            head,
+            PHONE,
+            ExpectedBinding::NeverBound,
+            ISSUED,
+            EXPIRES,
+        ),
+        Err(ReportRefusal::Malformed("head"))
+    );
+    let text = bind_fields(&log)
+        .to_string()
+        .replacen(r#""seq":6"#, r#""seq":9007199254740991"#, 1);
+    assert!(StationBindingChallenge::parse(text.as_bytes()).is_ok());
+}
+
 /// Two challenges minted with the same terms differ in their nonce: 32
 /// bytes from the operating system's CSPRNG.
 #[test]
@@ -301,8 +332,10 @@ fn each_minted_challenge_has_a_fresh_nonce() {
     );
 }
 
+/// The orders of Atem's answer (#120 comment 7207827118): Atem's proposal,
+/// for Astation's agreement.
 #[test]
-fn the_orders_are_the_agreed_ones() {
+fn the_orders_are_atems_proposal() {
     assert_eq!(
         BINDING_VERIFY_ORDER,
         [
@@ -603,12 +636,35 @@ fn every_builder_refusal_at_its_place_in_the_order() {
             "{id}"
         );
     }
-    // not_a_manager before stale_log.
+    // not_a_manager before stale_log, unknown_signer before stale_log:
+    // the signer's standing is read before the challenge's head, so a
+    // demoted or removed signer fails on its standing even when the Station
+    // is ahead too.
     let demoted = phone_roles(&book.provider, &log, &[Role::View]);
     let ahead_of_l = with(good.clone(), "head", demoted.head().to_json());
     assert_eq!(
         build(&demoted, &good, PHONE, STATION, &a, NOW),
         Err("not_a_manager")
+    );
+    let beyond_demoted = with(
+        good.clone(),
+        "head",
+        later(&book, &demoted).head().to_json(),
+    );
+    assert_eq!(
+        build(&demoted, &beyond_demoted, PHONE, STATION, &a, NOW),
+        Err("not_a_manager"),
+        "demoted, and the Station ahead of it"
+    );
+    let ipad_ahead = with(
+        with(good.clone(), "signer", json!("member:dev-ipad")),
+        "head",
+        later(&book, &log).head().to_json(),
+    );
+    assert_eq!(
+        build(&log, &ipad_ahead, "member:dev-ipad", STATION, &a, NOW),
+        Err("unknown_signer"),
+        "removed, and the Station ahead of it"
     );
     assert_eq!(
         build(&log, &ahead_of_l, PHONE, STATION, &a, NOW),

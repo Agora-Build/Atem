@@ -518,7 +518,8 @@ unit_enum! {
     /// released R9 account to `subject`; `Transfer` a bound one to
     /// `subject`, the intended new owner; `Unbind` a bound one, `subject`
     /// its current owner (the same proof as a bind: owner decision
-    /// 2026-11-27).
+    /// 2026-11-27; Auth/Portal's agreement pending, Portal #41 comment
+    /// 7208892757).
     pub enum BindingAction {
         Bind,
         Transfer,
@@ -564,6 +565,10 @@ record! {
     /// **seconds**. The app hands `StationBindingRequest` what it was told:
     /// its own token's for a bind or an unbind, and for a transfer the new
     /// owner it was shown (Atem's proposal, for Astation's agreement).
+    /// **Never fill it from the challenge or anything the Station sent**:
+    /// take it from the app's own token, or, for a transfer, from what the
+    /// user chose before the challenge was fetched; else `binding_mismatch`
+    /// can never fire.
     pub struct AuthClaims {
         pub issuer: String,
         pub subject: String,

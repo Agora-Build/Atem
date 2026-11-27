@@ -26,7 +26,9 @@
 //! - `account_id` (1–128 bytes of `[A-Za-z0-9._:-]`), `genesis_hash`
 //!   (lowercase hex), `head` `{seq, hash}`: the R9 account at the Station's
 //!   applied head;
-//! - `signer`: `member:<device_id>` only;
+//! - `signer`: `member:<device_id>` only: a `service:`, `host:` or
+//!   `browser:` signer is `malformed`, unlike the reports' `unknown_signer`
+//!   (Atem's reading of that grammar);
 //! - `expected_binding`: `{"state":"never_bound"}`, or `{"state": "bound" |
 //!   "unbound" | "released", "binding_id", "version", "owner"}`
 //!   ([`ExpectedBinding`]): the record the Station holds;
@@ -38,7 +40,8 @@
 //! `transfer` names `bound` and the intended new owner as `subject`
 //! (`subject ≠ owner`); an `unbind` names `bound` and the current owner as
 //! `subject` (`subject = owner`). An unbind needs the same proof as a bind
-//! or a transfer (owner decision 2026-11-27): it suspends every host of the
+//! or a transfer (owner decision 2026-11-27; Auth/Portal's agreement
+//! pending, Portal #41 comment 7208892757): it suspends every host of the
 //! R9 account at that Station, so a stolen Agora.Build session alone can't
 //! do it. Strict I-JSON, exact fields at every level, no `null`, no
 //! duplicate keys (escaped ones included), a challenge text at most 4,096
@@ -50,7 +53,13 @@
 //!   configured Station and the Agora.Build sign-in it was told
 //!   ([`AuthClaims`]), then holds the challenge as the body; it signs
 //!   through a [`KeyProvider`] ([`sign_station_binding`]) or hands a later
-//!   signature to [`StationBindingRequest::finish`].
+//!   signature to [`StationBindingRequest::finish`]. **Never fill
+//!   `expected` from the challenge or anything the Station sent**: take it
+//!   from the app's own token, or, for a transfer, from what the user chose
+//!   before the challenge was fetched; else `binding_mismatch` can never
+//!   fire. The builder takes no intended action: before it prompts, the
+//!   app compares the challenge's `action` (and, for a transfer, its
+//!   `expected_binding.owner`) with what the user started.
 //! - **The Station** verifies with [`verify_station_binding`] against its
 //!   log at its current head and the challenge it stored, and requires
 //!   `at_head`.
@@ -65,9 +74,11 @@
 //!
 //! **Atem's proposals, for Astation's agreement** (asked in the post):
 //! `owner` is named in the `unbound` and `released` states too, not only in
-//! `bound`; and the builder compares a transfer's `subject`, like every
+//! `bound`; the builder compares a transfer's `subject`, like every
 //! action's, with the `subject` the app supplies in [`AuthClaims`] (the new
-//! owner it was shown).
+//! owner it was shown); and both refusal orders, [`BINDING_VERIFY_ORDER`]
+//! and [`BINDING_BUILD_ORDER`], are those of Atem's answer (#120 comment
+//! 7207827118).
 use serde_json::{Map, Value, json};
 
 use crate::canonical;
@@ -91,7 +102,8 @@ pub const BINDING_TYPE: &str = "atem-station-binding";
 pub const MAX_CLAIM_BYTES: usize = 256;
 
 /// The verifier's refusal codes in the order its checks run: the first
-/// that fails is the code ([`verify_station_binding`]).
+/// that fails is the code ([`verify_station_binding`]). The order of Atem's
+/// answer (#120 comment 7207827118), for Astation's agreement.
 pub const BINDING_VERIFY_ORDER: [&str; 10] = [
     "malformed",
     "frozen",
@@ -106,7 +118,8 @@ pub const BINDING_VERIFY_ORDER: [&str; 10] = [
 ];
 
 /// The builder's refusal codes in the order its checks run
-/// ([`station_binding_request`]).
+/// ([`station_binding_request`]). The order of Atem's answer (#120 comment
+/// 7207827118), for Astation's agreement.
 pub const BINDING_BUILD_ORDER: [&str; 11] = [
     "malformed",
     "frozen",
@@ -291,6 +304,10 @@ impl ExpectedBinding {
 /// its `auth_time` in Unix seconds. The app hands the builder what it was
 /// told: its own token's for a bind or an unbind, and for a transfer the
 /// new owner it was shown (Atem's proposal, for Astation's agreement).
+/// Never fill it from the challenge or anything the Station sent: take it
+/// from the app's own token, or, for a transfer, from what the user chose
+/// before the challenge was fetched; else `binding_mismatch` can never
+/// fire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthClaims {
     pub issuer: String,
@@ -420,6 +437,7 @@ impl StationBindingChallenge {
         let head = o
             .get("head")
             .and_then(Head::from_json)
+            .filter(|h| h.seq <= canonical::MAX_SAFE_INTEGER)
             .ok_or(malformed("head"))?;
         let signer = str_field(o, "signer")?;
         if !member_signer_ok(signer) {
@@ -596,12 +614,12 @@ impl StationBindingRequest {
 
     /// The body object.
     pub fn to_json(&self) -> Value {
-        self.held.value.clone()
+        self.held.value().clone()
     }
 
     /// `jcs(body)`: the challenge's `jcs`.
     pub fn body_json(&self) -> &str {
-        &self.held.jcs
+        self.held.jcs()
     }
 
     /// `enc(["atem-station-binding-v1", jcs(body)])`: what the manager's
@@ -612,7 +630,7 @@ impl StationBindingRequest {
 
     /// The signer's key at the log's head, with its algorithm.
     pub fn signer_key(&self) -> &PublicKey {
-        &self.held.signer_key
+        self.held.signer_key()
     }
 
     /// The proof: this body with `sig` (P-256 64-byte `r‖s`, either S,
@@ -676,7 +694,7 @@ pub fn station_binding_request(
         challenge.head(),
         key,
     )?;
-    debug_assert_eq!(held.jcs, challenge.jcs());
+    debug_assert_eq!(held.jcs(), challenge.jcs());
     Ok(StationBindingRequest {
         challenge: challenge.clone(),
         held,
