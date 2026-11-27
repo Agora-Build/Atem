@@ -2982,7 +2982,9 @@ review.** A disable must reach every account's hosts, including those of an R9 a
       configured Station and the Agora.Build sign-in it was told, and refuses, in this order: `malformed`, `frozen`,
       `wrong_account`, `origin_mismatch`, `signer_mismatch`, `unknown_signer`, `not_a_manager` (no `manage` at its
       own head), `stale_log` or `fork` (a Station ahead of the signer means fetch first), `binding_mismatch`
-      (`issuer`, `subject` or `auth_time` other than it was told), `expired`. It returns an immutable request.
+      (`issuer`, `subject` or `auth_time` other than it was told), `expired`. It returns an immutable request. It
+      takes no intended action: before it prompts, the app compares the challenge's `action` (and, for a transfer,
+      its `expected_binding.owner`) with what the user started.
     - **The Station's verifier** (`verify_station_binding(log, proof, expected challenge, now_ms)`) reads membership
       and keys at its own head and refuses, in this order: `malformed`, `frozen`, `wrong_account`,
       `unknown_signer`, `not_a_manager` (at the verifier's head), `bad_signature`, `stale_log`, `fork`,
@@ -2996,7 +2998,11 @@ review.** A disable must reach every account's hosts, including those of an R9 a
     - **Atem's proposals, for Astation's agreement** (asked in the post): `owner` is named in the `unbound` and
       `released` states too, not only in `bound`; and the builder compares a transfer's `subject`, as every
       action's, with the `subject` the app supplies (the new owner it was shown). Which session makes a transfer
-      request is Astation's question to answer.
+      request is Astation's question to answer. Either way, **never fill `expected` from the challenge or anything
+      the Station sent; take it from the app's own token, or, for a transfer, from what the user chose before the
+      challenge was fetched**: else `binding_mismatch` can never fire. Both refusal orders above are Atem's
+      proposal too, and so is reading a `service:`, `host:` or `browser:` signer as `malformed` (the grammar is
+      `member:<device_id>` only), where the reports answer `unknown_signer`.
     - **The host-side link** of a room to an R9 account is R9.7b's route proof (`atem-host-route`,
       `atem-host-route-proxy`), (a)'s proved routes. The host signs nothing about Agora.Build ownership.
   - **When.** Astation creates it automatically at its next sign-in to the built-in Station, with the manager's
@@ -3041,7 +3047,8 @@ The transitions:
   authentication (`subject` = `owner`) and a current manager's fresh confirmation (`atem-station-binding`, `action`
   `unbind`), since an unbind suspends every host of the R9 account at that Station and a stolen Agora.Build session
   alone must not do it. Account deletion unbinds with no proof; D27's admin release is the Portal's authenticated
-  `binding_released`, never a manager proof. This also needs Auth/Portal's agreement (Portal #41);
+  `binding_released`, never a manager proof. This also needs Auth/Portal's agreement (pending, Portal #41 comment
+  7208892757);
 - **bound(A) → released:** an admin releases the binding of a lost account, through the Portal ("Releasing a binding"
   below);
 - **unbound or released → bound(B) (or A again):** only with the binding's proofs: a fresh native-manager proof and
@@ -3154,7 +3161,7 @@ I.9) and Astation.
 | 13 | Prompt framing: a per-prompt tag, counted blocks, escaped marker lines (matched after Cf removal, Unicode line separators, NFKC and lowercasing, and on a UTS #39 confusables skeleton), the shared core's size check. **Amended after agreement, 2026-11-09/10, #120 comment 6751584108.** The four stricter folding rules, Unicode 18.0.0 for all folding data, the snapshot wording, the mark line, the narrowed rule line, the final size figures; the live tag for `control` holders only | III.2 | Atem (released prompt text; senders see refusals near the bound) |
 | 14 | Directory records signed by the host key (optional); the typed `select` and snapshot boundary for host senders. **Amended by owner decision, 2026-11-15:** the first version addresses hosts through the device list (`project:<name>`, `atem:<atem_id>[/<route_id>]`); only label discovery and display wait for the directory | II.6 | Atem, Astation |
 | 15 | Features `host.delegated`, `host.alerts`, `host.senders` | V.1 | All |
-| 16 | **For Auth/Portal and Astation review; a joint design, not yet a contract.** Service enforcement for disabled Agora.Build accounts: **changed after Astation's review:** the durable service-owner lookup Astation builds, with the migration of existing rooms and unknown ownership never counted as enabled (**owner decision 2026-11-08:** legacy rooms still unknown are refused until claimed, owner choice 20); the proof-based binding (its single-use challenge, `atem-station-binding-v1` with a fresh confirmation, the token checks; **its bytes are Atem's answer on #120 comment 7207827118, built in the shared core with its bindings and the vectors `r9-vectors-station-binding`, Astation's three examples verbatim among them; a voluntary unbind needs the same proof, owner decision 2026-11-27; `owner` in every recorded state and a transfer's `subject` checked against the app's are Atem's proposals, for Astation's agreement**) and one service-ownership lifecycle (never bound, bound, unbound or released, transfers, a binding that moves only the binding account's or ownerless rooms and is refused while any room resolves to a disabled account, `binding_changed` reports, the admin-site "Release R9 binding" through D27's Portal admin API and `binding_released{account, binding_id, version}`); account-level `account_disabled` / `account_enabled` rows in Auth's change feed and in the Portal's Station feed to the built-in Station only; the built-in Station's enforcement points and least-disclosure close code; stage-3 services for bound accounts only; restarts and re-enabling; the `service_suspended` close code | III.5 | Auth/Portal, Astation |
+| 16 | **For Auth/Portal and Astation review; a joint design, not yet a contract.** Service enforcement for disabled Agora.Build accounts: **changed after Astation's review:** the durable service-owner lookup Astation builds, with the migration of existing rooms and unknown ownership never counted as enabled (**owner decision 2026-11-08:** legacy rooms still unknown are refused until claimed, owner choice 20); the proof-based binding (its single-use challenge, `atem-station-binding-v1` with a fresh confirmation, the token checks; **its bytes are Atem's answer on #120 comment 7207827118, built in the shared core with its bindings and the vectors `r9-vectors-station-binding`, Astation's three examples verbatim among them; a voluntary unbind needs the same proof, owner decision 2026-11-27, Auth/Portal's agreement pending (Portal #41 comment 7208892757); `owner` in every recorded state and a transfer's `subject` checked against the app's are Atem's proposals, for Astation's agreement**) and one service-ownership lifecycle (never bound, bound, unbound or released, transfers, a binding that moves only the binding account's or ownerless rooms and is refused while any room resolves to a disabled account, `binding_changed` reports, the admin-site "Release R9 binding" through D27's Portal admin API and `binding_released{account, binding_id, version}`); account-level `account_disabled` / `account_enabled` rows in Auth's change feed and in the Portal's Station feed to the built-in Station only; the built-in Station's enforcement points and least-disclosure close code; stage-3 services for bound accounts only; restarts and re-enabling; the `service_suspended` close code | III.5 | Auth/Portal, Astation |
 
 ## V. Compatibility and rollout
 
