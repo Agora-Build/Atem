@@ -79,6 +79,8 @@ struct Rig {
     link: Cell<u64>,
     via: Via,
     delegated: bool,
+    /// `host.senders` too (with `delegated`).
+    senders: bool,
     relay_url: String,
     fake: PathBuf,
 }
@@ -97,6 +99,12 @@ impl Rig {
     /// A verified host whose pinned list is the Mac, this host, the phone
     /// and [`SVC`]; `delegated`: the `host.delegated` hook on.
     fn start(via: Via, delegated: bool) -> Rig {
+        Rig::start_with(via, delegated, false)
+    }
+
+    /// [`Rig::start`]; `senders`: `host.senders` on too (the Station's
+    /// heads carry the host's mailbox).
+    fn start_with(via: Via, delegated: bool, senders: bool) -> Rig {
         let sandbox = Sandbox::new();
         write_verified_pairing(&sandbox.config(), ACCOUNT, HOST, 1);
         let host_seed = secret("suspended host");
@@ -145,6 +153,7 @@ impl Rig {
         };
         let mut station = FakeStation::new(&astation, &relay_url, &log, HOST, 1);
         station.silence_heads(true);
+        station.host_lists_senders(senders);
         let clock = HostClock::start(sandbox.dir.path(), "host-clock");
         let mut rig = Rig {
             sandbox,
@@ -158,6 +167,7 @@ impl Rig {
             link: Cell::new(0),
             via,
             delegated,
+            senders,
             relay_url,
             fake,
         };
@@ -175,7 +185,12 @@ impl Rig {
         let mut command = Command::new(env!("CARGO_BIN_EXE_atem"));
         command.env_clear();
         if self.delegated {
-            command.env("ATEM_TEST_HOST_FEATURES", "host.delegated");
+            let features = if self.senders {
+                "host.delegated,host.senders"
+            } else {
+                "host.delegated"
+            };
+            command.env("ATEM_TEST_HOST_FEATURES", features);
         }
         let local = match self.via {
             Via::Local => self.astation.url.clone(),
@@ -339,6 +354,15 @@ impl Rig {
         self.sandbox.atem(&["status"]).0
     }
 
+    /// `atem status`'s value of `label` now.
+    fn status_value(&self, label: &str) -> String {
+        self.status()
+            .lines()
+            .find_map(|l| l.strip_prefix(label))
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default()
+    }
+
     /// The host-work store.
     fn db(&self) -> rusqlite::Connection {
         support::delegated::host_db(self)
@@ -347,10 +371,14 @@ impl Rig {
     /// Everything of the host's trust and state that a suspension must
     /// never move (III.5): the state dump's identity and device list (its
     /// head, standing, members, control generations, recovery key), the
-    /// pinned device list file, the host trust generation and its floor,
-    /// the host's `host_channel_key`, the pairing record, the session
-    /// journal's principals; with the hook, the control parts, the feeds'
-    /// cursors and the reset marks.
+    /// pinned device list file and its carriage, intent, freeze and fault
+    /// files, the frozen genesis and the revoked grants' floor, the
+    /// journal's device-list files, the host trust generation and its
+    /// floor, the host's `host_channel_key`, the pairing record, the
+    /// session journal's principals; with the hook, the control parts, the
+    /// feeds' cursors and the reset marks; with `host.senders`, the
+    /// mailbox's cursor and owed dones. (The acknowledgments' book is reset
+    /// in memory by design: its rows go again.)
     fn kept(&self) -> Value {
         let config = self.sandbox.config();
         let read = |path: &Path| std::fs::read(path).ok().map(hex);
@@ -380,6 +408,21 @@ impl Rig {
             .collect()
         };
         let dump = self.dump();
+        let membership_files: Vec<Option<String>> = [
+            "pairing/membership.carriage",
+            "pairing/membership.intent",
+            "pairing/membership.freeze",
+            "pairing/membership.fault",
+            "pairing/frozen_genesis",
+            "pairing/revoked_floor",
+            "runtime/journal/membership_applied",
+            "runtime/journal/membership_deferred",
+            "runtime/journal/membership_fault",
+            "runtime/journal/frozen_genesis",
+        ]
+        .iter()
+        .map(|f| read(&config.join(f)))
+        .collect();
         json!({
             // The state dump's (ATEM_TEST_STATE_DUMP): the host's identity
             // and trust generation, the device list's head, applied head,
@@ -387,6 +430,7 @@ impl Rig {
             "dump_host": dump["host"],
             "dump_membership": dump["membership"],
             "membership": read(&config.join("pairing/membership.json")),
+            "membership_files": membership_files,
             "trust_gen": read(&config.join("pairing/trust_gen")),
             "trust_gen_floor": read(&config.join("cred/trust_gen_floor")),
             "host_channel_key": read(&config.join("pairing/host_channel_key")),
@@ -396,6 +440,8 @@ impl Rig {
             "control_feeds": rows("SELECT * FROM control_feeds"),
             "control_resets": rows("SELECT * FROM control_resets"),
             "control_unread": rows("SELECT * FROM control_unread"),
+            "mailbox_cursor": rows("SELECT * FROM mailbox_cursor"),
+            "mailbox_dones": rows("SELECT * FROM mailbox_dones"),
         })
     }
 }
@@ -562,7 +608,12 @@ fn with_the_hook_off_the_host_shows_the_text_drops_the_link_after_10_s_and_retri
     let old = rig.link();
     let suspended_at = Instant::now();
     rig.station().suspend_leaving_the_link(TEXT);
-    rig.status_line("Relay:", &format!("routed via relay"));
+    // The link still up: the text inside its parentheses.
+    rig.within("the routed line's text", || {
+        let relay = rig.status_value("Relay:");
+        relay.starts_with("routed via relay (")
+            && relay.ends_with(&format!("; no Astation; {SHOWN})"))
+    });
     // Dropped by the host, 10 s after the notice.
     rig.within("the host dropped the link", || {
         matches!(rig.relay_event(Duration::from_millis(100)), Some(RelayEvent::Closed(n)) if n == old)
@@ -651,15 +702,21 @@ fn a_router_close_for_a_suspended_service_fences_only_its_channel() {
     ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
 )]
 fn on_the_local_link_a_suspension_keeps_the_link() {
-    let rig = Rig::start(Via::Local, true);
-    rig.append(SVC, ControlAction::Cover);
+    let rig = Rig::start_with(Via::Local, true, true);
+    let cover = rig.append(SVC, ControlAction::Cover);
     rig.online();
     rig.status_line("Relay:", "connected locally");
+    rig.within("the cover's ack", || rig.acks_naming(&cover) == 1);
+    let mailbox = |rig: &Rig| rig.dump()["station"]["mailbox"].clone();
+    rig.within("the mailbox read", || mailbox(&rig)["open"] == true);
     let kept = rig.kept();
     rig.station().suspend(TEXT, &[]);
     rig.within("the gate closed", || {
         rig.dump()["station"]["feed"]["suspensions"] == 1 && !rig.gate_open()
     });
+    // As a refusal of every call kind: the acks and the dones held.
+    assert_eq!(rig.dump()["station"]["acks"]["held"], true);
+    assert_eq!(mailbox(&rig)["dones_refused"], true);
     rig.status_line("Relay:", &format!("connected locally ({SHOWN})"));
     rig.status_line(
         "Control feeds:",
@@ -689,9 +746,17 @@ fn on_the_local_link_a_suspension_keeps_the_link() {
     // Control feeds line's alert summary still names it as the run's
     // latest alert).
     rig.within("the text lifted", || {
-        rig.status()
-            .lines()
-            .any(|l| l.trim_end() == "Relay:          connected locally")
+        rig.status_value("Relay:") == "connected locally"
     });
     rig.status_line("Control feeds:", "revocations checked");
+    // Review M2: the holds end with the Station serving the link again:
+    // the cover's ack, sent on the suspended connection, goes again on the
+    // same local link, once, and the mailbox's dones may go.
+    rig.within("the cover's ack again", || rig.acks_naming(&cover) == 2);
+    rig.within("the dones' hold ended", || {
+        mailbox(&rig)["dones_refused"] == false
+    });
+    assert_eq!(rig.dump()["station"]["acks"]["held"], false);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(rig.acks_naming(&cover), 2, "exactly once");
 }
