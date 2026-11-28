@@ -1169,7 +1169,7 @@ const ACKS = readdirSync(fixturesDir)
   .sort();
 for (const name of ACKS) {
   check(`Station acks: ${name} through AckLedgerHandle`, () => {
-    eq(ACKS.length, 7, "the acknowledgment fixtures");
+    eq(ACKS.length, 8, "the acknowledgment fixtures");
     const f = load(name);
     const setup = f.setup;
     const st = setup.station;
@@ -1178,7 +1178,15 @@ for (const name of ACKS) {
     let now = setup.station_now_ms;
     let clientId = setup.report_client_id;
     const input = (on, step) => {
-      if (step.control_record !== undefined) return on.record(ctlRecord(step.control_record), step.revoked_at_ms ?? now, step.covered_hosts, now);
+      // No revoked_at_ms: no authenticated original time.
+      if (step.control_record !== undefined) return on.record(ctlRecord(step.control_record), step.revoked_at_ms, step.covered_hosts, now);
+      if (step.learn_revoked_at !== undefined) {
+        if (step.refused !== undefined) {
+          throwsCode(() => on.learnRevokedAt(step.learn_revoked_at, step.revoked_at_ms, now), step.refused);
+          return undefined;
+        }
+        return on.learnRevokedAt(step.learn_revoked_at, step.revoked_at_ms, now);
+      }
       if (step.control_ack !== undefined) {
         const link = linkOf(setup.links[step.link]);
         if (step.refused !== undefined) {
@@ -1201,8 +1209,12 @@ for (const name of ACKS) {
     const sendable = (id) => {
       if (!ledger.pendingReports().some((i) => i.reportId === id)) throw new Error(`${id} is not sendable`);
     };
-    for (const step of f.steps) {
-      if ("control_record" in step || "control_ack" in step || "tick" in step) {
+    // A branch is another history from the committed state, kept apart:
+    // its steps between a save and a restore of the Station.
+    const flat = (steps) => steps.flatMap((s) => ("branch" in s ? [{ branch_start: true }, ...flat(s.branch), { branch_end: true }] : [s]));
+    const saved = [];
+    for (const step of flat(f.steps)) {
+      if ("control_record" in step || "control_ack" in step || "learn_revoked_at" in step || "tick" in step) {
         const t = input(ledger, step);
         if (t === undefined) continue;
         made(t, step);
@@ -1215,6 +1227,31 @@ for (const name of ACKS) {
         made(t1, step.replica);
         commit(t1);
         eq(input(m.AckLedgerHandle.fromJson(committed), step.replica).made, [], `${name} the replica that lost`);
+      } else if ("either_order" in step) {
+        // Two Stations take the two inputs in either order: the same next
+        // state and the same reports; the first commits.
+        const both = (x, y) => {
+          const t1 = input(m.AckLedgerHandle.fromJson(committed), x);
+          const t2 = input(t1.next, y);
+          return [t2.next, [...t1.made, ...t2.made].map((i) => i.reportId)];
+        };
+        const [x, y] = step.either_order;
+        const [n1, m1] = both(x, y);
+        const [n2, m2] = both(y, x);
+        eq(n1.toJson(), n2.toJson(), `${name} either order's states`);
+        eq(m1, m2, `${name} either order's reports`);
+        eq(m1, step.made, `${name} made`);
+        committed = n1.toJson();
+        ledger = n1;
+      } else if ("branch_start" in step) {
+        saved.push([ledger, committed, now, clientId]);
+        ledger = m.AckLedgerHandle.fromJson(committed);
+      } else if ("branch_end" in step) {
+        [ledger, committed, now, clientId] = saved.pop();
+      } else if ("expect_start" in step) {
+        // Each revocation's start, as the state keeps it.
+        const starts = Object.fromEntries(Object.entries(JSON.parse(ledger.toJson()).revocations).map(([p, r]) => [p, r.revoked_at_ms]));
+        eq(canon(starts), canon(step.expect_start), `${name} starts`);
       } else if ("advance_ms" in step) {
         now += step.advance_ms;
       } else if ("restart" in step) {
@@ -1332,6 +1369,8 @@ check("Station acks: a call never changes its handle; the state loads only as wr
   throwsCode(() => l.ack({ ...linkB, hostID: "host-b" }, ack, nowMs), "malformed");
   throwsCode(() => l.ack(linkB, ack.replaceAll("host-b", "host-c"), nowMs), "not_the_link");
   throwsCode(() => l.record(ctlRecord("P4_unknown_field"), 0, [], nowMs), "unknown_field");
+  throwsCode(() => l.learnRevokedAt("service:svc-discord", 2 ** 53, nowMs), "malformed");
+  throwsCode(() => l.learnRevokedAt("service:svc-other", 0, nowMs), "unknown_revocation");
 });
 check("Station calls: fixture acks read and write back; pages, heads and fetches round-trip; builders refuse what readers refuse", () => {
   for (const name of ACKS) {

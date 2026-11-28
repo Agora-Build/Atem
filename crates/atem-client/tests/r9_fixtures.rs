@@ -38,7 +38,7 @@ use atem_client::push::{
 };
 use atem_client::session::wire::{self, Envelope};
 use atem_client::{KeyId, SignedObject};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use support::host::{HostConn, HostCore, HostSession};
 use support::*;
 
@@ -457,8 +457,8 @@ impl AckRun {
         &self.report.name
     }
 
-    /// The transition an input step makes on `ledger`: a record, an ack
-    /// or a tick, at the Station's clock.
+    /// The transition an input step makes on `ledger`: a record, an ack,
+    /// a learned original time or a tick, at the Station's clock.
     fn input(&self, ledger: &AckLedger, step: &Value) -> Option<LedgerTransition> {
         if let Some(label) = step.get("control_record") {
             let label = label.as_str().unwrap();
@@ -469,9 +469,8 @@ impl AckRun {
                 .iter()
                 .map(|h| h.as_str().unwrap().to_owned())
                 .collect();
-            let revoked_at = step
-                .get("revoked_at_ms")
-                .map_or(self.now, |v| v.as_u64().unwrap());
+            // No `revoked_at_ms`: no authenticated original time.
+            let revoked_at = step.get("revoked_at_ms").map(|v| v.as_u64().unwrap());
             let t = ledger.record(rec, revoked_at, &covered, self.now);
             return Some(t.unwrap_or_else(|e| panic!("{}: record {label}: {e}", self.name())));
         }
@@ -491,6 +490,19 @@ impl AckRun {
                     None
                 }
                 None => Some(t.unwrap_or_else(|e| panic!("{}: ack: {e}", self.name()))),
+            };
+        }
+        if let Some(principal) = step.get("learn_revoked_at") {
+            let principal = principal.as_str().unwrap();
+            let at = step["revoked_at_ms"].as_u64().unwrap();
+            let t = ledger.learn_revoked_at(principal, at, self.now);
+            return match step.get("refused") {
+                Some(code) => {
+                    let e = t.expect_err("refused");
+                    assert_eq!(Some(e.code()), code.as_str(), "{}", self.name());
+                    None
+                }
+                None => Some(t.unwrap_or_else(|e| panic!("{}: learn: {e}", self.name()))),
             };
         }
         if step.get("tick").is_some() {
@@ -536,14 +548,21 @@ impl AckRun {
 
     /// Every step kind and the keys it takes (an unknown step or key
     /// fails the run).
-    const KINDS: [(&'static str, &'static [&'static str]); 16] = [
+    const KINDS: [(&'static str, &'static [&'static str]); 20] = [
         (
             "control_record",
             &["revoked_at_ms", "covered_hosts", "made", "commit"],
         ),
         ("control_ack", &["link", "made", "commit", "refused"]),
+        (
+            "learn_revoked_at",
+            &["revoked_at_ms", "made", "commit", "refused"],
+        ),
         ("tick", &["made", "commit"]),
         ("replica", &[]),
+        ("either_order", &["made"]),
+        ("branch", &[]),
+        ("expect_start", &[]),
         ("advance_ms", &[]),
         ("restart", &[]),
         ("expect_report", &[]),
@@ -577,7 +596,7 @@ impl AckRun {
 
     fn step(&mut self, step: &Value) {
         match self.kind_of(step) {
-            "control_record" | "control_ack" | "tick" => {
+            "control_record" | "control_ack" | "learn_revoked_at" | "tick" => {
                 let Some(t) = self.input(&self.ledger, step) else {
                     self.report.pass();
                     return;
@@ -610,6 +629,87 @@ impl AckRun {
                 let t = self.input(&again, inner).unwrap();
                 assert_eq!(t.made, vec![], "{}: the replica that lost", self.name());
                 assert_eq!(t.next.to_json(), self.committed, "{}", self.name());
+            }
+            "either_order" => {
+                // Two Stations load the committed state; one takes the
+                // inputs in their order, the other in the reverse: the same
+                // next state, byte for byte, and the same reports made by
+                // the two together. The first commits.
+                let inner = step["either_order"].as_array().unwrap();
+                assert_eq!(inner.len(), 2, "{}", self.name());
+                for i in inner {
+                    let kind = self.kind_of(i);
+                    assert!(
+                        ["control_record", "control_ack", "learn_revoked_at", "tick"]
+                            .contains(&kind)
+                            && i.get("made").is_none(),
+                        "{}: {i}",
+                        self.name()
+                    );
+                }
+                let both = |x: &Value, y: &Value| {
+                    let l = AckLedger::from_json(&self.committed).unwrap();
+                    let t1 = self.input(&l, x).unwrap();
+                    let t2 = self.input(&t1.next, y).unwrap();
+                    let made: Vec<String> = t1
+                        .made
+                        .iter()
+                        .chain(&t2.made)
+                        .map(|i| i.report_id.clone())
+                        .collect();
+                    (t2.next, made)
+                };
+                let (n1, m1) = both(&inner[0], &inner[1]);
+                let (n2, m2) = both(&inner[1], &inner[0]);
+                assert_eq!(
+                    jcs(&n1.to_json()).unwrap(),
+                    jcs(&n2.to_json()).unwrap(),
+                    "{}: either order",
+                    self.name()
+                );
+                assert_eq!(m1, m2, "{}: either order", self.name());
+                assert_eq!(json!(m1), step["made"], "{}: made by {step}", self.name());
+                self.committed = n1.to_json();
+                self.ledger = n1;
+            }
+            "branch" => {
+                // Another history: a Station that loads the committed state
+                // and goes on alone through these steps; nothing of it
+                // (state, clock, report client ID, the Portal's records)
+                // reaches this one.
+                let saved = (
+                    self.ledger.clone(),
+                    self.committed.clone(),
+                    self.now,
+                    self.client_id.clone(),
+                    self.portal.clone(),
+                );
+                self.ledger = AckLedger::from_json(&self.committed).unwrap();
+                for inner in step["branch"].as_array().unwrap() {
+                    self.step(inner);
+                }
+                (
+                    self.ledger,
+                    self.committed,
+                    self.now,
+                    self.client_id,
+                    self.portal,
+                ) = saved;
+            }
+            "expect_start" => {
+                // Each revocation's start, as the state keeps it.
+                let starts: Map<String, Value> = self.ledger.to_json()["revocations"]
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(p, r)| (p.clone(), r["revoked_at_ms"].clone()))
+                    .collect();
+                assert_eq!(
+                    Value::Object(starts),
+                    step["expect_start"],
+                    "{}",
+                    self.name()
+                );
             }
             "advance_ms" => self.now += step["advance_ms"].as_u64().unwrap(),
             "restart" => {
@@ -1261,7 +1361,7 @@ fn r9_control_ack_scenarios() {
         .map(|n| n.trim_end_matches(".json").to_owned())
         .collect();
     names.sort();
-    assert_eq!(names.len(), 7, "{names:?}");
+    assert_eq!(names.len(), 8, "{names:?}");
     let mut passed = 0;
     for name in &names {
         let file = load(name);
@@ -1403,7 +1503,9 @@ fn replacement_feed_acks_are_the_hosts_results_and_settle_a_fresh_ledger() {
     let mut ledger = AckLedger::new(&origin, ACCOUNT, genesis_hash()).unwrap();
     let hosts = ["host-b".to_owned(), "host-c".to_owned()];
     for label in snapshot {
-        let t = ledger.record(&record(label), now, &hosts, now).unwrap();
+        let t = ledger
+            .record(&record(label), Some(now), &hosts, now)
+            .unwrap();
         assert!(t.made.is_empty());
         ledger = t.next;
     }

@@ -1157,7 +1157,7 @@ impl FakeStation {
         if !self.other_on {
             let now = self.now();
             let covered = [self.host_id.clone()];
-            if let Ok(t) = self.ledger.record(&record, now, &covered, now) {
+            if let Ok(t) = self.ledger.record(&record, Some(now), &covered, now) {
                 self.ledger = t.next;
             }
         }

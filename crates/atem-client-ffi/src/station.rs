@@ -35,8 +35,8 @@
 //! `Invalid{code}` (the relay's `too_large`, `not_strict`, `wrong_message`,
 //! `unknown_field`, `malformed`; a record's parse codes; the ledger's
 //! `incomplete_link`, `not_the_link`, `other_account`, `other_station`,
-//! `not_the_record`, `record_id_reused`); a state that doesn't load is
-//! `Stored{code}`.
+//! `not_the_record`, `record_id_reused`, `unknown_revocation`); a state
+//! that doesn't load is `Stored{code}`.
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -542,10 +542,10 @@ pub fn report_answer(status: u16) -> ReportAnswerKind {
 /// (`revocation_applied` per host and integration, `revoked` per
 /// revocation) and the native-signed records still to re-sign.
 ///
-/// **A handle never changes.** `record`, `ack`, `tick`, `confirm`,
-/// `refuse`, `stop_reporting` and `resume_reporting` return an
-/// `AckTransition`; the handle they were called on stays as it was, so it
-/// is safe to share across threads.
+/// **A handle never changes.** `record`, `learn_revoked_at`, `ack`,
+/// `tick`, `confirm`, `refuse`, `stop_reporting` and `resume_reporting`
+/// return an `AckTransition`; the handle they were called on stays as it
+/// was, so it is safe to share across threads.
 ///
 /// **Persistence.** In one transaction, store `next.to_json()` (it holds
 /// every report not yet settled). Only once it committed, use `next`, then
@@ -685,16 +685,19 @@ impl AckLedgerHandle {
     /// parser reads it), before it serves it, at `now_ms`. For the
     /// Station's own `revoke` (signed with the integration's service key),
     /// the first of its principal starts the revocation: `revoked_at_ms` is
-    /// when the Portal revoked the integration (the deadline's start, but at
-    /// most an hour after the record's `issued_at`: the start kept is
-    /// `min(revoked_at_ms, issued_at + 1 hour)`) and `covered_hosts` the
-    /// hosts its grant covered. For any other record `revoked_at_ms` is
-    /// unused and `covered_hosts` are the hosts its re-sign alert waits
-    /// for. The same record again changes nothing.
+    /// when the Portal revoked the integration, an authenticated original
+    /// time (the deadline's start, but at most an hour after the record's
+    /// `issued_at`: the start kept is `min(revoked_at_ms, issued_at + 1
+    /// hour)`), or none when you have none (a late start, a legacy row):
+    /// the start is then the record's `issued_at` (late, never early; never
+    /// pass `now`, 0 or a guess), and `learn_revoked_at` lowers it later.
+    /// `covered_hosts` are the hosts its grant covered. For any other
+    /// record `revoked_at_ms` is unused and `covered_hosts` are the hosts
+    /// its re-sign alert waits for. The same record again changes nothing.
     pub fn record(
         &self,
         record_json: String,
-        revoked_at_ms: u64,
+        revoked_at_ms: Option<u64>,
         covered_hosts: Vec<String>,
         now_ms: u64,
     ) -> Result<AckTransition> {
@@ -703,6 +706,34 @@ impl AckLedgerHandle {
             &record,
             revoked_at_ms,
             &covered_hosts,
+            now_ms,
+        )?))
+    }
+
+    /// An authenticated original revocation time of `principal`
+    /// (`service:<id>`) learned after its own revoke was recorded (the
+    /// integration's `revokedAt`, from a checkpoint or the feed), at
+    /// `now_ms`: it only lowers the start (`min(start, revoked_at_ms)`; an
+    /// equal or later time changes nothing; at the same `now_ms`, two learns
+    /// give the same state in either order); a date that ends the window
+    /// makes the final at once, after the per-host reports already made.
+    /// After the final it still lowers the stored start, but makes no report
+    /// and changes no report or the final: no report changes and none is
+    /// sent twice. The reports and their ids don't change. `Invalid{code}`:
+    /// `malformed` for a value above 2^53 − 1, `unknown_revocation` for a
+    /// principal with no own revoke recorded: keep the date, and pass it to
+    /// `record`, or learn it again once the own revoke is committed (another
+    /// replica may have just recorded it, as with any lost
+    /// compare-and-swap).
+    pub fn learn_revoked_at(
+        &self,
+        principal: String,
+        revoked_at_ms: u64,
+        now_ms: u64,
+    ) -> Result<AckTransition> {
+        Ok(transition(self.ledger.learn_revoked_at(
+            &principal,
+            revoked_at_ms,
             now_ms,
         )?))
     }
@@ -729,7 +760,8 @@ impl AckLedgerHandle {
     }
 
     /// The Station's timer at `now_ms`: a revocation whose deadline (24 h
-    /// after its start, `record`'s clamped `revoked_at_ms`) passed gets its
+    /// after its start: `record`'s clamped `revoked_at_ms`, or the own
+    /// revoke's `issued_at`, lowered by `learn_revoked_at`) passed gets its
     /// `revoked` report.
     pub fn tick(&self, now_ms: u64) -> AckTransition {
         transition(self.ledger.tick(now_ms))

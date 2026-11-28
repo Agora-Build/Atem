@@ -1420,7 +1420,7 @@ fun main(args: Array<String>) {
     val ackNames = dir.list()!!.filter { it.startsWith("r9-control-ack-") && it.endsWith(".json") }
         .map { it.removeSuffix(".json") }.sorted()
     for (name in ackNames) check("Station acks: $name through AckLedgerHandle") {
-        eq(ackNames.size, 7, "the acknowledgment fixtures")
+        eq(ackNames.size, 8, "the acknowledgment fixtures")
         val f = load(name)
         val setup = f["setup"]
         val st = setup["station"]
@@ -1431,8 +1431,16 @@ fun main(args: Array<String>) {
         fun input(on: AckLedgerHandle, step: Any?): AckTransition? {
             val o = step.obj()
             return when {
+                // No revoked_at_ms: no authenticated original time.
                 "control_record" in o -> on.record(ctlRecord(o["control_record"].s()),
-                    o["revoked_at_ms"]?.l()?.toULong() ?: now, strs(o["covered_hosts"]), now)
+                    o["revoked_at_ms"]?.l()?.toULong(), strs(o["covered_hosts"]), now)
+                "learn_revoked_at" in o -> {
+                    val at = o["revoked_at_ms"].l().toULong()
+                    if ("refused" in o) {
+                        throwsCode(o["refused"].s()) { on.learnRevokedAt(o["learn_revoked_at"].s(), at, now) }
+                        null
+                    } else on.learnRevokedAt(o["learn_revoked_at"].s(), at, now)
+                }
                 "control_ack" in o -> {
                     val link = linkOf(setup["links"][o["link"].s()])
                     val ack = Json.write(o["control_ack"])
@@ -1456,10 +1464,18 @@ fun main(args: Array<String>) {
         fun sendable(id: String) {
             if (ledger.pendingReports().none { it.reportId == id }) throw AssertionError("$id is not sendable")
         }
-        for (step in f["steps"].arr()) {
+        // A branch is another history from the committed state, kept apart:
+        // its steps between a save and a restore of the Station.
+        fun flat(steps: List<Any?>): List<Any?> = steps.flatMap { s ->
+            val inner = s.obj()["branch"]
+            if (inner == null) listOf(s)
+            else listOf(mapOf("branch_start" to true)) + flat(inner.arr()) + listOf(mapOf("branch_end" to true))
+        }
+        val saved = ArrayList<List<Any?>>()
+        for (step in flat(f["steps"].arr())) {
             val o = step.obj()
             when {
-                "control_record" in o || "control_ack" in o || "tick" in o -> {
+                "control_record" in o || "control_ack" in o || "learn_revoked_at" in o || "tick" in o -> {
                     val t = input(ledger, step)
                     if (t != null) {
                         made(t, step)
@@ -1476,6 +1492,37 @@ fun main(args: Array<String>) {
                     commit(t1)
                     eq(input(AckLedgerHandle.fromJson(committed), inner)!!.made, emptyList<ReportIntentInfo>(), "$name the replica that lost")
                 }
+                "either_order" in o -> {
+                    // Two Stations take the two inputs in either order: the
+                    // same next state and the same reports; the first commits.
+                    fun both(x: Any?, y: Any?): Pair<AckLedgerHandle, List<String>> {
+                        val t1 = input(AckLedgerHandle.fromJson(committed), x)!!
+                        val t2 = input(t1.next, y)!!
+                        return t2.next to (t1.made + t2.made).map { it.reportId }
+                    }
+                    val (x, y) = o["either_order"].arr()
+                    val (n1, m1) = both(x, y)
+                    val (n2, m2) = both(y, x)
+                    eq(n1.toJson(), n2.toJson(), "$name either order's states")
+                    eq(m1, m2, "$name either order's reports")
+                    eq(m1, strs(o["made"]), "$name made")
+                    committed = n1.toJson()
+                    ledger = n1
+                }
+                "branch_start" in o -> {
+                    saved.add(listOf(ledger, committed, now, clientId))
+                    ledger = AckLedgerHandle.fromJson(committed)
+                }
+                "branch_end" in o -> {
+                    val back = saved.removeAt(saved.size - 1)
+                    ledger = back[0] as AckLedgerHandle
+                    committed = back[1] as String
+                    now = back[2] as ULong
+                    clientId = back[3] as String?
+                }
+                // Each revocation's start, as the state keeps it.
+                "expect_start" in o -> eq(canon(Json.parse(ledger.toJson())["revocations"].obj().mapValues { it.value["revoked_at_ms"] }),
+                    canon(o["expect_start"]), "$name starts")
                 "advance_ms" in o -> now += o["advance_ms"].l().toULong()
                 "restart" in o -> {
                     ledger = AckLedgerHandle.fromJson(committed)
@@ -1595,6 +1642,8 @@ fun main(args: Array<String>) {
         throwsCode("incomplete_link") { l.ack(linkB.copy(connectionId = ""), ack, nowMs) }
         throwsCode("not_the_link") { l.ack(linkB, ack.replace("host-b", "host-c"), nowMs) }
         throwsCode("unknown_field") { l.record(ctlRecord("P4_unknown_field"), 0uL, emptyList(), nowMs) }
+        throwsCode("malformed") { l.learnRevokedAt("service:svc-discord", 9007199254740992uL, nowMs) }
+        throwsCode("unknown_revocation") { l.learnRevokedAt("service:svc-other", 0uL, nowMs) }
     }
     check("Station calls: fixture acks read and write back; pages, heads and fetches round-trip; builders refuse what readers refuse") {
         for (name in ackNames) for (step in load(name)["steps"].arr()) {

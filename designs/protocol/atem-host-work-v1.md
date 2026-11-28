@@ -3333,7 +3333,44 @@ own Station's feed:
   ledger takes the start as `min(revoked_at_ms, issued_at + 1 hour)`: a
   Station that records its own revoke more than an hour after its
   `issued_at` gets its deadline at `issued_at` plus 25 hours, never later,
-  and the host's resends below never stop before it. So: the result of a
+  and the host's resends below never stop before it. A start may be late,
+  never early: `deadline_passed` says every task admitted before the
+  revocation has passed its deadline (at most 24 hours after its
+  admission, design I.4.4). So (**Atem's proposal, for Astation's
+  agreement (#120 comment 7234876179)**) a Station with no authenticated
+  original time (one that starts late, a legacy row with no `revokedAt`)
+  passes none (`revoked_at_ms` `None`): the start is then the own revoke's
+  `issued_at`, which the Station signs only once the Portal revoked
+  (I.8), so at or after the revocation; it passes nothing it can't
+  justify (never `now`, 0 or a guess). An authenticated original time it
+  learns after the record (the integration's `revokedAt`, from a
+  checkpoint or the feed) goes to `learn_revoked_at`, which only lowers
+  the start (`min(start, revoked_at_ms)`, still at most `issued_at` plus
+  an hour): an equal or later time changes nothing, so learns are
+  idempotent, and the start is the `min` of every date, so they are
+  order-free (at the same `now_ms`, two learns give the same ledger in
+  either order, byte for byte, on any replica); a date that ends the
+  window makes the final at once, after the per-host reports already
+  made. A learn never raises a start: a date up to an hour after
+  `issued_at` that `record` would have kept leaves a `None` record's
+  `issued_at`, so the same date gives a final up to an hour earlier when
+  it comes after the record, yet never before the revocation's own
+  deadline (the Station signs its own revoke only after the Portal
+  revoked). After the final a learn
+  still lowers the stored start, but makes no report and changes no
+  report or the final: after the final, no report changes and none is
+  sent twice. A learn and an ack don't commute when the date ends the
+  window and the ack completes the covered hosts (the ack first:
+  `all_applied`; the learn first: `deadline_passed`, then the host's late
+  `revocation_applied`); this is inherent, as it is today for an ack that
+  arrives just before or just after the deadline, and either order gives
+  true reports. A learn for a principal with no own revoke recorded is
+  refused `unknown_revocation`, a value above 2^53 − 1 `malformed`; on
+  `unknown_revocation` the Station keeps the date and passes it to
+  `record`, or learns it again once the own revoke is committed (another
+  replica may have just recorded it with none: as with any lost
+  compare-and-swap, it starts again from the new state). Hosts change
+  nothing: the deadline stays within their resends. So: the result of a
   service's own `revoke` (signed with the service's key) is
   sent again on every (re)connection and every 10 minutes while connected,
   until that record's `issued_at` plus 25 hours on the host's clock (the
@@ -3529,9 +3566,12 @@ The Station reports a revocation's progress to the Portal (`POST
 Station's own `revoke` (signed with the integration's service key: the
 Portal revoked the integration), whose record fixes the integration
 (`about.integration_id`), the hosts its grant covered and the revocation's
-start (`min(revoked_at_ms, issued_at + 1 hour)`, "When a host
-acknowledges" below); a later revoke of the same principal (a re-signed
-copy, a reset's snapshot) changes none of them. A native revoke of the same service
+start (`min(revoked_at_ms, issued_at + 1 hour)`, or `issued_at` with no
+authenticated original time, "When a host acknowledges" below; only a
+learned original time lowers it, and after the final that changes no
+report); a later revoke of the
+same principal (a re-signed copy, a reset's snapshot) changes none of
+them. A native revoke of the same service
 appended earlier counts for its hosts, and they are reported once the
 Station's own revoke is recorded, naming the native record. An own revoke
 whose grant covered no host is final at once, as `revoked{all_applied,
@@ -3555,13 +3595,20 @@ revocation is complete (**agreed with Auth/Portal (2026-11-11, #148 comment 6803
   revocation in force; else `deadline_passed`, with the hosts that didn't
   confirm (never none), 24 hours after the revocation's start (the
   Station's `revoked_at_ms`, at most an hour after the own revoke's
-  `issued_at`, "When a host acknowledges" above). That start
-  is persisted, so a restart never moves the deadline. An ack or a record
-  is counted after any deadline its time has passed, so the outcome
-  depends on time, never on when the Station looked; an own revoke recorded
-  after its own deadline is final at once (**agreed with Auth/Portal (2026-11-11, #148 comment 6803727308)**): `all_applied` when
-  every covered host already has the
-  revocation in force (through a native revoke), else `deadline_passed`.
+  `issued_at`, or that `issued_at` with none, lowered by a learned
+  original time, "When a host acknowledges" above). That
+  start is persisted, so a restart never moves the deadline. An ack, a
+  record or a learned time is counted after any deadline its time has
+  passed, so the outcome depends on time, never on when the Station
+  looked; an own revoke recorded after its own deadline is final at once
+  (**agreed with Auth/Portal (2026-11-11, #148 comment 6803727308)**):
+  `all_applied` when every covered host already has the revocation in
+  force (through a native revoke), else `deadline_passed`; a learned time
+  that ends the window makes the final at once too, after the per-host
+  reports already made (**Atem's proposal, for Astation's agreement (#120
+  comment 7234876179)**). The reports and their `reportId`s don't
+  change with a learned time: only the final's time moves, and only
+  earlier.
 - **Order.** Reports of one principal go to the Portal in the order they
   were made, one at a time: a report is sent only once every report of
   the same principal made before it is settled (done, final or dropped),
@@ -3757,12 +3804,31 @@ carrying a current manager's original stop unchanged, naming the old feed;
 a fresh ledger, with no carried settlement, counting it per host from acks
 naming the new feed, a duplicate from the host that read the old feed and
 applied from the one that didn't; its counts shown, `expect_counts`, and
-its re-sign alert ended once both hosts have each effect in force). They
+its re-sign alert ended once both hosts have each effect in force), and
+`r9-control-ack-late-start` (**Atem's proposal, for Astation's agreement
+(#120 comment 7234876179)**: an own revoke recorded with no authenticated
+original time, its final at its `issued_at` plus 24 hours and nothing 1 ms
+before; a learn before any own revoke refused `unknown_revocation`; a
+restart between the record and the learn; a later date and the same
+date twice changing nothing; a date 2 hours earlier moving the deadline 2
+hours earlier with nothing at once; two learns the same ledger in either
+order, two that would each end the window included; a date 25 hours
+earlier, learned after host-b applied, the final at once,
+`deadline_passed` naming host-c, after host-b's report; an earlier date
+after the final lowering only the stored start, with no report made or
+changed, and a later one changing nothing; and host-c's later ack still
+reported). In these fixtures a record step without `revoked_at_ms` now
+means no authenticated original time (`None`), no longer the Station's
+clock, and `learn_revoked_at`, `either_order`, `branch` and `expect_start`
+are new steps (`fixtures/schema.md`): a runner that still takes the clock
+gets another deadline on `r9-control-ack-late-start`. They
 run in
 `crates/atem-client/tests/r9_fixtures.rs` against `AckLedger`, in the
 bindings' `tests/station.rs` and in the Swift, Kotlin and WASM conformance
 suites through `AckLedgerHandle`; `scripts/check-r9-vectors.py` recomputes
-every `reportId` in them and derives each `expect_counts` from the steps.
+every `reportId` in them and derives from the steps each `expect_counts`,
+every report each step makes (a final's `not_before` included) and what
+the Station sends at each `expect_report`.
 Every SDK package's checksum manifest lists them.
 
 (New in step 4; the goldens and the 256 KiB bound on the complete message

@@ -1,0 +1,434 @@
+{
+  "name": "r9-control-ack-late-start",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "relay",
+  "log": "r9-vectors-membership-log",
+  "note": "The ack ledger's original revocation time (host-work-v1 section 11.4; Atem's proposal, for Astation's agreement, #120 comment 7234876179). A Station that starts late or reads a legacy row records its own revoke of svc-discord, covering host-b and host-c, with no authenticated original time (no revoked_at_ms): the start is the revoke's issued_at, at or after the revocation (the Station signs its own revoke only once the Portal revoked), so its final comes at issued_at + 24 h and nothing 1 ms before (a branch: another history from the committed state). A start may be late, never early: deadline_passed says every task admitted before the revocation has passed its deadline. A learn before any own revoke is refused unknown_revocation. host-b applies it, and the Station restarts before it learns the Portal's original time (learn_revoked_at), which only lowers the start: a later date changes nothing; a date 2 h earlier moves the deadline 2 h earlier with nothing at once (two replicas: the one that lost makes nothing; the same date again changes nothing; a branch shows the final 2 h earlier); two learns give the same ledger in either order; a date 25 h earlier ends the window: the final at once, revoked{deadline_passed, pending_hosts: [host-c]}, after host-b's report made before it. A date learned after the final, earlier still, lowers the stored start but makes no report and changes neither a report nor the final (the final stands and is made once), so two dates that would each end the window give the same ledger in either order (a branch); a later one changes nothing. host-c applies it later: its revocation_applied is still made and sent after the final. The reports and their ids are the deadline fixture's: only the final's time moved, and only earlier.",
+  "setup": {
+    "station": {
+      "origin": "https://station-dev.agora.build",
+      "account_id": "acct-test-1",
+      "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89"
+    },
+    "records": "r9-vectors-host-work-control",
+    "integrations": {
+      "i-01jc5zq9x8w7v6t5s4r3q2p1n0": "service:svc-discord"
+    },
+    "links": {
+      "host-b": {
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "connection_id": "relay-1:host-b"
+      },
+      "host-c": {
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-c",
+        "host_trust_gen": 1,
+        "connection_id": "relay-1:host-c"
+      }
+    },
+    "station_now_ms": 1793620940000
+  },
+  "steps": [
+    {
+      "learn_revoked_at": "service:svc-discord",
+      "revoked_at_ms": 1793613704000,
+      "refused": "unknown_revocation"
+    },
+    {
+      "control_record": "S4_revoke",
+      "covered_hosts": [
+        "host-b",
+        "host-c"
+      ],
+      "made": []
+    },
+    {
+      "expect_start": {
+        "service:svc-discord": 1793620904000
+      }
+    },
+    {
+      "control_ack": {
+        "type": "relay",
+        "op": "control_ack",
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "cursor": 1,
+        "results": [
+          {
+            "record_id": "00000000-0000-4000-8000-000000000004",
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "applied"
+              }
+            ]
+          }
+        ]
+      },
+      "link": "host-b",
+      "made": [
+        "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+      ]
+    },
+    {
+      "restart": true
+    },
+    {
+      "branch": [
+        {
+          "advance_ms": 86363999
+        },
+        {
+          "tick": true,
+          "made": []
+        },
+        {
+          "advance_ms": 1
+        },
+        {
+          "tick": true,
+          "made": [
+            "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+          ]
+        },
+        {
+          "expect_report": [
+            {
+              "not_before": [],
+              "report": {
+                "host": "host-b",
+                "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
+                "kind": "revocation_applied",
+                "record_id": "00000000-0000-4000-8000-000000000004"
+              },
+              "report_id": "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+            }
+          ]
+        },
+        {
+          "confirm": "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+        },
+        {
+          "expect_report": [
+            {
+              "not_before": [
+                "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+              ],
+              "report": {
+                "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
+                "kind": "revoked",
+                "outcome": "deadline_passed",
+                "pending_hosts": [
+                  "host-c"
+                ]
+              },
+              "report_id": "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "learn_revoked_at": "service:svc-discord",
+      "revoked_at_ms": 1793622704000,
+      "made": []
+    },
+    {
+      "expect_start": {
+        "service:svc-discord": 1793620904000
+      }
+    },
+    {
+      "replica": {
+        "learn_revoked_at": "service:svc-discord",
+        "revoked_at_ms": 1793613704000,
+        "made": []
+      }
+    },
+    {
+      "expect_start": {
+        "service:svc-discord": 1793613704000
+      }
+    },
+    {
+      "learn_revoked_at": "service:svc-discord",
+      "revoked_at_ms": 1793613704000,
+      "made": []
+    },
+    {
+      "expect_start": {
+        "service:svc-discord": 1793613704000
+      }
+    },
+    {
+      "branch": [
+        {
+          "advance_ms": 79163999
+        },
+        {
+          "tick": true,
+          "made": []
+        },
+        {
+          "advance_ms": 1
+        },
+        {
+          "tick": true,
+          "made": [
+            "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+          ]
+        }
+      ]
+    },
+    {
+      "either_order": [
+        {
+          "learn_revoked_at": "service:svc-discord",
+          "revoked_at_ms": 1793610104000
+        },
+        {
+          "learn_revoked_at": "service:svc-discord",
+          "revoked_at_ms": 1793602904000
+        }
+      ],
+      "made": []
+    },
+    {
+      "expect_start": {
+        "service:svc-discord": 1793602904000
+      }
+    },
+    {
+      "branch": [
+        {
+          "either_order": [
+            {
+              "learn_revoked_at": "service:svc-discord",
+              "revoked_at_ms": 1793530904000
+            },
+            {
+              "learn_revoked_at": "service:svc-discord",
+              "revoked_at_ms": 1793512904000
+            }
+          ],
+          "made": [
+            "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+          ]
+        },
+        {
+          "expect_start": {
+            "service:svc-discord": 1793512904000
+          }
+        },
+        {
+          "expect_report": [
+            {
+              "not_before": [],
+              "report": {
+                "host": "host-b",
+                "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
+                "kind": "revocation_applied",
+                "record_id": "00000000-0000-4000-8000-000000000004"
+              },
+              "report_id": "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "learn_revoked_at": "service:svc-discord",
+      "revoked_at_ms": 1793530904000,
+      "made": [
+        "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+      ]
+    },
+    {
+      "expect_start": {
+        "service:svc-discord": 1793530904000
+      }
+    },
+    {
+      "expect_report": [
+        {
+          "not_before": [],
+          "report": {
+            "host": "host-b",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
+            "kind": "revocation_applied",
+            "record_id": "00000000-0000-4000-8000-000000000004"
+          },
+          "report_id": "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+        }
+      ]
+    },
+    {
+      "confirm": "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+    },
+    {
+      "expect_report": [
+        {
+          "not_before": [
+            "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+          ],
+          "report": {
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
+            "kind": "revoked",
+            "outcome": "deadline_passed",
+            "pending_hosts": [
+              "host-c"
+            ]
+          },
+          "report_id": "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+        }
+      ]
+    },
+    {
+      "learn_revoked_at": "service:svc-discord",
+      "revoked_at_ms": 1793512904000,
+      "made": []
+    },
+    {
+      "restart": true
+    },
+    {
+      "expect_start": {
+        "service:svc-discord": 1793512904000
+      }
+    },
+    {
+      "expect_report": [
+        {
+          "not_before": [
+            "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+          ],
+          "report": {
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
+            "kind": "revoked",
+            "outcome": "deadline_passed",
+            "pending_hosts": [
+              "host-c"
+            ]
+          },
+          "report_id": "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+        }
+      ]
+    },
+    {
+      "learn_revoked_at": "service:svc-discord",
+      "revoked_at_ms": 1793548904000,
+      "made": []
+    },
+    {
+      "expect_start": {
+        "service:svc-discord": 1793512904000
+      }
+    },
+    {
+      "tick": true,
+      "made": []
+    },
+    {
+      "control_ack": {
+        "type": "relay",
+        "op": "control_ack",
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-c",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "cursor": 1,
+        "results": [
+          {
+            "record_id": "00000000-0000-4000-8000-000000000004",
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "applied"
+              }
+            ]
+          }
+        ]
+      },
+      "link": "host-c",
+      "made": [
+        "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d"
+      ]
+    },
+    {
+      "expect_report": [
+        {
+          "not_before": [
+            "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+          ],
+          "report": {
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
+            "kind": "revoked",
+            "outcome": "deadline_passed",
+            "pending_hosts": [
+              "host-c"
+            ]
+          },
+          "report_id": "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+        }
+      ]
+    },
+    {
+      "confirm": "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+    },
+    {
+      "expect_report": [
+        {
+          "not_before": [],
+          "report": {
+            "host": "host-c",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
+            "kind": "revocation_applied",
+            "record_id": "00000000-0000-4000-8000-000000000004"
+          },
+          "report_id": "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d"
+        }
+      ]
+    },
+    {
+      "confirm": "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d"
+    },
+    {
+      "expect_report": []
+    },
+    {
+      "expect_counts": [
+        {
+          "effect": "revocation",
+          "host": "host-b",
+          "principal": "service:svc-discord",
+          "record_id": "00000000-0000-4000-8000-000000000004"
+        },
+        {
+          "effect": "revocation",
+          "host": "host-c",
+          "principal": "service:svc-discord",
+          "record_id": "00000000-0000-4000-8000-000000000004"
+        }
+      ]
+    },
+    {
+      "expect_portal": [
+        "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca",
+        "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d",
+        "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+      ]
+    }
+  ]
+}
