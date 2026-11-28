@@ -1416,6 +1416,7 @@ struct SnapshotArgs {
     snapshot: Vec<String>,
     marks: Vec<ControlSnapshotMark>,
     covered: Vec<String>,
+    provisioned: Vec<String>,
 }
 
 impl SnapshotArgs {
@@ -1442,6 +1443,7 @@ impl SnapshotArgs {
                 })
                 .collect(),
             covered: strs("covered"),
+            provisioned: strs("provisioned"),
         }
     }
 
@@ -1454,6 +1456,7 @@ impl SnapshotArgs {
             self.snapshot,
             self.marks,
             self.covered,
+            self.provisioned,
         )
     }
 }
@@ -1462,17 +1465,23 @@ impl SnapshotArgs {
 /// through the export beside the ledger gives the vector's answer; input
 /// outside its grammar is `Invalid`: a record its parse refuses (its
 /// code), and, `malformed`, an origin not in its exact form, a candidate
-/// feed that isn't a UUID v4, a mark or covered principal that isn't a
-/// service's, a principal marked twice or covered twice.
+/// feed that isn't a UUID v4, a mark, covered or provisioned principal
+/// that isn't a service's, a principal marked, covered or provisioned
+/// twice. Every code among the answers, `coverage_dropped` included.
 #[test]
 fn every_snapshot_case_through_the_binding() {
     let control = load("r9-vectors-host-work-control");
     let cases = control["snapshots"].as_array().unwrap();
     assert!(cases.len() >= 8);
+    let mut codes = std::collections::BTreeSet::new();
     for case in cases {
         let got = SnapshotArgs::of(case).check().unwrap();
         assert_eq!(consistency_json(&got), case["expect"], "{}", case["label"]);
+        if let ControlSnapshotConsistency::Inconsistent { code, .. } = got {
+            codes.insert(code);
+        }
     }
+    assert!(codes.contains("coverage_dropped"), "{codes:?}");
 
     let n1 = cases
         .iter()
@@ -1490,6 +1499,14 @@ fn every_snapshot_case_through_the_binding() {
     refused(&|a| a.candidate = a.candidate.to_uppercase(), "malformed");
     refused(&|a| a.covered.push("host:host-a".into()), "malformed");
     refused(&|a| a.covered.push(a.covered[0].clone()), "malformed");
+    refused(&|a| a.provisioned.push("host:host-a".into()), "malformed");
+    refused(
+        &|a| {
+            a.provisioned
+                .extend(["service:svc-discord".into(), "service:svc-discord".into()])
+        },
+        "malformed",
+    );
     refused(
         &|a| {
             a.marks.push(ControlSnapshotMark {

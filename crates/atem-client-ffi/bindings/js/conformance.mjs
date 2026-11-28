@@ -1337,12 +1337,14 @@ check("control snapshots: every case through checkControlSnapshotConsistency", (
       snapshot: c.snapshot.map(ctlRecord),
       marks: Object.entries(c.marks).map(([principal, markMs]) => ({ principal, markMs })),
       covered: c.covered,
+      provisioned: c.provisioned,
       ...edit,
     };
-    return m.checkControlSnapshotConsistency(logAfter(c.chain), a.origin, a.candidate, a.retained, a.snapshot, a.marks, a.covered);
+    return m.checkControlSnapshotConsistency(logAfter(c.chain), a.origin, a.candidate, a.retained, a.snapshot, a.marks, a.covered, a.provisioned);
   };
   if (ctl.snapshots.length < 8) throw new Error(`${ctl.snapshots.length} snapshot cases`);
   for (const c of ctl.snapshots) same(snapshotOut(run(c)), c.expect, c.label);
+  if (!ctl.snapshots.some((c) => c.expect.code === "coverage_dropped")) throw new Error("a coverage_dropped case");
   const n1 = ctl.snapshots.find((c) => c.label === "N1_retained_native_revoke");
   const mark = { principal: "service:svc-discord", markMs: n1.marks["service:svc-discord"] };
   throwsCode(() => run(n1, { snapshot: [ctlRecord("A2_cover"), ctlRecord("P4_unknown_field")] }), "unknown_field");
@@ -1352,6 +1354,8 @@ check("control snapshots: every case through checkControlSnapshotConsistency", (
   throwsCode(() => run(n1, { marks: [{ principal: "member:dev-mac", markMs: 1 }] }), "malformed");
   throwsCode(() => run(n1, { marks: [{ ...mark, mark_ms: 1 }] }), "malformed");
   throwsCode(() => run(n1, { covered: ["service:svc-discord", "service:svc-discord"] }), "malformed");
+  throwsCode(() => run(n1, { provisioned: ["host:host-a"] }), "malformed");
+  throwsCode(() => run(n1, { provisioned: ["service:svc-discord", "service:svc-discord"] }), "malformed");
 });
 // A current manager's re-signed copy of a former manager's stop
 // (r9-vectors-resigned-copy; host-work-v1 §11.1, condition (c)): each case
@@ -1396,7 +1400,7 @@ check("resigned copy: the snapshot checker passes what the copy check refuses", 
   for (const p of rcopy.checker_passes) {
     const snap = p.snapshot;
     const marks = Object.entries(snap.marks).map(([principal, markMs]) => ({ principal, markMs }));
-    const a = m.checkControlSnapshotConsistency(rcopyLog(p), snap.origin, snap.candidate_feed_id, snap.retained.map(rcopyRecord), snap.snapshot.map(rcopyRecord), marks, snap.covered);
+    const a = m.checkControlSnapshotConsistency(rcopyLog(p), snap.origin, snap.candidate_feed_id, snap.retained.map(rcopyRecord), snap.snapshot.map(rcopyRecord), marks, snap.covered, snap.provisioned);
     same(snapshotOut(a), snap.expect, `${p.label}: consistent`);
     const got = copyRefusal(() => m.checkResignedCopy(rcopyLog(p), rcopyRecord(p.original), rcopyRecord(p.copy), p.candidate_feed_id));
     same(got, { code: p.code, detail: p.detail }, `${p.label}: refused as a copy`);

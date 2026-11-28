@@ -1931,14 +1931,16 @@ final class ConformanceTests: XCTestCase {
             }
         }
         func snapshotRun(_ c: [String: Any], origin: String? = nil, candidate: String? = nil, snapshot: [String]? = nil,
-                         marks: [ControlSnapshotMark]? = nil, covered: [String]? = nil) throws -> ControlSnapshotConsistency {
+                         marks: [ControlSnapshotMark]? = nil, covered: [String]? = nil,
+                         provisioned: [String]? = nil) throws -> ControlSnapshotConsistency {
             let defaultMarks = o(c["marks"]).map { ControlSnapshotMark(principal: $0.key, markMs: u($0.value)) }
             return try checkControlSnapshotConsistency(
                 log: logAfter(a(c["chain"]).map(s)), origin: origin ?? s(c["origin"]),
                 candidateFeedId: candidate ?? s(c["candidate_feed_id"]),
                 retainedJson: a(c["retained"]).map { ctlRecord(s($0)) },
                 snapshotJson: snapshot ?? a(c["snapshot"]).map { ctlRecord(s($0)) },
-                marks: marks ?? defaultMarks, covered: covered ?? a(c["covered"]).map(s))
+                marks: marks ?? defaultMarks, covered: covered ?? a(c["covered"]).map(s),
+                provisioned: provisioned ?? a(c["provisioned"]).map(s))
         }
         check("control snapshots: every case through checkControlSnapshotConsistency") {
             let cases = a(ctl["snapshots"]).map(o)
@@ -1946,6 +1948,7 @@ final class ConformanceTests: XCTestCase {
             for c in cases {
                 try eq(canon(snapshotOut(try snapshotRun(c))), canon(c["expect"]!), s(c["label"]))
             }
+            try eq(cases.contains { (o($0["expect"])["code"] as? String) == "coverage_dropped" }, true, "a coverage_dropped case")
             let n1 = cases.first { s($0["label"]) == "N1_retained_native_revoke" }!
             let mark = ControlSnapshotMark(principal: "service:svc-discord", markMs: u(o(n1["marks"])["service:svc-discord"]))
             try throwsCode("unknown_field") { _ = try snapshotRun(n1, snapshot: [ctlRecord("A2_cover"), ctlRecord("P4_unknown_field")]) }
@@ -1954,6 +1957,8 @@ final class ConformanceTests: XCTestCase {
             try throwsCode("malformed") { _ = try snapshotRun(n1, marks: [mark, mark]) }
             try throwsCode("malformed") { _ = try snapshotRun(n1, marks: [ControlSnapshotMark(principal: "member:dev-mac", markMs: 1)]) }
             try throwsCode("malformed") { _ = try snapshotRun(n1, covered: ["service:svc-discord", "service:svc-discord"]) }
+            try throwsCode("malformed") { _ = try snapshotRun(n1, provisioned: ["host:host-a"]) }
+            try throwsCode("malformed") { _ = try snapshotRun(n1, provisioned: ["service:svc-discord", "service:svc-discord"]) }
         }
         // A current manager's re-signed copy of a former manager's stop
         // (r9-vectors-resigned-copy; host-work-v1 §11.1, condition (c)):
@@ -2008,7 +2013,8 @@ final class ConformanceTests: XCTestCase {
                 let marks = o(snap["marks"]).map { ControlSnapshotMark(principal: $0.key, markMs: u($0.value)) }
                 let answer = try checkControlSnapshotConsistency(log: try rcopyLog(p), origin: s(snap["origin"]),
                     candidateFeedId: s(snap["candidate_feed_id"]), retainedJson: a(snap["retained"]).map(rcopyRecord),
-                    snapshotJson: a(snap["snapshot"]).map(rcopyRecord), marks: marks, covered: a(snap["covered"]).map(s))
+                    snapshotJson: a(snap["snapshot"]).map(rcopyRecord), marks: marks, covered: a(snap["covered"]).map(s),
+                    provisioned: a(snap["provisioned"]).map(s))
                 try eq(canon(snapshotOut(answer)), canon(snap["expect"]!), "\(s(p["label"])): consistent")
                 let got = try copyRefusal { _ = try checkResignedCopy(log: try rcopyLog(p), originalJson: rcopyRecord(p["original"]),
                     copyJson: rcopyRecord(p["copy"]), candidateFeedId: s(p["candidate_feed_id"])) }

@@ -988,7 +988,7 @@ def check_host_work_control(file, data, report, context):
 # check_snapshot_consistency's codes, in the order its checks run.
 SNAPSHOT_CODES = [
     "invalid_retained", "invalid_record", "wrong_origin", "not_signed_anew", "not_candidate_feed",
-    "cover_not_first", "uncovered_cover", "not_above_mark", "stop_lost",
+    "cover_not_first", "uncovered_cover", "not_above_mark", "coverage_dropped", "stop_lost",
     "stop_not_resigned",
 ]
 
@@ -1045,7 +1045,10 @@ def derive_snapshot(case, snap, by_label, entries):
     not_above_mark (signed anew with the service's own key, issued at or
     below its principal's mark or with no mark). Then, at index the
     snapshot's length, cover_not_first for a covered principal with no
-    cover; then each effect of each retained revoke or interrupt_running
+    cover; then coverage_dropped for a provisioned service (in sorted
+    order) neither covered, nor revoked by a revoke of it the snapshot
+    carries, nor removed from the device list at the head (a `remove` of it
+    in L + chain); then each effect of each retained revoke or interrupt_running
     (valid, or a removed manager's), in the retained order (the revocation, then
     the interrupt), not in force after the snapshot alone (snapshot_stops;
     a service's interrupt is due once its principal is revoked by a
@@ -1092,6 +1095,10 @@ def snapshot_answer(case, snap, by_label, entries):
 
     covered, marks = set(snap["covered"]), snap["marks"]
     case.equal(sorted(covered), snap["covered"], "covered: sorted, each once")
+    provisioned = snap["provisioned"]
+    case.equal(sorted(set(provisioned)), provisioned, "provisioned: sorted, each once")
+    case.check(all(sr_device_id(p, "service:") for p in provisioned), "provisioned: service principals")
+    removed = {b["device_id"] for b in replay_bodies if b["action"] == "remove"}
 
     def answer():
         def at(index, code, body=None, principal=None, reason=None, effect=None, revoke_seq=None):
@@ -1146,6 +1153,16 @@ def snapshot_answer(case, snap, by_label, entries):
         end = len(snap["snapshot"])
         for p in sorted(covered - covers):
             return at(end, "cover_not_first", principal=p)
+        # A provisioned service stops needing a cover only at a revoke of it
+        # the snapshot carries (each verified at the head by now) or its
+        # removal at the head.
+        for p in provisioned:
+            revoked_here = any(
+                by_label[l]["record"]["body"]["principal"] == p and by_label[l]["record"]["body"]["action"] == "revoke"
+                for l in snap["snapshot"]
+            )
+            if p not in covered and not revoked_here and p[len("service:"):] not in removed:
+                return at(end, "coverage_dropped", principal=p)
         fresh = snapshot_stops(snap["snapshot"], verdict, by_label, entry_at)
         revoked = {
             by_label[r]["record"]["body"]["principal"]

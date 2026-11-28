@@ -479,8 +479,8 @@ data_enum! {
         /// `another_account`, `another_genesis`, `another_signer` (another
         /// member, or the principal's own key), `another_origin` (a
         /// service's `revoke` or `interrupt_running` naming another
-        /// origin). These reasons and their order are Atem's reading, for
-        /// Astation's confirmation (asked on Astation #114).
+        /// origin). These reasons and their order are Atem's reading,
+        /// agreed with Astation (Astation #114 comment 7209301522).
         NotInPlan { reason: String },
     }
 }
@@ -1625,11 +1625,13 @@ data_enum! {
         /// doesn't verify, never re-sign it), `invalid_record` (`reason`:
         /// the verifier's pending or refusal code), `wrong_origin`,
         /// `not_signed_anew`, `not_candidate_feed`, `cover_not_first`,
-        /// `uncovered_cover`, `not_above_mark`, then `stop_lost` or
-        /// `stop_not_resigned` (a removed manager's retained stop, `reason`
-        /// `removed_manager`: a current manager signs it again; `effect`:
-        /// `revocation` or `interrupt`; `revoke_seq`: a host principal's
-        /// interrupt). `index` is otherwise the snapshot record's position
+        /// `uncovered_cover`, `not_above_mark`, then `coverage_dropped` (a
+        /// provisioned service neither covered, nor revoked by the
+        /// snapshot, nor removed at the head; no `record_id`), then
+        /// `stop_lost` or `stop_not_resigned` (a removed manager's
+        /// retained stop, `reason` `removed_manager`: a current manager
+        /// signs it again; `effect`: `revocation` or `interrupt`;
+        /// `revoke_seq`: a host principal's interrupt). `index` is otherwise the snapshot record's position
         /// (from 0), or the snapshot's length for what only the whole
         /// snapshot shows (a covered principal with no cover, a retained
         /// stop's effect not kept). `record_id` is that snapshot

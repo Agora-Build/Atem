@@ -864,7 +864,7 @@ listed after the table:
 | `signer_report_challenge(signer, slot, origin, connection, issued_at, expires_at, recovery)` (JS `signerReportChallenge`, `recovery` `{generation, planId, candidateFeedId, sourceHash, evidenceHash}`) | the Station's challenge as canonical JSON, a fresh 32-byte nonce from the OS CSPRNG: the verifier report's fields, `signer` a native member (`member:<device_id>`; reading (a)), and `recovery: SignerReportRecovery{generation, plan_id, candidate_feed_id, source_hash, evidence_hash}` (`generation` a canonical decimal string, 1 to 2^63 − 1, no sign or leading zero; the ids UUID v4; the hashes lowercase hex SHA-256). Store it |
 | `parse_signer_report_challenge(challenge_json)` | `SignerReportChallenge{signer, slot, origin, connection, nonce, issued_at, expires_at, recovery}`, read strictly: at most 4,096 bytes, exactly these fields at both levels, each one's grammar |
 | `SignerReportRequest(log, challenge_json, signer, slot, origin, journal, key_id, now_ms)` | an immutable handle (UniFFI Object, a WASM class) on the body the core builds from `journal: SignerJournalView{id, since, revision, records, drafts, processes}`, which your adapter hands over under its journal lock after its barrier's durable commit (B1): `id` the journal's 16 random bytes (base64url), `since` the device-list `seq` at its creation, `revision` its append count, `records` the plan's bodies in `signing` or `signed` (one in `signing` with no saved signature included), `drafts` its unsigned drafts, each a control record's body as JSON, `processes` its roster, every process generation attached to the journal (base64url, `verifier_report_process()` among them, at most 4,096). The core reads each body strictly as one of the plan's records by this member (a service's `revoke` or `interrupt_running` naming the challenge's origin, reading (c), or a `host:` principal's `interrupt_running`), and counts and hashes them itself: you supply no hash. Refused: a challenge for another Station (`origin_mismatch`), signer (`signer_mismatch`) or slot (`slot_mismatch`), a `signer` that isn't `member:<id>` or a field out of its grammar (`malformed`), the log frozen (`frozen`), a signer that isn't a current native member (`unknown_signer`) or never held `manage` (`not_a_manager`), the challenge expired at `now_ms` (`expired`; reading (b)), then a journal `id` that isn't 16 bytes, `since` 0, a body that isn't one of the plan's records by this member, a body twice in a set (`malformed`; the same body as a record and as a draft is read, reading (d)), then a roster without this loaded core's own process, an id that isn't 16 bytes of base64url, an id twice, or more than 4,096 ids (`malformed`) |
-| `signer_report_plan_record(log, body_json, member, origin)` (JS `signerReportPlanRecord`) | the plan predicate (built for Astation's ask, #114 comment 7093796254): whether `body_json`, a control record's body as your journal holds it, is one of the plan's records for `member` (`member:<device_id>`) at `origin` (the challenge's, exact), by exactly the rule `SignerReportRequest` reads a journal's bodies with, so your adapter selects its records and drafts, and checks its barrier before drafting and at the key-signing boundary, by the builder's own rule. `SignerPlanRecord::InPlan` (the request takes it; while the plan's barrier holds, refuse to draft or sign it), or `NotInPlan{reason}` (leave it out of this plan's report; this plan's barrier doesn't hold it), `reason` in the order checked: `another_account`, `another_genesis`, `another_signer` (another member, or the principal's own key), `another_origin` (a service's `revoke` or `interrupt_running` naming another origin); a `host:` principal's `interrupt_running` is `InPlan` at every origin. `Report{malformed}`: this member's `cover`, `hold` or `release` (reading (c), judged after the signer and before the origin: never skip it), a body that isn't a control record's, a `member` that isn't `member:<id>`, an `origin` not in its exact form. Bodies only: the list's freeze and the member's standing change no answer. **Atem's reading, for Astation's confirmation (asked on Astation #114):** another account, genesis or signer as `NotInPlan` with a reason (never `Report{malformed}`), the order account, genesis, signer, action, origin, and the four reason codes; which bodies are `InPlan` is the agreed B2 rule with reading (c). JS: `{type: "in_plan"}` or `{type: "not_in_plan", reason}` |
+| `signer_report_plan_record(log, body_json, member, origin)` (JS `signerReportPlanRecord`) | the plan predicate (built for Astation's ask, #114 comment 7093796254): whether `body_json`, a control record's body as your journal holds it, is one of the plan's records for `member` (`member:<device_id>`) at `origin` (the challenge's, exact), by exactly the rule `SignerReportRequest` reads a journal's bodies with, so your adapter selects its records and drafts, and checks its barrier before drafting and at the key-signing boundary, by the builder's own rule. `SignerPlanRecord::InPlan` (the request takes it; while the plan's barrier holds, refuse to draft or sign it), or `NotInPlan{reason}` (leave it out of this plan's report; this plan's barrier doesn't hold it), `reason` in the order checked: `another_account`, `another_genesis`, `another_signer` (another member, or the principal's own key), `another_origin` (a service's `revoke` or `interrupt_running` naming another origin); a `host:` principal's `interrupt_running` is `InPlan` at every origin. `Report{malformed}`: this member's `cover`, `hold` or `release` (reading (c), judged after the signer and before the origin: never skip it), a body that isn't a control record's, a `member` that isn't `member:<id>`, an `origin` not in its exact form. Bodies only: the list's freeze and the member's standing change no answer. Atem's reading, **agreed with Astation (Astation #114 comment 7209301522):** another account, genesis or signer as `NotInPlan` with a reason (never `Report{malformed}`), the order account, genesis, signer, action, origin, and the four reason codes; which bodies are `InPlan` is the agreed B2 rule with reading (c). JS: `{type: "in_plan"}` or `{type: "not_in_plan", reason}` |
 | `request.sign_request()` / `request.body_json()` | the `SignRequest` for `key_id` (purpose `SignerReport`, `fresh_confirmation: true`, label `atem-signer-report-v2`, `input` = `enc([label, body])`, `body_json` the held body); the held body, read only |
 | `request.finish(signature)` | the report (canonical `{"body":<held body>,"sig":…}`) once `signature` (P-256 64-byte `r‖s`, either S, normalized to low S; or Ed25519) verifies under the signer's key at the log's head over the held body; anything else is `Report{bad_signature}`. The handle never changes |
 | `sign_signer_report(provider, log, challenge_json, signer, slot, origin, journal, key_id, now_ms)` (Swift, Kotlin; JS `signSignerReport(store, …)` with a `SoftwareKeyStore`, for tests and tools: a native's key is never a software key) | the request's checks, then the provider signs at once after the owner's fresh confirmation (no binding lock held meanwhile): the report, or `Report{signing_failed}` when the owner cancels or the provider fails, `Report{bad_signature}` when `key_id` isn't the signer's key in the log |
@@ -886,9 +886,9 @@ listed after the table:
   `cover`, `hold` or `release` this member's journal holds refuses the
   request (`malformed`), never skipped, and `signer_report_plan_record`
   refuses it too (after the account, genesis and signer and before the
-  origin: that order is Atem's reading, for Astation's confirmation, asked
-  on Astation #114). The agreed text says "a service's record naming this
-  origin".
+  origin: that order is Atem's reading, agreed with Astation, Astation
+  #114 comment 7209301522). The agreed text says "a service's record
+  naming this origin".
 - (d) One body may be both a record and a draft: each set is read on its
   own; only a body twice in one set is `malformed`.
 - (e) `journal.since` is compared with nothing, `head.seq` included:
@@ -2152,7 +2152,7 @@ account's record); never re-sign it.
 ### The snapshot checker
 
 `check_control_snapshot_consistency(log, origin, candidate_feed_id,
-retained_json, snapshot_json, marks, covered)` checks a replacement
+retained_json, snapshot_json, marks, covered, provisioned)` checks a replacement
 feed's snapshot, before you publish it, for **consistency** with the
 records the restored Station retained. **It never says** that the
 retained records are the whole history, that a mark bounds every time the
@@ -2167,10 +2167,11 @@ you: what a rollback lost, nothing here can see (#114, items 1, 3 and 4).
 | `snapshot_json` | the snapshot's records, in publication order |
 | `marks` | `ControlSnapshotMark{principal, mark_ms}` per service principal, once each: a record its own key signs anew is issued strictly after `mark_ms` (`U_p` after a rollback, or the mark you sign above) |
 | `covered` | the principals the snapshot covers (`service:<id>`), once each: the services you currently cover at the cut (below) |
+| `provisioned` | the services you provisioned at your origin and haven't handed over (`service:<id>`, the identity `covered` uses), once each; required, and an empty list checks nothing (built for Astation's request, Astation #114 comment 7208700195): each must be in `covered`, revoked by a `revoke` of it the snapshot carries, or removed from the device list at the head, else `coverage_dropped` |
 
-**What `covered` holds** (**Atem's reading, for Astation's agreement
-(Astation #114, comment 7207811340)**; host-work-v1 §11.1, "Which
-principals a Station currently covers"). The checker never derives it:
+**What `covered` holds** (Atem's reading, **agreed with Astation
+(Astation #114 comments 7208700195 and 7209301522)**; host-work-v1 §11.1,
+"Which principals a Station currently covers"). The checker never derives it:
 pass every service you provisioned at your origin and haven't handed
 over, except those whose coverage ended. Coverage of a service ends only
 at a revoke of it that the snapshot itself carries and that verifies at
@@ -2206,7 +2207,11 @@ feed), `cover_not_first` (each covered principal's cover first, a hold or
 release after it), `uncovered_cover`, `not_above_mark` (signed anew with
 the service's own key, issued at or below the mark, or no mark). Then,
 with `index` the snapshot's length: `cover_not_first` for a covered
-principal with no cover, and each effect of each retained `revoke` or
+principal with no cover, `coverage_dropped` for a provisioned service (in
+sorted order) neither covered, nor revoked by the snapshot, nor removed at
+the head (no `record_id`; a Portal-only revoke, an expiry, an absent key
+or a missing reservation never clears coverage; its place in the order is
+Atem's choice), and each effect of each retained `revoke` or
 `interrupt_running` that the snapshot alone doesn't keep on a fresh host
 (a revocation, or an interrupt due because its principal is revoked, in
 force; an interrupt not yet due, of a principal nothing revokes, an
@@ -2223,10 +2228,11 @@ old feed and needs no mark, but must still be valid at the head and of
 your origin. Errors: a record its parse refuses is `Invalid{code}`; any
 other input outside its grammar (an origin not in its exact form, a
 candidate that isn't a UUID v4, a principal that isn't `service:<id>`,
-marked or covered twice, a mark above 2^53 − 1, a frozen list)
-`Invalid{malformed}`. JS: `checkControlSnapshotConsistency(log, origin,
-candidateFeedId, retainedJson, snapshotJson, [{principal, markMs}],
-covered)` gives `{type: "consistent"}` or `{type: "inconsistent", index,
+marked, covered or provisioned twice, a mark above 2^53 − 1, a frozen
+list) `Invalid{malformed}`. `stop_not_resigned` is effect-only; whether a
+snapshot stop is a conforming copy is "The copy check"'s, below. JS:
+`checkControlSnapshotConsistency(log, origin, candidateFeedId,
+retainedJson, snapshotJson, [{principal, markMs}], covered, provisioned)` gives `{type: "consistent"}` or `{type: "inconsistent", index,
 code, principal, recordId, reason, effect, revokeSeq}` (`null` where
 none). Its cases: `r9-vectors-host-work-control`'s `snapshots`.
 

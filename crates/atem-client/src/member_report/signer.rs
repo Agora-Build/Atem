@@ -56,8 +56,8 @@
 //! its records and drafts, and checks its barrier, by the builder's own
 //! rule (Astation's ask on #114 comment 7093796254): one implementation,
 //! which the builder and the verifier's export check call too. Its typed
-//! answer's reasons and order are Atem's reading, for Astation's
-//! confirmation (asked on Astation #114).
+//! answer's reasons and order are Atem's reading, agreed with Astation
+//! (Astation #114 comment 7209301522).
 //!
 //! **Atem's readings, agreed with Astation, #114 comment 7093796254** (the
 //! agreed text left them open; each is fail-closed):
@@ -547,7 +547,7 @@ pub enum PlanRecord {
 
 /// Why a control-record body isn't one of the plan's records, in the order
 /// the predicate checks (the reasons, their codes and that order are
-/// Atem's reading, for Astation's confirmation, asked on Astation #114).
+/// Atem's reading, agreed with Astation, Astation #114 comment 7209301522).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutOfPlan {
     /// Another `account_id` than the list's.
@@ -689,8 +689,8 @@ impl Plan<'_> {
 /// builder refuses those itself.
 ///
 /// Which bodies are in the plan is the agreed B2 rule with agreed reading
-/// (c). **Atem's reading, for Astation's confirmation (asked on Astation
-/// #114):** a body of another account, genesis or signer is
+/// (c). **Atem's reading, agreed with Astation (Astation #114 comment
+/// 7209301522):** a body of another account, genesis or signer is
 /// [`PlanRecord::NotInPlan`] with a reason, never `malformed` (the builder
 /// refuses it either way); the order account, genesis, signer, action,
 /// origin; and the four reason codes ([`OutOfPlan::code`]).

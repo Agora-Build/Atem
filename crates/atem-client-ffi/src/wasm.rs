@@ -622,8 +622,8 @@ pub fn verify_signer_report(
 /// `SignerReportRequest` reads a journal's bodies with: `{type: "in_plan"}`
 /// or `{type: "not_in_plan", reason}` (`another_account`,
 /// `another_genesis`, `another_signer`, `another_origin`; the reasons and
-/// their order Atem's reading, for Astation's confirmation, asked on
-/// Astation #114), or throws `kind: "report"`, `code: "malformed"` (this
+/// their order Atem's reading, agreed with Astation, Astation #114 comment
+/// 7209301522), or throws `kind: "report"`, `code: "malformed"` (this
 /// member's cover, hold or release; a body that isn't a control record's;
 /// a member or origin outside its grammar).
 #[wasm_bindgen(js_name = signerReportPlanRecord)]
@@ -2387,10 +2387,13 @@ impl AckTransition {
 /// records the restored Station retained
 /// (`check_control_snapshot_consistency`): never a statement that a
 /// history, a clock or an author's stops are complete. `marks` is an array
-/// of `{principal, markMs}`; `covered` the principals the snapshot covers.
-/// Returns `{type: "consistent"}` or `{type: "inconsistent", index, code,
-/// principal, recordId, reason, effect, revokeSeq}` (`null` where none).
+/// of `{principal, markMs}`; `covered` the principals the snapshot covers;
+/// `provisioned` the services the Station provisioned at its origin and
+/// hasn't handed over (`coverage_dropped`; may be empty). Returns `{type:
+/// "consistent"}` or `{type: "inconsistent", index, code, principal,
+/// recordId, reason, effect, revokeSeq}` (`null` where none).
 #[wasm_bindgen(js_name = checkControlSnapshotConsistency)]
+#[allow(clippy::too_many_arguments)]
 pub fn check_control_snapshot_consistency(
     log: &MembershipLog,
     origin: String,
@@ -2399,6 +2402,7 @@ pub fn check_control_snapshot_consistency(
     snapshot_json: Vec<String>,
     marks: JsValue,
     covered: Vec<String>,
+    provisioned: Vec<String>,
 ) -> JsResult<JsValue> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -2427,6 +2431,7 @@ pub fn check_control_snapshot_consistency(
         snapshot_json,
         marks,
         covered,
+        provisioned,
     ))
 }
 

@@ -1615,13 +1615,14 @@ fun main(args: Array<String>) {
     fun snapshotRun(c: Any?, origin: String = c["origin"].s(), candidate: String = c["candidate_feed_id"].s(),
                     snapshot: List<String> = strs(c["snapshot"]).map { ctlRecord(it) },
                     marks: List<ControlSnapshotMark> = c["marks"].obj().map { (p, m) -> ControlSnapshotMark(p, m.l().toULong()) },
-                    covered: List<String> = strs(c["covered"])) =
+                    covered: List<String> = strs(c["covered"]), provisioned: List<String> = strs(c["provisioned"])) =
         checkControlSnapshotConsistency(logAfter(strs(c["chain"])), origin, candidate,
-            strs(c["retained"]).map { ctlRecord(it) }, snapshot, marks, covered)
+            strs(c["retained"]).map { ctlRecord(it) }, snapshot, marks, covered, provisioned)
     check("control snapshots: every case through checkControlSnapshotConsistency") {
         val cases = ctl["snapshots"].arr()
         eq(cases.size >= 8, true, "snapshot cases")
         for (c in cases) eq(canon(snapshotOut(snapshotRun(c))), canon(c["expect"]), c["label"].s())
+        eq(cases.any { it["expect"].obj()["code"] == "coverage_dropped" }, true, "a coverage_dropped case")
         val n1 = cases.first { it["label"] == "N1_retained_native_revoke" }
         val mark = ControlSnapshotMark("service:svc-discord", n1["marks"]["service:svc-discord"].l().toULong())
         throwsCode("unknown_field") { snapshotRun(n1, snapshot = listOf(ctlRecord("A2_cover"), ctlRecord("P4_unknown_field"))) }
@@ -1630,6 +1631,8 @@ fun main(args: Array<String>) {
         throwsCode("malformed") { snapshotRun(n1, marks = listOf(mark, mark)) }
         throwsCode("malformed") { snapshotRun(n1, marks = listOf(ControlSnapshotMark("member:dev-mac", 1uL))) }
         throwsCode("malformed") { snapshotRun(n1, covered = listOf("service:svc-discord", "service:svc-discord")) }
+        throwsCode("malformed") { snapshotRun(n1, provisioned = listOf("host:host-a")) }
+        throwsCode("malformed") { snapshotRun(n1, provisioned = listOf("service:svc-discord", "service:svc-discord")) }
     }
     // A current manager's re-signed copy of a former manager's stop
     // (r9-vectors-resigned-copy; host-work-v1 §11.1, condition (c)): each
@@ -1676,7 +1679,8 @@ fun main(args: Array<String>) {
             val snap = p["snapshot"]
             val marks = snap["marks"].obj().map { (k, m) -> ControlSnapshotMark(k, m.l().toULong()) }
             val a = checkControlSnapshotConsistency(rcopyLog(p), snap["origin"].s(), snap["candidate_feed_id"].s(),
-                snap["retained"].arr().map { rcopyRecord(it) }, snap["snapshot"].arr().map { rcopyRecord(it) }, marks, strs(snap["covered"]))
+                snap["retained"].arr().map { rcopyRecord(it) }, snap["snapshot"].arr().map { rcopyRecord(it) }, marks, strs(snap["covered"]),
+                strs(snap["provisioned"]))
             eq(canon(snapshotOut(a)), canon(snap["expect"]), "${p["label"].s()}: consistent")
             val got = copyRefusal { checkResignedCopy(rcopyLog(p), rcopyRecord(p["original"]), rcopyRecord(p["copy"]), p["candidate_feed_id"].s()) }
             eq(canon(got), canon(mapOf("code" to p["code"], "detail" to p["detail"])), "${p["label"].s()}: refused as a copy")

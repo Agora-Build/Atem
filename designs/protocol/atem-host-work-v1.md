@@ -1579,11 +1579,11 @@ leaves the coverage on the old feed: its holds, revokes and interrupts
 still apply, so no stop is lost, but its releases are refused until a
 newer cover arrives.
 
-**Which principals a Station currently covers** (**Atem's reading, for
-Astation's agreement (Astation #114, comment 7207811340)**; it amends
-"Resets" above and design I.5.2, which the agreed text leaves undefined,
-and narrows the Station Builders contract's snapshot duty, so Auth/Portal
-is told on Portal #41). At origin O, a Station stops covering a service
+**Which principals a Station currently covers** (Atem's reading, **agreed
+with Astation (Astation #114 comments 7208700195 and 7209301522)**; it
+amends "Resets" above and design I.5.2, which the agreed text leaves
+undefined, and narrows the Station Builders contract's snapshot duty, so
+Auth/Portal is told on Portal #41). At origin O, a Station stops covering a service
 principal p at the first of:
 
 1. a revoke of p that the snapshot itself carries and that verifies at
@@ -1626,19 +1626,29 @@ p's coverage there, since no newer cover moves it, and its delegated
 tasks keep running. That is why coverage ends only with a stop the
 snapshot carries, or with the device list. It also removes #114's R3
 deadlock for a revoked service: a carried stop needs no `U_p` (R4), a
-fresh cover does. The snapshot checker below is unchanged (`covered` is
-its caller's input); the `snapshots` vectors' `D` cases give each row's
+fresh cover does. The snapshot checker below takes `covered` as its
+caller's input and checks it against `provisioned` (`coverage_dropped`,
+below); the `snapshots` vectors' `D` cases give each row's
 main form, not the first row's hold or release signed anew after its
 cover nor item 1's revokes signed anew, and the last row is `I5`'s (a
 covered principal with no cover). A Station's own revoke signed anew is
 still held to the mark (`not_above_mark`), so for an R3-fenced principal
 whose retained revoke was lost the stop comes from a current manager (no
 change proposed: Astation #147's external ceiling makes `U_p` known
-going forward). An optional input, `provisioned` (the services the
-Station provisioned at O and hasn't handed over), with a code
-`coverage_dropped` for one in it that is neither covered, revoked by the
-snapshot nor removed at the verifying head, would make the rule
-mechanical for a Station's assembler: offered, not built.
+going forward). The checker takes `provisioned`, the services the Station
+provisioned at O and hasn't handed over (built for Astation's request,
+#114 comment 7208700195; required, and an empty set checks nothing), in
+the identity form `covered` uses (the principal: a service has one key in
+the device list's history, ids never reused and no entry changing a key,
+so a revoke valid at the head names its principal's one key, and one
+naming any other key is refused `key_mismatch` before coverage is
+judged; Atem's reading). Its `coverage_dropped` makes the rule mechanical
+for a Station's assembler: some p in `provisioned` is neither in
+`covered`, nor revoked by a `revoke` of p that the snapshot carries (valid
+at the verifying head), nor removed from the device list at the head. A
+Portal-only revoke, an expiry, an absent key or a missing reservation
+never clears coverage, and every required interrupt is still carried
+(`stop_lost` otherwise).
 
 **A replacement feed after a rollback** (Astation #114, items 2 and 6). A
 Station that recovers from a rollback publishes a replacement feed: a new
@@ -1683,7 +1693,9 @@ verifying head (never a frozen list), with each service principal's mark
 and the set of principals the snapshot covers (`covered`: the services the
 Station currently covers at the cut, as "Which principals a Station
 currently covers" above reads it; the caller's input, which the checker
-never derives). First over the retained
+never derives), and the services the Station provisioned at its origin
+and hasn't handed over (`provisioned`, the caller's input; required,
+possibly empty). First over the retained
 records, then record by record in publication order, then over the whole
 snapshot, it answers `Consistent` or the first inconsistency `{index, code, principal, record_id?, reason?,
 effect?, revoke_seq?}`, the codes in the order they are checked:
@@ -1698,6 +1710,7 @@ effect?, revoke_seq?}`, the codes in the order they are checked:
 | `cover_not_first` | a covered principal's first record isn't its cover, or a hold or release comes before its principal's cover; after the last record (`index`: the snapshot's length), a covered principal with no cover |
 | `uncovered_cover` | a cover of a principal outside the covered set |
 | `not_above_mark` | a record signed anew with the service's own key is issued at or below its principal's mark, or the principal has none (a retained stop carried unchanged needs no mark) |
+| `coverage_dropped` | after the last record (`index`: the snapshot's length; no `record_id`): a principal in `provisioned`, in sorted order, that is neither in `covered`, nor revoked by a `revoke` of it the snapshot carries, nor removed from the device list at the head. Its place, after `cover_not_first` for a covered principal with no cover and before the retained stops' effects, is **Atem's choice** |
 | `stop_lost` | after the last record: an effect of a retained `revoke` or `interrupt_running` that is valid at the head (its principal's revocation, and the interrupt with it) isn't kept by the snapshot alone applied to a fresh state, as the paragraph below says (`effect`: `revocation` or `interrupt`; `record_id`: that retained stop; `revoke_seq`: a host principal's interrupt) |
 | `stop_not_resigned` | the same for a retained stop refused `removed_manager` (`reason`), a genuine stop whose signature verifies under its signer's key from the list's history: a current manager signs it again (I.5.4). Effect-only: any valid stop that keeps the original's effects passes it; whether a stop is a conforming copy is `check_resigned_copy`'s, stricter, below |
 
@@ -1894,8 +1907,8 @@ core builds only the primitive.
   the list's freeze and the member's standing change no answer (the
   builder refuses those itself). Which bodies are in the plan is the
   agreed B2 rule with the agreed reading on the plan's records above;
-  three points of the typed answer are **Atem's reading, for Astation's
-  confirmation (asked on Astation #114)**: a body of another account,
+  three points of the typed answer are Atem's reading, **agreed with
+  Astation (Astation #114 comment 7209301522)**: a body of another account,
   genesis or signer is **not in the plan** with a reason, never
   `malformed` (the builder refuses it either way); the order account,
   genesis, signer, action, origin (so another member's cover is
@@ -1983,9 +1996,15 @@ core builds only the primitive.
     absent from the set. (Options (ii), judging per journal, and (iii),
     an owner-confirmed exit under the agreed impact bound, were not
     taken.)
-- **The final cut, a fixpoint** (**Atem's reading of "a report and a
-  publication use the same recovery tuple, head and commitments", for
-  Astation's agreement (Astation #114, comment 7207806862)**). A
+- **The final cut, a fixpoint** (Atem's reading of "a report and a
+  publication use the same recovery tuple, head and commitments",
+  **agreed with Astation (Astation #114 comments 7208700195 and
+  7209301522)**: the final report round's challenge commits to its base;
+  every known author's latest report answers that round; newly exported
+  record digests extend the next round's base; holds persist through
+  re-reporting; a moved membership head is revalidated; if discovery
+  needs another stop signature after every eligible manager is held, the
+  plan is abandoned and the higher generation opened). A
   challenge's `evidence_hash` names its round's **base**: the evidence
   collected before the round opened. A round's own reports are its
   result, not part of its base. A round is final when every known
@@ -2017,8 +2036,9 @@ core builds only the primitive.
     verifying head (`verify_control` valid, its signer a current manager
     there); (b) it is in its author's final verified report (in
     `records`, exported signed, no `records_mismatch`); (c) it has the
-    original's **stop intent** (**corrected in Astation #114 (Atem's
-    comment after 7207806862)**): every body field equal but `signer` (a
+    original's **stop intent** (corrected in Astation #114, Atem's comment
+    7209160922, and **agreed with Astation, Astation #114 comment
+    7209301522**): every body field equal but `signer` (a
     current manager), `record_id` (a fresh UUID v4, never the
     original's), `issued_at` (display only for a native's record) and a
     service's `feed_id`, which is either the original's feed or the
@@ -2137,8 +2157,9 @@ ordering can't stop a key holder. The Station's duties:
     back, or isn't trusted yet), it waits. It never signs at or below the
     mark and never bypasses it.
 - A Station re-issues covers only for principals it currently covers
-  ("Which principals a Station currently covers" above: **Atem's reading,
-  for Astation's agreement (Astation #114, comment 7207811340)**).
+  ("Which principals a Station currently covers" above: Atem's reading,
+  **agreed with Astation (Astation #114 comments 7208700195 and
+  7209301522)**).
 - A Station that hands an integration over stops signing for it, and the
   key leaves with it (or the integration is created again as a new
   principal).
@@ -2270,8 +2291,8 @@ replay); and `snapshots`, the cases of `check_snapshot_consistency` (one
 or more per code, and consistent ones, item 2's retained stop among
 them), each with its inputs, `expect` and `in_force`: the stops in force
 after the retained records, after the snapshot alone and after both.
-(**New with the coverage reading above, for Astation's agreement,
-Astation #114 comment 7207811340.**) The `D` cases give its rows' main
+(**New with the coverage reading above, agreed with Astation, Astation
+#114 comments 7208700195 and 7209301522.**) The `D` cases give its rows' main
 forms (not the first row's hold signed anew after its cover, nor item
 1's revokes signed anew; the last row is `I5`'s): a revoked service
 outside `covered` with its retained revoke carried (the Station's own, a
@@ -2282,7 +2303,19 @@ unrevoked one outside `covered` (on `E7`, for which `S1_cover` and
 `M2_interrupt` gain their verdicts) and a current manager's copy of a
 removed manager's revoke for an uncovered principal
 (`M4_revoke_resigned`, the copy naming the original's feed; `N3`'s
-`M8_revoke_resigned_a2` names the candidate feed).
+`M8_revoke_resigned_a2` names the candidate feed). Every case gives its
+`provisioned` (empty but in the `P` cases, today's verdicts unchanged);
+the `P` cases, Astation's requested ones (#114 comment 7208700195): a
+service stopped by a carried manager's copy on either feed (no
+`coverage_dropped`), a revoked service whose snapshot misses an
+`interrupt_running` in force (`stop_lost`), two principals (a revoke of
+one never clears the other's coverage: `coverage_dropped` for the
+other), a revoke naming another key of the principal (`M12_revoke_another_key`,
+refused `key_mismatch` before coverage is judged), a Portal-only revoke
+(`coverage_dropped`) and the same with nothing provisioned (consistent),
+a removal at the head, a provisioned principal that is covered, and
+`coverage_dropped`'s place (after a covered principal's missing cover,
+before a retained stop's lost effect).
 `scripts/check-r9-vectors.py` derives each snapshot case's answer and
 `in_force` from the records' verdicts on its chain, with no state
 machine, and checks every code is exercised.
