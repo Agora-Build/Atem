@@ -35,8 +35,8 @@ binding proof (delegated host-work III.5 (b); its orders Atem's proposal,
 7209922243), Astation's three posted examples included (their digests and
 both signatures), and `r9-vectors-resigned-copy`, whose every copy check's
 code and detail, or copy, it derives from the bytes (host-work-v1 §11.1
-condition (c), Astation #114), each copy's verify_control verdict taken
-from its `checks`. The other files' `expect` and each `reason` are checked
+condition (c), Astation #114), each copy's verify_control verdict derived
+from the replayed chain (its `checks` only a cross-check). The other files' `expect` and each `reason` are checked
 by the Rust runner (`crates/atem-client/tests/vectors.rs`) and the binding
 suites.
 It also recomputes every Station report id of the acknowledgment fixtures
