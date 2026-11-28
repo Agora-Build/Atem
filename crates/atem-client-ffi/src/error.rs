@@ -74,8 +74,8 @@ pub enum AtemError {
     /// `expired`), and the reporter's `origin_mismatch` (a challenge for
     /// another Station) and `signing_failed` (the provider declined or
     /// failed). A manager's signer report (Astation #114 item 4) adds
-    /// `not_a_manager`, `recovery_mismatch` and `records_mismatch` in its
-    /// own order. A manager's Station binding proof (delegated host-work
+    /// `not_a_manager`, `recovery_mismatch`, `records_mismatch` and (v2,
+    /// its process roster) `processes_mismatch` in its own order. A manager's Station binding proof (delegated host-work
     /// III.5 (b)) uses `malformed`, `frozen`, `wrong_account`,
     /// `unknown_signer`, `not_a_manager`, `bad_signature`, `stale_log`,
     /// `fork`, `challenge_mismatch` and `expired` in its verifier's order,

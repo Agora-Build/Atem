@@ -4994,18 +4994,26 @@ def check_verifier_report(file, data, report, context):
 # A native manager's signed report of its control-record signing journal
 # (host-work-v1 §11.1 "The signer report"; Astation #114 item 4, agreed on
 # #114 comment 7089435073): the verifier report's core with a recovery and a
-# journal in place of the inventory.
+# journal in place of the inventory. Version 2 (Astation #114 comment
+# 7208700195): the journal commits to its process roster; v1 is refused.
 SR_BODY_FIELDS = sorted(["account_id", "challenge", "genesis_hash", "head", "journal", "process", "recovery", "signer", "slot", "type", "v"])
 SR_CHALLENGE_FIELDS = sorted(VR_CHALLENGE_FIELDS + ["recovery"])
 SR_RECOVERY_FIELDS = ["candidate_feed_id", "evidence_hash", "generation", "plan_id", "source_hash"]
-SR_JOURNAL_FIELDS = ["drafts", "drafts_hash", "id", "records", "records_hash", "revision", "since"]
-SR_LABEL = "atem-signer-report-v1"
+SR_JOURNAL_FIELDS = ["drafts", "drafts_hash", "id", "processes", "processes_hash", "records", "records_hash", "revision", "since"]
+SR_LABEL = "atem-signer-report-v2"
 SR_RECORDS = "atem-signer-report-records-v1"
 SR_DRAFTS = "atem-signer-report-drafts-v1"
+SR_PROCESSES = "atem-signer-report-processes-v1"
+# A roster holds at most this many process generations (as the adapter hands
+# it and as a report's is exported).
+SR_MAX_PROCESSES = 4096
+# The vectors' reports' own process (a builder's is its loaded core's).
+SR_PROCESS = b"vectors-process!"
 SR_MAX_GENERATION = 2**63 - 1
 SR_VERIFY_ORDER = [
     "malformed", "frozen", "wrong_account", "unknown_signer", "not_a_manager", "bad_signature", "stale_log", "fork",
-    "signer_mismatch", "slot_mismatch", "challenge_mismatch", "recovery_mismatch", "records_mismatch", "expired",
+    "signer_mismatch", "slot_mismatch", "challenge_mismatch", "recovery_mismatch", "records_mismatch",
+    "processes_mismatch", "expired",
 ]
 CONTROL_LABEL = "atem-host-work-control-v1"
 # A control record's body fields (record.rs, delegated host-work I.5.3).
@@ -5150,8 +5158,29 @@ def sr_journal_ok(o):
         return False
     return (
         vr_b64u(o["id"], 16) and vr_int(o["since"], 1) and vr_int(o["revision"]) and vr_int(o["records"]) and vr_int(o["drafts"])
-        and all(isinstance(o[k], str) and re.fullmatch(HEX64, o[k]) is not None for k in ("records_hash", "drafts_hash"))
+        and vr_int(o["processes"], 1)
+        and all(isinstance(o[k], str) and re.fullmatch(HEX64, o[k]) is not None for k in ("records_hash", "drafts_hash", "processes_hash"))
     )
+
+
+def sr_roster(ids):
+    """A roster as an adapter or an export hands it: at most 4,096 ids, each
+    16 bytes of base64url, none twice; the raw ids sorted by bytes, or the
+    rule that failed (count, id, duplicate)."""
+    if len(ids) > SR_MAX_PROCESSES:
+        raise Refused("count")
+    raw = []
+    for i in ids:
+        if not vr_b64u(i, 16):
+            raise Refused("id")
+        raw.append(b64u_decode(i))
+    if len(set(raw)) != len(raw):
+        raise Refused("duplicate")
+    return sorted(raw)
+
+
+def sr_processes_hash(raw):
+    return sha256(enc([SR_PROCESSES] + sorted(raw))).hex()
 
 
 def read_sr_challenge(text):
@@ -5186,7 +5215,7 @@ def read_sr_report(text):
         raise Refused("malformed")
     if not isinstance(body, dict) or not sr_flat(body):
         raise Refused("malformed")
-    if body.get("type") != "atem-signer-report" or type(body.get("v")) is not int or body["v"] != 1:
+    if body.get("type") != "atem-signer-report" or type(body.get("v")) is not int or body["v"] != 2:
         raise Refused("malformed")
     if len(jcs(body).encode("utf-8")) > MAX_BODY_BYTES or sorted(body) != SR_BODY_FIELDS:
         raise Refused("malformed")
@@ -5275,7 +5304,22 @@ def sr_exported(exported, journal, lst, member, origin, alg, public):
     return [jcs(vr_strict(t, VR_MAX_OBJECT_BYTES)) for t in exported]
 
 
-def sr_verify(text, lst, expected, exported, now):
+def sr_exported_processes(exported, journal, process):
+    """The exported roster against the report's processes: the count first
+    (and the bound), then each id, none twice, the processes_hash, and the
+    report's own process among them; the ids sorted by bytes."""
+    if len(exported) != journal["processes"]:
+        raise Refused("processes_mismatch")
+    try:
+        raw = sr_roster(exported)
+    except Refused:
+        raise Refused("processes_mismatch")
+    if sr_processes_hash(raw) != journal["processes_hash"] or b64u_decode(process) not in raw:
+        raise Refused("processes_mismatch")
+    return [b64u_encode(r) for r in raw]
+
+
+def sr_verify(text, lst, expected, exported, now, exported_processes):
     """verify_signer_report, from the file's note: the first failure in the
     agreed order, or the verified report."""
     body, sig = read_sr_report(text)
@@ -5301,12 +5345,13 @@ def sr_verify(text, lst, expected, exported, now):
         raise Refused("recovery_mismatch")
     member = body["signer"][len("member:"):]
     records = sr_exported(exported, body["journal"], lst, member, body["challenge"]["origin"], alg, public)
+    processes = sr_exported_processes(exported_processes, body["journal"], body["process"])
     if now >= expected["expires_at"]:
         raise Refused("expired")
     return {
         "signer": body["signer"], "slot": body["slot"], "process": body["process"],
         "connection": body["challenge"]["connection"], "head": head, "at_head": head == lst.head(),
-        "recovery": body["recovery"], "journal": body["journal"], "records": records,
+        "recovery": body["recovery"], "journal": body["journal"], "records": records, "processes": processes,
     }
 
 
@@ -5329,8 +5374,10 @@ def sr_digests(texts, lst, member, origin):
 
 
 def sr_build(case, lst):
-    """signer_report_body, from the file's note: the body but its process,
-    or Refused."""
+    """signer_report_body, from the file's note: the body but its process
+    and its journal.processes_hash (both the loaded core's own: the roster is
+    the journal's other ids and, when own_process, the builder's own), or
+    Refused."""
     signer, slot, now, challenge, journal = case["signer"], case["slot"], case["now_ms"], case["challenge"], case["journal"]
     m = re.fullmatch(VR_SIGNER, signer)
     if m is None or m.group(1) != "member" or re.fullmatch(OPAQUE_ID, slot) is None:
@@ -5353,14 +5400,23 @@ def sr_build(case, lst):
         raise Refused("malformed")
     records = sr_digests(journal["records"], lst, m.group(2), challenge["origin"])
     drafts = sr_digests(journal["drafts"], lst, m.group(2), challenge["origin"])
+    # The roster holds the builder's own process; its other ids in their
+    # grammar, none twice, the bound counting the own one.
+    if case["own_process"] is not True or len(journal["processes"]) + 1 > SR_MAX_PROCESSES:
+        raise Refused("malformed")
+    try:
+        sr_roster(journal["processes"])
+    except Refused:
+        raise Refused("malformed")
     return {
-        "type": "atem-signer-report", "v": 1, "account_id": lst.account_id, "genesis_hash": lst.genesis_hash,
+        "type": "atem-signer-report", "v": 2, "account_id": lst.account_id, "genesis_hash": lst.genesis_hash,
         "head": lst.head(), "signer": signer, "slot": slot,
         "challenge": {k: challenge[k] for k in VR_ECHO_FIELDS}, "recovery": challenge["recovery"],
         "journal": {
             "id": journal["id"], "since": journal["since"], "revision": journal["revision"],
             "records": len(records), "records_hash": sr_set_hash(SR_RECORDS, records),
             "drafts": len(drafts), "drafts_hash": sr_set_hash(SR_DRAFTS, drafts),
+            "processes": len(journal["processes"]) + 1,
         },
     }
 
@@ -5416,7 +5472,7 @@ def check_signer_report(file, data, report, context):
         with report.case(file, f"report {c['label']}") as case:
             expected = read_sr_challenge(json.dumps(c["challenge"]))
             try:
-                verified = sr_verify(c["report"], lst(c), expected, c["exported"], c["now_ms"])
+                verified = sr_verify(c["report"], lst(c), expected, c["exported"], c["now_ms"], c["exported_processes"])
                 case.equal(verified, c.get("expect"), "verified")
                 body = json.loads(c["report"])["body"]
                 case.equal(jcs(body), c["jcs"], "jcs")
@@ -5436,6 +5492,14 @@ def check_signer_report(file, data, report, context):
                     case.check(s_ > P256_N // 2, "S is high")
                     twin = sig[:32] + (P256_N - s_).to_bytes(32, "big")
                     case.check(verify("p256", keys.public("dev-phone", "auth"), twin, enc([SR_LABEL, jcs(report_["body"])])), "its low-S twin verifies")
+                if c["label"] == "v1_report":
+                    report_ = json.loads(c["report"])
+                    body = report_["body"]
+                    case.check(body["v"] == 1 and "processes" not in body["journal"], "a v1 body")
+                    case.check(
+                        verify("p256", keys.public("dev-phone", "auth"), b64u_decode(report_["sig"]), enc(["atem-signer-report-v1", jcs(body)])),
+                        "signed under the retired v1 label",
+                    )
     with report.case(file, "coverage") as case:
         case.equal(sorted(codes), sorted(SR_VERIFY_ORDER), "every verifier code")
         labels = {c["label"] for c in data["valid"] + data["invalid"]}
@@ -5444,6 +5508,9 @@ def check_signer_report(file, data, report, context):
             "not_a_manager", "recovered_manager", "pending_recovery_subject", "high_s_signature", "signer_mismatch", "slot_mismatch", "records_one_missing",
             "records_one_extra", "records_signed_after_report", "records_possibly_signed", "records_body_without_signature",
             "records_wrong_signer", "records_another_origin", "records_duplicate", "expired_at_expires_at",
+            "one_process", "several_processes", "processes_one_missing", "processes_one_extra", "processes_duplicate",
+            "processes_own_absent", "processes_count_mismatch", "processes_id_15_bytes", "processes_another_set",
+            "v1_report", "v_1",
         ):
             case.check(label in labels, f"{label} present")
         mismatched = {c["label"] for c in data["invalid"] if c["code"] == "recovery_mismatch"}
@@ -5468,17 +5535,24 @@ def check_signer_report(file, data, report, context):
             "hold_at_another_origin", "frozen_list", "demoted_manager", "origin_not_exact", "member_a_service",
         ):
             case.check(label in labels, f"{label} present")
+    built = set()
     for c in data["builder"] + data["request"]:
         with report.case(file, f"builder {c['label']}") as case:
             try:
                 body = sr_build(c, lst(c))
-                case.equal(body, c.get("body_but_process"), "the body but its process")
+                case.equal(body, c.get("body_but_process"), "the body but its process and its roster's hash")
             except Refused as e:
                 case.equal(e.code, c.get("code"), "refused")
+            built.add(c["label"])
+    with report.case(file, "builder roster coverage") as case:
+        for label in ("one_process", "several_processes", "no_own_process", "no_process", "process_twice", "process_id_15_bytes"):
+            case.check(label in built, f"{label} present")
     for c in data["request"]:
         with report.case(file, f"request {c['label']}") as case:
             case.equal(c["sign_request"], {"purpose": "signer_report", "fresh_confirmation": True, "label": SR_LABEL}, "sign request")
-            held = dict(c["body_but_process"], process=b64u_encode(b"vectors-process!"))
+            held = dict(c["body_but_process"], process=b64u_encode(SR_PROCESS))
+            roster = [b64u_decode(p) for p in c["journal"]["processes"]] + [SR_PROCESS]
+            held["journal"] = dict(held["journal"], processes_hash=sr_processes_hash(roster))
             signer_alg = keys.keys[c["key"].split("/")[0]]["auth"]["alg"]
             signer_pub = keys.public(c["key"].split("/")[0], "auth")
             for f in c["finishes"]:
@@ -5511,7 +5585,7 @@ SB_BUILD_ORDER = [
 ]
 SB_LABELS = {
     "signed_under_verifier_report_label": VR_LABEL,
-    "signed_under_signer_report_label": "atem-signer-report-v1",
+    "signed_under_signer_report_label": "atem-signer-report-v2",
     "signed_under_route_label": "atem-host-route-v1",
     "signed_under_proxy_route_label": "atem-host-route-proxy-v1",
     "signed_under_sig_c_label": "atem-ch1-client-sig-v1",

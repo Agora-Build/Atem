@@ -526,16 +526,17 @@ struct JsJournal {
     revision: f64,
     records: Vec<String>,
     drafts: Vec<String>,
+    processes: Vec<String>,
 }
 
 fn signer_journal(v: JsValue) -> JsResult<crate::types::SignerJournalView> {
     only_fields(
         &v,
-        &["id", "since", "revision", "records", "drafts"],
+        &["id", "since", "revision", "records", "drafts", "processes"],
         "journal",
     )?;
     let j: JsJournal = serde_wasm_bindgen::from_value(v)
-        .map_err(|_| bad("journal {id, since, revision, records, drafts}"))?;
+        .map_err(|_| bad("journal {id, since, revision, records, drafts, processes}"))?;
     let count = |v: f64, what: &str| {
         ms(v).map_err(|_| bad(&format!("journal.{what} is a non-negative safe integer")))
     };
@@ -545,6 +546,7 @@ fn signer_journal(v: JsValue) -> JsResult<crate::types::SignerJournalView> {
         revision: count(j.revision, "revision")?,
         records: j.records,
         drafts: j.drafts,
+        processes: j.processes,
     })
 }
 
@@ -587,17 +589,21 @@ pub fn parse_signer_report_challenge(challenge_json: String) -> JsResult<JsValue
 }
 
 /// Verifies a signer report against `log` at its head, the stored
-/// challenge and the exported signed records
+/// challenge, the exported signed records and the exported roster (each
+/// process generation base64url)
 /// (`member_report::signer::verify_signer_report`): `{signer, slot,
 /// process, connection, head, atHead, recovery, journal: {id, since,
-/// revision, records, recordsHash, drafts, draftsHash}, records}`, or
-/// throws `kind: "report"` with the first failure's `code`.
+/// revision, records, recordsHash, drafts, draftsHash, processes,
+/// processesHash}, records, processes}`, or throws `kind: "report"` with
+/// the first failure's `code` (`processes_mismatch` after
+/// `records_mismatch`).
 #[wasm_bindgen(js_name = verifySignerReport)]
 pub fn verify_signer_report(
     log: &MembershipLog,
     report_json: String,
     expected_challenge_json: String,
     exported_records_json: Vec<String>,
+    exported_processes: Vec<String>,
     now_ms: f64,
 ) -> JsResult<JsValue> {
     ok(crate::member_report::signer::verify_signer_report(
@@ -605,6 +611,7 @@ pub fn verify_signer_report(
         report_json,
         expected_challenge_json,
         exported_records_json,
+        exported_processes,
         ms(now_ms)?,
     ))
 }
@@ -637,7 +644,9 @@ pub fn signer_report_plan_record(
 /// A signer report waiting for its signature
 /// (`member_report::signer::SignerReportRequest`): an immutable handle on
 /// the body the core built from the journal (`{id, since, revision,
-/// records, drafts}`, the bodies as JSON texts). A key that answers later
+/// records, drafts, processes}`, the bodies as JSON texts, `processes` the
+/// journal's roster, this instance's own process among them). A key that
+/// answers later
 /// signs `signRequest().input` after the owner's fresh confirmation and
 /// hands the signature to `finish`, which takes only a signature over the
 /// held body by its signer.

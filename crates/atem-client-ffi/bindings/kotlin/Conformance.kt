@@ -774,11 +774,13 @@ fun main(args: Array<String>) {
     }
     // A manager's signer report (host-work-v1 §11.1 "The signer report";
     // Astation #114 item 4): each challenge read or refused; each report
-    // verified with its exported records, or refused as Report(code); each
-    // builder case as a SignerReportRequest (its body but the process,
-    // which is this core's); the immutable request's finishes, signed here
-    // with the JDK (another body, another member: refused); and the
-    // synchronous signer through the app's provider.
+    // verified with its exported records and roster (v2), or refused as
+    // Report(code); each builder case as a SignerReportRequest (its body but
+    // the process and the roster's hash, which are this core's: the hash
+    // recomputed here over the case's roster and this core's process); the
+    // immutable request's finishes, signed here with the JDK (another body,
+    // another member: refused); and the synchronous signer through the app's
+    // provider.
     val srep = load("r9-vectors-signer-report")
     fun srepLog(c: Any?): MembershipLog {
         val at = HostClock(c["now_ms"].l().toULong(), 1000uL, "boot-1")
@@ -797,10 +799,23 @@ fun main(args: Array<String>) {
     fun recoveryIn(r: Any?) = SignerReportRecovery(
         r["generation"].s(), r["plan_id"].s(), r["candidate_feed_id"].s(), r["source_hash"].s(), r["evidence_hash"].s(),
     )
-    fun journalIn(j: Any?) = SignerJournalView(
-        j["id"].s(), j["since"].l().toULong(), j["revision"].l().toULong(),
-        j["records"].arr().map { it.s() }, j["drafts"].arr().map { it.s() },
-    )
+    // A builder case's journal: its roster the file's ids, then this core's
+    // own process when the case's own_process says so.
+    fun journalIn(c: Any?): SignerJournalView {
+        val j = c["journal"]
+        val own = if (c["own_process"] == true) listOf(verifierReportProcess()) else emptyList()
+        return SignerJournalView(
+            j["id"].s(), j["since"].l().toULong(), j["revision"].l().toULong(),
+            j["records"].arr().map { it.s() }, j["drafts"].arr().map { it.s() },
+            j["processes"].arr().map { it.s() } + own,
+        )
+    }
+    // SHA-256(enc(["atem-signer-report-processes-v1", p1…pn])) over the raw
+    // ids sorted by bytes.
+    fun processesHash(ids: List<String>): String {
+        val raw = ids.map { Base64.getUrlDecoder().decode(it) }.sortedWith { a, b -> java.util.Arrays.compareUnsigned(a, b) }
+        return hex(MessageDigest.getInstance("SHA-256").digest(encodeFields(listOf(utf8("atem-signer-report-processes-v1")) + raw)))
+    }
     fun srepOut(v: VerifiedSignerReport): Map<String, Any?> = mapOf(
         "signer" to v.signer,
         "slot" to v.slot,
@@ -813,11 +828,13 @@ fun main(args: Array<String>) {
             "id" to v.journal.id, "since" to v.journal.since.toLong(), "revision" to v.journal.revision.toLong(),
             "records" to v.journal.records.toLong(), "records_hash" to v.journal.recordsHash,
             "drafts" to v.journal.drafts.toLong(), "drafts_hash" to v.journal.draftsHash,
+            "processes" to v.journal.processes.toLong(), "processes_hash" to v.journal.processesHash,
         ),
         "records" to v.records,
+        "processes" to v.processes,
     )
     fun srepRequest(log: MembershipLog, c: Any?, challenge: Any?, slot: String, key: String) =
-        SignerReportRequest(log, Json.write(challenge), c["signer"].s(), slot, c["station"].s(), journalIn(c["journal"]), key, c["now_ms"].l().toULong())
+        SignerReportRequest(log, Json.write(challenge), c["signer"].s(), slot, c["station"].s(), journalIn(c), key, c["now_ms"].l().toULong())
     check("signer report: challenges") {
         for (c in srep["challenges"].arr()) {
             val fields = c.obj()["fields"]
@@ -848,7 +865,8 @@ fun main(args: Array<String>) {
     check("signer report: reports") {
         for (c in srep["valid"].arr() + srep["invalid"].arr()) {
             val verify = {
-                verifySignerReport(srepLog(c), c["report"].s(), Json.write(c["challenge"]), c["exported"].arr().map { it.s() }, c["now_ms"].l().toULong())
+                verifySignerReport(srepLog(c), c["report"].s(), Json.write(c["challenge"]), c["exported"].arr().map { it.s() },
+                    c["exported_processes"].arr().map { it.s() }, c["now_ms"].l().toULong())
             }
             val expect = c.obj()["expect"]
             if (expect != null) eq(srepOut(verify()), expect, c["label"].s())
@@ -860,6 +878,8 @@ fun main(args: Array<String>) {
         eq(byCase.getValue("records_possibly_signed")["code"], "records_mismatch", "records_possibly_signed")
         eq(byCase.getValue("not_a_manager")["code"], "not_a_manager", "not_a_manager")
         eq(byCase.getValue("high_s_signature")["code"], "bad_signature", "high_s_signature")
+        eq(byCase.getValue("processes_own_absent")["code"], "processes_mismatch", "processes_own_absent")
+        eq(byCase.getValue("v1_report")["code"], "malformed", "v1_report")
     }
     check("signer report: the builder") {
         for (c in srep["builder"].arr() + srep["request"].arr()) {
@@ -871,6 +891,9 @@ fun main(args: Array<String>) {
             }
             val body = LinkedHashMap(Json.parse(build().bodyJson()).obj())
             eq(body.remove("process"), verifierReportProcess(), "${c["label"].s()}: this core's process")
+            val journal = LinkedHashMap(body.getValue("journal").obj())
+            eq(journal.remove("processes_hash"), processesHash(journalIn(c).processes), "${c["label"].s()}: the roster's hash")
+            body["journal"] = journal
             eq(body, want, c["label"].s())
         }
     }
@@ -929,18 +952,24 @@ fun main(args: Array<String>) {
         val k = keys["dev-phone"]["auth"]
         keysUsed.addP256("dev-phone/auth", unhex(k["secret_hex"].s()), unhex(k["pub_hex"].s()))
         val report = signSignerReport(keysUsed, log, Json.write(c["challenge"]), c["signer"].s(), c["slot"].s(), c["station"].s(),
-            journalIn(c["journal"]), "dev-phone/auth", c["now_ms"].l().toULong())
+            journalIn(c), "dev-phone/auth", c["now_ms"].l().toULong())
         val records = listOf("phone_revoke", "phone_interrupt", "phone_host_interrupt").map { label ->
             canonicalJson(Json.write(srep["records"].arr().first { it["label"] == label }["record"]))
         }
-        val v = verifySignerReport(log, report, Json.write(c["challenge"]), records, c["now_ms"].l().toULong())
+        val roster = journalIn(c).processes
+        val v = verifySignerReport(log, report, Json.write(c["challenge"]), records, roster, c["now_ms"].l().toULong())
         eq(v.process, verifierReportProcess(), "process")
         eq(v.journal.records, 3uL, "records")
+        eq(v.journal.processes, roster.size.toULong(), "processes")
+        eq(v.processes.contains(verifierReportProcess()), true, "its own process in the verified roster")
+        reportError("processes_mismatch") {
+            verifySignerReport(log, report, Json.write(c["challenge"]), records, listOf(verifierReportProcess()), c["now_ms"].l().toULong())
+        }
         eq(keysUsed.requests.single().purpose, SigningPurpose.SIGNER_REPORT, "purpose")
         eq(keysUsed.requests.single().freshConfirmation, true, "a fresh confirmation")
         reportError("bad_signature") {
             signSignerReport(reporters, log, Json.write(c["challenge"]), c["signer"].s(), c["slot"].s(), c["station"].s(),
-                journalIn(c["journal"]), "dev-mac/auth", c["now_ms"].l().toULong())
+                journalIn(c), "dev-mac/auth", c["now_ms"].l().toULong())
         }
     }
     // A manager's Station binding proof (delegated host-work III.5 (b);

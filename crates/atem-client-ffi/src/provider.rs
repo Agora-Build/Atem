@@ -651,7 +651,7 @@ mod tests {
     /// the background.
     #[test]
     fn a_signer_report_names_its_purpose_and_asks_a_fresh_confirmation() {
-        let body = br#"{"slot":"astation-ios","type":"atem-signer-report","v":1}"#;
+        let body = br#"{"slot":"astation-ios","type":"atem-signer-report","v":2}"#;
         let request = sign_request(
             &KeyId::new("k"),
             &SigningInput::new(SignLabel::SignerReport, body),
@@ -659,7 +659,7 @@ mod tests {
         assert_eq!(request.purpose, SigningPurpose::SignerReport);
         assert!(request.fresh_confirmation);
         assert!(SigningPurpose::SignerReport.needs_fresh_confirmation());
-        assert_eq!(request.label, "atem-signer-report-v1");
+        assert_eq!(request.label, "atem-signer-report-v2");
         assert_eq!(
             request.body_json.as_deref().map(str::as_bytes),
             Some(&body[..])

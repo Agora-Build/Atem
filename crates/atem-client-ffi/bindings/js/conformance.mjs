@@ -656,12 +656,22 @@ check("verifier report: a bot signs with its own key", () => {
 // ------------------------------------------- a manager's signer report
 // r9-vectors-signer-report (host-work-v1 §11.1 "The signer report"; Astation
 // #114 item 4): each challenge read or refused; each report verified with
-// its exported records, or refused with kind report and its code; each
-// builder case as a SignerReportRequest (its body but the process, which is
-// this instance's); the immutable request's finishes, signed here with
-// Node's crypto (another body, another member: refused); and the
-// synchronous signer with a software key.
+// its exported records and roster (v2), or refused with kind report and its
+// code; each builder case as a SignerReportRequest (its body but the process
+// and the roster's hash, which are this instance's: the hash recomputed
+// here over the case's roster and this instance's process); the immutable
+// request's finishes, signed here with Node's crypto (another body, another
+// member: refused); and the synchronous signer with a software key.
 const srep = load("r9-vectors-signer-report");
+// A builder case's journal: its roster the file's ids, then this instance's
+// own process when the case's own_process says so.
+const srepJournal = (c) => ({ ...c.journal, processes: [...c.journal.processes, ...(c.own_process ? [m.verifierReportProcess()] : [])] });
+// SHA-256(enc(["atem-signer-report-processes-v1", p1…pn])) over the raw ids
+// sorted by bytes.
+const srepProcessesHash = (ids) => {
+  const raw = ids.map((p) => Buffer.from(p, "base64url")).sort(Buffer.compare);
+  return createHash("sha256").update(m.encodeFields([utf8("atem-signer-report-processes-v1"), ...raw])).digest("hex");
+};
 const srepLog = (c) => {
   const now = { wallMs: c.now_ms, monoMs: 1000, bootId: "boot-1" };
   const chain = c.chain.map((label) => str(srep.entries.find((e) => e.label === label).entry));
@@ -699,8 +709,11 @@ const srepOut = (v) => ({
     records_hash: v.journal.recordsHash,
     drafts: v.journal.drafts,
     drafts_hash: v.journal.draftsHash,
+    processes: v.journal.processes,
+    processes_hash: v.journal.processesHash,
   },
   records: v.records,
+  processes: v.processes,
 });
 check("signer report: challenges", () => {
   for (const c of srep.challenges) {
@@ -726,7 +739,7 @@ check("signer report: challenges", () => {
 });
 check("signer report: reports", () => {
   for (const c of [...srep.valid, ...srep.invalid]) {
-    const verify = () => m.verifySignerReport(srepLog(c), c.report, str(c.challenge), c.exported, c.now_ms);
+    const verify = () => m.verifySignerReport(srepLog(c), c.report, str(c.challenge), c.exported, c.exported_processes, c.now_ms);
     if (c.expect !== undefined) same(srepOut(verify()), c.expect, c.label);
     else reportError(verify, c.code);
   }
@@ -735,17 +748,21 @@ check("signer report: reports", () => {
   eq(byCase.records_possibly_signed.code, "records_mismatch", "records_possibly_signed");
   eq(byCase.not_a_manager.code, "not_a_manager", "not_a_manager");
   eq(byCase.high_s_signature.code, "bad_signature", "high_s_signature");
+  eq(byCase.processes_own_absent.code, "processes_mismatch", "processes_own_absent");
+  eq(byCase.v1_report.code, "malformed", "v1_report");
 });
 check("signer report: the builder", () => {
   for (const c of [...srep.builder, ...srep.request]) {
-    const build = () => new m.SignerReportRequest(srepLog(c), str(c.challenge), c.signer, c.slot, c.station, c.journal, "key", c.now_ms);
+    const build = () => new m.SignerReportRequest(srepLog(c), str(c.challenge), c.signer, c.slot, c.station, srepJournal(c), "key", c.now_ms);
     if (c.body_but_process === undefined) {
       reportError(build, c.code);
       continue;
     }
     const body = JSON.parse(build().bodyJson());
     eq(body.process, m.verifierReportProcess(), `${c.label}: this instance's process`);
+    eq(body.journal.processes_hash, srepProcessesHash(srepJournal(c).processes), `${c.label}: the roster's hash`);
     delete body.process;
+    delete body.journal.processes_hash;
     same(body, c.body_but_process, c.label);
   }
 });
@@ -768,7 +785,7 @@ check("signer report: the plan predicate", () => {
 check("signer report: the immutable request", () => {
   for (const c of srep.request) {
     const log = srepLog(c);
-    const request = (challenge, slot) => new m.SignerReportRequest(log, str(challenge), c.signer, slot, c.station, c.journal, c.key, c.now_ms);
+    const request = (challenge, slot) => new m.SignerReportRequest(log, str(challenge), c.signer, slot, c.station, srepJournal(c), c.key, c.now_ms);
     const held = request(c.challenge, c.slot);
     const body = held.bodyJson();
     const sr = held.signRequest();
@@ -793,11 +810,15 @@ check("signer report: the synchronous signer, with a software key", () => {
   store.insertP256("dev-phone/auth", unhex(keys["dev-phone"].auth.secret_hex));
   store.insertP256("dev-mac/auth", unhex(keys["dev-mac"].auth.secret_hex));
   const log = srepLog(c);
-  const sign = (key) => m.signSignerReport(store, log, str(c.challenge), c.signer, c.slot, c.station, c.journal, key, c.now_ms);
+  const sign = (key) => m.signSignerReport(store, log, str(c.challenge), c.signer, c.slot, c.station, srepJournal(c), key, c.now_ms);
   const records = ["phone_revoke", "phone_interrupt", "phone_host_interrupt"].map((l) => m.canonicalJson(str(srep.records.find((r) => r.label === l).record)));
-  const v = m.verifySignerReport(log, sign(c.key), str(c.challenge), records, c.now_ms);
+  const roster = srepJournal(c).processes;
+  const v = m.verifySignerReport(log, sign(c.key), str(c.challenge), records, roster, c.now_ms);
   eq(v.process, m.verifierReportProcess(), "process");
   eq(v.journal.records, 3, "records");
+  eq(v.journal.processes, roster.length, "processes");
+  if (!v.processes.includes(m.verifierReportProcess())) throw new Error("its own process in the verified roster");
+  reportError(() => m.verifySignerReport(log, sign(c.key), str(c.challenge), records, [m.verifierReportProcess()], c.now_ms), "processes_mismatch");
   reportError(() => sign("dev-mac/auth"), "bad_signature");
 });
 

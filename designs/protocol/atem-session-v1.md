@@ -4676,7 +4676,8 @@ conformance suites and `scripts/check-r9-vectors.py`, which derives every
 verdict) and `r9-vectors-signer-report` (host-work-v1 §11.1 "The signer
 report", a native manager's signed report of its control-record signing
 journal on the same core, agreed with Astation, #114 comment 7089435073;
-its runners are `crates/atem-client/tests/signer_report.rs`, the FFI's, the
+version 2, its process roster, agreed with Astation, #114 comment
+7208700195; its runners are `crates/atem-client/tests/signer_report.rs`, the FFI's, the
 binding conformance suites and `scripts/check-r9-vectors.py`) and
 `r9-vectors-station-binding` (delegated host-work III.5 (b), a native
 manager's Station binding proof: Astation's three posted examples verbatim,

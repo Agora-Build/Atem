@@ -3,7 +3,8 @@
 //! array rules of §R9.2 (sets sorted and unique, sequences kept in order).
 //!
 //! Parsing checks only what holds for every signed object: strict I-JSON,
-//! no `null`, the size bound, a known `type` with `v: 1`, canonical arrays,
+//! no `null`, the size bound, a known `type` with its `v` (1; a signer
+//! report's 2, `SignLabel::body_version`), canonical arrays,
 //! and which fields may sit beside `body`. What each field means (an entry's
 //! action rules, a grant's lifetime, a hint's times) is checked by the layer
 //! that knows the log and the clock. The signature is checked with a key the
@@ -383,8 +384,13 @@ pub(crate) fn check_body(body: &Value) -> Result<(SignLabel, String)> {
         .and_then(Value::as_str)
         .ok_or(Error::Malformed("type"))?;
     let label = SignLabel::of_body_type(body_type).ok_or(Error::UnknownType)?;
-    if body.get("v").and_then(Value::as_u64) != Some(1) {
-        return Err(Error::Malformed("v must be 1"));
+    if body.get("v").and_then(Value::as_u64) != Some(label.body_version()) {
+        // A signer report is the one body at v2 (its process roster); its
+        // v1 is refused, never read (no compatibility path).
+        return Err(Error::Malformed(match label.body_version() {
+            2 => "v must be 2",
+            _ => "v must be 1",
+        }));
     }
     check_value(body, &|path| array_rule(label, path))?;
     let jcs = jcs(body)?;
@@ -466,12 +472,25 @@ mod tests {
     }
 
     /// A signer report (Astation #114 item 4) has no array at all: its
-    /// journal carries counts and set hashes, never the bodies; nothing
-    /// sits beside it but `sig`.
+    /// journal carries counts and set hashes, never the bodies or the
+    /// process roster; nothing sits beside it but `sig`. It is the one body
+    /// at `v: 2` (its roster, #114 comment 7208700195): v1 is refused.
     #[test]
     fn a_signer_report_takes_no_array() {
+        for v in [1, 3] {
+            assert_eq!(
+                parse(&json!({"body": {"type": "atem-signer-report", "v": v}, "sig": "AA"})),
+                Err(Error::Malformed("v must be 2")),
+                "v {v}"
+            );
+        }
+        // Every other body stays at v: 1.
+        assert_eq!(
+            parse(&json!({"body": {"type": "atem-verifier-report", "v": 2}, "sig": "AA"})),
+            Err(Error::Malformed("v must be 1"))
+        );
         let report = |extra: Value| {
-            let mut body = json!({"type": "atem-signer-report", "v": 1, "slot": "astation-ios"});
+            let mut body = json!({"type": "atem-signer-report", "v": 2, "slot": "astation-ios"});
             body.as_object_mut()
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
@@ -482,6 +501,7 @@ mod tests {
         for extra in [
             json!({"slot": ["a"]}),
             json!({"journal": {"records": ["a"]}}),
+            json!({"journal": {"processes": ["a"]}}),
             json!({"recovery": {"plan_id": []}}),
         ] {
             assert_eq!(parse(&report(extra)), Err(Error::ArrayNotCanonical));

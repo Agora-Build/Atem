@@ -348,6 +348,7 @@ fn a_signer_report_holds_no_lock() {
         revision: 0,
         records: Vec::new(),
         drafts: Vec::new(),
+        processes: vec![atem_client_ffi::member_report::verifier_report_process()],
     };
     let report = atem_client_ffi::member_report::signer::sign_signer_report(
         provider.clone(),
@@ -366,6 +367,7 @@ fn a_signer_report_holds_no_lock() {
         report,
         challenge,
         Vec::new(),
+        vec![atem_client_ffi::member_report::verifier_report_process()],
         WALL,
     )
     .unwrap();

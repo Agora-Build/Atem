@@ -21,18 +21,30 @@
 //!   [`signer_report_body`] the journal's own bodies ([`JournalView`]): the
 //!   plan's records in `signing` or `signed`, and its drafts. The builder
 //!   reads each strictly and computes the counts and the set hashes itself
-//!   (the caller supplies no hash). The body
-//!   `{"type":"atem-signer-report","v":1,"account_id","genesis_hash",
+//!   (the caller supplies no hash), and the journal's process roster
+//!   (every process generation attached to it). The body
+//!   `{"type":"atem-signer-report","v":2,"account_id","genesis_hash",
 //!   "head":{"seq","hash"},"signer","slot","process","challenge":{"origin",
 //!   "connection","nonce","issued_at","expires_at"},"recovery":{…},
 //!   "journal":{"id","since","revision","records","records_hash","drafts",
-//!   "drafts_hash"}}` is signed over `enc(["atem-signer-report-v1",
-//!   jcs(body)])` by the manager's own `auth_key`, with a fresh
-//!   confirmation ([`sign_signer_report`], or
+//!   "drafts_hash","processes","processes_hash"}}` is signed over
+//!   `enc(["atem-signer-report-v2", jcs(body)])` by the manager's own
+//!   `auth_key`, with a fresh confirmation ([`sign_signer_report`], or
 //!   [`SignerReportBody::with_signature`] for a key that answers later);
 //! - the Station verifies it with [`verify_signer_report`] against its log
-//!   at its current head, the challenge it stored and the signed records
-//!   exported with the report.
+//!   at its current head, the challenge it stored, and the signed records
+//!   and the roster exported with the report.
+//!
+//! **Version 2: the process roster** (option (i), agreed with Astation,
+//! #114 comment 7208700195). The adapter durably appends `attach{process}`
+//! the first time a process takes the journal's lock, before that process
+//! can append any `signing` entry; the report commits to the attached set:
+//! `journal.processes` (its count, 1 to 2^53 − 1) and `processes_hash =
+//! SHA-256(enc(["atem-signer-report-processes-v1", p1…pn]))`, each `p` the
+//! 16 raw bytes of a process generation (the body's `process` form),
+//! sorted by bytes. The builder refuses a roster without this core's own
+//! process. v1 is refused as `malformed` everywhere: no compatibility path
+//! (the owner's standing rule; Astation updates with Atem).
 //!
 //! **The plan's records** (B2): a control-record body this member signs
 //! (`signer` `member:<id>`), of this account and genesis, that is a
@@ -67,17 +79,27 @@
 //! v1`. A body's digest doesn't depend on its signature.
 //!
 //! **What it proves.** That this manager's key signed this report for this
-//! challenge and plan, and that the exported records are exactly its
+//! challenge and plan, that the exported records are exactly its
 //! `records`: each a signed control record of the plan by this member,
 //! verified under its `auth_key`, once, their count and `records_hash` the
-//! report's. **It is consistency only, never completeness of anything
-//! outside the journal**: an old or unaccounted-for process, a range before
-//! `since`, a changed journal `id` and a rolled-back protected store stay
-//! the adapter's and the owner's unresolved obligations (Astation's rules
-//! on #114). A body the journal holds as `signing` with no saved signature
-//! is in `records` and can't be exported as signed, so the report stays
-//! refused (`records_mismatch`): Astation's conservative rule, with no
-//! permissive path.
+//! report's; and that the exported roster is exactly its `processes`: the
+//! signer attested that these processes attached to journal `id`. That is
+//! the adapter's word under B6, exactly as strong as `records`, and never
+//! evidence about a process absent from the set, nor about another
+//! journal. **It is consistency only, never completeness of anything
+//! outside the journal**: a process that bypassed the adapter (a build
+//! before the journal, another install's journal, a rolled-back store), a
+//! range before `since`, a changed journal `id` and a rolled-back protected
+//! store stay the adapter's and the owner's unresolved obligations
+//! (Astation's rules on #114). A body the journal holds as `signing` with
+//! no saved signature is in `records` and can't be exported as signed, so
+//! the report stays refused (`records_mismatch`): Astation's conservative
+//! rule, with no permissive path.
+//!
+//! **The resolution rule** (Astation #114 comment 7208700195): a displaced
+//! process P of member M is accounted for by a verified report R iff R's
+//! signer is M and P is in R's `processes`. Comparing journals and
+//! generations (which journal, which recovery) is the Station's.
 use serde_json::{Map, Value, json};
 
 use super::{
@@ -89,7 +111,9 @@ use crate::canonical::{self, MAX_SAFE_INTEGER, Numbers};
 use crate::control::record::{
     ControlAction, ControlBody, ControlPrincipal, ControlRecord, ControlSigner,
 };
-use crate::domain::{SIGNER_REPORT_DRAFTS, SIGNER_REPORT_RECORDS, SignLabel, SigningInput};
+use crate::domain::{
+    SIGNER_REPORT_DRAFTS, SIGNER_REPORT_PROCESSES, SIGNER_REPORT_RECORDS, SignLabel, SigningInput,
+};
 use crate::encoding::{Hash32, b64u, b64u_decode_array};
 use crate::keys::PublicKey;
 use crate::membership::{Head, MemberKind, MemberStatus, Membership};
@@ -101,6 +125,14 @@ use crate::signed::{MAX_OBJECT_BYTES, SignedObject, check_body};
 pub const SIGNER_REPORT_TYPE: &str = "atem-signer-report";
 /// A journal's `id`: 16 random bytes made with the journal, base64url.
 pub const JOURNAL_ID_BYTES: usize = 16;
+/// A journal's process roster at most, as the adapter hands it and as a
+/// report's roster is exported: 4,096 process generations. Nothing else a
+/// report carries is bounded as a list (the records export is bounded only
+/// by its count), so this is the brief's bound (Atem's reading, Astation
+/// #114 comment 7208700195 asked for one).
+pub const MAX_JOURNAL_PROCESSES: usize = 4096;
+/// The body's `v`: 2, the process roster's version (v1 refused).
+const SIGNER_REPORT_V: u64 = 2;
 /// A recovery's `generation` at most, 2^63 − 1 (at least 1), written as a
 /// canonical decimal string.
 pub const MAX_GENERATION: u64 = i64::MAX as u64;
@@ -109,7 +141,7 @@ const MAX_GENERATION_DIGITS: usize = 19;
 
 /// The verifier's refusal codes in the order its checks run: the first
 /// that fails is the code ([`verify_signer_report`]).
-pub const SIGNER_VERIFY_ORDER: [&str; 14] = [
+pub const SIGNER_VERIFY_ORDER: [&str; 15] = [
     "malformed",
     "frozen",
     "wrong_account",
@@ -123,6 +155,7 @@ pub const SIGNER_VERIFY_ORDER: [&str; 14] = [
     "challenge_mismatch",
     "recovery_mismatch",
     "records_mismatch",
+    "processes_mismatch",
     "expired",
 ];
 
@@ -147,7 +180,7 @@ const RECOVERY_FIELDS: [&str; 5] = [
     "source_hash",
     "evidence_hash",
 ];
-const JOURNAL_FIELDS: [&str; 7] = [
+const JOURNAL_FIELDS: [&str; 9] = [
     "id",
     "since",
     "revision",
@@ -155,6 +188,8 @@ const JOURNAL_FIELDS: [&str; 7] = [
     "records_hash",
     "drafts",
     "drafts_hash",
+    "processes",
+    "processes_hash",
 ];
 /// The challenge a minter issues and stores: the verifier report's seven
 /// fields and the recovery.
@@ -406,10 +441,14 @@ impl SignerReportChallenge {
 /// under its exclusive lock (B1): its `id` (16 random bytes made with the
 /// journal, never changed), `since` (the device-list `seq` at its
 /// creation, at least 1), `revision` (the count of every append ever made,
-/// 0 to 2^53 − 1), and the bodies themselves, each a control-record body's
+/// 0 to 2^53 − 1), the bodies themselves, each a control-record body's
 /// JSON: `records`, the plan's records it put into `signing` or `signed`
 /// (a body in `signing` with no saved signature included), and `drafts`,
-/// its unsigned drafts of the plan's records.
+/// its unsigned drafts of the plan's records; and `processes`, its roster:
+/// every process generation attached to this journal (each 16 bytes,
+/// base64url as the body writes `process`, at most
+/// [`MAX_JOURNAL_PROCESSES`]), this process's own ([`process_generation`])
+/// among them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalView {
     pub id: [u8; JOURNAL_ID_BYTES],
@@ -417,10 +456,12 @@ pub struct JournalView {
     pub revision: u64,
     pub records: Vec<String>,
     pub drafts: Vec<String>,
+    pub processes: Vec<String>,
 }
 
 /// A report's `journal` as signed: the journal's identity, range and
-/// revision, and each set's count and hash.
+/// revision, and each set's count and hash (its records, its drafts and
+/// its process roster).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalSummary {
     pub id: [u8; JOURNAL_ID_BYTES],
@@ -430,11 +471,13 @@ pub struct JournalSummary {
     pub records_hash: Hash32,
     pub drafts: u64,
     pub drafts_hash: Hash32,
+    pub processes: u64,
+    pub processes_hash: Hash32,
 }
 
 impl JournalSummary {
     /// `{"id","since","revision","records","records_hash","drafts",
-    /// "drafts_hash"}`.
+    /// "drafts_hash","processes","processes_hash"}`.
     pub fn to_json(&self) -> Value {
         json!({
             "id": b64u(&self.id),
@@ -444,10 +487,13 @@ impl JournalSummary {
             "records_hash": self.records_hash.to_hex(),
             "drafts": self.drafts,
             "drafts_hash": self.drafts_hash.to_hex(),
+            "processes": self.processes,
+            "processes_hash": self.processes_hash.to_hex(),
         })
     }
 
-    /// Exactly the seven fields, each in its grammar.
+    /// Exactly the nine fields, each in its grammar (`processes` 1 to
+    /// 2^53 − 1: a journal's roster holds at least its reporter).
     fn read(value: &Value) -> Result<Self, ReportRefusal> {
         let o = exact(value, &JOURNAL_FIELDS, "journal")?;
         let id = str_field(o, "id")
@@ -466,6 +512,10 @@ impl JournalSummary {
                 .and_then(|h| Hash32::from_hex(h).ok())
                 .ok_or(malformed(name))
         };
+        let processes = int("processes", "journal.processes")?;
+        if processes == 0 {
+            return Err(malformed("journal.processes"));
+        }
         Ok(JournalSummary {
             id,
             since,
@@ -474,6 +524,8 @@ impl JournalSummary {
             records_hash: hash("records_hash", "journal.records_hash")?,
             drafts: int("drafts", "journal.drafts")?,
             drafts_hash: hash("drafts_hash", "journal.drafts_hash")?,
+            processes,
+            processes_hash: hash("processes_hash", "journal.processes_hash")?,
         })
     }
 }
@@ -664,18 +716,33 @@ pub fn signer_report_plan_record(
     .judge(&body)
 }
 
-/// `digests` sorted by bytes, or `None` when one is there twice.
-fn sorted_once(mut digests: Vec<[u8; 32]>) -> Option<Vec<[u8; 32]>> {
-    digests.sort_unstable();
-    (!digests.windows(2).any(|w| w[0] == w[1])).then_some(digests)
+/// `items` sorted by bytes, or `None` when one is there twice.
+fn sorted_once<const N: usize>(mut items: Vec<[u8; N]>) -> Option<Vec<[u8; N]>> {
+    items.sort_unstable();
+    (!items.windows(2).any(|w| w[0] == w[1])).then_some(items)
 }
 
-/// `SHA-256(enc([label, d1…dn]))` over `digests`, sorted.
-fn set_hash(label: &str, digests: &[[u8; 32]]) -> Hash32 {
-    let mut fields: Vec<&[u8]> = Vec::with_capacity(digests.len() + 1);
+/// `SHA-256(enc([label, d1…dn]))` over `items`, sorted.
+fn set_hash<const N: usize>(label: &str, items: &[[u8; N]]) -> Hash32 {
+    let mut fields: Vec<&[u8]> = Vec::with_capacity(items.len() + 1);
     fields.push(label.as_bytes());
-    fields.extend(digests.iter().map(|d| &d[..]));
+    fields.extend(items.iter().map(|d| &d[..]));
     Hash32::of_enc(&fields)
+}
+
+/// A roster of process generations as an adapter or an export hands it:
+/// at most [`MAX_JOURNAL_PROCESSES`] ids, each 16 bytes of base64url (no
+/// padding), none twice: the ids sorted by bytes, or which rule failed
+/// (`count` for the bound, before any id is read; `id`; `duplicate`).
+fn read_roster<S: AsRef<str>>(roster: &[S]) -> Result<Vec<[u8; PROCESS_BYTES]>, &'static str> {
+    if roster.len() > MAX_JOURNAL_PROCESSES {
+        return Err("count");
+    }
+    let ids = roster
+        .iter()
+        .map(|id| b64u_decode_array::<PROCESS_BYTES>(id.as_ref()).map_err(|_| "id"))
+        .collect::<Result<Vec<_>, _>>()?;
+    sorted_once(ids).ok_or("duplicate")
 }
 
 // ----------------------------------------------------------------- body
@@ -723,7 +790,7 @@ impl SignerReportBody {
         &self.held.jcs
     }
 
-    /// `enc(["atem-signer-report-v1", jcs(body)])`: what the manager's key
+    /// `enc(["atem-signer-report-v2", jcs(body)])`: what the manager's key
     /// signs, with a fresh confirmation.
     pub fn signing_input(&self) -> SigningInput {
         self.held.signing_input()
@@ -778,7 +845,9 @@ impl SignerReportBody {
 /// (`expired`); then the journal: `since` 0 or `revision` beyond 2^53 − 1,
 /// a body that isn't one of the plan's records by this member (another
 /// account, genesis, signer or origin, a cover, hold or release, anything
-/// that isn't a control-record body), or a body twice in one set
+/// that isn't a control-record body), a body twice in one set, then a
+/// roster without this core's own process, with an id that isn't 16 bytes
+/// of base64url, an id twice, or more than [`MAX_JOURNAL_PROCESSES`] ids
 /// (`malformed`).
 pub fn signer_report_body(
     log: &Membership,
@@ -815,6 +884,13 @@ pub fn signer_report_body(
     };
     let records = plan.digests(&journal.records, "journal.records")?;
     let drafts = plan.digests(&journal.drafts, "journal.drafts")?;
+    // The roster holds this process: the adapter attached it before this
+    // process could sign anything (B6).
+    let process = process_generation();
+    let processes = read_roster(&journal.processes)
+        .ok()
+        .filter(|ids| ids.binary_search(&process).is_ok())
+        .ok_or(malformed("journal.processes"))?;
     let summary = JournalSummary {
         id: journal.id,
         since: journal.since,
@@ -823,11 +899,12 @@ pub fn signer_report_body(
         records_hash: set_hash(SIGNER_REPORT_RECORDS, &records),
         drafts: drafts.len() as u64,
         drafts_hash: set_hash(SIGNER_REPORT_DRAFTS, &drafts),
+        processes: processes.len() as u64,
+        processes_hash: set_hash(SIGNER_REPORT_PROCESSES, &processes),
     };
-    let process = process_generation();
     let mut value: Map<String, Value> = common_body(log, &challenge.base, &process);
     value.insert("type".into(), json!(SIGNER_REPORT_TYPE));
-    value.insert("v".into(), json!(1));
+    value.insert("v".into(), json!(SIGNER_REPORT_V));
     value.insert("recovery".into(), challenge.recovery.to_json());
     value.insert("journal".into(), summary.to_json());
     let held = HeldBody::new(
@@ -861,8 +938,16 @@ pub fn sign_signer_report(
 // --------------------------------------------------------- verification
 
 /// A verified signer report: what the Station's recovery decides on. It
-/// proves the report's signature and that the exported records match it,
-/// and nothing about what lies outside the journal.
+/// proves the report's signature and that the exported records and roster
+/// match it, and nothing about what lies outside the journal.
+///
+/// `processes` is the verified roster: the signer attested that these
+/// processes attached to journal `journal.id`. It is the adapter's word
+/// under B6, exactly as strong as `records`; never evidence about a process
+/// absent from the set, nor about another journal. **The resolution rule**
+/// (Astation #114 comment 7208700195): a displaced process P of member M is
+/// accounted for by a verified report R iff R's signer is M and P is in R's
+/// `processes`. Comparing journals and generations is the Station's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedSignerReport {
     /// `member:<device_id>`.
@@ -882,6 +967,9 @@ pub struct VerifiedSignerReport {
     /// The exported records, each verified, in the order given: exactly the
     /// report's `records`.
     pub records: Vec<ControlRecord>,
+    /// The exported roster, verified, sorted by bytes: exactly the report's
+    /// `processes`, `process` among them.
+    pub processes: Vec<[u8; PROCESS_BYTES]>,
 }
 
 /// The exported records checked against the report's `records`: their
@@ -922,10 +1010,34 @@ fn exported_records<R: AsRef<[u8]>>(
     Ok(records)
 }
 
+/// The exported roster checked against the report's `processes`: at most
+/// [`MAX_JOURNAL_PROCESSES`] ids and their count first (before any id is
+/// read), then each a 16-byte base64url id, none twice, their set hash the
+/// journal's, and the report's own `process` among them. Any failure is
+/// `processes_mismatch`, naming which.
+fn check_roster<S: AsRef<str>>(
+    exported: &[S],
+    journal: &JournalSummary,
+    process: &[u8; PROCESS_BYTES],
+) -> Result<Vec<[u8; PROCESS_BYTES]>, ReportRefusal> {
+    if exported.len() as u64 != journal.processes {
+        return Err(ReportRefusal::ProcessesMismatch("count"));
+    }
+    let ids = read_roster(exported).map_err(ReportRefusal::ProcessesMismatch)?;
+    if set_hash(SIGNER_REPORT_PROCESSES, &ids) != journal.processes_hash {
+        return Err(ReportRefusal::ProcessesMismatch("processes_hash"));
+    }
+    if ids.binary_search(process).is_err() {
+        return Err(ReportRefusal::ProcessesMismatch("own process"));
+    }
+    Ok(ids)
+}
+
 /// Verifies a signer report (`{"body","sig"}` as received) against `log`
-/// at its current head, the challenge the minter stored, and the signed
-/// records exported with it (`exported`, each `{"body","sig"}`), at
-/// `now_ms` on the verifier's clock. Membership and keys are read at the
+/// at its current head, the challenge the minter stored, the signed
+/// records exported with it (`exported`, each `{"body","sig"}`) and its
+/// exported roster (`exported_processes`, each process generation
+/// base64url), at `now_ms` on the verifier's clock. Membership and keys are read at the
 /// verifier's head, never the report's. In this order, the first failure
 /// is the code ([`SIGNER_VERIFY_ORDER`]): exactly a report (`malformed`);
 /// the log not frozen (`frozen`); `account_id` and `genesis_hash` the log's
@@ -940,18 +1052,22 @@ fn exported_records<R: AsRef<[u8]>>(
 /// records exactly the report's `records` (`records_mismatch`: one that
 /// isn't a signed control record of the plan by this member, one whose
 /// signature doesn't verify under its key, a duplicate, another count or
-/// `records_hash`); `now_ms` before `expires_at` (`expired`).
+/// `records_hash`); the exported roster exactly the report's `processes`
+/// (`processes_mismatch`: a malformed id, a duplicate, another count or
+/// `processes_hash`, or a roster without the report's own `process`);
+/// `now_ms` before `expires_at` (`expired`).
 ///
 /// A body the journal holds as `signing` with no saved signature counts in
 /// `records` and can't be exported: such a report is `records_mismatch`
 /// until its signature is recovered. **Consistency only**: the report
 /// proves what this journal holds, never that the journal is all this
 /// member signed.
-pub fn verify_signer_report<R: AsRef<[u8]>>(
+pub fn verify_signer_report<R: AsRef<[u8]>, P: AsRef<str>>(
     log: &Membership,
     report_json: &[u8],
     expected: &SignerReportChallenge,
     exported: &[R],
+    exported_processes: &[P],
     now_ms: u64,
 ) -> Result<VerifiedSignerReport, ReportRefusal> {
     let object = read_report(report_json, SignLabel::SignerReport)?;
@@ -975,6 +1091,7 @@ pub fn verify_signer_report<R: AsRef<[u8]>>(
         origin: &body.echo.origin,
     };
     let records = exported_records(exported, &journal, &plan, &key)?;
+    let processes = check_roster(exported_processes, &journal, &body.process)?;
     if now_ms >= expected.expires_at() {
         return Err(ReportRefusal::Expired);
     }
@@ -988,5 +1105,6 @@ pub fn verify_signer_report<R: AsRef<[u8]>>(
         recovery,
         journal,
         records,
+        processes,
     })
 }

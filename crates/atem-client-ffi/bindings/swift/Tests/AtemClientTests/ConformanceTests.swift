@@ -993,11 +993,13 @@ final class ConformanceTests: XCTestCase {
         }
         // A manager's signer report (host-work-v1 §11.1 "The signer
         // report"; Astation #114 item 4): each challenge read or refused;
-        // each report verified with its exported records, or refused as
-        // Report(code); each builder case as a SignerReportRequest (its body
-        // but the process, which is this core's); the immutable request's
-        // finishes, signed here with CryptoKit (another body, another member:
-        // refused); and the synchronous signer through the app's provider.
+        // each report verified with its exported records and roster (v2), or
+        // refused as Report(code); each builder case as a SignerReportRequest
+        // (its body but the process and the roster's hash, which are this
+        // core's: the hash recomputed here over the case's roster and this
+        // core's process); the immutable request's finishes, signed here with
+        // CryptoKit (another body, another member: refused); and the
+        // synchronous signer through the app's provider.
         let srep = try load("r9-vectors-signer-report")
         func srepLog(_ c: [String: Any]) throws -> MembershipLog {
             let at = HostClock(wallMs: u(c["now_ms"]), monoMs: 1000, bootId: "boot-1")
@@ -1015,9 +1017,19 @@ final class ConformanceTests: XCTestCase {
             SignerReportRecovery(generation: s(r["generation"]), planId: s(r["plan_id"]), candidateFeedId: s(r["candidate_feed_id"]),
                 sourceHash: s(r["source_hash"]), evidenceHash: s(r["evidence_hash"]))
         }
-        func journalIn(_ j: [String: Any]) -> SignerJournalView {
-            SignerJournalView(id: s(j["id"]), since: u(j["since"]), revision: u(j["revision"]),
-                records: a(j["records"]).map(s), drafts: a(j["drafts"]).map(s))
+        // A builder case's journal: its roster the file's ids, then this
+        // core's own process when the case's own_process says so.
+        func journalIn(_ c: [String: Any]) -> SignerJournalView {
+            let j = o(c["journal"])
+            let own = (c["own_process"] as? Bool) == true ? [verifierReportProcess()] : []
+            return SignerJournalView(id: s(j["id"]), since: u(j["since"]), revision: u(j["revision"]),
+                records: a(j["records"]).map(s), drafts: a(j["drafts"]).map(s), processes: a(j["processes"]).map(s) + own)
+        }
+        // SHA-256(enc(["atem-signer-report-processes-v1", p1…pn])) over the
+        // raw ids sorted by bytes.
+        func processesHash(_ ids: [String]) -> String {
+            let raw = ids.map(b64u).sorted { $0.lexicographicallyPrecedes($1) }
+            return hex(Data(SHA256.hash(data: encodeFields(fields: [utf8("atem-signer-report-processes-v1")] + raw))))
         }
         func srepOut(_ v: VerifiedSignerReport) -> [String: Any] {
             [
@@ -1027,13 +1039,15 @@ final class ConformanceTests: XCTestCase {
                 "recovery": recoveryOut(v.recovery),
                 "journal": ["id": v.journal.id, "since": v.journal.since, "revision": v.journal.revision,
                             "records": v.journal.records, "records_hash": v.journal.recordsHash,
-                            "drafts": v.journal.drafts, "drafts_hash": v.journal.draftsHash] as [String: Any],
+                            "drafts": v.journal.drafts, "drafts_hash": v.journal.draftsHash,
+                            "processes": v.journal.processes, "processes_hash": v.journal.processesHash] as [String: Any],
                 "records": v.records,
+                "processes": v.processes,
             ]
         }
         func srepRequest(_ log: MembershipLog, _ c: [String: Any], _ challenge: [String: Any], _ slot: String, _ key: String) throws -> SignerReportRequest {
             try SignerReportRequest(log: log, challengeJson: js(challenge), signer: s(c["signer"]), slot: slot,
-                origin: s(c["station"]), journal: journalIn(o(c["journal"])), keyId: key, nowMs: u(c["now_ms"]))
+                origin: s(c["station"]), journal: journalIn(c), keyId: key, nowMs: u(c["now_ms"]))
         }
         check("signer report: challenges") {
             for c in a(srep["challenges"]).map(o) {
@@ -1071,7 +1085,8 @@ final class ConformanceTests: XCTestCase {
         check("signer report: reports") {
             for c in a(srep["valid"]).map(o) + a(srep["invalid"]).map(o) {
                 let verify = { try verifySignerReport(log: try srepLog(c), reportJson: s(c["report"]),
-                    expectedChallengeJson: js(o(c["challenge"])), exportedRecordsJson: a(c["exported"]).map(s), nowMs: u(c["now_ms"])) }
+                    expectedChallengeJson: js(o(c["challenge"])), exportedRecordsJson: a(c["exported"]).map(s),
+                    exportedProcesses: a(c["exported_processes"]).map(s), nowMs: u(c["now_ms"])) }
                 if let expect = c["expect"] as? [String: Any] {
                     try eq(canon(srepOut(try verify())), canon(expect), s(c["label"]))
                 } else {
@@ -1085,6 +1100,8 @@ final class ConformanceTests: XCTestCase {
             try eq(s(byCase["records_possibly_signed"]!["code"]), "records_mismatch", "records_possibly_signed")
             try eq(s(byCase["not_a_manager"]!["code"]), "not_a_manager", "not_a_manager")
             try eq(s(byCase["high_s_signature"]!["code"]), "bad_signature", "high_s_signature")
+            try eq(s(byCase["processes_own_absent"]!["code"]), "processes_mismatch", "processes_own_absent")
+            try eq(s(byCase["v1_report"]!["code"]), "malformed", "v1_report")
         }
         check("signer report: the builder") {
             for c in a(srep["builder"]).map(o) + a(srep["request"]).map(o) {
@@ -1096,6 +1113,10 @@ final class ConformanceTests: XCTestCase {
                 let text = try build().bodyJson()
                 var body = o(try JSONSerialization.jsonObject(with: Data(text.utf8)))
                 try eq(body.removeValue(forKey: "process") as? String, verifierReportProcess(), "\(s(c["label"])): this core's process")
+                var journal = o(body["journal"])
+                try eq(journal.removeValue(forKey: "processes_hash") as? String, processesHash(journalIn(c).processes),
+                    "\(s(c["label"])): the roster's hash")
+                body["journal"] = journal
                 try eq(canon(body), canon(want), s(c["label"]))
             }
         }
@@ -1167,15 +1188,23 @@ final class ConformanceTests: XCTestCase {
             try phone.addP256("dev-mac/auth", secret: unhex(s(key("dev-mac", "auth")["secret_hex"])))
             func sign(_ keyId: String) throws -> String {
                 try signSignerReport(provider: phone, log: log, challengeJson: js(o(c["challenge"])), signer: s(c["signer"]),
-                    slot: s(c["slot"]), origin: s(c["station"]), journal: journalIn(o(c["journal"])), keyId: keyId, nowMs: u(c["now_ms"]))
+                    slot: s(c["slot"]), origin: s(c["station"]), journal: journalIn(c), keyId: keyId, nowMs: u(c["now_ms"]))
             }
             let records = try ["phone_revoke", "phone_interrupt", "phone_host_interrupt"].map { label in
                 try canonicalJson(json: js(o(a(srep["records"]).map(o).first { s($0["label"]) == label }!["record"])))
             }
-            let v = try verifySignerReport(log: log, reportJson: try sign("dev-phone/auth"),
-                expectedChallengeJson: js(o(c["challenge"])), exportedRecordsJson: records, nowMs: u(c["now_ms"]))
+            let roster = journalIn(c).processes
+            let report = try sign("dev-phone/auth")
+            let v = try verifySignerReport(log: log, reportJson: report,
+                expectedChallengeJson: js(o(c["challenge"])), exportedRecordsJson: records, exportedProcesses: roster, nowMs: u(c["now_ms"]))
             try eq(v.process, verifierReportProcess(), "process")
             try eq(v.journal.records, 3, "records")
+            try eq(v.journal.processes, UInt64(roster.count), "processes")
+            try eq(v.processes.contains(verifierReportProcess()), true, "its own process in the verified roster")
+            try reportError("processes_mismatch") {
+                _ = try verifySignerReport(log: log, reportJson: report, expectedChallengeJson: js(o(c["challenge"])),
+                    exportedRecordsJson: records, exportedProcesses: [verifierReportProcess()], nowMs: u(c["now_ms"]))
+            }
             try eq(phone.requests.count, 1, "one request")
             try eq(phone.requests[0].purpose, .signerReport, "purpose")
             try eq(phone.requests[0].freshConfirmation, true, "a fresh confirmation")

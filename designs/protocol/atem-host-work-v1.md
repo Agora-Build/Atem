@@ -1731,7 +1731,9 @@ holds, no more).
 typed primitive **agreed with Astation, Astation #114 comment
 7089435073**; the five points below the agreed text left open are
 Atem's readings, **agreed with Astation, Astation #114 comment
-7093796254**). Before a Station publishes a replacement feed, every
+7093796254**; version 2, its process roster, **agreed with Astation,
+Astation #114 comment 7208700195**: option (i) below). Before a Station
+publishes a replacement feed, every
 native manager that could have signed one of the plan's stops reports its
 signing journal, so the snapshot includes every stop that author can have
 signed. The author's own device holds a durable barrier from its report
@@ -1799,14 +1801,18 @@ core builds only the primitive.
   `malformed` when it is read (**Atem's reading, agreed with Astation, Astation #114 comment 7093796254**; a report body
   naming a service, a host, a grant or `recovery` is `unknown_signer`, as
   agreed).
-- **The body**, type `atem-signer-report`, `v` 1, signed by the member's
-  own `auth_key` over `enc(["atem-signer-report-v1", jcs(body)])`, with a
+- **The body**, type `atem-signer-report`, `v` 2, signed by the member's
+  own `auth_key` over `enc(["atem-signer-report-v2", jcs(body)])`, with a
   fresh confirmation (purpose `SignerReport`: the plan, the origin, the
   counts, and that the barrier holds this device's stops until the plan
-  ends; never in the background):
+  ends; never in the background). Version 2 adds the process roster
+  (`journal.processes`, `journal.processes_hash`); v1 (`v` 1, under
+  `atem-signer-report-v1`) is refused as `malformed` everywhere, with no
+  compatibility path (the owner's standing rule; Astation updates with
+  Atem):
 
   ```json
-  {"body":{"type":"atem-signer-report","v":1,
+  {"body":{"type":"atem-signer-report","v":2,
     "account_id":"…","genesis_hash":"<hex>","head":{"seq":9,"hash":"<hex>"},
     "signer":"member:dev-phone","slot":"astation-ios","process":"<b64u 16>",
     "challenge":{"origin":"https://station-dev.agora.build","connection":3,
@@ -1814,7 +1820,8 @@ core builds only the primitive.
     "recovery":{"generation":"7","plan_id":"<UUID v4>","candidate_feed_id":"<UUID v4>",
                 "source_hash":"<hex>","evidence_hash":"<hex>"},
     "journal":{"id":"<b64u 16>","since":4,"revision":118,
-               "records":3,"records_hash":"<hex>","drafts":0,"drafts_hash":"<hex>"}},
+               "records":3,"records_hash":"<hex>","drafts":0,"drafts_hash":"<hex>",
+               "processes":2,"processes_hash":"<hex>"}},
    "sig":"<b64u>"}
   ```
 
@@ -1829,17 +1836,33 @@ core builds only the primitive.
   SHA-256(enc(["atem-signer-report-records-v1", d1…dn]))`, each `d` the 32
   bytes of `SHA-256(jcs(body))`, sorted by bytes; `drafts` and
   `drafts_hash` the same over its unsigned drafts of the plan's records,
-  with `atem-signer-report-drafts-v1`. The rest is the verifier report's:
-  strict I-JSON, exact fields at every level, no `null`, no array, the
-  body's `jcs` at most 4,096 bytes and the object at most 16 KiB.
+  with `atem-signer-report-drafts-v1`. `processes` (1 to 2^53 − 1) and
+  `processes_hash` are over the journal's process roster: the process
+  generations attached to it (the adapter durably appends
+  `attach{process}` the first time a process takes the journal's lock,
+  before that process can append any `signing` entry), the reporter's own
+  among them: `processes_hash =
+  SHA-256(enc(["atem-signer-report-processes-v1", p1…pn]))`, each `p` the
+  16 raw bytes of a process generation (the body's `process` form),
+  sorted by bytes. The set-hash labels keep `-v1`: only the report's own
+  label moved. The rest is the verifier report's: strict I-JSON, exact
+  fields at every level, no `null`, no array, the body's `jcs` at most
+  4,096 bytes and the object at most 16 KiB.
 - **The builder** (`member_report::signer_report_body`; the bindings'
   immutable `SignerReportRequest`) takes the log, the challenge, the
   reporter's `member:<id>`, its slot, its configured Station and the
   journal's view `{id, since, revision, records: [body_json], drafts:
-  [body_json]}`, under the adapter's lock. It reads each body strictly as
+  [body_json], processes: [process]}`, under the adapter's lock
+  (`processes`: every process generation attached to the journal,
+  base64url as the body writes `process`). It reads each body strictly as
   one of the plan's records by this member (anything else, or a body
-  twice in one set, is `malformed`), computes the counts and the set
-  hashes itself (the caller supplies no hash), and refuses a challenge for
+  twice in one set, is `malformed`), refuses a roster without the
+  process the core minted for this process (`process_generation()`), or
+  with an id that isn't 16 bytes of base64url, an id twice or more than
+  4,096 ids (`malformed`; the bound is **Atem's reading**: nothing else a
+  report carries is bounded as a list, the records export only by its
+  count), computes the counts and the set hashes itself (the caller
+  supplies no hash), and refuses a challenge for
   another Station (`origin_mismatch`), signer or slot, and a signer that
   isn't a current native member (`unknown_signer`) or never held `manage`
   (`not_a_manager`). Two points are **Atem's reading, agreed with Astation, Astation #114 comment 7093796254**:
@@ -1879,7 +1902,8 @@ core builds only the primitive.
   `another_signer`, this member's own `malformed`); and the four reason
   codes.
 - **The verifier**, `verify_signer_report(log, report, expected_challenge,
-  exported_records[], now_ms)`, reads membership at the verifier's head;
+  exported_records[], exported_processes[], now_ms)`, reads membership at
+  the verifier's head;
   the first failure is the code, in this order: `malformed`, `frozen`,
   `wrong_account`, `unknown_signer` (services, hosts, `recovery` and
   grants included), `not_a_manager` (a current native that never held
@@ -1889,12 +1913,21 @@ core builds only the primitive.
   `records_mismatch` (an exported record that isn't a signed control
   record of the plan by this member, one whose signature doesn't verify
   under its `auth_key`, a duplicate, or another count or `records_hash`
-  than the report's), `expired`. It returns `{signer, slot, process,
-  connection, head, at_head, recovery, journal, records}`, `records` the
-  verified exported records.
+  than the report's), `processes_mismatch` (the exported roster, each a
+  process generation in base64url, isn't exactly the report's: a
+  malformed id, a duplicate, another count or `processes_hash` than the
+  report's, or a roster without the report's own `process`; the count
+  and the 4,096 bound are checked before any id is read), `expired`. It
+  returns `{signer, slot, process, connection, head, at_head, recovery,
+  journal, records, processes}`, `records` the verified exported records
+  and `processes` the verified roster, sorted by bytes.
 - **What it proves:** the report's signature, for this challenge and
-  plan, and that the export matches it. **It is consistency only, never
-  completeness of anything outside the journal.** A `signing` body with
+  plan, and that the export matches it. Its `processes` say that the
+  signer attested that these processes attached to journal `id`: the
+  adapter's word under B6, exactly as strong as `records`, never evidence
+  about a process absent from the set, nor about another journal. **It is
+  consistency only, never completeness of anything outside the
+  journal.** A `signing` body with
   no saved signature is in `records` and can't be exported as signed, so
   the report stays `records_mismatch` and reconciliation stays fenced until
   the exact evidence is recovered (Astation's conservative rule; there is
@@ -1917,8 +1950,8 @@ core builds only the primitive.
   - the barrier's persisted lifetime is independent of the challenge's and
     the report's short acceptance lease: an expired report may need a
     fresh one, and never clears the barrier.
-- **One journal, not one process** (**Atem's reading, for Astation's
-  agreement (Astation #114, comment 7207806862)**). No agreed record
+- **One journal, not one process** (**Atem's reading, agreed with
+  Astation (Astation #114 comments 7208700195 and 7209301522)**). No agreed record
   proves, on its own, that a displaced process stopped or that it signed
   only through the exclusive journal: a successor's report accounts for
   its journal's records, and a timeout, a matching key, a new process's
@@ -1929,32 +1962,27 @@ core builds only the primitive.
   it holds the successor. So what needs proving is that a process used
   journal J, not that it stopped, and no signature proves that: it is the
   adapter invariant every report rests on (B6).
-  - **Liveness, the risk to settle.** If every app relaunch counts as an
-    unresolved participant that only independent evidence clears, every
-    recovery after any relaunch stays blocked for good (unknown authors
-    still block reopening, above). Astation picks one:
-    - (i) a process roster in the journal, a new primitive version Atem
-      would build (with a new pin): the adapter durably appends
-      `attach{process}` the first time a process takes the journal's lock,
-      before that process can append any `signing` entry (B3's order); the
-      signer report gains `journal.processes` and `journal.processes_hash`
-      over the sorted process ids attached since `since`, the reporter's
-      own included, exported and checked as the records are. A displaced
-      process P of member M is accounted for by a verified report of M
-      naming journal J exactly when P is in J's attached set: the strength
-      of `records` (the adapter's word under B6), no more. A process that
-      bypassed the adapter (a build before the journal, another install's
-      journal, a rolled-back store), or one absent from J's set, stays
-      unresolved;
-    - (ii) judging per journal, processes used only to detect a second
-      journal or an unjournaled build;
-    - (iii) an owner-confirmed exit under the agreed impact bound (service
-      stops mirrored in the Portal, a `host:` revoke in the device list,
-      only interrupts lost, each bounded by its task's deadline):
-      Astation's policy, not the shared contract.
-
-    Atem recommends (i) or (ii). Nothing of (i) is built until Astation
-    chooses: a report names one process, its own (`process`).
+  - **Liveness, settled by the process roster** (option (i), **agreed
+    with Astation, Astation #114 comment 7208700195**; built: version 2
+    of the report). If every app relaunch counted as an unresolved
+    participant that only independent evidence clears, every recovery
+    after any relaunch would stay blocked for good (unknown authors still
+    block reopening, above). So the journal keeps a roster: the adapter
+    durably appends `attach{process}` the first time a process takes the
+    journal's lock, before that process can append any `signing` entry
+    (B3's order), and the signer report commits to the attached set
+    (`journal.processes`, `journal.processes_hash`, above), the reporter's
+    own included, exported and checked as the records are
+    (`processes_mismatch`). **The resolution rule:** a displaced process
+    P of member M is accounted for by a verified report R iff R's signer
+    is M and P is in R's `processes`: the strength of `records` (the
+    adapter's word under B6), no more. Comparing journals and generations
+    is the Station's. Legacy, absent or rolled-back journal evidence
+    stays unresolved: a process that bypassed the adapter (a build before
+    the journal, another install's journal, a rolled-back store), or one
+    absent from the set. (Options (ii), judging per journal, and (iii),
+    an owner-confirmed exit under the agreed impact bound, were not
+    taken.)
 - **The final cut, a fixpoint** (**Atem's reading of "a report and a
   publication use the same recovery tuple, head and commitments", for
   Astation's agreement (Astation #114, comment 7207806862)**). A
@@ -2214,7 +2242,9 @@ It derives no other verdict.
 Every SDK package's checksum manifest lists the file.
 
 **`r9-vectors-signer-report`** (the signer report above; agreed with
-Astation, #114 comment 7089435073): log L of `r9-vectors-membership-log`
+Astation, #114 comment 7089435073; version 2, its process roster, agreed
+with Astation, #114 comment 7208700195, every case moved to v2): log L
+of `r9-vectors-membership-log`
 and its own `entries` (dev-desk, an Ed25519 native without `manage`, then
 made a manager; dev-phone demoted; R7 and A8 byte for byte: dev-newmac,
 added by the Recovery Kit, waiting, then a manager); `records`, the
@@ -2222,14 +2252,24 @@ control records the cases use; the challenges read or refused; valid
 reports (at the head and at an ancestor, with drafts, with zero records, a
 host sender's interrupt with a service's stops, a reinstalled journal, a
 demoted manager, an Ed25519 manager, a manager added by the Recovery Kit
-once its recovery took effect, records exported in another order);
+once its recovery took effect, records exported in another order; a
+roster of one process, of two and of three, the reporter's own among
+them, exported in another order);
 refused ones (every malformed form, the recovery and journal grammars
 included; each code in its order; `not_a_manager`; each challenge and
 recovery field mismatched; `records_mismatch` in each form: one missing,
 one extra, one signed after the report, a possibly signed body without a
 signature, a wrong signer, another origin, a duplicate, another key, a
 high S; a high-S report; substitution by another member and another slot;
-expiry); the builder's bodies and refusals; and the immutable request's
+expiry; `processes_mismatch` in each form: one missing, one extra, a
+duplicate, another set of the same count, the reporter's own absent, a
+count the hash doesn't hold, ids of 15 bytes, padded or not base64url,
+and its place between `records_mismatch` and `expired`; a v1 report
+signed under `atem-signer-report-v1`, and `v` 1 or 3 under v2's label,
+`malformed`); the builder's bodies (but their process and their
+roster's hash, both the loaded core's) and refusals (a roster without
+the builder's own process, an empty one, an id twice, ids out of their
+grammar); and the immutable request's
 finishes (the challenge grammar's forms and the builder's signers as
 #198's file has them, and journal bodies over 4,096 bytes of `jcs` and
 16 KiB of text); and `plan_predicate` (built for Astation's ask, #114
