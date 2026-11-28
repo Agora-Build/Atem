@@ -377,7 +377,7 @@ Auth). Every ledger call is made at the Station's clock.
 
 | step | meaning |
 |---|---|
-| `{"control_record": label, "revoked_at_ms"?: n, "covered_hosts": [host], "made": [report_id], "commit"?: false}` | the Station stores the record `label` in its feed and records it (`revoked_at_ms`: when the Portal revoked the integration, an authenticated original time, for the Station's own first revoke; the ledger keeps `min(revoked_at_ms, the record's issued_at + 1 hour)` as the deadline's start; absent, no authenticated original time (`None`): the start is the record's `issued_at`); `made`: the report ids the transition made, in order; `commit: false`: the Station dies before the commit, and the transition is lost |
+| `{"control_record": label, "revoked_at_ms"?: n, "covered_hosts": [host], "made": [report_id], "commit"?: false}` | the Station stores the record `label` in its feed and records it (`revoked_at_ms`: when the Portal revoked the integration, an authenticated original time, for the Station's own first revoke; the ledger keeps `min(revoked_at_ms, the record's issued_at + 1 hour)` as the deadline's start; absent, no authenticated original time (`None`): the start is the record's `issued_at`; **changed** with `r9-control-ack-late-start`: an absent `revoked_at_ms` meant the clock before, and a runner that still takes the clock gets another deadline on that fixture); `made`: the report ids the transition made, in order; `commit: false`: the Station dies before the commit, and the transition is lost |
 | `{"learn_revoked_at": principal, "revoked_at_ms": n, "made": [report_id], "commit"?: false, "refused"?: code}` | the Station learns an authenticated original time of `principal`'s revocation after it recorded its own revoke (`learn_revoked_at`): the start only lowers (after the final too, where it makes no report and changes none); `refused`: the ledger refuses it with that code (`unknown_revocation`, `malformed`) and nothing changes |
 | `{"control_ack": message, "link": name, "made": [report_id], "commit"?: false, "refused"?: code}` | a host's `control_ack` (the complete wire message, read with the strict reader) arrives on the link `name`; `refused`: the ledger refuses it whole with that code (`not_the_link`, `other_account`, `other_station`, `not_the_record`, `incomplete_link`, `malformed`) and nothing changes |
 | `{"tick": true, "made": [report_id], "commit"?: false}` | the Station's timer, at its clock |
@@ -400,11 +400,16 @@ An unknown step or key fails the run. The report ids are known answers:
 `scripts/check-r9-vectors.py` recomputes every one in these files from its
 definition (host-work-v1 §11.4, "Reports") and its report's integration
 and host, derives each `expect_counts` from the steps alone (the
-records tracked and the acks taken), and the finals: the step that makes
-each `revoked` report, its outcome and pending hosts, and each
-`expect_start` (a revocation's start from its own revoke's `revoked_at_ms`
-or `issued_at`, lowered by every learn; the deadline 24 hours
-after it). `r9-control-ack-late-start` (**Atem's proposal, for Astation's
+records tracked and the acks taken), every report each step makes, in
+order (a `revocation_applied` at a covered host's first count once the own
+revoke is recorded, or at the own revoke for the hosts counted before it;
+a final after its deadline or at its last covered host, its `not_before`
+the reports of the hosts counted then; none from a learn or a tick), what
+the Station sends at each `expect_report` (and that each report it
+confirms or fails is sendable), and each `expect_start`,
+`expect_refused`, `expect_dropped` and `expect_stopped` (a revocation's
+start from its own revoke's `revoked_at_ms` or `issued_at`, lowered by
+every learn; the deadline 24 hours after it). `r9-control-ack-late-start` (**Atem's proposal, for Astation's
 agreement, #120 comment 7234876179**): an own revoke recorded with no
 authenticated original time and the original time learned later, which
 only lowers the start (after the final too, where no report changes and

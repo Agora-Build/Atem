@@ -3348,15 +3348,27 @@ own Station's feed:
   the start (`min(start, revoked_at_ms)`, still at most `issued_at` plus
   an hour): an equal or later time changes nothing, so learns are
   idempotent, and the start is the `min` of every date, so they are
-  order-free (two learns give the same ledger in either order, byte for
-  byte, on any replica); a date that ends the window makes the final at
-  once, after the per-host reports already made. After the final a learn
+  order-free (at the same `now_ms`, two learns give the same ledger in
+  either order, byte for byte, on any replica); a date that ends the
+  window makes the final at once, after the per-host reports already
+  made. A learn never raises a start: a date up to an hour after
+  `issued_at` that `record` would have kept leaves a `None` record's
+  `issued_at`, so the same date gives a final up to an hour later when it
+  comes after the record (late, never early). After the final a learn
   still lowers the stored start, but makes no report and changes no
   report or the final: after the final, no report changes and none is
-  sent twice. A learn for a principal with no
-  own revoke recorded is refused `unknown_revocation` (the date goes to
-  `record`), a value above 2^53 − 1 `malformed`. Hosts change nothing:
-  the deadline stays within their resends. So: the result of a
+  sent twice. A learn and an ack don't commute when the date ends the
+  window and the ack completes the covered hosts (the ack first:
+  `all_applied`; the learn first: `deadline_passed`, then the host's late
+  `revocation_applied`); this is inherent, as it is today for an ack that
+  arrives just before or just after the deadline, and either order gives
+  true reports. A learn for a principal with no own revoke recorded is
+  refused `unknown_revocation`, a value above 2^53 − 1 `malformed`; on
+  `unknown_revocation` the Station keeps the date and passes it to
+  `record`, or learns it again once the own revoke is committed (another
+  replica may have just recorded it with none: as with any lost
+  compare-and-swap, it starts again from the new state). Hosts change
+  nothing: the deadline stays within their resends. So: the result of a
   service's own `revoke` (signed with the service's key) is
   sent again on every (re)connection and every 10 minutes while connected,
   until that record's `issued_at` plus 25 hours on the host's clock (the
@@ -3803,12 +3815,18 @@ earlier, learned after host-b applied, the final at once,
 `deadline_passed` naming host-c, after host-b's report; an earlier date
 after the final lowering only the stored start, with no report made or
 changed, and a later one changing nothing; and host-c's later ack still
-reported). They
+reported). In these fixtures a record step without `revoked_at_ms` now
+means no authenticated original time (`None`), no longer the Station's
+clock, and `learn_revoked_at`, `either_order`, `branch` and `expect_start`
+are new steps (`fixtures/schema.md`): a runner that still takes the clock
+gets another deadline on `r9-control-ack-late-start`. They
 run in
 `crates/atem-client/tests/r9_fixtures.rs` against `AckLedger`, in the
 bindings' `tests/station.rs` and in the Swift, Kotlin and WASM conformance
 suites through `AckLedgerHandle`; `scripts/check-r9-vectors.py` recomputes
-every `reportId` in them and derives each `expect_counts` from the steps.
+every `reportId` in them and derives from the steps each `expect_counts`,
+every report each step makes (a final's `not_before` included) and what
+the Station sends at each `expect_report`.
 Every SDK package's checksum manifest lists them.
 
 (New in step 4; the goldens and the 256 KiB bound on the complete message

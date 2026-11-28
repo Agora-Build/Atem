@@ -4724,8 +4724,9 @@ digests a sequence's state keeps (each the body of a record of that
 principal with that `record_id`) and each step's position against the
 file's stations), every Station report id of the acknowledgment
 fixtures `r9-control-ack-*` (host-work-v1 §11.4) and their
-`expect_counts` and finals (when each `revoked` is made, its outcome and
-pending hosts, and each `expect_start`), derived from the steps,
+`expect_counts` and reports (every report each step makes, in order, a
+final's `not_before` included, what the Station sends at each
+`expect_report`, and each `expect_start`), derived from the steps,
 and of `r9-vectors-host-envelope` (its entries' chain, hashes and
 signatures, each object's `jcs`, signing input, signature, seal `info`,
 `sealed_hash`, the open with the recipient key, the seal again from the

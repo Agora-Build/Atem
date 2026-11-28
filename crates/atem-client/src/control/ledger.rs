@@ -524,8 +524,11 @@ impl std::error::Error for RecordRefusal {}
 /// stable name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LearnRefusal {
-    /// No own revoke of the principal is recorded: pass the date to
-    /// [`AckLedger::record`] with it instead.
+    /// No own revoke of the principal is recorded: keep the date, and pass
+    /// it to [`AckLedger::record`] with the own revoke, or learn it again
+    /// once the own revoke is committed (another replica may have just
+    /// recorded it with none: as with any lost compare-and-swap, start
+    /// again from the new state).
     UnknownRevocation,
     /// `revoked_at_ms` above 2^53 − 1.
     Malformed(&'static str),
@@ -879,19 +882,28 @@ impl AckLedger {
     /// own revoke's `issued_at` already, so the deadline stays within the
     /// host's resends): an equal or later time changes nothing, so learns
     /// are idempotent, and the start is the `min` of every date, so they are
-    /// order-free: two learns give the same ledger in either order, byte
-    /// for byte, on any replica. A date that ends the window makes the
-    /// final at once, after the per-host reports already made. After the
-    /// final (all applied or the deadline passed) a learn still lowers the
-    /// stored start, but makes no report and changes no report or the
-    /// final: after the final, no report changes and none is sent twice.
-    /// What is reported doesn't change: the same reports, with the same
-    /// `report_id`s; only the final's time moves, and only earlier (Atem's
-    /// proposal, for Astation's agreement, #120 comment 7234876179).
-    /// Refused: a value above 2^53 − 1
+    /// order-free: at the same `now_ms`, two learns give the same ledger in
+    /// either order, byte for byte, on any replica. It never raises a
+    /// start: a date up to an hour after the own revoke's `issued_at` that
+    /// `record` would have kept leaves a `None` record's `issued_at` (late,
+    /// never early; the final up to an hour later than if the date had come
+    /// with the record). A date that ends the window makes the final at
+    /// once, after the per-host reports already made. After the final (all
+    /// applied or the deadline passed) a learn still lowers the stored
+    /// start, but makes no report and changes no report or the final: after
+    /// the final, no report changes and none is sent twice. A learn and an
+    /// ack don't commute when the date ends the window and the ack
+    /// completes the covered hosts (the ack first: `all_applied`; the learn
+    /// first: `deadline_passed`, then the host's late `revocation_applied`),
+    /// as an ack just before or just after a deadline doesn't: either
+    /// order gives true reports. What is reported doesn't change: the same
+    /// reports, with the same `report_id`s; only the final's time moves, and
+    /// only earlier (Atem's proposal, for Astation's agreement, #120 comment
+    /// 7234876179). Refused: a value above 2^53 − 1
     /// ([`LearnRefusal::Malformed`], checked first) and a principal with no
-    /// own revoke recorded ([`LearnRefusal::UnknownRevocation`]: pass the
-    /// date to `record` instead).
+    /// own revoke recorded ([`LearnRefusal::UnknownRevocation`]: keep the
+    /// date, and pass it to `record`, or learn it again once the own revoke
+    /// is committed).
     pub fn learn_revoked_at(
         &self,
         principal: &str,
@@ -4335,6 +4347,8 @@ mod ack_ledger_tests {
         let mut lowered = t.next.to_json();
         lowered["revocations"]["service:svc-1"]["revoked_at_ms"] = json!(issued - 25 * HOUR);
         assert_eq!(lowered, fin.to_json(), "only the start moved");
+        // A start lowered after the final reloads as it was.
+        assert_eq!(AckLedger::from_json(&t.next.to_json()).unwrap(), t.next);
         l = t.next;
         assert_eq!(l.tick_at(issued + 2 * DAY), vec![]);
         let b = l.ack_by(
@@ -4459,6 +4473,23 @@ mod ack_ledger_tests {
             Report::Revoked { integration_id, .. } if integration_id == "i-svc-2"
         ));
         assert_eq!(t.next, l.tick(T0 + DAY).next);
+        // svc-1 learns a date that ends its window at the same time: svc-2's
+        // final, due already, comes first, then svc-1's. The deadlines are
+        // passed before the date is taken, so a tick at that time first
+        // gives the same ledger, byte for byte: the outcome never depends on
+        // when the Station ticked.
+        let t = l.learn_revoked_at("service:svc-1", T0, T0 + DAY).unwrap();
+        let integrations: Vec<&str> = t.made.iter().map(|i| i.report.integration_id()).collect();
+        assert_eq!(integrations, vec!["i-svc-2", INTEGRATION]);
+        let ticked = l
+            .tick(T0 + DAY)
+            .next
+            .learn_revoked_at("service:svc-1", T0, T0 + DAY)
+            .unwrap();
+        assert_eq!(
+            jcs(&t.next.to_json()).unwrap(),
+            jcs(&ticked.next.to_json()).unwrap()
+        );
 
         // Refusals: nothing changes.
         let late = |l: &AckLedger, principal: &str, at: u64| {

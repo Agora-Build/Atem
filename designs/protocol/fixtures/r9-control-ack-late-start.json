@@ -299,6 +299,9 @@
       "made": []
     },
     {
+      "restart": true
+    },
+    {
       "expect_start": {
         "service:svc-discord": 1793512904000
       }
