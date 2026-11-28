@@ -39,7 +39,10 @@ The other files'
 It also recomputes every Station report id of the acknowledgment fixtures
 (`r9-control-ack-*`, host-work-v1 §11.4): the known answers of the
 reference ledger's `report_id`, and derives their `expect_counts` (the
-ledger's counts) from the steps; from host-work-v1 §11.1 ("Resets"), the
+ledger's counts) and their finals (the step that makes each `revoked`,
+its outcome and pending hosts, and each `expect_start`: a revocation's
+start from the own revoke's `revoked_at_ms` or `issued_at`, lowered by a
+learned date before the final) from the steps; from host-work-v1 §11.1 ("Resets"), the
 snapshot checker's answers and the stops in force of
 `r9-vectors-host-work-control`'s `snapshots` (each record's verdict taken
 from its `checks`, as the bound and O1 take each step's result); and, from host-work-v1 §4 and §11.2, the
@@ -1458,7 +1461,16 @@ def ids_in(step):
     out += step.get("expect_refused", []) + step.get("expect_dropped", []) + step.get("expect_portal", [])
     if "replica" in step:
         out += ids_in(step["replica"])
+    for inner in step.get("branch", []):
+        out += ids_in(inner)
     return out
+
+
+def flat_steps(steps):
+    """Every step, a branch's inside it (in order) included."""
+    for step in steps:
+        yield step
+        yield from flat_steps(step.get("branch", []))
 
 
 def check_control_ack(file, data, report, context):
@@ -1467,9 +1479,12 @@ def check_control_ack(file, data, report, context):
     claims its link's association at the Station's origin and names records
     of the vectors, and every report id it names is one of its reports',
     recomputed here: each expected report's id from its own kind,
-    integration and host; and each `expect_counts`, the ledger's counts
-    (derive_counts). Which reports are made, and when, is the ledger's
-    (the Rust runner and the binding suites, R9.12)."""
+    integration and host; each `expect_counts`, the ledger's counts
+    (derive_counts); and when each final is made, with its outcome and
+    pending hosts, and each start (derive_finals). When each per-host
+    report is made is the ledger's (the Rust runner and the binding
+    suites, R9.12). A `branch` is another history from the committed
+    state, checked as one and kept apart."""
     mlog = context["membership_log"]
     control = context["host_work_control"]
     records = {v["label"]: v["record"]["body"] for v in control["records"]}
@@ -1502,7 +1517,7 @@ def check_control_ack(file, data, report, context):
             known[rid] = ("revocation_applied", integration, host)
 
     with report.case(file, "report ids") as case:
-        steps = data["steps"]
+        steps = list(flat_steps(data["steps"]))
         named = [rid for step in steps for rid in ids_in(step)]
         unknown = sorted({rid for rid in named if rid not in known})
         case.check(not unknown, f"{len(set(named))} distinct report ids, each one of the station's reports", f"unknown {unknown}")
@@ -1537,6 +1552,8 @@ def check_control_ack(file, data, report, context):
                 acks.append(step)
             if "replica" in step:
                 collect(step["replica"])
+            for inner in step.get("either_order", []) + step.get("branch", []):
+                collect(inner)
 
         for step in data["steps"]:
             collect(step)
@@ -1557,9 +1574,12 @@ def check_control_ack(file, data, report, context):
                 bad.append(f"{step['link']}'s ack names a record outside the vectors")
         case.check(not bad, f"{len(acks)} acks: each claims its link's association (or is refused not_the_link), at the station's origin, naming records of the vectors", "; ".join(bad))
 
-    if any("expect_counts" in step for step in data["steps"]):
+    if any("expect_counts" in step for step in flat_steps(data["steps"])):
         with report.case(file, "counts") as case:
             derive_counts(case, data, records)
+
+    with report.case(file, "finals") as case:
+        derive_finals(case, data, records)
 
 
 # A count's effect, in the ledger's order: the revocation before the interrupt.
@@ -1605,23 +1625,202 @@ def derive_counts(case, data, records):
             apply(step["replica"])
 
     checked = 0
-    for i, step in enumerate(data["steps"], 1):
-        apply(step)
-        if "expect_counts" in step:
-            checked += 1
-            keys = sorted(counts, key=lambda k: (k[0], COUNT_EFFECTS[k[1]], -1 if k[2] is None else k[2], k[3]))
-            want = []
-            for principal, effect, seq, host in keys:
-                count = {"effect": effect, "host": host, "principal": principal, "record_id": counts[(principal, effect, seq, host)]}
-                if seq is not None:
-                    count["revoke_seq"] = seq
-                want.append(count)
-            if step["expect_counts"] != want:
-                wrong.append(i)
+
+    def run(steps, where):
+        nonlocal tracked, counts, checked
+        for i, step in enumerate(steps, 1):
+            apply(step)
+            if "branch" in step:
+                # Another history: nothing of it reaches this one.
+                saved = (dict(tracked), dict(counts))
+                run(step["branch"], f"{where}{i}.")
+                tracked, counts = saved
+            if "expect_counts" in step:
+                checked += 1
+                keys = sorted(counts, key=lambda k: (k[0], COUNT_EFFECTS[k[1]], -1 if k[2] is None else k[2], k[3]))
+                want = []
+                for principal, effect, seq, host in keys:
+                    count = {"effect": effect, "host": host, "principal": principal, "record_id": counts[(principal, effect, seq, host)]}
+                    if seq is not None:
+                        count["revoke_seq"] = seq
+                    want.append(count)
+                if step["expect_counts"] != want:
+                    wrong.append(f"{where}{i}")
+
+    run(data["steps"], "")
     case.check(
         not wrong,
         f"{checked} expect_counts: each the counts derived from the records tracked and the acks taken, per principal, effect and host, through the first record that said so"
         + (f" (not: steps {wrong})" if wrong else ""),
+    )
+
+
+REVOCATION_DEADLINE_MS = 24 * 60 * 60 * 1000
+REVOCATION_START_SLACK_MS = 60 * 60 * 1000
+MAX_SAFE_INTEGER = 2**53 - 1
+
+
+def derive_finals(case, data, records):
+    """Each revocation's final, derived from the steps alone (no ledger;
+    host-work-v1 §11.4, "Reports"): the Station's own first `revoke` of a
+    principal (signed with its key, not a member's) starts its revocation,
+    covering the step's hosts, at min(revoked_at_ms, issued_at + 1 hour),
+    or at its issued_at with no revoked_at_ms (no authenticated original
+    time: late, never early); a learned original time lowers the start
+    while there is no final (`learn_revoked_at`; refused
+    `unknown_revocation` without an own revoke, `malformed` above
+    2^53 - 1). Every record, ack, learn and tick first makes the final of
+    each revocation whose start + 24 hours its time reached; the
+    revocation counts a host at its first `applied` or `duplicate` (any
+    record of the principal), and is `all_applied` once every covered host
+    is counted; a learn makes the final its date ends at once. Each
+    step's `made` holds exactly the finals derived for it, in order; each
+    `revoked` an `expect_report` offers has the outcome and pending hosts
+    derived; each `expect_start` the starts derived. A `replica` step
+    counts once, a step with `commit: false` not at all, `either_order`
+    gives the same finals and starts in both orders (the first kept), and
+    a `branch` is another history, kept apart."""
+    setup = data["setup"]
+    station = setup["station"]
+    hosts = {name: link["host_id"] for name, link in setup["links"].items()}
+    final_id = {
+        principal: report_id("revoked", station["account_id"], station["genesis_hash"], principal, integration)
+        for integration, principal in setup["integrations"].items()
+    }
+    wrong, finals_made, checked = [], 0, 0
+
+    def fresh():
+        # tracked: record_id -> principal; counted: (principal, host);
+        # revs: principal -> {covered, start, final: (outcome, pending)}.
+        return {"tracked": {}, "counted": set(), "revs": {}}
+
+    def copy(st):
+        return {
+            "tracked": dict(st["tracked"]),
+            "counted": set(st["counted"]),
+            "revs": {p: dict(r) for p, r in st["revs"].items()},
+        }
+
+    def finish(st, principal, made):
+        r = st["revs"][principal]
+        pending = sorted(h for h in r["covered"] if (principal, h) not in st["counted"])
+        r["final"] = ("deadline_passed", pending) if pending else ("all_applied", [])
+        made.append(final_id[principal])
+
+    def when_all_applied(st, principal, made):
+        r = st["revs"][principal]
+        if r["final"] is None and all((principal, h) in st["counted"] for h in r["covered"]):
+            finish(st, principal, made)
+
+    def pass_deadlines(st, now, made):
+        for principal in sorted(st["revs"]):
+            r = st["revs"][principal]
+            if r["final"] is None and now >= r["start"] + REVOCATION_DEADLINE_MS:
+                finish(st, principal, made)
+
+    def transition(st, step, now, where):
+        """The state after an input step, and the finals it made; None when
+        the step is refused (nothing changes)."""
+        if "refused" in step:
+            if "learn_revoked_at" in step:
+                at, principal = step["revoked_at_ms"], step["learn_revoked_at"]
+                code = "malformed" if at > MAX_SAFE_INTEGER else None if principal in st["revs"] else "unknown_revocation"
+                if code != step["refused"]:
+                    wrong.append(f"{where}: refused {code}, not {step['refused']}")
+            return None
+        st, made = copy(st), []
+        pass_deadlines(st, now, made)
+        if "control_record" in step:
+            body = records[step["control_record"]]
+            effects = {"revoke": ["revocation"], "interrupt_running": ["interrupt"]}.get(body["action"])
+            if effects is not None and body["record_id"] not in st["tracked"]:
+                principal = body["principal"]
+                st["tracked"][body["record_id"]] = principal
+                own = not body["signer"].startswith("member:")
+                if own and "revocation" in effects and principal not in st["revs"]:
+                    issued = body["issued_at"]
+                    start = min(step.get("revoked_at_ms", issued), issued + REVOCATION_START_SLACK_MS)
+                    st["revs"][principal] = {"covered": set(step["covered_hosts"]), "start": start, "final": None}
+                    when_all_applied(st, principal, made)
+                    pass_deadlines(st, now, made)
+        elif "control_ack" in step:
+            host = hosts[step["link"]]
+            for result in step["control_ack"]["results"]:
+                principal = st["tracked"].get(result.get("record_id"))
+                if principal is None:
+                    continue
+                for e in result["effects"]:
+                    if e["effect"] == "revocation" and e["result"] in ("applied", "duplicate"):
+                        if (principal, host) not in st["counted"]:
+                            st["counted"].add((principal, host))
+                            r = st["revs"].get(principal)
+                            if r is not None and host in r["covered"]:
+                                when_all_applied(st, principal, made)
+        elif "learn_revoked_at" in step:
+            r = st["revs"].get(step["learn_revoked_at"])
+            if r is None:
+                wrong.append(f"{where}: a learn with no own revoke is refused unknown_revocation")
+            elif r["final"] is None:
+                r["start"] = min(r["start"], step["revoked_at_ms"])
+                pass_deadlines(st, now, made)
+        return st, made
+
+    def run(st, now, steps, where):
+        nonlocal finals_made, checked
+        for i, step in enumerate(steps, 1):
+            at = f"{where}{i}"
+            inputs = ("control_record", "control_ack", "learn_revoked_at", "tick")
+            if any(k in step for k in inputs) or "replica" in step:
+                inner = step.get("replica", step)
+                t = transition(st, inner, now, at)
+                if t is None:
+                    continue
+                got = [rid for rid in inner["made"] if rid.startswith("revoked:")]
+                if got != t[1]:
+                    wrong.append(f"{at}: made {got}, derived {t[1]}")
+                finals_made += len(t[1])
+                if inner.get("commit") is not False:
+                    st = t[0]
+            elif "either_order" in step:
+                def both(first, second):
+                    after, made = transition(st, first, now, at)
+                    after, more = transition(after, second, now, at)
+                    return after, made + more
+
+                x, y = step["either_order"]
+                (s1, m1), (s2, m2) = both(x, y), both(y, x)
+                if s1["revs"] != s2["revs"] or m1 != m2:
+                    wrong.append(f"{at}: the two orders differ")
+                got = [rid for rid in step["made"] if rid.startswith("revoked:")]
+                if got != m1:
+                    wrong.append(f"{at}: made {got}, derived {m1}")
+                finals_made += len(m1)
+                st = s1
+            elif "branch" in step:
+                run(copy(st), now, step["branch"], f"{at}.")
+            elif "advance_ms" in step:
+                now += step["advance_ms"]
+            elif "expect_start" in step:
+                checked += 1
+                starts = {p: r["start"] for p, r in st["revs"].items()}
+                if step["expect_start"] != starts:
+                    wrong.append(f"{at}: starts {step['expect_start']}, derived {starts}")
+            elif "expect_report" in step:
+                for intent in step["expect_report"]:
+                    r = intent["report"]
+                    if r["kind"] != "revoked":
+                        continue
+                    checked += 1
+                    principal = setup["integrations"][r["integration_id"]]
+                    rev = st["revs"].get(principal) or {}
+                    if rev.get("final") != (r["outcome"], r["pending_hosts"]):
+                        wrong.append(f"{at}: {r['outcome']} {r['pending_hosts']}, derived {rev.get('final')}")
+
+    run(fresh(), setup["station_now_ms"], data["steps"], "")
+    case.check(
+        not wrong,
+        f"{finals_made} finals made, each exactly at the step its derived deadline or its last covered host makes it (the start from the own revoke's revoked_at_ms or issued_at, clamped, lowered by learns before the final); {checked} offered finals and expected starts, each the derived one",
+        "; ".join(wrong),
     )
 
 

@@ -4724,7 +4724,8 @@ digests a sequence's state keeps (each the body of a record of that
 principal with that `record_id`) and each step's position against the
 file's stations), every Station report id of the acknowledgment
 fixtures `r9-control-ack-*` (host-work-v1 §11.4) and their
-`expect_counts`, derived from the steps,
+`expect_counts` and finals (when each `revoked` is made, its outcome and
+pending hosts, and each `expect_start`), derived from the steps,
 and of `r9-vectors-host-envelope` (its entries' chain, hashes and
 signatures, each object's `jcs`, signing input, signature, seal `info`,
 `sealed_hash`, the open with the recipient key, the seal again from the
@@ -4823,7 +4824,10 @@ amended for step 4: typed reasons, host-work-v1 §11.4 wire rule 10)
 `r9-control-ack-reasons`, and (**agreed with Astation (2026-11-22, #114
 comment 7082464868, items 2 and 6)**: a replacement feed after a
 Station's rollback, a current manager's original stop carried unchanged,
-a fresh ledger's counts) `r9-control-ack-replacement-feed`.
+a fresh ledger's counts) `r9-control-ack-replacement-feed`, and (**Atem's
+proposal, for Astation's agreement (#120 comment 7234876179)**: a
+revocation's start unknown at intake and lowered later by a learned
+original time) `r9-control-ack-late-start`.
 
 ### R9.13 Open questions for Astation
 

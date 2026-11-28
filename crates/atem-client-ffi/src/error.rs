@@ -286,6 +286,17 @@ impl From<atem_client::control::AckRefusal> for AtemError {
     }
 }
 
+impl From<atem_client::control::LearnRefusal> for AtemError {
+    /// A learned revocation time the Station's ledger refuses:
+    /// `Invalid{code}`, `unknown_revocation` or `malformed`.
+    fn from(e: atem_client::control::LearnRefusal) -> Self {
+        AtemError::Invalid {
+            code: e.code().into(),
+            detail: e.to_string(),
+        }
+    }
+}
+
 impl From<atem_client::control::RecordRefusal> for AtemError {
     /// A record the Station's ledger refuses: `Invalid{code}`,
     /// `other_account`, `other_station`, `record_id_reused` or

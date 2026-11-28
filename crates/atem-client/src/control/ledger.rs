@@ -13,9 +13,10 @@
 //! between them safe.
 //!
 //! **A transition never changes the ledger it is called on.**
-//! [`AckLedger::record`], [`AckLedger::ack`], [`AckLedger::tick`],
-//! [`AckLedger::confirm`], [`AckLedger::refuse`],
-//! [`AckLedger::stop_reporting`] and [`AckLedger::resume_reporting`] return
+//! [`AckLedger::record`], [`AckLedger::learn_revoked_at`],
+//! [`AckLedger::ack`], [`AckLedger::tick`], [`AckLedger::confirm`],
+//! [`AckLedger::refuse`], [`AckLedger::stop_reporting`] and
+//! [`AckLedger::resume_reporting`] return
 //! a [`LedgerTransition`]: the next ledger, the report intents the
 //! transition made and the operator alerts it raised. The next ledger holds
 //! every intent not yet settled (confirmed, refused or dropped), so the
@@ -80,8 +81,9 @@
 //! service's revocation starts at the Station's own `revoke` (signed with the
 //! service key: the Portal revoked the integration), whose `record` fixes the
 //! integration (`about.integration_id`), the covered hosts and the
-//! revocation's start (below); a later revoke of the same principal (a
-//! re-signed copy, a snapshot after a reset) changes none of them. A native revoke appended to
+//! revocation's start (below; only a learned original time lowers it); a
+//! later revoke of the same principal (a re-signed copy, a snapshot after a
+//! reset) changes none of them. A native revoke appended to
 //! the feed is counted, and reported once the Station's own revoke is
 //! recorded.
 //! - `revocation_applied{integration_id, host, record_id}`: once per covered
@@ -99,10 +101,18 @@
 //!   result of that revoke again at its `issued_at` plus 25 hours (§11.4,
 //!   the deadline plus the slack), so a Station that records its revoke
 //!   late must not push the deadline past it (Atem's proposal, for
-//!   Astation's agreement). An ack or a
-//!   record is applied after any deadline its `now_ms` has passed, so the
-//!   outcome depends on time, never on when the Station ticked; an own
-//!   revoke recorded after its own deadline is final at once.
+//!   Astation's agreement). `deadline_passed` says every task admitted
+//!   before the revocation has passed its deadline (at most 24 hours after
+//!   its admission, I.4.4), so a start may be late, never early: a Station
+//!   with no authenticated original time passes none, and the start is the
+//!   own revoke's `issued_at` (signed only once the Portal revoked); one
+//!   it learns later only lowers the start
+//!   ([`AckLedger::learn_revoked_at`], before the final only; Atem's
+//!   proposal, for Astation's agreement, #120 comment 7234876179). An ack,
+//!   a record or a learned date is applied after any deadline its `now_ms`
+//!   has passed, so the outcome depends on time, never on when the Station
+//!   ticked; an own revoke recorded after its own deadline, or a date that
+//!   ends the window, is final at once.
 //!
 //! **Report ids** come from the report's identity, never from time, order
 //! or a counter: `<kind>:<hex SHA-256 of enc([STATION_REPORT_ID, kind,
@@ -509,6 +519,37 @@ impl std::fmt::Display for RecordRefusal {
 
 impl std::error::Error for RecordRefusal {}
 
+/// Why [`AckLedger::learn_revoked_at`] refuses a date. `code()` is a
+/// stable name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LearnRefusal {
+    /// No own revoke of the principal is recorded: pass the date to
+    /// [`AckLedger::record`] with it instead.
+    UnknownRevocation,
+    /// `revoked_at_ms` above 2^53 − 1.
+    Malformed(&'static str),
+}
+
+impl LearnRefusal {
+    pub fn code(&self) -> &'static str {
+        match self {
+            LearnRefusal::UnknownRevocation => "unknown_revocation",
+            LearnRefusal::Malformed(_) => "malformed",
+        }
+    }
+}
+
+impl std::fmt::Display for LearnRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LearnRefusal::Malformed(what) => write!(f, "malformed: {what}"),
+            other => f.write_str(other.code()),
+        }
+    }
+}
+
+impl std::error::Error for LearnRefusal {}
+
 /// Why [`AckLedger::ack`] refuses an ack: refused whole, nothing of it
 /// counted. `code()` is a stable name.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -630,8 +671,10 @@ struct Tracked {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Revocation {
     integration_id: String,
-    /// The deadline's start: the Station's `revoked_at_ms`, at most an hour
-    /// after the own revoke's `issued_at` ([`REVOCATION_START_SLACK_MS`]).
+    /// The deadline's start: the Station's `revoked_at_ms` (else the own
+    /// revoke's `issued_at`), at most an hour after that `issued_at`
+    /// ([`REVOCATION_START_SLACK_MS`]), lowered by a date learned before
+    /// the final.
     revoked_at_ms: u64,
     covered: BTreeSet<String>,
     /// The `revoked` report made.
@@ -713,22 +756,28 @@ impl AckLedger {
     /// [`AckLedger::tick`] would). For the Station's own `revoke` (signed
     /// with the service key), the first of its principal starts the
     /// revocation: `revoked_at_ms` is when the Portal revoked the
-    /// integration (the deadline's start, but at most
-    /// [`REVOCATION_START_SLACK_MS`] after the record's `issued_at`: the
-    /// start kept is `min(revoked_at_ms, issued_at + 1 hour)`, so the
-    /// deadline never passes the host's last resend at `issued_at` plus 25
-    /// hours) and `covered_hosts` the hosts its grant covered (a set); the
-    /// hosts that have it in force already (through a native revoke) are
-    /// reported at once, and a revocation
-    /// recorded after its own deadline is final at once. For any other
-    /// record `revoked_at_ms` is unused, and `covered_hosts` are the hosts
-    /// its alert waits for. The same record again (a retried intake, a
-    /// snapshot's re-issue) changes nothing; a `cover`, `hold` or `release`
-    /// is not tracked.
+    /// integration, an authenticated original time (the deadline's start,
+    /// but at most [`REVOCATION_START_SLACK_MS`] after the record's
+    /// `issued_at`: the start kept is `min(revoked_at_ms, issued_at + 1
+    /// hour)`, so the deadline never passes the host's last resend at
+    /// `issued_at` plus 25 hours), or `None` when the Station has none (a
+    /// late start, a legacy row): the start is then the record's
+    /// `issued_at`, at or after the revocation, since the Station signs its
+    /// own revoke only once the Portal revoked; a start may be late, never
+    /// early, so pass nothing you can't justify (never `now`, 0 or a guess),
+    /// and lower it later with [`AckLedger::learn_revoked_at`] (Atem's
+    /// proposal, for Astation's agreement, #120 comment 7234876179).
+    /// `covered_hosts` are the hosts its grant covered (a set); the hosts
+    /// that have it in force already (through a native revoke) are reported
+    /// at once, and a revocation recorded after its own deadline is final
+    /// at once. For any other record `revoked_at_ms` is unused, and
+    /// `covered_hosts` are the hosts its alert waits for. The same record
+    /// again (a retried intake, a snapshot's re-issue) changes nothing; a
+    /// `cover`, `hold` or `release` is not tracked.
     pub fn record(
         &self,
         rec: &ControlRecord,
-        revoked_at_ms: u64,
+        revoked_at_ms: Option<u64>,
         covered_hosts: &[String],
         now_ms: u64,
     ) -> std::result::Result<LedgerTransition, RecordRefusal> {
@@ -738,7 +787,7 @@ impl AckLedger {
         if rec.feed().is_some_and(|(origin, _)| origin != self.origin) {
             return Err(RecordRefusal::OtherStation);
         }
-        if revoked_at_ms > MAX_SAFE_INTEGER {
+        if revoked_at_ms.is_some_and(|at| at > MAX_SAFE_INTEGER) {
             return Err(RecordRefusal::Malformed("revoked_at_ms"));
         }
         let covered: BTreeSet<String> = covered_hosts.iter().cloned().collect();
@@ -792,11 +841,14 @@ impl AckLedger {
                 .integration_id
                 .clone()
                 .ok_or(RecordRefusal::Malformed("about.integration_id"))?;
+            // No authenticated original time: the own revoke's `issued_at`,
+            // at or after the revocation (late, never early).
             next.revocations.insert(
                 principal.clone(),
                 Revocation {
                     integration_id,
                     revoked_at_ms: revoked_at_ms
+                        .unwrap_or(rec.issued_at())
                         .min(rec.issued_at().saturating_add(REVOCATION_START_SLACK_MS)),
                     covered: covered.clone(),
                     outcome: None,
@@ -811,6 +863,52 @@ impl AckLedger {
             }
             next.finish_when_all_applied(&principal, &mut intents);
             // Recorded after its own deadline: final at once.
+            next.pass_deadlines(now_ms, &mut intents);
+        }
+        Ok(next.with(intents))
+    }
+
+    /// An authenticated original revocation time of `principal`
+    /// (`service:<id>`) that the Station learned after it recorded its own
+    /// revoke (the integration's `revokedAt`, from a checkpoint or the
+    /// feed: the Station's word, as `record`'s `revoked_at_ms` is), at
+    /// `now_ms` (deadlines `now_ms` passed are applied first, as
+    /// [`AckLedger::tick`] would). It only lowers the start, to
+    /// `min(start, revoked_at_ms)` (the start is at most an hour after the
+    /// own revoke's `issued_at` already, so the deadline stays within the
+    /// host's resends): an equal or later time changes nothing, so learns
+    /// are idempotent and, while the window is open, order-free. A date that
+    /// ends the window makes the final at once, after the per-host reports
+    /// already made. It acts before the final only: after it (all applied
+    /// or the deadline passed) the final stands and nothing changes, so of
+    /// two dates that would each end the window the first's start is kept
+    /// (the same reports either way). What is reported doesn't change: the
+    /// same reports, with the same `report_id`s; only the final's time
+    /// moves, and only earlier (Atem's proposal, for Astation's agreement,
+    /// #120 comment 7234876179). Refused: a value above 2^53 − 1
+    /// ([`LearnRefusal::Malformed`], checked first) and a principal with no
+    /// own revoke recorded ([`LearnRefusal::UnknownRevocation`]: pass the
+    /// date to `record` instead).
+    pub fn learn_revoked_at(
+        &self,
+        principal: &str,
+        revoked_at_ms: u64,
+        now_ms: u64,
+    ) -> std::result::Result<LedgerTransition, LearnRefusal> {
+        if revoked_at_ms > MAX_SAFE_INTEGER {
+            return Err(LearnRefusal::Malformed("revoked_at_ms"));
+        }
+        if !self.revocations.contains_key(principal) {
+            return Err(LearnRefusal::UnknownRevocation);
+        }
+        let mut next = self.clone();
+        let mut intents = Vec::new();
+        next.pass_deadlines(now_ms, &mut intents);
+        if let Some(r) = next.revocations.get_mut(principal)
+            && r.outcome.is_none()
+        {
+            r.revoked_at_ms = r.revoked_at_ms.min(revoked_at_ms);
+            // Ended by this date: final at once.
             next.pass_deadlines(now_ms, &mut intents);
         }
         Ok(next.with(intents))
@@ -2028,7 +2126,7 @@ mod ack_ledger_tests {
 
     impl Adopt for AckLedger {
         fn rec(&mut self, r: &ControlRecord, at: u64, covered: &[&str]) -> Vec<ReportIntent> {
-            let t = self.record(r, at, &hosts(covered), at).unwrap();
+            let t = self.record(r, Some(at), &hosts(covered), at).unwrap();
             *self = t.next;
             t.made
         }
@@ -2325,7 +2423,7 @@ mod ack_ledger_tests {
             (12, ControlAction::Release),
         ] {
             let r = rec(By::Own, action, n);
-            let t = l.record(&r, T0, &hosts(&["a"]), T0).unwrap();
+            let t = l.record(&r, Some(T0), &hosts(&["a"]), T0).unwrap();
             assert_eq!((t.next, t.made), (before.clone(), vec![]));
             let kind = match action {
                 ControlAction::Cover => E::Cover,
@@ -3299,12 +3397,12 @@ mod ack_ledger_tests {
         // Another account, another root, another Station's feed.
         let other = rec_of("acct-other", ORIGIN, By::Own, ControlAction::Hold, 2);
         assert_eq!(
-            l.record(&other, T0, &[], T0).unwrap_err(),
+            l.record(&other, Some(T0), &[], T0).unwrap_err(),
             RecordRefusal::OtherAccount
         );
         let rooted = AckLedger::new(ORIGIN, ACCOUNT, Hash32([8; 32])).unwrap();
         assert_eq!(
-            rooted.record(&s, T0, &[], T0).unwrap_err(),
+            rooted.record(&s, Some(T0), &[], T0).unwrap_err(),
             RecordRefusal::OtherAccount
         );
         let elsewhere = rec_of(
@@ -3317,7 +3415,7 @@ mod ack_ledger_tests {
             3,
         );
         assert_eq!(
-            l.record(&elsewhere, T0, &[], T0).unwrap_err(),
+            l.record(&elsewhere, Some(T0), &[], T0).unwrap_err(),
             RecordRefusal::OtherStation
         );
         // Hosts out of grammar or too many, a time out of range.
@@ -3327,19 +3425,22 @@ mod ack_ledger_tests {
             (0..=MAX_HOSTS).map(|i| format!("h{i}")).collect(),
         ] {
             assert!(matches!(
-                l.record(&s, T0, &bad, T0).unwrap_err(),
+                l.record(&s, Some(T0), &bad, T0).unwrap_err(),
                 RecordRefusal::Malformed(_)
             ));
         }
         assert!(matches!(
-            l.record(&s, MAX_SAFE_INTEGER + 1, &[], T0).unwrap_err(),
+            l.record(&s, Some(MAX_SAFE_INTEGER + 1), &[], T0)
+                .unwrap_err(),
             RecordRefusal::Malformed(_)
         ));
         // The same record again is no change (a retried intake, a
         // snapshot's re-issue in a new feed); its first hosts stand.
         let mut l = ledger();
         l.rec(&s, T0, &["a", "b"]);
-        let t = l.record(&s, T0 + HOUR, &hosts(&["c"]), T0 + HOUR).unwrap();
+        let t = l
+            .record(&s, Some(T0 + HOUR), &hosts(&["c"]), T0 + HOUR)
+            .unwrap();
         assert_eq!((t.next, t.made), (l.clone(), vec![]));
         // Another body under a record id the ledger holds: an ack naming
         // that id would be ambiguous.
@@ -3351,13 +3452,13 @@ mod ack_ledger_tests {
             1,
         );
         assert_eq!(
-            l.record(&reused, T0, &[], T0).unwrap_err(),
+            l.record(&reused, Some(T0), &[], T0).unwrap_err(),
             RecordRefusal::RecordIdReused
         );
         // A hold reusing it is refused too: ids are this feed's.
         let reused = rec(By::Own, ControlAction::Hold, 1);
         assert_eq!(
-            l.record(&reused, T0, &[], T0).unwrap_err(),
+            l.record(&reused, Some(T0), &[], T0).unwrap_err(),
             RecordRefusal::RecordIdReused
         );
         // Duplicated hosts are one set.
@@ -4041,7 +4142,9 @@ mod ack_ledger_tests {
             T0 + HOUR,
         );
         let s = revoke(By::Own, false, 1);
-        let late = l.record(&s, T0, &hosts(&["a", "b"]), T0 + DAY).unwrap();
+        let late = l
+            .record(&s, Some(T0), &hosts(&["a", "b"]), T0 + DAY)
+            .unwrap();
         assert_eq!(
             reports(&late.made),
             vec![
@@ -4051,10 +4154,14 @@ mod ack_ledger_tests {
         );
         assert_eq!(late.made[1].not_before, ids(&late.made[..1]));
         // Before its deadline: only the host in force.
-        let t = l.record(&s, T0, &hosts(&["a", "b"]), T0 + DAY - 1).unwrap();
+        let t = l
+            .record(&s, Some(T0), &hosts(&["a", "b"]), T0 + DAY - 1)
+            .unwrap();
         assert_eq!(reports(&t.made), vec![applied("a", &n)]);
         // Every covered host in force: all applied, whenever it is recorded.
-        let t = l.record(&s, T0, &hosts(&["a"]), T0 + 2 * DAY).unwrap();
+        let t = l
+            .record(&s, Some(T0), &hosts(&["a"]), T0 + 2 * DAY)
+            .unwrap();
         assert_eq!(
             reports(&t.made),
             vec![applied("a", &n), revoked(RevokedOutcome::AllApplied, &[])]
@@ -4063,15 +4170,307 @@ mod ack_ledger_tests {
         // tick at its time would.
         let (l, _) = revoked_ledger();
         let t = l
-            .record(&interrupt(By::Native, 3), T0, &hosts(&["a"]), T0 + DAY)
+            .record(
+                &interrupt(By::Native, 3),
+                Some(T0),
+                &hosts(&["a"]),
+                T0 + DAY,
+            )
             .unwrap();
         assert_eq!(
             reports(&t.made),
             vec![revoked(RevokedOutcome::DeadlinePassed, &["a", "b"])]
         );
         let again = l
-            .record(&revoke(By::Own, false, 1), T0, &[], T0 + DAY)
+            .record(&revoke(By::Own, false, 1), Some(T0), &[], T0 + DAY)
             .unwrap();
         assert_eq!(reports(&again.made), reports(&t.made));
+    }
+
+    // ----------------------------------------------------------- late start
+
+    /// `learn_revoked_at`, committed.
+    fn learn(l: &mut AckLedger, at: u64, now: u64) -> Vec<ReportIntent> {
+        let t = l.learn_revoked_at("service:svc-1", at, now).unwrap();
+        *l = t.next;
+        t.made
+    }
+
+    /// The start the state keeps.
+    fn start(l: &AckLedger) -> Value {
+        l.to_json()["revocations"]["service:svc-1"]["revoked_at_ms"].clone()
+    }
+
+    /// With no authenticated original time the start is the own revoke's
+    /// `issued_at` (the Station signs it only after the Portal revoked, so
+    /// it is at or after the revocation: late, never early), whenever the
+    /// Station records it; the state is the one `Some(issued_at)` gives.
+    #[test]
+    fn an_unknown_start_is_the_own_revokes_issued_at() {
+        let s = revoke(By::Own, false, 1);
+        let issued = s.issued_at();
+        for now in [issued - HOUR, issued, issued + 3 * HOUR, issued + DAY - 1] {
+            let t = ledger().record(&s, None, &hosts(&["a", "b"]), now).unwrap();
+            assert_eq!(t.made, vec![], "recorded at {now}");
+            let mut l = t.next;
+            assert_eq!(start(&l), json!(issued), "recorded at {now}");
+            let known = ledger()
+                .record(&s, Some(issued), &hosts(&["a", "b"]), now)
+                .unwrap();
+            assert_eq!(l.to_json(), known.next.to_json(), "the same state");
+            assert_eq!(l.tick_at(issued + DAY - 1), vec![], "recorded at {now}");
+            assert_eq!(
+                reports(&l.tick_at(issued + DAY)),
+                vec![revoked(RevokedOutcome::DeadlinePassed, &["a", "b"])],
+                "recorded at {now}"
+            );
+        }
+        // Recorded after that deadline: final at once.
+        let t = ledger()
+            .record(&s, None, &hosts(&["a"]), issued + DAY)
+            .unwrap();
+        assert_eq!(
+            reports(&t.made),
+            vec![revoked(RevokedOutcome::DeadlinePassed, &["a"])]
+        );
+        // For any other record it is unused, as `Some` is.
+        let n = revoke(By::Native, false, 2);
+        let none = ledger().record(&n, None, &hosts(&["a"]), T0).unwrap();
+        let some = ledger().record(&n, Some(T0), &hosts(&["a"]), T0).unwrap();
+        assert_eq!(none, some);
+    }
+
+    /// A date learned after the record only lowers the start: an equal or
+    /// later one changes nothing, a later learn of the same date neither.
+    #[test]
+    fn a_learned_date_only_lowers_the_start() {
+        let s = revoke(By::Own, false, 1);
+        let issued = s.issued_at();
+        let mut l = ledger();
+        l = l
+            .record(&s, None, &hosts(&["a", "b"]), issued)
+            .unwrap()
+            .next;
+        // Two hours earlier: the deadline moves two hours earlier, and
+        // nothing happens at once.
+        assert_eq!(learn(&mut l, issued - 2 * HOUR, issued + HOUR), vec![]);
+        assert_eq!(start(&l), json!(issued - 2 * HOUR));
+        let lowered = l.clone();
+        // A later date, the same date again: no change.
+        for at in [issued + 5 * HOUR, issued, issued - 2 * HOUR] {
+            let t = l
+                .learn_revoked_at("service:svc-1", at, issued + HOUR)
+                .unwrap();
+            assert_eq!(
+                (t.next, t.made, t.alerts),
+                (lowered.clone(), vec![], vec![])
+            );
+        }
+        assert_eq!(l.tick_at(issued - 2 * HOUR + DAY - 1), vec![]);
+        assert_eq!(
+            reports(&l.tick_at(issued - 2 * HOUR + DAY)),
+            vec![revoked(RevokedOutcome::DeadlinePassed, &["a", "b"])]
+        );
+        // A known start clamped to an hour after its issued_at is lowered
+        // only by an earlier date.
+        let mut l = ledger();
+        l.rec(&s, issued + 3 * HOUR, &["a"]);
+        assert_eq!(start(&l), json!(issued + HOUR));
+        assert_eq!(learn(&mut l, issued + 2 * HOUR, issued + 3 * HOUR), vec![]);
+        assert_eq!(start(&l), json!(issued + HOUR));
+        assert_eq!(learn(&mut l, issued + HOUR / 2, issued + 3 * HOUR), vec![]);
+        assert_eq!(start(&l), json!(issued + HOUR / 2));
+    }
+
+    /// A learned date that ends the window makes the final at once, after
+    /// the per-host reports already made; a host that applies it later is
+    /// still reported, and a learn after the final changes nothing.
+    #[test]
+    fn a_learned_date_that_ends_the_window_is_final_at_once() {
+        let s = revoke(By::Own, false, 1);
+        let issued = s.issued_at();
+        let mut l = ledger();
+        l = l
+            .record(&s, None, &hosts(&["a", "b"]), issued)
+            .unwrap()
+            .next;
+        let a = l.ack_by(
+            "a",
+            vec![res(&s, &[(E::Revocation, R::Applied)])],
+            issued + HOUR,
+        );
+        let f = learn(&mut l, issued - 25 * HOUR, issued + 2 * HOUR);
+        assert_eq!(
+            reports(&f),
+            vec![revoked(RevokedOutcome::DeadlinePassed, &["b"])]
+        );
+        assert_eq!(f[0].not_before, ids(&a));
+        assert_eq!(start(&l), json!(issued - 25 * HOUR));
+        // After the final: an earlier, an equal or a later date, then or
+        // later, changes nothing; the final stands and is made once.
+        let fin = l.clone();
+        for (at, now) in [
+            (issued - 30 * HOUR, issued + 2 * HOUR),
+            (issued - 25 * HOUR, issued + 3 * HOUR),
+            (issued, issued + 2 * DAY),
+        ] {
+            let t = l.learn_revoked_at("service:svc-1", at, now).unwrap();
+            assert_eq!((t.next, t.made), (fin.clone(), vec![]), "learned {at}");
+        }
+        assert_eq!(l.tick_at(issued + 2 * DAY), vec![]);
+        let b = l.ack_by(
+            "b",
+            vec![res(&s, &[(E::Revocation, R::Applied)])],
+            issued + 3 * HOUR,
+        );
+        assert_eq!(reports(&b), vec![applied("b", &s)]);
+        // The order the reports go: a's, the final, then b's.
+        assert_eq!(l.pending_reports(), a);
+        l.confirm_id(&a[0].report_id);
+        assert_eq!(l.pending_reports(), f);
+        l.confirm_id(&f[0].report_id);
+        assert_eq!(l.pending_reports(), b);
+    }
+
+    /// Two learns give the same ledger in either order while the window is
+    /// open, the second ending it included; once one ended it the other
+    /// changes nothing, so two that would each end it make the same reports
+    /// in either order, the start kept the first's.
+    #[test]
+    fn learns_give_the_same_ledger_in_either_order() {
+        let s = revoke(By::Own, false, 1);
+        let issued = s.issued_at();
+        let mut base = ledger();
+        base = base
+            .record(&s, None, &hosts(&["a", "b"]), issued)
+            .unwrap()
+            .next;
+        base.ack_by(
+            "a",
+            vec![res(&s, &[(E::Revocation, R::Applied)])],
+            issued + HOUR,
+        );
+        let now = issued + 2 * HOUR;
+        let both = |x: u64, y: u64| {
+            let mut l = base.clone();
+            let mut made = learn(&mut l, x, now);
+            made.extend(learn(&mut l, y, now));
+            (l, made)
+        };
+        for (x, y) in [
+            (issued - 2 * HOUR, issued - 5 * HOUR),
+            (issued - 2 * HOUR, issued - 25 * HOUR),
+            (issued + HOUR, issued - 3 * HOUR),
+        ] {
+            let ((l1, m1), (l2, m2)) = (both(x, y), both(y, x));
+            assert_eq!(jcs(&l1.to_json()).unwrap(), jcs(&l2.to_json()).unwrap());
+            assert_eq!(m1, m2, "learned {x} and {y}");
+        }
+        let (x, y) = (issued - 25 * HOUR, issued - 30 * HOUR);
+        let ((l1, m1), (l2, m2)) = (both(x, y), both(y, x));
+        assert_eq!(m1, m2);
+        assert_eq!(l1.pending, l2.pending);
+        assert_eq!((start(&l1), start(&l2)), (json!(x), json!(y)));
+    }
+
+    /// A restart between the record and the learn: the learn acts on the
+    /// state the Station committed, as it would have on the live one.
+    #[test]
+    fn a_learn_after_a_restart_acts_on_the_committed_state() {
+        let s = revoke(By::Own, false, 1);
+        let issued = s.issued_at();
+        let mut l = ledger();
+        l = l
+            .record(&s, None, &hosts(&["a", "b"]), issued)
+            .unwrap()
+            .next;
+        l.ack_by(
+            "a",
+            vec![res(&s, &[(E::Revocation, R::Applied)])],
+            issued + HOUR,
+        );
+        let mut restarted = AckLedger::from_json(&l.to_json()).unwrap();
+        for at in [issued - 2 * HOUR, issued - 25 * HOUR] {
+            let live = l.learn_revoked_at("service:svc-1", at, issued + 2 * HOUR);
+            let back = restarted.learn_revoked_at("service:svc-1", at, issued + 2 * HOUR);
+            assert_eq!(live, back, "learned {at}");
+        }
+        learn(&mut restarted, issued - 2 * HOUR, issued + 2 * HOUR);
+        let mut again = AckLedger::from_json(&restarted.to_json()).unwrap();
+        assert_eq!(start(&again), json!(issued - 2 * HOUR));
+        assert_eq!(again.tick_at(issued - 2 * HOUR + DAY - 1), vec![]);
+        assert_eq!(again.tick_at(issued - 2 * HOUR + DAY).len(), 1);
+    }
+
+    /// A learn passes the deadlines at its time first, as `record` does,
+    /// and refuses a value out of range (`malformed`, checked first) and a
+    /// principal with no own revoke recorded (`unknown_revocation`: the
+    /// date goes to `record` instead).
+    #[test]
+    fn a_learn_passes_the_deadlines_and_refuses_what_it_cant_use() {
+        let s = revoke(By::Own, false, 1);
+        let issued = s.issued_at();
+        let svc2 = rec_for(
+            ACCOUNT,
+            ORIGIN,
+            "svc-2",
+            By::Own,
+            ControlAction::Revoke {
+                interrupt_running: false,
+            },
+            2,
+        );
+        let mut l = ledger();
+        l.rec(&svc2, T0, &["a"]);
+        l = l
+            .record(&s, None, &hosts(&["a"]), issued + 20 * HOUR)
+            .unwrap()
+            .next;
+        // svc-2's deadline passed: its final first, whatever svc-1 learns.
+        let t = l
+            .learn_revoked_at("service:svc-1", issued + HOUR, T0 + DAY)
+            .unwrap();
+        assert_eq!(t.made.len(), 1);
+        assert!(matches!(
+            &t.made[0].report,
+            Report::Revoked { integration_id, .. } if integration_id == "i-svc-2"
+        ));
+        assert_eq!(t.next, l.tick(T0 + DAY).next);
+
+        // Refusals: nothing changes.
+        let late = |l: &AckLedger, principal: &str, at: u64| {
+            l.learn_revoked_at(principal, at, issued).unwrap_err()
+        };
+        assert_eq!(
+            late(&l, "service:svc-1", MAX_SAFE_INTEGER + 1),
+            LearnRefusal::Malformed("revoked_at_ms")
+        );
+        assert_eq!(
+            late(&l, "service:svc-9", MAX_SAFE_INTEGER + 1).code(),
+            "malformed"
+        );
+        let mut native_only = ledger();
+        native_only.rec(&revoke(By::Native, false, 3), T0, &["a"]);
+        for (ledger, principal) in [
+            (&ledger(), "service:svc-1"),
+            (&native_only, "service:svc-1"),
+            (&l, "service:svc-9"),
+            (&l, "host:host-z"),
+            (&l, "svc-1"),
+        ] {
+            let e = late(ledger, principal, issued);
+            assert_eq!(e, LearnRefusal::UnknownRevocation, "{principal}");
+            assert_eq!(e.code(), "unknown_revocation");
+            assert_eq!(e.to_string(), "unknown_revocation");
+        }
+        assert_eq!(
+            LearnRefusal::Malformed("revoked_at_ms").to_string(),
+            "malformed: revoked_at_ms"
+        );
+        // A value at the bound is a date.
+        assert!(
+            l.learn_revoked_at("service:svc-1", MAX_SAFE_INTEGER, issued)
+                .is_ok()
+        );
     }
 }

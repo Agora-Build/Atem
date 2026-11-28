@@ -1733,7 +1733,7 @@ final class ConformanceTests: XCTestCase {
             .sorted()
         for name in ackNames {
             check("Station acks: \(name) through AckLedgerHandle") {
-                try eq(ackNames.count, 7, "the acknowledgment fixtures")
+                try eq(ackNames.count, 8, "the acknowledgment fixtures")
                 let f = try load(name)
                 let setup = o(f["setup"])
                 let st = o(setup["station"])
@@ -1744,8 +1744,17 @@ final class ConformanceTests: XCTestCase {
                 var clientId = setup["report_client_id"] as? String
                 func input(_ on: AckLedgerHandle, _ step: [String: Any]) throws -> AckTransition? {
                     if let label = step["control_record"] {
-                        let at = step["revoked_at_ms"].map { u($0) } ?? now
+                        // No revoked_at_ms: no authenticated original time.
+                        let at = step["revoked_at_ms"].map { u($0) }
                         return try on.record(recordJson: ctlRecord(s(label)), revokedAtMs: at, coveredHosts: a(step["covered_hosts"]).map(s), nowMs: now)
+                    }
+                    if let principal = step["learn_revoked_at"] {
+                        let at = u(step["revoked_at_ms"])
+                        if let refused = step["refused"] {
+                            try throwsCode(s(refused)) { _ = try on.learnRevokedAt(principal: s(principal), revokedAtMs: at, nowMs: now) }
+                            return nil
+                        }
+                        return try on.learnRevokedAt(principal: s(principal), revokedAtMs: at, nowMs: now)
                     }
                     if let message = step["control_ack"] {
                         let link = linkOf(links[s(step["link"])])
@@ -1771,8 +1780,17 @@ final class ConformanceTests: XCTestCase {
                         throw Failure(description: "\(id) is not sendable")
                     }
                 }
-                for step in a(f["steps"]).map(o) {
-                    if step["control_record"] != nil || step["control_ack"] != nil || step["tick"] != nil {
+                // A branch is another history from the committed state, kept
+                // apart: its steps between a save and a restore of the Station.
+                func flat(_ steps: [Any]) -> [[String: Any]] {
+                    steps.map(o).flatMap { step -> [[String: Any]] in
+                        guard let inner = step["branch"] else { return [step] }
+                        return [["branch_start": true]] + flat(a(inner)) + [["branch_end": true]]
+                    }
+                }
+                var saved: [(AckLedgerHandle, String, UInt64, String?)] = []
+                for step in flat(a(f["steps"])) {
+                    if step["control_record"] != nil || step["control_ack"] != nil || step["learn_revoked_at"] != nil || step["tick"] != nil {
                         if let t = try input(ledger, step) {
                             try made(t, step)
                             if (step["commit"] as? Bool) != false { commit(t) }
@@ -1786,6 +1804,32 @@ final class ConformanceTests: XCTestCase {
                         commit(t1)
                         let lost = try input(try AckLedgerHandle.fromJson(stateJson: committed), inner)!
                         try eq(lost.made, [ReportIntentInfo](), "\(name) the replica that lost")
+                    } else if let inner = step["either_order"] {
+                        // Two Stations take the two inputs in either order: the
+                        // same next state and the same reports; the first commits.
+                        func both(_ x: [String: Any], _ y: [String: Any]) throws -> (AckLedgerHandle, [String]) {
+                            let t1 = try input(try AckLedgerHandle.fromJson(stateJson: committed), x)!
+                            let t2 = try input(t1.next, y)!
+                            return (t2.next, (t1.made + t2.made).map { $0.reportId })
+                        }
+                        let pair = a(inner).map(o)
+                        let (n1, m1) = try both(pair[0], pair[1])
+                        let (n2, m2) = try both(pair[1], pair[0])
+                        try eq(n1.toJson(), n2.toJson(), "\(name) either order's states")
+                        try eq(m1, m2, "\(name) either order's reports")
+                        try eq(m1, a(step["made"]).map(s), "\(name) made")
+                        committed = n1.toJson()
+                        ledger = n1
+                    } else if step["branch_start"] != nil {
+                        saved.append((ledger, committed, now, clientId))
+                        ledger = try AckLedgerHandle.fromJson(stateJson: committed)
+                    } else if step["branch_end"] != nil {
+                        (ledger, committed, now, clientId) = saved.removeLast()
+                    } else if let want = step["expect_start"] {
+                        // Each revocation's start, as the state keeps it.
+                        let state = o(try JSONSerialization.jsonObject(with: Data(ledger.toJson().utf8)))
+                        let starts = o(state["revocations"]).mapValues { o($0)["revoked_at_ms"]! }
+                        try eq(canon(starts), canon(want), "\(name) starts")
                     } else if let ms = step["advance_ms"] {
                         now += u(ms)
                     } else if step["restart"] != nil {
@@ -1925,6 +1969,8 @@ final class ConformanceTests: XCTestCase {
             try throwsCode("incomplete_link") { _ = try l.ack(link: noConnection, ackJson: ack, nowMs: nowMs) }
             try throwsCode("not_the_link") { _ = try l.ack(link: linkB, ackJson: ack.replacingOccurrences(of: "host-b", with: "host-c"), nowMs: nowMs) }
             try throwsCode("unknown_field") { _ = try l.record(recordJson: ctlRecord("P4_unknown_field"), revokedAtMs: 0, coveredHosts: [], nowMs: nowMs) }
+            try throwsCode("malformed") { _ = try l.learnRevokedAt(principal: "service:svc-discord", revokedAtMs: 9_007_199_254_740_992, nowMs: nowMs) }
+            try throwsCode("unknown_revocation") { _ = try l.learnRevokedAt(principal: "service:svc-other", revokedAtMs: 0, nowMs: nowMs) }
         }
         check("Station calls: fixture acks read and write back; pages, heads and fetches round-trip; builders refuse what readers refuse") {
             for name in ackNames {

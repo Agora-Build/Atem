@@ -1407,7 +1407,7 @@ jar); it can be run on a download the same way.
 `WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
 Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 
-- **Conformance** (153 checks in JS, 155 in Kotlin and in Swift: the same 153
+- **Conformance** (155 checks in JS, 157 in Kotlin and in Swift: the same 155
   in each language, plus two in Kotlin and Swift, whose provider sees the
   signing request and so the purposes of the five device-list actions and
   of control records; five of each language's are the verifier reports',
@@ -1471,16 +1471,18 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   provider asked under `ServiceControl` (no confirmation) for the
   integration's own key and `ControlRecord` (a fresh confirmation of the
   body) for a native manager.
-- **The Station's side** (`tests/station.rs`, Rust; twelve conformance
+- **The Station's side** (`tests/station.rs`, Rust; thirteen conformance
   checks per language, of the 70 and 72 above): every acknowledgment
   fixture (`r9-control-ack-*`, one check each, its `expect_counts` against
   the state's `done`) through `AckLedgerHandle` as
   a Station persists it (each call's next state committed before the
   reports go and adopted after, restarts from the committed state, two
   replicas from one state giving the same next state and reports and the
-  one that lost the compare-and-swap making nothing), with the Portal's
-  answers through `report_answer`; a call never changing the handle it was
-  called on, and the state loading only as written; every fixture ack read
+  one that lost the compare-and-swap making nothing, two inputs in either
+  order giving the same next state, a branch from the committed state kept
+  apart), with the Portal's answers through `report_answer`; a call never
+  changing the handle it was called on, `learn_revoked_at`'s two refusals,
+  and the state loading only as written; every fixture ack read
   and written back, feed pages, heads and device-list fetches round-tripping,
   the builders refusing what the readers refuse (a record the control
   parser refuses, a position above the head, a `mailbox` head before stage
@@ -1879,9 +1881,10 @@ to re-sign. Keep one per device list your Station serves.
 |---|---|
 | `AckLedgerHandle::new(origin, account_id, genesis_hash)`, `from_json(state_json)`, `to_json()` | an empty ledger (`origin` exact, as hosts compare it: `https://` and a lowercase host, a port only when not the default, no path; `http://` on a loopback address for development; else `Invalid{malformed}`); the stored one (`Stored{code}`: `too_large` over 64 MiB, `malformed`, `unsupported_version`, `stored_invalid`, also for a `pending` list not in the order the reports were made: it would stall a principal); its durable state, canonical JSON (`"v": 1`) |
 | `origin()`, `account_id()`, `genesis_hash()` | the Station and the device list the ledger is for (`genesis_hash` in lowercase hex): check them against the device list a stored state is loaded for |
-| `record(record_json, revoked_at_ms, covered_hosts, now_ms)` | a record you stored in your feed, before you serve it. Your own `revoke` (signed with the integration's service key) starts the revocation: `revoked_at_ms` is when the Portal revoked the integration (the deadline's start, but the ledger keeps `min(revoked_at_ms, the record's issued_at + 1 hour)`, so the deadline is at most `issued_at` plus 25 hours, where a host stops resending the revoke's result: **Atem's proposal, agreed with Astation (2026-11-11, #120 comment 6810116314)**, host-work-v1 §11.4), `covered_hosts` the hosts its grant covered. For any other record `covered_hosts` are the hosts its re-sign alert waits for. Refused (`Invalid{code}`): `other_account`, `other_station`, `record_id_reused` (another body under a `record_id` the ledger tracks), `malformed`, or the record's parse code |
+| `record(record_json, revoked_at_ms, covered_hosts, now_ms)` | a record you stored in your feed, before you serve it. Your own `revoke` (signed with the integration's service key) starts the revocation: `revoked_at_ms` is when the Portal revoked the integration, an authenticated original time (the deadline's start, but the ledger keeps `min(revoked_at_ms, the record's issued_at + 1 hour)`, so the deadline is at most `issued_at` plus 25 hours, where a host stops resending the revoke's result: **Atem's proposal, agreed with Astation (2026-11-11, #120 comment 6810116314)**, host-work-v1 §11.4), or none (`Option<u64>`: Swift `UInt64?`, Kotlin `ULong?`, JS `undefined`) when you have none (you started late, a legacy row): the start is then the record's `issued_at`, at or after the revocation (late, never early: never pass `now`, 0 or a guess), and `learn_revoked_at` lowers it later (**Atem's proposal, for Astation's agreement (#120 comment 7234876179)**); `covered_hosts` the hosts its grant covered. For any other record `revoked_at_ms` is unused and `covered_hosts` are the hosts its re-sign alert waits for. Refused (`Invalid{code}`): `other_account`, `other_station`, `record_id_reused` (another body under a `record_id` the ledger tracks), `malformed`, or the record's parse code |
+| `learn_revoked_at(principal, revoked_at_ms, now_ms)` | an authenticated original time of the revocation of `principal` (`service:<id>`) you learned after you recorded its own revoke (the integration's `revokedAt`, from a checkpoint or the feed): it only lowers the start, to `min(start, revoked_at_ms)` (an equal or later time changes nothing; two learns give the same state in either order while the window is open), and only before the final (after it nothing changes). Like `record`, it first passes the deadlines at `now_ms`; a date that ends the window makes the final at once, after the per-host reports already made. The reports and their `report_id`s don't change: only the final's time moves, and only earlier (**Atem's proposal, for Astation's agreement (#120 comment 7234876179)**). Refused (`Invalid{code}`): `unknown_revocation` (no own revoke of `principal` recorded: pass the date to `record`), `malformed` (above 2^53 − 1, checked first) |
 | `ack(link, ack_json, now_ms)` | a host's `control_ack` as received, on the link whose verified association is `link` (`LinkAssociationInfo{account_id, genesis_hash, host_id, host_trust_gen, connection_id}`). Refused whole, nothing counted: `incomplete_link`, `not_the_link` (the ack's account, root, host or trust generation isn't the link's), `other_account`, `other_station`, `not_the_record` (a result whose effects aren't the record's), or the reader's code. Answer `not_the_link`, `other_account` and `other_station` with `relay_control_ack_refused` on the link; the others get no reply |
-| `tick(now_ms)` | your timer: a revocation 24 hours past its start (`record`'s `min(revoked_at_ms, issued_at + 1 hour)`) gets its `revoked{deadline_passed}` report |
+| `tick(now_ms)` | your timer: a revocation 24 hours past its start (`record`'s `min(revoked_at_ms, issued_at + 1 hour)`, or `issued_at` with no `revoked_at_ms`, lowered by `learn_revoked_at`) gets its `revoked{deadline_passed}` report |
 | `pending_reports()` | what to send now, in order: `ReportIntentInfo{report_id, report, not_before}`, `report` being `RevocationApplied{integration_id, host, record_id}` or `Revoked{integration_id, outcome, pending_hosts}` |
 | `report_answer(status)` | the class of the Portal's HTTP status: `Confirm`, `Retry`, `Refuse`, `StopReporting` (below) |
 | `confirm(report_id)`, `refuse(report_id)` | the Portal accepted the report; refused it for good (settled, never sent again, a `ReportRefused` alert) |
@@ -1895,7 +1898,8 @@ the call made; never send it: send the committed state's
 AckLedgerHandle(origin, accountId, genesisHash)`,
 `AckLedgerHandle.fromJson(text)`, `toJson()`, `origin()`, `accountId()`,
 `genesisHash()`, `record(recordJson,
-revokedAtMs, coveredHosts, nowMs)`, `ack({accountId, genesisHash, hostId,
+revokedAtMs, coveredHosts, nowMs)` (`revokedAtMs` a number or `undefined`),
+`learnRevokedAt(principal, revokedAtMs, nowMs)`, `ack({accountId, genesisHash, hostId,
 hostTrustGen, connectionId}, ackJson, nowMs)`, `tick(nowMs)`,
 `confirm(id)`, `refuse(id)`, `stopReporting(clientId)`,
 `resumeReporting(clientId)`, `pendingReports()` (plain objects:
@@ -2065,7 +2069,8 @@ first reports this Station's record `duplicate` and is still counted);
 `revocation_applied` (but one dropped by a resume under another report
 client ID), `revoked{deadline_passed, pending_hosts}` 24 hours after the
 revocation's start (`min(revoked_at_ms, the own revoke's issued_at + 1
-hour)`).
+hour)`, or that `issued_at` with no `revoked_at_ms`, lowered by
+`learn_revoked_at` before the final).
 
 **Its size.** The ledger keeps the `revoke` and `interrupt_running` records
 it tracks (at most 64 covered hosts each), what each host has in force, the

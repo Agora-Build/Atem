@@ -2177,18 +2177,35 @@ impl AckLedgerHandle {
     }
     /// A record the Station stored in its feed (`record`): for its own
     /// `revoke`, the revocation starts at `min(revokedAtMs, the record's
-    /// issued_at + 1 hour)`.
+    /// issued_at + 1 hour)`, or at its issued_at when `revokedAtMs` is
+    /// `undefined` (no authenticated original time).
     pub fn record(
         &self,
         record_json: String,
-        revoked_at_ms: f64,
+        revoked_at_ms: Option<f64>,
         covered_hosts: Vec<String>,
         now_ms: f64,
     ) -> JsResult<AckTransition> {
         ack_transition(err(self.0.record(
             record_json,
-            ms(revoked_at_ms)?,
+            revoked_at_ms.map(ms).transpose()?,
             covered_hosts,
+            ms(now_ms)?,
+        ))?)
+    }
+    /// An authenticated original revocation time of `principal` learned
+    /// after its own revoke was recorded (`learn_revoked_at`): it only
+    /// lowers the start, before the final only.
+    #[wasm_bindgen(js_name = learnRevokedAt)]
+    pub fn learn_revoked_at(
+        &self,
+        principal: String,
+        revoked_at_ms: f64,
+        now_ms: f64,
+    ) -> JsResult<AckTransition> {
+        ack_transition(err(self.0.learn_revoked_at(
+            principal,
+            ms(revoked_at_ms)?,
             ms(now_ms)?,
         ))?)
     }

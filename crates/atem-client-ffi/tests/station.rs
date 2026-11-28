@@ -138,8 +138,8 @@ impl Station {
         }
     }
 
-    /// A record, an ack or a tick on `ledger` (`None`: refused, as the
-    /// step says).
+    /// A record, an ack, a learned original time or a tick on `ledger`
+    /// (`None`: refused, as the step says).
     fn input(&self, ledger: &AckLedgerHandle, step: &Value) -> Option<AckTransition> {
         if let Some(label) = step.get("control_record") {
             let hosts = step["covered_hosts"]
@@ -148,11 +148,21 @@ impl Station {
                 .iter()
                 .map(s)
                 .collect();
-            let at = step
-                .get("revoked_at_ms")
-                .map_or(self.now, |v| v.as_u64().unwrap());
+            // No `revoked_at_ms`: no authenticated original time.
+            let at = step.get("revoked_at_ms").map(|v| v.as_u64().unwrap());
             let record = self.records[label.as_str().unwrap()].to_string();
             return Some(ledger.record(record, at, hosts, self.now).unwrap());
+        }
+        if let Some(principal) = step.get("learn_revoked_at") {
+            let at = step["revoked_at_ms"].as_u64().unwrap();
+            let t = ledger.learn_revoked_at(s(principal), at, self.now);
+            return match step.get("refused") {
+                Some(want) => {
+                    assert_eq!(code(t.unwrap_err()), s(want), "{}", self.name);
+                    None
+                }
+                None => Some(t.unwrap()),
+            };
         }
         if let Some(message) = step.get("control_ack") {
             let link = self.links[step["link"].as_str().unwrap()].clone();
@@ -193,7 +203,7 @@ impl Station {
 
     fn step(&mut self, step: &Value) {
         let o = step.as_object().unwrap();
-        if ["control_record", "control_ack", "tick"]
+        if ["control_record", "control_ack", "learn_revoked_at", "tick"]
             .iter()
             .any(|k| o.contains_key(*k))
         {
@@ -217,6 +227,51 @@ impl Station {
             let again = AckLedgerHandle::from_json(self.committed.clone()).unwrap();
             let t = self.input(&again, inner).unwrap();
             assert!(t.made.is_empty(), "{}", self.name);
+        } else if let Some(inner) = step.get("either_order") {
+            // Two Stations load the committed state and take the two inputs
+            // in either order: the same next state and the same reports.
+            let both = |x: &Value, y: &Value| {
+                let l = AckLedgerHandle::from_json(self.committed.clone()).unwrap();
+                let t1 = self.input(&l, x).unwrap();
+                let t2 = self.input(&t1.next, y).unwrap();
+                let made: Vec<String> = t1
+                    .made
+                    .iter()
+                    .chain(&t2.made)
+                    .map(|i| i.report_id.clone())
+                    .collect();
+                (t2.next, made)
+            };
+            let (n1, m1) = both(&inner[0], &inner[1]);
+            let (n2, m2) = both(&inner[1], &inner[0]);
+            assert_eq!(n1.to_json(), n2.to_json(), "{}", self.name);
+            assert_eq!(m1, m2, "{}", self.name);
+            assert_eq!(json!(m1), step["made"], "{}: {step}", self.name);
+            self.committed = n1.to_json();
+            self.ledger = n1;
+        } else if let Some(steps) = step.get("branch") {
+            // Another history from the committed state, kept apart.
+            let saved = (
+                self.ledger.clone(),
+                self.committed.clone(),
+                self.now,
+                self.client_id.clone(),
+            );
+            self.ledger = AckLedgerHandle::from_json(self.committed.clone()).unwrap();
+            for inner in steps.as_array().unwrap() {
+                self.step(inner);
+            }
+            (self.ledger, self.committed, self.now, self.client_id) = saved;
+        } else if let Some(want) = step.get("expect_start") {
+            // Each revocation's start, as the state keeps it.
+            let state: Value = serde_json::from_str(&self.ledger.to_json()).unwrap();
+            let starts: serde_json::Map<String, Value> = state["revocations"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(p, r)| (p.clone(), r["revoked_at_ms"].clone()))
+                .collect();
+            assert_eq!(Value::Object(starts), *want, "{}", self.name);
         } else if let Some(ms) = step.get("advance_ms") {
             self.now += ms.as_u64().unwrap();
         } else if step.get("restart").is_some() {
@@ -305,7 +360,7 @@ fn ack_fixtures() -> Vec<Value> {
         .map(|n| n.trim_end_matches(".json").to_owned())
         .collect();
     names.sort();
-    assert_eq!(names.len(), 7);
+    assert_eq!(names.len(), 8);
     names.iter().map(|n| load(n)).collect()
 }
 
@@ -442,9 +497,49 @@ fn a_call_never_changes_its_handle_and_the_state_loads_only_as_written() {
         .ack(station.links["host-b"].clone(), "{}".into(), station.now);
     assert_eq!(code(t.unwrap_err()), "wrong_message");
     let refused = records()["P4_unknown_field"].to_string();
-    let t = station.ledger.record(refused, 0, vec![], station.now);
+    let t = station.ledger.record(refused, Some(0), vec![], station.now);
     assert_eq!(code(t.unwrap_err()), "unknown_field");
+    let s4 = records()["S4_revoke"].to_string();
+    let t = station
+        .ledger
+        .record(s4, Some(MAX_SAFE + 1), vec![], station.now);
+    assert_eq!(code(t.unwrap_err()), "malformed");
+    // A learned original time: only for a principal whose own revoke is
+    // recorded, and only in range.
+    let principal = "service:svc-discord".to_owned();
+    let t = station
+        .ledger
+        .learn_revoked_at(principal.clone(), MAX_SAFE + 1, station.now);
+    assert_eq!(code(t.unwrap_err()), "malformed");
+    let empty = AckLedgerHandle::new(
+        s(&st["origin"]),
+        s(&st["account_id"]),
+        s(&st["genesis_hash"]),
+    )
+    .unwrap();
+    for (ledger, principal) in [
+        (&empty, principal.as_str()),
+        (&station.ledger, "service:svc-9"),
+    ] {
+        let t = ledger.learn_revoked_at(principal.into(), 0, station.now);
+        assert_eq!(code(t.unwrap_err()), "unknown_revocation", "{principal}");
+    }
+    // Learned, it lowers the start; the handle called on stays as it was.
+    let before = station.ledger.to_json();
+    let t = station
+        .ledger
+        .learn_revoked_at(principal, 1_793_620_000_000, station.now)
+        .unwrap();
+    assert_eq!(station.ledger.to_json(), before);
+    let state: Value = serde_json::from_str(&t.next.to_json()).unwrap();
+    assert_eq!(
+        state["revocations"]["service:svc-discord"]["revoked_at_ms"],
+        json!(1_793_620_000_000u64)
+    );
 }
+
+/// 2^53 − 1.
+const MAX_SAFE: u64 = 9_007_199_254_740_991;
 
 #[test]
 fn relay_calls_round_trip_and_refuse_what_the_readers_refuse() {
@@ -731,7 +826,7 @@ fn the_three_refusals_and_a_stale_association_refused_without_disclosure() {
     let ledger = ledger
         .record(
             s4,
-            1_793_620_903_000,
+            Some(1_793_620_903_000),
             vec!["host-b".into()],
             1_793_620_940_000,
         )

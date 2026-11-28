@@ -377,12 +377,16 @@ Auth). Every ledger call is made at the Station's clock.
 
 | step | meaning |
 |---|---|
-| `{"control_record": label, "revoked_at_ms"?: n, "covered_hosts": [host], "made": [report_id], "commit"?: false}` | the Station stores the record `label` in its feed and records it (`revoked_at_ms`, default the clock: when the Portal revoked the integration, for the Station's own first revoke; the ledger keeps `min(revoked_at_ms, the record's issued_at + 1 hour)` as the deadline's start); `made`: the report ids the transition made, in order; `commit: false`: the Station dies before the commit, and the transition is lost |
+| `{"control_record": label, "revoked_at_ms"?: n, "covered_hosts": [host], "made": [report_id], "commit"?: false}` | the Station stores the record `label` in its feed and records it (`revoked_at_ms`: when the Portal revoked the integration, an authenticated original time, for the Station's own first revoke; the ledger keeps `min(revoked_at_ms, the record's issued_at + 1 hour)` as the deadline's start; absent, no authenticated original time (`None`): the start is the record's `issued_at`); `made`: the report ids the transition made, in order; `commit: false`: the Station dies before the commit, and the transition is lost |
+| `{"learn_revoked_at": principal, "revoked_at_ms": n, "made": [report_id], "commit"?: false, "refused"?: code}` | the Station learns an authenticated original time of `principal`'s revocation after it recorded its own revoke (`learn_revoked_at`): the start only lowers, before the final only; `refused`: the ledger refuses it with that code (`unknown_revocation`, `malformed`) and nothing changes |
 | `{"control_ack": message, "link": name, "made": [report_id], "commit"?: false, "refused"?: code}` | a host's `control_ack` (the complete wire message, read with the strict reader) arrives on the link `name`; `refused`: the ledger refuses it whole with that code (`not_the_link`, `other_account`, `other_station`, `not_the_record`, `incomplete_link`, `malformed`) and nothing changes |
 | `{"tick": true, "made": [report_id], "commit"?: false}` | the Station's timer, at its clock |
 | `{"advance_ms": n}` | the Station's clock moves |
 | `{"restart": true}` | the Station restarts: it reloads its last committed state |
-| `{"replica": step}` | two replicas load the same committed state and process `step` (a record, an ack or a tick): the same next state and intents, byte for byte; the first commits, the second's compare-and-swap fails and it processes `step` again on the new state, making nothing |
+| `{"replica": step}` | two replicas load the same committed state and process `step` (a record, an ack, a learn or a tick): the same next state and intents, byte for byte; the first commits, the second's compare-and-swap fails and it processes `step` again on the new state, making nothing |
+| `{"either_order": [step, step], "made": [report_id]}` | two Stations load the committed state; one processes the two input steps (each with no `made`) in their order, the other in the reverse: the same next state, byte for byte, and the same report ids made by the two together, `made`, in either order; the first order commits |
+| `{"branch": [step]}` | another history: a Station loads the committed state and goes on through these steps alone (its own clock, from the current one); nothing of it (state, clock, report client ID, the Portal's records) reaches this history |
+| `{"expect_start": {principal: n}}` | each revocation's start, exactly as the state keeps it (`revocations`' `revoked_at_ms`), by principal |
 | `{"expect_report": [intent]}` | what the Station sends now, in order (`pending_reports`), exactly: each `{"not_before": [report_id], "report": {…}, "report_id": "…"}`, the report `{"kind": "revocation_applied", "integration_id", "host", "record_id"}` or `{"kind": "revoked", "integration_id", "outcome", "pending_hosts"}` |
 | `{"confirm": report_id}` | the Station POSTs that report (it must be sendable now) and the Portal answers `200` (for a repeat, its recorded `200`): `confirm`, committed |
 | `{"report_failure": {"report_id", "status": n \| "no_answer", "code"?, "reached"?: true, "answer", "alerts"?: [alert]}}` | the Station POSTs that report and the Portal's answer is `status` (`no_answer`: a network error or a timeout; `reached`: the Portal recorded it before the answer was lost; `code`: the Portal's error code, for the reader). `answer` is its class (`ReportAnswer`: `retry`, `refuse`, `stop_reporting`): `retry` changes nothing, `refuse` is `refuse(report_id)` and `stop_reporting` is `stop_reporting(client_id)` under the Station's current report client ID, committed, and `alerts` are the operator alerts that transition raised (`{"kind": "report_refused", "report_id"}`, `{"kind": "reporting_stopped", "client_id"}`; none when absent) |
@@ -395,8 +399,15 @@ Auth). Every ledger call is made at the Station's clock.
 An unknown step or key fails the run. The report ids are known answers:
 `scripts/check-r9-vectors.py` recomputes every one in these files from its
 definition (host-work-v1 §11.4, "Reports") and its report's integration
-and host, and derives each `expect_counts` from the steps alone (the
-records tracked and the acks taken). `r9-control-ack-replacement-feed`
+and host, derives each `expect_counts` from the steps alone (the
+records tracked and the acks taken), and the finals: the step that makes
+each `revoked` report, its outcome and pending hosts, and each
+`expect_start` (a revocation's start from its own revoke's `revoked_at_ms`
+or `issued_at`, lowered by learns before the final; the deadline 24 hours
+after it). `r9-control-ack-late-start` (**Atem's proposal, for Astation's
+agreement, #120 comment 7234876179**): an own revoke recorded with no
+authenticated original time and the original time learned later, which
+only lowers the start, before the final only. `r9-control-ack-replacement-feed`
 (Astation #114, items 2 and 6, agreed 2026-11-22): a Station's
 replacement feed carries a current manager's original stop unchanged
 (`M7_revoke_interrupt`, naming the old feed), a fresh ledger (no carried
