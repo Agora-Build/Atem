@@ -1699,7 +1699,7 @@ effect?, revoke_seq?}`, the codes in the order they are checked:
 | `uncovered_cover` | a cover of a principal outside the covered set |
 | `not_above_mark` | a record signed anew with the service's own key is issued at or below its principal's mark, or the principal has none (a retained stop carried unchanged needs no mark) |
 | `stop_lost` | after the last record: an effect of a retained `revoke` or `interrupt_running` that is valid at the head (its principal's revocation, and the interrupt with it) isn't kept by the snapshot alone applied to a fresh state, as the paragraph below says (`effect`: `revocation` or `interrupt`; `record_id`: that retained stop; `revoke_seq`: a host principal's interrupt) |
-| `stop_not_resigned` | the same for a retained stop refused `removed_manager` (`reason`), a genuine stop whose signature verifies under its signer's key from the list's history: a current manager signs it again (I.5.4) |
+| `stop_not_resigned` | the same for a retained stop refused `removed_manager` (`reason`), a genuine stop whose signature verifies under its signer's key from the list's history: a current manager signs it again (I.5.4). Effect-only: any valid stop that keeps the original's effects passes it; whether a stop is a conforming copy is `check_resigned_copy`'s, stricter, below |
 
 Every retained stop counts, in the retained order, and a retained record
 that doesn't verify is reported before anything is compared. An effect is
@@ -2000,9 +2000,9 @@ core builds only the primitive.
   suffices.
 - **A current manager's copy of a former manager's stop** (Astation's
   ordering of #114 comment 7120876576 agrees with B1 to B6 and the
-  snapshot contract; the points and conditions below are **Atem's
-  reading, for Astation's agreement (Astation #114, comment
-  7207806862)**). A copy repairs a `stop_not_resigned` (I.5.4):
+  snapshot contract; the points and conditions below are Atem's reading,
+  **agreed with Astation (Astation #114 comments 7208700195 and
+  7209301522)**). A copy repairs a `stop_not_resigned` (I.5.4):
   - it is signed before its author's own barrier, never after: a copy is
     one of the plan's records, so B2 refuses drafting or signing it after
     its author's report. Reporting again under the barrier is allowed (a
@@ -2023,7 +2023,9 @@ core builds only the primitive.
     original's), `issued_at` (display only for a native's record) and a
     service's `feed_id`, which is either the original's feed or the
     plan's candidate feed of the same origin (a current manager's stop
-    may name any feed of the origin, so both forms are valid). So
+    may name any feed of the origin, so both forms are valid; the
+    candidate feed's form is M8/M11's, and copies a Station retained in
+    that form stay eligible, Astation #114 comment 7209301522). So
     `account_id`, `genesis_hash`, `principal`, `principal_key`, `action`
     (and `interrupt_running` on a revoke), a service's `origin` (always
     the original's), a host principal's `revoke_seq`, and `about` are the
@@ -2032,8 +2034,9 @@ core builds only the primitive.
     `M11_interrupt_resigned_a2` name the candidate feed (`N3`, `N9`,
     `Q32`), `M4_revoke_resigned` the original's feed (`D8`); (d) the
     final snapshot is `Consistent`,
-    no `stop_not_resigned` for the original. A shared helper for (c)
-    (`check_resigned_copy`, with vectors) is offered, not built;
+    no `stop_not_resigned` for the original. Condition (c) is the shared
+    core's `control::check_resigned_copy` (below), so the Mac and the
+    Station judge a copy alike;
   - a moved head needs the copy verified again at the new head, which
     opens a new round (agreed input 4), never an outright refusal of new
     membership: it is refused only when (a) fails;
@@ -2046,8 +2049,53 @@ core builds only the primitive.
     this plan. The exit is B4's: the plan is abandoned and a higher
     generation opened, in which a manager signs the copy before
     reporting.
-- **The order of a recovery** (**Atem's recommendation, for Astation's
-  agreement (Astation #114, comment 7207806862)**): collect the retained,
+- **`check_resigned_copy(log, original_json, copy_json,
+  candidate_feed_id)`** (the shared core's `control::resign`; the
+  bindings' `check_resigned_copy`, JS `checkResignedCopy`; built for
+  Astation's ask, #114 comment 7208700195): condition (c) as one pure
+  judgement on the list at its head. It answers the copy, `{original_record_id,
+  copy_record_id, signer, principal, action, feed}` (`signer` the copy's,
+  a current manager; `feed` `original` or `candidate`, none for a host
+  principal's record), or the first refusal, in this order:
+  1. `malformed`: either object isn't a signed control record that reads
+     strictly (a `record_id` that isn't a UUID v4 among them), the
+     candidate feed isn't a UUID v4, or the list is frozen;
+  2. `not_a_stop`: the original is a `cover`, `hold` or `release`, never
+     copied (the Station signs those anew with its own key);
+  3. `original_invalid`: the original's signature verifies under no
+     `auth_key` its signer had in the list's history, at some `seq`
+     (`unknown_signer`, `host_key_signed`, `bad_signature`); its signer
+     may since have been removed or demoted, which is the point;
+  4. `copy_invalid`: the copy isn't valid at the head
+     (`verify_control`) with a current native manager as its signer (the
+     verifier's pending or refusal code, or `signed_by_principal` for a
+     record valid under the principal's own key);
+  5. `same_record_id`: the copy's `record_id` is the original's;
+  6. field by field in the body's order, `intent_mismatch` naming the
+     first that differs (`account_id`, `genesis_hash`, `origin`,
+     `principal`, `principal_key`, `action`, `interrupt_running`,
+     `revoke_seq`, `about.integration_id`, `about.by`), and at `feed_id`'s
+     place (after `origin`) `feed_mismatch` for a service's copy naming
+     neither the original's feed nor the candidate. `signer`,
+     `record_id` and `issued_at` may differ; `origin` never.
+
+  The field order, the details, the frozen list's refusal and
+  `signed_by_principal` are **Atem's reading**. **It is stricter than
+  the snapshot checker**, which stays the consistency-only check agreed
+  with #199: the checker's `stop_not_resigned` is an effect-only check,
+  which any valid stop keeping the original's effects satisfies (a
+  current manager's revoke with another `about` or another feed of the
+  origin, `interrupt_running` over the original's `false`, the
+  principal's own revoke signed anew above its mark: D's item 1 ends its
+  coverage). A conforming copy always keeps every effect of its
+  original, so the two never disagree in that direction; the snapshots
+  the checker passes and this refuses are the adapter's to refuse, with
+  this function: Astation's publication rule, "require a conforming copy
+  to discharge the original obligation" (#114 comment 7208700195), with
+  the final author's exported signed copy and the complete checked
+  snapshot. Vectors: `r9-vectors-resigned-copy` (below).
+- **The order of a recovery** (Atem's recommendation, **agreed with
+  Astation (Astation #114 comments 7208700195 and 7209301522)**): collect the retained,
   imported and Portal evidence; take first the reports of the authors who
   can no longer sign copies (demoted managers); compute the originals that
   need copies (`stop_not_resigned`); current managers sign every copy and
@@ -2240,6 +2288,35 @@ removed manager's revoke for an uncovered principal
 machine, and checks every code is exercised.
 It derives no other verdict.
 Every SDK package's checksum manifest lists the file.
+
+**`r9-vectors-resigned-copy`** (`check_resigned_copy` above; condition
+(c), agreed with Astation, #114 comments 7208700195 and 7209301522): log
+L of `r9-vectors-membership-log` and its own `entries` (`RC7_hs7_revoke`,
+HS7_revoke byte for byte; `RC7_demote_phone` and `RC8_demote_phone`,
+dev-phone demoted on L and after HS7); `records`, each with its
+`verify_control` verdict on each of the file's chains (originals by
+dev-ipad, the manager E6 removed, and by dev-phone before its demotion;
+the same bodies but one field; originals that don't verify; dev-mac's
+copies and copies by others); `cases`, each `check_resigned_copy`'s
+answer on its list: valid copies (a service's revoke on the original's
+feed and on the candidate feed, a revoke with `interrupt_running`, a
+service's `interrupt_running`, a host principal's `interrupt_running`,
+a demoted manager's original) and every refusal (`malformed` in its
+forms, a non-v4 `record_id` among them; a cover and a hold never
+copied; originals forged, by an unknown member, by a host's key; copies
+by a demoted and a removed manager, by the service's key, a cover, by a
+member not yet in the list, a host principal's before its revoke; the
+same `record_id`; each field of the stop intent once, a third feed's
+`feed_mismatch` and a host stop copied as a service's); and
+`checker_passes`, two snapshots `check_snapshot_consistency` finds
+consistent whose stop the copy check refuses (a current manager's
+revoke with another `about.by`, the service's own revoke signed anew).
+Its runners are `crates/atem-client/tests/resigned_copy.rs` (which also
+checks that every conforming copy satisfies the snapshot checker), the
+FFI's, the binding conformance suites and `scripts/check-r9-vectors.py`,
+which derives every answer from the bytes (each copy's `verify_control`
+verdict taken from its `checks`). Every SDK package's checksum manifest
+lists the file.
 
 **`r9-vectors-signer-report`** (the signer report above; agreed with
 Astation, #114 comment 7089435073; version 2, its process roster, agreed

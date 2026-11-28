@@ -1353,6 +1353,55 @@ check("control snapshots: every case through checkControlSnapshotConsistency", (
   throwsCode(() => run(n1, { marks: [{ ...mark, mark_ms: 1 }] }), "malformed");
   throwsCode(() => run(n1, { covered: ["service:svc-discord", "service:svc-discord"] }), "malformed");
 });
+// A current manager's re-signed copy of a former manager's stop
+// (r9-vectors-resigned-copy; host-work-v1 §11.1, condition (c)): each case
+// through checkResignedCopy (the copy, or kind invalid with the copy
+// check's code and detail), and the snapshots the effect-only checker
+// passes whose stop the copy check refuses.
+const rcopy = load("r9-vectors-resigned-copy");
+const rcopyLog = (c) => {
+  const now = { wallMs: c.now_ms, monoMs: 1000, bootId: "boot-1" };
+  const chain = c.chain.map((label) => str(rcopy.entries.find((e) => e.label === label).entry));
+  return m.MembershipLog.verify(ACCOUNT, GENESIS, [...L, ...chain], now);
+};
+const rcopyRecord = (label) => str(rcopy.records.find((r) => r.label === label).record);
+const copyRefusal = (f) => {
+  try {
+    f();
+  } catch (e) {
+    eq(e.kind, "invalid", "kind");
+    return { code: e.code, ...(e.detail !== "" ? { detail: e.detail } : {}) };
+  }
+  throw new Error("expected a refusal, nothing thrown");
+};
+check("resigned copy: every case through checkResignedCopy", () => {
+  same(m.resignedCopyCodes(), rcopy.codes, "codes");
+  const codes = new Set();
+  for (const c of rcopy.cases) {
+    const judge = () => m.checkResignedCopy(rcopyLog(c), c.original_json, c.copy_json, c.candidate_feed_id);
+    if (c.expect === undefined) {
+      const got = copyRefusal(judge);
+      same(got, { code: c.code, ...(c.detail !== undefined ? { detail: c.detail } : {}) }, c.label);
+      codes.add(got.code);
+      continue;
+    }
+    const v = judge();
+    const out = { original_record_id: v.originalRecordId, copy_record_id: v.copyRecordId, signer: v.signer, principal: v.principal, action: v.action };
+    if (v.feed !== null && v.feed !== undefined) out.feed = v.feed;
+    same(out, c.expect, c.label);
+  }
+  same([...codes].sort(), [...rcopy.codes].sort(), "every code");
+});
+check("resigned copy: the snapshot checker passes what the copy check refuses", () => {
+  for (const p of rcopy.checker_passes) {
+    const snap = p.snapshot;
+    const marks = Object.entries(snap.marks).map(([principal, markMs]) => ({ principal, markMs }));
+    const a = m.checkControlSnapshotConsistency(rcopyLog(p), snap.origin, snap.candidate_feed_id, snap.retained.map(rcopyRecord), snap.snapshot.map(rcopyRecord), marks, snap.covered);
+    same(snapshotOut(a), snap.expect, `${p.label}: consistent`);
+    const got = copyRefusal(() => m.checkResignedCopy(rcopyLog(p), rcopyRecord(p.original), rcopyRecord(p.copy), p.candidate_feed_id));
+    same(got, { code: p.code, detail: p.detail }, `${p.label}: refused as a copy`);
+  }
+});
 check("Station acks: a call never changes its handle; the state loads only as written", () => {
   const f = load("r9-control-ack-per-effect");
   const st = f.setup.station;

@@ -1315,6 +1315,24 @@ record! {
     }
 }
 
+record! {
+    /// A current manager's re-signed copy that discharges its original
+    /// (`check_resigned_copy`; host-work-v1 §11.1, condition (c)): the two
+    /// records' ids, the copy's signer (`member:<device_id>`, a current
+    /// native manager), the principal, the stop (`revoke` or
+    /// `interrupt_running`), and which feed a service's copy names:
+    /// `original` (the original's) or `candidate` (the plan's candidate
+    /// feed); `None` for a host principal's record, which names no feed.
+    pub struct ResignedCopy {
+        pub original_record_id: String,
+        pub copy_record_id: String,
+        pub signer: String,
+        pub principal: String,
+        pub action: String,
+        pub feed: Option<String>,
+    }
+}
+
 data_enum! {
     /// A record against a device list (`verify_control_record`, I.5.4).
     pub enum ControlCheckInfo {

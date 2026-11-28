@@ -22,10 +22,14 @@
 //! has in force, the durable, retryable reports it owes the Portal, and the
 //! re-sign alerts (I.5.4, I.5.8). [`snapshot`] checks a Station's
 //! replacement feed after a rollback for consistency with the records it
-//! retained, never for completeness (host-work-v1 §11.1, "Resets").
+//! retained, never for completeness (host-work-v1 §11.1, "Resets"), and
+//! [`resign`] judges a current manager's re-signed copy of a removed or
+//! demoted manager's stop (§11.1, "A current manager's copy of a former
+//! manager's stop").
 pub mod ledger;
 pub mod record;
 pub mod relay;
+pub mod resign;
 pub mod snapshot;
 pub mod state;
 pub mod verify;
@@ -45,6 +49,7 @@ pub use relay::{
     FeedEntry, FeedHead, Heads, HeadsWithMailbox, MailboxHead, MembershipFetch,
     MembershipFetchResult, RefusalCode, RefusedCall, RelayError, SyncMismatch, ToHost, ToStation,
 };
+pub use resign::{COPY_CHECK_CODES, CopyFeed, CopyRefusal, ResignedCopy, check_resigned_copy};
 pub use snapshot::{
     InconsistencyCode, SnapshotConsistency, SnapshotInconsistency, SnapshotInput,
     check_snapshot_consistency,

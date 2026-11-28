@@ -33,7 +33,10 @@ here and its set hashes recomputed from the journal's bodies (host-work-v1
 binding proof (delegated host-work III.5 (b); its orders Atem's proposal,
 #120 comment 7207827118, agreed with Astation, Atem #210 comment
 7209922243), Astation's three posted examples included (their digests and
-both signatures). The other files' `expect` and each `reason` are checked
+both signatures), and `r9-vectors-resigned-copy`, whose every copy check's
+code and detail, or copy, it derives from the bytes (host-work-v1 §11.1
+condition (c), Astation #114), each copy's verify_control verdict taken
+from its `checks`. The other files' `expect` and each `reason` are checked
 by the Rust runner (`crates/atem-client/tests/vectors.rs`) and the binding
 suites.
 It also recomputes every Station report id of the acknowledgment fixtures
@@ -1056,6 +1059,24 @@ def derive_snapshot(case, snap, by_label, entries):
     `expect`, and `in_force` the stops derived after the retained records,
     the snapshot alone and both in order; a host that read the old feed
     keeps every stop. Returns the answer's code, or `consistent`."""
+    got, verdict, entry_at = snapshot_answer(case, snap, by_label, entries)
+    case.equal(got, snap["expect"], "the answer, derived from the verdicts, the feeds, the marks and the effects")
+    in_force = {
+        "retained": snapshot_stops(snap["retained"], verdict, by_label, entry_at),
+        "snapshot": snapshot_stops(snap["snapshot"], verdict, by_label, entry_at),
+        "snapshot_over_retained": snapshot_stops(snap["retained"] + snap["snapshot"], verdict, by_label, entry_at),
+    }
+    case.equal(in_force, snap["in_force"], "in_force: the stops after the retained records, the snapshot alone and both")
+    kept = all(in_force["snapshot_over_retained"].get(p) == s for p, s in in_force["retained"].items())
+    case.check(kept, "a host that read the old feed keeps every stop it had")
+    return got.get("code", "consistent")
+
+
+def snapshot_answer(case, snap, by_label, entries):
+    """check_snapshot_consistency's answer for a snapshot case (derive_snapshot's
+    rules), with the verdict and entry readers it used: (answer, verdict,
+    entry_at). `by_label` holds the records (each with its `checks`),
+    `entries` the device-list bodies by label (L's and the chain's)."""
     chain = snap["chain"]
     replay_bodies = [entries[label] for label in LOG_L + list(chain)]
 
@@ -1171,17 +1192,7 @@ def derive_snapshot(case, snap, by_label, entries):
                 return at(end, code, body, p, reason, "interrupt")
         return {"consistent": True}
 
-    got = answer()
-    case.equal(got, snap["expect"], "the answer, derived from the verdicts, the feeds, the marks and the effects")
-    in_force = {
-        "retained": snapshot_stops(snap["retained"], verdict, by_label, entry_at),
-        "snapshot": snapshot_stops(snap["snapshot"], verdict, by_label, entry_at),
-        "snapshot_over_retained": snapshot_stops(snap["retained"] + snap["snapshot"], verdict, by_label, entry_at),
-    }
-    case.equal(in_force, snap["in_force"], "in_force: the stops after the retained records, the snapshot alone and both")
-    kept = all(in_force["snapshot_over_retained"].get(p) == s for p, s in in_force["retained"].items())
-    case.check(kept, "a host that read the old feed keeps every stop it had")
-    return got.get("code", "consistent")
+    return answer(), verdict, entry_at
 
 
 # Applied::why's codes (host-work-v1 §11.1), by what they explain.
@@ -5564,6 +5575,211 @@ def check_signer_report(file, data, report, context):
                     case.equal(f["code"], "bad_signature", f"{f['label']}: bad_signature")
 
 
+# ------------------------------------------------ r9-vectors-resigned-copy
+
+# A current manager's re-signed copy of a removed or demoted manager's stop
+# (host-work-v1 §11.1, condition (c); agreed with Astation, Astation #114
+# comments 7208700195 and 7209301522): check_resigned_copy's codes in the
+# order its checks run.
+RC_CODES = [
+    "malformed", "not_a_stop", "original_invalid", "copy_invalid", "same_record_id", "intent_mismatch",
+    "feed_mismatch",
+]
+RC_INTENT_FIELDS = [
+    "about.by", "about.integration_id", "account_id", "action", "genesis_hash", "interrupt_running", "origin",
+    "principal", "principal_key", "revoke_seq",
+]
+
+
+def rc_read(text):
+    """A control record as check_resigned_copy reads one: strict I-JSON
+    within 16 KiB, exactly body and sig, the body exactly a control
+    record's (sr_control_body), or Refused("malformed")."""
+    value = vr_strict(text, VR_MAX_OBJECT_BYTES)
+    if not isinstance(value, dict) or sorted(value) != ["body", "sig"]:
+        raise Refused("malformed")
+    body = sr_control_body(value["body"])
+    try:
+        sig = b64u_decode(value["sig"])
+    except ValueError:
+        raise Refused("malformed")
+    return body, sig
+
+
+def rc_keys_ever(lst, bodies, device_id):
+    """Every auth_key `device_id` had in the list's history (an add, the
+    genesis, or a recovery_add that took effect)."""
+    keys = []
+    for body in bodies:
+        if body["action"] in ("genesis", "add") and body["member"]["device_id"] == device_id:
+            keys.append(body["member"]["auth_key"])
+        if body["action"] == "recovery_add" and body["member"]["device_id"] == device_id and device_id in lst.recovered:
+            keys.append(body["member"]["auth_key"])
+    return keys
+
+
+def rc_intent(o, c, candidate):
+    """The stop intent field by field in the body's order: (code, detail)
+    of the first that differs, or the feed a service's copy names (None for
+    a host principal's)."""
+    for field in ("account_id", "genesis_hash", "origin"):
+        if o.get(field) != c.get(field):
+            return ("intent_mismatch", field), None
+    feed = None
+    if "feed_id" in o:
+        if c["feed_id"] == o["feed_id"]:
+            feed = "original"
+        elif c["feed_id"] == candidate:
+            feed = "candidate"
+        else:
+            return ("feed_mismatch", None), None
+    for field in ("principal", "principal_key", "action", "interrupt_running", "revoke_seq"):
+        if o.get(field) != c.get(field):
+            return ("intent_mismatch", field), None
+    for sub in ("integration_id", "by"):
+        if o["about"].get(sub) != c["about"].get(sub):
+            return ("intent_mismatch", f"about.{sub}"), None
+    return None, feed
+
+
+def rc_check(c, lst, bodies, copy_verdict):
+    """check_resigned_copy, from the file's note: {"code", "detail"?} of the
+    first check that fails, or the copy. `copy_verdict` gives the copy's
+    verify_control verdict on the case's list (the file's `checks`, as the
+    snapshot checks take theirs)."""
+    def refused(code, detail=None):
+        return {"code": code, **({"detail": detail} if detail is not None else {})}
+
+    try:
+        o, osig = rc_read(c["original_json"])
+    except Refused:
+        return refused("malformed", "original")
+    try:
+        k, _ = rc_read(c["copy_json"])
+    except Refused:
+        return refused("malformed", "copy")
+    if re.fullmatch(UUID_V4, c["candidate_feed_id"]) is None:
+        return refused("malformed", "candidate_feed_id")
+    if lst.frozen:
+        return refused("malformed", "list frozen")
+    if o["action"] not in ("revoke", "interrupt_running"):
+        return refused("not_a_stop")
+    # The original's signature under any key its signer had.
+    if o["signer"] == o["principal"]:
+        if o["principal"].startswith("host:"):
+            return refused("original_invalid", "host_key_signed")
+        signer_id = o["principal"][len("service:"):]
+    else:
+        signer_id = o["signer"][len("member:"):]
+    keys = rc_keys_ever(lst, bodies, signer_id)
+    if not keys:
+        return refused("original_invalid", "unknown_signer")
+    message = enc([CONTROL_LABEL, jcs(o)])
+    if not any(verify(key["alg"], b64u_decode(key["pub"]), osig, message) for key in keys):
+        return refused("original_invalid", "bad_signature")
+    v = copy_verdict()
+    if v["verdict"] != "valid":
+        return refused("copy_invalid", v["reason"])
+    if not v["signer"].startswith("member:"):
+        return refused("copy_invalid", "signed_by_principal")
+    if k["record_id"] == o["record_id"]:
+        return refused("same_record_id")
+    mismatch, feed = rc_intent(o, k, c["candidate_feed_id"])
+    if mismatch is not None:
+        return refused(*mismatch)
+    out = {
+        "original_record_id": o["record_id"], "copy_record_id": k["record_id"], "signer": v["signer"],
+        "principal": k["principal"], "action": k["action"],
+    }
+    if feed is not None:
+        out["feed"] = feed
+    return out
+
+
+def check_resigned_copy(file, data, report, context):
+    """Every case's answer derived here from the file's note (check_resigned_copy,
+    host-work-v1 §11.1 condition (c)): the chain's entries; each record's
+    jcs, signing input and signature by its test key; each case's refusal
+    code and detail, or its copy, from the bytes (the strict reading, the
+    action, the original's signature under its signer's keys from the list's
+    history, the stop intent field by field), the copy's verify_control
+    verdict taken from its `checks`; and each checker_passes case: the
+    snapshot checker's answer (snapshot_answer, the control vectors' rules)
+    consistent while the copy check refuses."""
+    keys = context["keys"]
+    mlog = context["membership_log"]
+    by_label = {r["label"]: r for r in data["records"]}
+    with report.case(file, "entries") as case:
+        check_report_entries(case, data, mlog)
+        hs7 = next(v["entry"] for v in mlog["others"] if v["label"] == "HS7_revoke")
+        entries_by_label = {e["label"]: e for e in data["entries"]}
+        case.equal(jcs(entries_by_label["RC7_hs7_revoke"]["entry"]), jcs(hs7), "RC7_hs7_revoke is HS7_revoke, byte for byte")
+        case.equal(data["codes"], RC_CODES, "the codes in their order")
+    for rec in data["records"]:
+        with report.case(file, f"record {rec['label']}") as case:
+            wire = rec["record"]
+            case.equal(sorted(wire), ["body", "sig"], "wire {body, sig}")
+            text = jcs(wire["body"])
+            case.equal(text, rec["jcs"], "jcs")
+            name, part = rec["signed_with"].split("/")
+            entry = keys.keys[name][part]
+            case.check(
+                verify(entry.get("alg", "ed25519"), keys.public(name, part), b64u_decode(wire["sig"]), enc([CONTROL_LABEL, text])),
+                f"signed by {rec['signed_with']}",
+            )
+            if "parse_error" in rec:
+                try:
+                    rc_read(json.dumps(wire))
+                    case.fail("its record_id or a field out of its grammar: refused")
+                except Refused:
+                    case.check(True, "refused by the strict reading")
+            else:
+                case.equal(enc([CONTROL_LABEL, text]).hex(), rec["signing_input_hex"], "signing input")
+    codes, fields = set(), set()
+    for c in data["cases"]:
+        with report.case(file, f"case {c['label']}") as case:
+            lst = report_list(c, data, mlog, SrList)
+            bodies = report_bodies(data, mlog, c["chain"])
+
+            def copy_verdict():
+                found = [v for v in by_label[c["copy"]]["checks"] if v["chain"] == c["chain"]]
+                return found[0] if len(found) == 1 else {"verdict": "unknown", "reason": "none"}
+
+            for key in ("original", "copy"):
+                if key in c:
+                    case.equal(c[f"{key}_json"], jcs(by_label[c[key]]["record"]), f"{key}_json is {c[key]}")
+            got = rc_check(c, lst, bodies, copy_verdict)
+            want = c["expect"] if "expect" in c else {k: c[k] for k in ("code", "detail") if k in c}
+            case.equal(got, want, "the answer, derived from the bytes")
+            if "code" in got:
+                codes.add(got["code"])
+                if got["code"] == "intent_mismatch":
+                    fields.add(got["detail"])
+    with report.case(file, "coverage") as case:
+        case.equal(sorted(codes), sorted(RC_CODES), "every code")
+        case.equal(sorted(fields), RC_INTENT_FIELDS, "each field of the stop intent mismatched once")
+        valid = [c for c in data["cases"] if "expect" in c]
+        case.check({c["expect"].get("feed") for c in valid} == {"original", "candidate", None}, "both feeds and a host principal's")
+    entries = {v["label"]: v["entry"]["body"] for v in mlog["log"] + mlog["others"]}
+    for p in data["checker_passes"]:
+        with report.case(file, f"checker passes {p['label']}") as case:
+            snap = dict(p["snapshot"], chain=p["chain"])
+            got, _, _ = snapshot_answer(case, snap, by_label, entries)
+            case.equal(got, snap["expect"], "the snapshot checker's answer")
+            case.equal(got, {"consistent": True}, "consistent")
+            lst = report_list(p, data, mlog, SrList)
+            bodies = report_bodies(data, mlog, p["chain"])
+            pair = {
+                "original_json": jcs(by_label[p["original"]]["record"]), "copy_json": jcs(by_label[p["copy"]]["record"]),
+                "candidate_feed_id": p["candidate_feed_id"],
+            }
+
+            def copy_verdict():
+                return next(v for v in by_label[p["copy"]]["checks"] if v["chain"] == p["chain"])
+
+            case.equal(rc_check(pair, lst, bodies, copy_verdict), {"code": p["code"], "detail": p["detail"]}, "the copy check refuses it")
+
+
 # ----------------------------------------------- r9-vectors-station-binding
 
 # A native manager's Station binding proof (delegated host-work III.5 (b);
@@ -6172,6 +6388,7 @@ CHECKERS = [
     ("r9-vectors-verifier-report", check_verifier_report),
     ("r9-vectors-signer-report", check_signer_report),
     ("r9-vectors-station-binding", check_station_binding),
+    ("r9-vectors-resigned-copy", check_resigned_copy),
 ]
 
 

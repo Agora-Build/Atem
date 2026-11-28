@@ -312,6 +312,21 @@ impl From<atem_client::control::RecordRefusal> for AtemError {
 /// What the framing refuses to render (a line of Atem's that isn't one
 /// line, a snapshot that doesn't match its digest, a prompt that doesn't
 /// read back) is input that isn't what it must be: `Invalid` `malformed`.
+impl From<atem_client::control::CopyRefusal> for AtemError {
+    /// A copy that doesn't discharge its original (`check_resigned_copy`):
+    /// `Invalid{code}`, `malformed`, `not_a_stop`, `original_invalid`,
+    /// `copy_invalid`, `same_record_id`, `intent_mismatch` or
+    /// `feed_mismatch`, `detail` exactly what the refusal names (the first
+    /// field of the intent that differs, the copy's verdict, the part that
+    /// doesn't read), else empty.
+    fn from(e: atem_client::control::CopyRefusal) -> Self {
+        AtemError::Invalid {
+            code: e.code().into(),
+            detail: e.detail().unwrap_or_default().into(),
+        }
+    }
+}
+
 impl From<FramingError> for AtemError {
     fn from(e: FramingError) -> Self {
         AtemError::malformed(&e.to_string())

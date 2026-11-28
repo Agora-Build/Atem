@@ -1955,6 +1955,66 @@ final class ConformanceTests: XCTestCase {
             try throwsCode("malformed") { _ = try snapshotRun(n1, marks: [ControlSnapshotMark(principal: "member:dev-mac", markMs: 1)]) }
             try throwsCode("malformed") { _ = try snapshotRun(n1, covered: ["service:svc-discord", "service:svc-discord"]) }
         }
+        // A current manager's re-signed copy of a former manager's stop
+        // (r9-vectors-resigned-copy; host-work-v1 §11.1, condition (c)):
+        // each case through checkResignedCopy (the copy, or Invalid with the
+        // copy check's code and detail), and the snapshots the effect-only
+        // checker passes whose stop the copy check refuses.
+        let rcopy = try load("r9-vectors-resigned-copy")
+        func rcopyLog(_ c: [String: Any]) throws -> MembershipLog {
+            let at = HostClock(wallMs: u(c["now_ms"]), monoMs: 1000, bootId: "boot-1")
+            let entries = a(rcopy["entries"]).map(o)
+            let chain = a(c["chain"]).map { label in js(entries.first { s($0["label"]) == s(label) }!["entry"]!) }
+            return try MembershipLog.verify(accountId: account, genesisHash: genesis, entries: l + chain, now: at)
+        }
+        func rcopyRecord(_ label: Any?) -> String {
+            js(a(rcopy["records"]).map(o).first { s($0["label"]) == s(label) }!["record"]!)
+        }
+        func copyRefusal(_ f: () throws -> Void) throws -> [String: Any] {
+            do {
+                try f()
+            } catch let AtemError.Invalid(code, detail) {
+                var out: [String: Any] = ["code": code]
+                if !detail.isEmpty { out["detail"] = detail }
+                return out
+            }
+            throw Failure(description: "expected a refusal, nothing thrown")
+        }
+        check("resigned copy: every case through checkResignedCopy") {
+            try eq(resignedCopyCodes(), a(rcopy["codes"]).map(s), "codes")
+            var codes = Set<String>()
+            for c in a(rcopy["cases"]).map(o) {
+                let judge = { try checkResignedCopy(log: try rcopyLog(c), originalJson: s(c["original_json"]),
+                    copyJson: s(c["copy_json"]), candidateFeedId: s(c["candidate_feed_id"])) }
+                guard let expect = c["expect"] as? [String: Any] else {
+                    let got = try copyRefusal { _ = try judge() }
+                    var want: [String: Any] = ["code": s(c["code"])]
+                    if let detail = c["detail"] { want["detail"] = s(detail) }
+                    try eq(canon(got), canon(want), s(c["label"]))
+                    codes.insert(s(got["code"]))
+                    continue
+                }
+                let v = try judge()
+                var out: [String: Any] = ["original_record_id": v.originalRecordId, "copy_record_id": v.copyRecordId,
+                    "signer": v.signer, "principal": v.principal, "action": v.action]
+                if let feed = v.feed { out["feed"] = feed }
+                try eq(canon(out), canon(expect), s(c["label"]))
+            }
+            try eq(codes.sorted(), a(rcopy["codes"]).map(s).sorted(), "every code")
+        }
+        check("resigned copy: the snapshot checker passes what the copy check refuses") {
+            for p in a(rcopy["checker_passes"]).map(o) {
+                let snap = o(p["snapshot"])
+                let marks = o(snap["marks"]).map { ControlSnapshotMark(principal: $0.key, markMs: u($0.value)) }
+                let answer = try checkControlSnapshotConsistency(log: try rcopyLog(p), origin: s(snap["origin"]),
+                    candidateFeedId: s(snap["candidate_feed_id"]), retainedJson: a(snap["retained"]).map(rcopyRecord),
+                    snapshotJson: a(snap["snapshot"]).map(rcopyRecord), marks: marks, covered: a(snap["covered"]).map(s))
+                try eq(canon(snapshotOut(answer)), canon(snap["expect"]!), "\(s(p["label"])): consistent")
+                let got = try copyRefusal { _ = try checkResignedCopy(log: try rcopyLog(p), originalJson: rcopyRecord(p["original"]),
+                    copyJson: rcopyRecord(p["copy"]), candidateFeedId: s(p["candidate_feed_id"])) }
+                try eq(canon(got), canon(["code": s(p["code"]), "detail": s(p["detail"])]), "\(s(p["label"])): refused as a copy")
+            }
+        }
         check("Station acks: a call never changes its handle; the state loads only as written") {
             let f = try load("r9-control-ack-per-effect")
             let setup = o(f["setup"])
@@ -3158,6 +3218,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 157)
+        XCTAssertEqual(passed, 159)
     }
 }

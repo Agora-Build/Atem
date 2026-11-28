@@ -1600,6 +1600,33 @@ pub fn verify_control_record(log: &MembershipLog, record_json: String) -> JsResu
     ))
 }
 
+/// A current manager's re-signed copy judged against a removed or demoted
+/// manager's stop (`control::check_resigned_copy`): `{originalRecordId,
+/// copyRecordId, signer, principal, action, feed?}` (`feed` `original` or
+/// `candidate`, absent for a host principal's record), or throws `kind:
+/// "invalid"` with the copy check's `code` and `detail`.
+#[wasm_bindgen(js_name = checkResignedCopy)]
+pub fn check_resigned_copy(
+    log: &MembershipLog,
+    original_json: String,
+    copy_json: String,
+    candidate_feed_id: String,
+) -> JsResult<JsValue> {
+    ok(crate::control::check_resigned_copy(
+        log.0.clone(),
+        original_json,
+        copy_json,
+        candidate_feed_id,
+    ))
+}
+
+/// `checkResignedCopy`'s codes, in the order its checks run
+/// (`control::resigned_copy_codes`).
+#[wasm_bindgen(js_name = resignedCopyCodes)]
+pub fn resigned_copy_codes() -> Vec<String> {
+    crate::control::resigned_copy_codes()
+}
+
 /// The bytes a key signs for `body` (`control_record_signing_input`): a
 /// Station's key in WebCrypto or a KMS signs them, then
 /// `controlRecordWithSignature` makes the record.

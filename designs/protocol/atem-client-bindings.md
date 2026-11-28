@@ -132,7 +132,11 @@ comment 7089435073**: a new file in the manifest; version 2, its process
 roster, **agreed with Astation, Astation #114 comment 7208700195**),
 `atem-client-<version>-r9-vectors-station-binding.json` (amended for a
 native manager's Station binding proof, Atem's answer on #120 comment
-7207827118: a new file in the manifest) and the six
+7207827118: a new file in the manifest),
+`atem-client-<version>-r9-vectors-resigned-copy.json` (amended for the
+shared copy check, `check_resigned_copy`, **agreed with Astation,
+Astation #114 comments 7208700195 and 7209301522**: a new file in the
+manifest) and the six
 `atem-client-<version>-r9-control-ack-*.json` (amended for step 4: the
 sixth, `r9-control-ack-reasons`, is O5's, **for Astation's sign-off**) in its SHA-256
 manifest. These are the shared positive/negative request vectors from
@@ -161,9 +165,12 @@ manager's signer reports from `fixtures/r9-vectors-signer-report.json`
 (host-work-v1 §11.1; "A manager's signed signer report" below), a native
 manager's Station binding proofs, Astation's three posted examples among
 them, from `fixtures/r9-vectors-station-binding.json` (delegated host-work
-III.5 (b); "A manager's Station binding proof" below) and the Station's
-acknowledgment fixtures `fixtures/r9-control-ack-*.json` (§9, delegated
-host-work test 48).
+III.5 (b); "A manager's Station binding proof" below), a current
+manager's re-signed copies of former managers' stops judged by
+`check_resigned_copy` from `fixtures/r9-vectors-resigned-copy.json`
+(host-work-v1 §11.1, condition (c); §9 "The copy check" below) and the
+Station's acknowledgment fixtures `fixtures/r9-control-ack-*.json` (§9,
+delegated host-work test 48).
 The Rust core's tests run all of them; the Swift, Kotlin and WASM
 conformance suites run the framing vectors through the exports of
 [Prompt framing](#prompt-framing-delegated-host-work-design-iii2) (VII.C test
@@ -1276,7 +1283,7 @@ errors: ProviderError.Cancelled{reason} | UnknownKey | OpenFailed | Failed{reaso
 
 | variant | `code` (stable) |
 |---|---|
-| `Invalid{code, detail}` | the crate's: `not_strict_json`, `not_canonical`, `too_large`, `null_value`, `malformed`, `unknown_type`, `array_not_canonical`, `kit_sig_missing`, `kit_sig_unexpected`, `bad_key`, `weak_key`, `wrong_alg`, `high_s`, `bad_signature`, `zero_shared_secret`, `open_failed`, `backup_invalid`, `kit_tag_mismatch`, `genesis_mismatch`, `unknown_key`, `provider_error`; `not_canonical` also for a caller's integer above 2^53 − 1 (a time, a version) that would enter a signed body; `malformed` for a `HostClock` time above 2^53 − 1; for a control record its parse refuses (§9), also `wrong_type`, `unknown_field`, `field_not_allowed`, `not_for_host_principal` (`detail` names the field) |
+| `Invalid{code, detail}` | the crate's: `not_strict_json`, `not_canonical`, `too_large`, `null_value`, `malformed`, `unknown_type`, `array_not_canonical`, `kit_sig_missing`, `kit_sig_unexpected`, `bad_key`, `weak_key`, `wrong_alg`, `high_s`, `bad_signature`, `zero_shared_secret`, `open_failed`, `backup_invalid`, `kit_tag_mismatch`, `genesis_mismatch`, `unknown_key`, `provider_error`; `not_canonical` also for a caller's integer above 2^53 − 1 (a time, a version) that would enter a signed body; `malformed` for a `HostClock` time above 2^53 − 1; for a control record its parse refuses (§9), also `wrong_type`, `unknown_field`, `field_not_allowed`, `not_for_host_principal` (`detail` names the field); for a copy `check_resigned_copy` refuses (§9 "The copy check"), also `not_a_stop`, `original_invalid`, `copy_invalid`, `same_record_id`, `intent_mismatch`, `feed_mismatch` (`detail` exactly what the refusal names: the first field that differs, the copy's verdict) |
 | `Membership{code, detail, index}` | `membership_invalid`; `detail` the verifier's (`bad_signature`, `gap`, `signer_not_manager`, `blob_version_not_increasing`, `kit_sig_missing`, …); `index` into what was passed |
 | `Channel{code, detail}` | `handshake_failed`, `stale_target`, `account_frozen`, `busy` (also as the host's clear, advisory error before the channel opens), `unknown_host`, `record_rejected`, `limit`, `too_large`, `closed`, `signing_failed`, `invalid_hello`, `cannot_carry` (a divergence deeper than any carriage) |
 | `Refused{code, detail, error_json, next}` | the host's session error code (`unauthorized`, `membership_invalid`, `membership_incomplete`, `recovery_pending`, `account_frozen`, `unsupported_version`, `busy`, …) |
@@ -1508,6 +1515,13 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   provider asked under `ServiceControl` (no confirmation) for the
   integration's own key and `ControlRecord` (a fresh confirmation of the
   body) for a native manager.
+- **The copy check** (`tests/resigned_copy.rs`, Rust; two conformance
+  checks per language): every case of `r9-vectors-resigned-copy` through
+  `check_resigned_copy`, the copy or `Invalid` with its code and detail,
+  every code among them and `resigned_copy_codes` in their order; and its
+  `checker_passes`: each snapshot consistent through
+  `check_control_snapshot_consistency` while its stop is refused as a
+  copy.
 - **The Station's side** (`tests/station.rs`, Rust; thirteen conformance
   checks per language, of the 70 and 72 above): every acknowledgment
   fixture (`r9-control-ack-*`, one check each, its `expect_counts` against
@@ -1592,6 +1606,7 @@ acknowledgments").
 | `parse_control_record(record_json)` | the body, field by field (strict JSON, at most 16 KiB, exactly the body's fields); no signature check. For a record text over 16 KiB this call and the page reader (`FeedEntry::parse_record`, a `control_sync_result`'s records) give different codes (`not_strict_json` here, `malformed` there), though both refuse the same records: compare whether it parses, not the code |
 | `control_why_codes()` | the shared vocabulary of reasons, every code once in a fixed order (JS `controlWhyCodes()`; **for Astation's sign-off**, amended for step 4, O5): the codes `ControlApplied.why` and `ControlEffectResult.why` take in this version. A well-formed reason outside it, read from a `control_ack`, is a later version's: treat it as unrecognized, information only. `r9-vectors-station-calls`'s `why_codes` pins it |
 | `verify_control_record(log, record_json)` | against a verified `MembershipLog`: `Valid{signer, key_seq, head}` (`signer` `service:<id>` for the principal's own key, from the entry at `key_seq`; `member:<id>` for a current native manager), `Pending{reason}` (`principal_unknown`, `signer_unknown`, `revoke_not_in_list`: verify again after the list advances) or `Refused{reason}` (`wrong_account`, `bad_signature`, `key_mismatch`, `signer_not_allowed`, `removed_manager`, `host_key_signed`, `not_a_service`, `not_a_revoke`: keep it as evidence). A record the parse refuses is `Invalid{code}` |
+| `check_resigned_copy(log, original_json, copy_json, candidate_feed_id)` (JS `checkResignedCopy`), `resigned_copy_codes()` (JS `resignedCopyCodes`) | whether `copy_json`, a current native manager's stop, is a re-signed copy of `original_json`, a stop a removed or demoted manager signed, that discharges the original's obligation (host-work-v1 §11.1, condition (c); §9 "The copy check" below): `ResignedCopy{original_record_id, copy_record_id, signer, principal, action, feed}` (`feed` `original` or `candidate`, `None` for a host principal's record), or `Invalid{code, detail}` with the copy check's code; the codes in their order |
 | `ControlStateHandle::new(log)`, `from_json(log, state_json)`, `to_json()`, `apply(record_json, log, pos, host_applied_seq)` | the reference control state of one device list, as a host keeps it. A handle never changes: `apply` verifies the record against `log` (the device list at the head of this transaction) and returns `ControlTransition{applied, next, touched}`, `applied` being `ControlApplied{result, effects, actions, evidence, why}` (`why`, amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**: `Applied::why`'s code, host-work-v1 §11.1, set exactly when the record is pending or refused or kept as evidence, else `None`; JS `null`; and each effect's `ControlEffectResult.why`, O5, **for Astation's sign-off**, the record's `why` exactly on an effect `pending` or `refused`, what a host writes in its `control_ack`), `next` the state after the record, a new handle, and `touched` the principals whose part it changed (the record's, or none). `pos` is `ControlFeedPos{origin, feed_id, feed_seq}`, where the record was read: its `origin` is always the Station origin you sync the feed from (a host's own configured Station), never one taken from a page or the record, which is what bounds a part's `order`; a record whose body names another `origin` or `feed_id` counts as read at no position (its hold still applies, its cover and release don't). Amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**: `touched`, and the rule that `pos`'s `origin` is the host's own configured Station origin, are new |
 | `principals()`, `part(principal)`, `control_state_from_parts(log, parts)` | the state one part per principal (amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**: new), for a store that keeps a row per principal: `part` is a principal's canonical JSON (`None` when the state has none); `control_state_from_parts` (JS `controlStateFromParts`) loads `ControlStatePart{principal, part_json}`s in any order, read as strictly as `from_json`, and returns `ControlLoadedParts{state, foreign}`. Every part names its device list (`account_id`, `genesis_hash`): one of another list (an earlier pairing's leftover) is skipped, never loaded, and its principal listed in `foreign`: delete those rows. The list loaded is always `log`, never inferred from the parts. Write the parts a transition `touched` (a touched principal always has a part in `next`); no other part changed |
 | `standing(principal)` | what is in force for `service:<id>` or `host:<host_id>` (amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**: new): `ControlStanding{revoked, interrupted, held, coverage}`: the revoking record's `record_id` (never for a host principal, whose revocation is a device-list entry), the revocations whose interrupt a record put in force (a service's revoking `record_id`, a host principal's `revoke_seq` in decimal; sorted as text, so `"10"` before `"9"`), the hold, and `ControlCoverage{origin, feed_id}`, the covering feed. A principal the state holds nothing for has nothing in force |
@@ -2214,6 +2229,51 @@ candidateFeedId, retainedJson, snapshotJson, [{principal, markMs}],
 covered)` gives `{type: "consistent"}` or `{type: "inconsistent", index,
 code, principal, recordId, reason, effect, revokeSeq}` (`null` where
 none). Its cases: `r9-vectors-host-work-control`'s `snapshots`.
+
+### The copy check
+
+`check_resigned_copy(log, original_json, copy_json, candidate_feed_id)`
+(the shared core's `control::check_resigned_copy`; **agreed with
+Astation, Astation #114 comments 7208700195 and 7209301522**) is
+condition (c) of host-work-v1 §11.1's "A current manager's copy of a
+former manager's stop", one pure judgement, so your Station and the
+manager's app judge a copy alike: the copy, a current native manager's
+stop valid at `log`'s head, carries exactly the original's stop intent.
+It answers `ResignedCopy{original_record_id, copy_record_id, signer,
+principal, action, feed}`, or `Invalid{code, detail}`, the first that
+fails in this order: `malformed` (either object isn't a signed control
+record that reads strictly, a non-v4 `record_id` among them; the
+candidate feed isn't a UUID v4; the list is frozen; `detail`
+`original`, `copy`, `candidate_feed_id` or `list frozen`), `not_a_stop`
+(a `cover`, `hold` or `release` is never copied: you sign those anew
+with your own key), `original_invalid` (no `auth_key` its signer had in
+the list's history verifies it: `unknown_signer`, `host_key_signed`,
+`bad_signature`), `copy_invalid` (the copy isn't valid at the head with a
+current native manager as its signer: the verifier's code, or
+`signed_by_principal`), `same_record_id`, then field by field in the
+body's order `intent_mismatch` (`detail` the first field that differs:
+`account_id`, `genesis_hash`, `origin`, `principal`, `principal_key`,
+`action`, `interrupt_running`, `revoke_seq`, `about.integration_id`,
+`about.by`) or, at `feed_id`'s place, `feed_mismatch` (a service's copy
+naming neither the original's feed nor `candidate_feed_id`). `signer`,
+`record_id` and `issued_at` may differ; `origin` never. `detail` is
+exactly what the refusal names, else empty. The field order, the
+details, the frozen list's refusal, `signed_by_principal` and the use of
+`Invalid` (no new error variant) are Atem's readings.
+
+**It is stricter than the snapshot checker, which stays effect-only.**
+`check_control_snapshot_consistency`'s `stop_not_resigned` fires only
+when the snapshot alone drops an effect of a removed manager's retained
+stop, so any valid stop that keeps those effects passes it: a current
+manager's revoke with another `about` or another feed of the origin,
+`interrupt_running` over the original's `false`, the service's own revoke
+signed anew above its mark. A conforming copy always keeps every effect,
+so the two never disagree in that direction. The snapshots the checker
+passes and this refuses are yours to refuse: require a conforming copy
+(this call), in its author's final verified signer report, before you
+count a removed or demoted manager's original as discharged. Its cases:
+`r9-vectors-resigned-copy` (`cases`, and `checker_passes`: two snapshots
+the checker passes whose stop this refuses).
 
 ### The Station binding proof
 

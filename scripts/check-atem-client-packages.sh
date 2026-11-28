@@ -49,6 +49,7 @@ SHIPPED_VECTORS=(
   r9-vectors-verifier-report.json:r9-vectors-verifier-report.json
   r9-vectors-signer-report.json:r9-vectors-signer-report.json
   r9-vectors-station-binding.json:r9-vectors-station-binding.json
+  r9-vectors-resigned-copy.json:r9-vectors-resigned-copy.json
 )
 for fixture in "$ROOT"/designs/protocol/fixtures/r9-control-ack-*.json; do
   SHIPPED_VECTORS+=("$(basename "$fixture"):$(basename "$fixture")")

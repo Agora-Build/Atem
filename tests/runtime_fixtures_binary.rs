@@ -2041,8 +2041,10 @@ fn r9_fixtures_run_against_the_real_runtime() {
     // `r9-vectors-station-binding` (a native manager's Station binding
     // proof, delegated host-work III.5 (b)); 109 with
     // `r9-control-ack-late-start` (a revocation's start unknown at intake
-    // and lowered by a learned original time, host-work-v1 §11.4).
-    assert_eq!(files.len(), 109, "the r9 fixture files");
+    // and lowered by a learned original time, host-work-v1 §11.4); 110 with
+    // `r9-vectors-resigned-copy` (a current manager's re-signed copy of a
+    // former manager's stop, Astation #114).
+    assert_eq!(files.len(), 110, "the r9 fixture files");
     let only = std::env::var("ATEM_FIXTURE").ok();
     let mut not_expressible = Vec::new();
     let mut runnable = Vec::new();

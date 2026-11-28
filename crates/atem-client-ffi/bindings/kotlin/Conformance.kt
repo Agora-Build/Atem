@@ -1631,6 +1631,57 @@ fun main(args: Array<String>) {
         throwsCode("malformed") { snapshotRun(n1, marks = listOf(ControlSnapshotMark("member:dev-mac", 1uL))) }
         throwsCode("malformed") { snapshotRun(n1, covered = listOf("service:svc-discord", "service:svc-discord")) }
     }
+    // A current manager's re-signed copy of a former manager's stop
+    // (r9-vectors-resigned-copy; host-work-v1 §11.1, condition (c)): each
+    // case through checkResignedCopy (the copy, or Invalid with the copy
+    // check's code and detail), and the snapshots the effect-only checker
+    // passes whose stop the copy check refuses.
+    val rcopy = load("r9-vectors-resigned-copy")
+    fun rcopyLog(c: Any?): MembershipLog {
+        val at = HostClock(c["now_ms"].l().toULong(), 1000uL, "boot-1")
+        val chain = c["chain"].arr().map { label -> Json.write(rcopy["entries"].arr().first { it["label"] == label }["entry"]) }
+        return MembershipLog.verify(account, genesis, l + chain, at)
+    }
+    fun rcopyRecord(label: Any?) = Json.write(rcopy["records"].arr().first { it["label"] == label }["record"])
+    fun copyRefusal(f: () -> Unit): Map<String, Any?> {
+        try {
+            f()
+        } catch (e: AtemException.Invalid) {
+            return linkedMapOf<String, Any?>("code" to e.code).also { if (e.detail.isNotEmpty()) it["detail"] = e.detail }
+        }
+        throw AssertionError("expected a refusal, nothing thrown")
+    }
+    check("resigned copy: every case through checkResignedCopy") {
+        eq(resignedCopyCodes(), strs(rcopy["codes"]), "codes")
+        val codes = sortedSetOf<String>()
+        for (c in rcopy["cases"].arr()) {
+            val judge = { checkResignedCopy(rcopyLog(c), c["original_json"].s(), c["copy_json"].s(), c["candidate_feed_id"].s()) }
+            val expect = c.obj()["expect"]
+            if (expect == null) {
+                val got = copyRefusal { judge() }
+                val want = linkedMapOf<String, Any?>("code" to c["code"]).also { w -> c.obj()["detail"]?.let { w["detail"] = it } }
+                eq(canon(got), canon(want), c["label"].s())
+                codes.add(got.getValue("code") as String)
+                continue
+            }
+            val v = judge()
+            val out = linkedMapOf<String, Any?>("original_record_id" to v.originalRecordId, "copy_record_id" to v.copyRecordId,
+                "signer" to v.signer, "principal" to v.principal, "action" to v.action).also { o -> v.feed?.let { o["feed"] = it } }
+            eq(canon(out), canon(expect), c["label"].s())
+        }
+        eq(codes.toList(), strs(rcopy["codes"]).sorted(), "every code")
+    }
+    check("resigned copy: the snapshot checker passes what the copy check refuses") {
+        for (p in rcopy["checker_passes"].arr()) {
+            val snap = p["snapshot"]
+            val marks = snap["marks"].obj().map { (k, m) -> ControlSnapshotMark(k, m.l().toULong()) }
+            val a = checkControlSnapshotConsistency(rcopyLog(p), snap["origin"].s(), snap["candidate_feed_id"].s(),
+                snap["retained"].arr().map { rcopyRecord(it) }, snap["snapshot"].arr().map { rcopyRecord(it) }, marks, strs(snap["covered"]))
+            eq(canon(snapshotOut(a)), canon(snap["expect"]), "${p["label"].s()}: consistent")
+            val got = copyRefusal { checkResignedCopy(rcopyLog(p), rcopyRecord(p["original"]), rcopyRecord(p["copy"]), p["candidate_feed_id"].s()) }
+            eq(canon(got), canon(mapOf("code" to p["code"], "detail" to p["detail"])), "${p["label"].s()}: refused as a copy")
+        }
+    }
     check("Station acks: a call never changes its handle; the state loads only as written") {
         val f = load("r9-control-ack-per-effect")
         val st = f["setup"]["station"]
