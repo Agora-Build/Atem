@@ -2195,7 +2195,8 @@ impl AckLedgerHandle {
     }
     /// An authenticated original revocation time of `principal` learned
     /// after its own revoke was recorded (`learn_revoked_at`): it only
-    /// lowers the start, before the final only.
+    /// lowers the start; after the final it makes no report and changes no
+    /// report or the final.
     #[wasm_bindgen(js_name = learnRevokedAt)]
     pub fn learn_revoked_at(
         &self,

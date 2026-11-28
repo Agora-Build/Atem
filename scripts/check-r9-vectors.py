@@ -41,8 +41,8 @@ It also recomputes every Station report id of the acknowledgment fixtures
 reference ledger's `report_id`, and derives their `expect_counts` (the
 ledger's counts) and their finals (the step that makes each `revoked`,
 its outcome and pending hosts, and each `expect_start`: a revocation's
-start from the own revoke's `revoked_at_ms` or `issued_at`, lowered by a
-learned date before the final) from the steps; from host-work-v1 §11.1 ("Resets"), the
+start from the own revoke's `revoked_at_ms` or `issued_at`, lowered by
+every learned date) from the steps; from host-work-v1 §11.1 ("Resets"), the
 snapshot checker's answers and the stops in force of
 `r9-vectors-host-work-control`'s `snapshots` (each record's verdict taken
 from its `checks`, as the bound and O1 take each step's result); and, from host-work-v1 §4 and §11.2, the
@@ -1666,8 +1666,8 @@ def derive_finals(case, data, records):
     principal (signed with its key, not a member's) starts its revocation,
     covering the step's hosts, at min(revoked_at_ms, issued_at + 1 hour),
     or at its issued_at with no revoked_at_ms (no authenticated original
-    time: late, never early); a learned original time lowers the start
-    while there is no final (`learn_revoked_at`; refused
+    time: late, never early); a learned original time lowers the start,
+    after the final too, where it makes nothing (`learn_revoked_at`; refused
     `unknown_revocation` without an own revoke, `malformed` above
     2^53 - 1). Every record, ack, learn and tick first makes the final of
     each revocation whose start + 24 hours its time reached; the
@@ -1760,7 +1760,8 @@ def derive_finals(case, data, records):
             r = st["revs"].get(step["learn_revoked_at"])
             if r is None:
                 wrong.append(f"{where}: a learn with no own revoke is refused unknown_revocation")
-            elif r["final"] is None:
+            else:
+                # After the final too, where it makes nothing.
                 r["start"] = min(r["start"], step["revoked_at_ms"])
                 pass_deadlines(st, now, made)
         return st, made
@@ -1819,7 +1820,7 @@ def derive_finals(case, data, records):
     run(fresh(), setup["station_now_ms"], data["steps"], "")
     case.check(
         not wrong,
-        f"{finals_made} finals made, each exactly at the step its derived deadline or its last covered host makes it (the start from the own revoke's revoked_at_ms or issued_at, clamped, lowered by learns before the final); {checked} offered finals and expected starts, each the derived one",
+        f"{finals_made} finals made, each exactly at the step its derived deadline or its last covered host makes it (the start from the own revoke's revoked_at_ms or issued_at, clamped, lowered by every learn); {checked} offered finals and expected starts, each the derived one",
         "; ".join(wrong),
     )
 

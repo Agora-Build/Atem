@@ -3347,11 +3347,13 @@ own Station's feed:
   checkpoint or the feed) goes to `learn_revoked_at`, which only lowers
   the start (`min(start, revoked_at_ms)`, still at most `issued_at` plus
   an hour): an equal or later time changes nothing, so learns are
-  idempotent and, while the window is open, order-free; a date that ends
-  the window makes the final at once, after the per-host reports already
-  made; after the final nothing changes (the final stands and is made
-  once; of two dates that would each end the window, the first's start is
-  kept, with the same reports either way). A learn for a principal with no
+  idempotent, and the start is the `min` of every date, so they are
+  order-free (two learns give the same ledger in either order, byte for
+  byte, on any replica); a date that ends the window makes the final at
+  once, after the per-host reports already made. After the final a learn
+  still lowers the stored start, but makes no report and changes no
+  report or the final: after the final, no report changes and none is
+  sent twice. A learn for a principal with no
   own revoke recorded is refused `unknown_revocation` (the date goes to
   `record`), a value above 2^53 − 1 `malformed`. Hosts change nothing:
   the deadline stays within their resends. So: the result of a
@@ -3552,7 +3554,8 @@ Portal revoked the integration), whose record fixes the integration
 (`about.integration_id`), the hosts its grant covered and the revocation's
 start (`min(revoked_at_ms, issued_at + 1 hour)`, or `issued_at` with no
 authenticated original time, "When a host acknowledges" below; only a
-learned original time lowers it, before the final); a later revoke of the
+learned original time lowers it, and after the final that changes no
+report); a later revoke of the
 same principal (a re-signed copy, a reset's snapshot) changes none of
 them. A native revoke of the same service
 appended earlier counts for its hosts, and they are reported once the
@@ -3579,7 +3582,7 @@ revocation is complete (**agreed with Auth/Portal (2026-11-11, #148 comment 6803
   confirm (never none), 24 hours after the revocation's start (the
   Station's `revoked_at_ms`, at most an hour after the own revoke's
   `issued_at`, or that `issued_at` with none, lowered by a learned
-  original time before the final, "When a host acknowledges" above). That
+  original time, "When a host acknowledges" above). That
   start is persisted, so a restart never moves the deadline. An ack, a
   record or a learned time is counted after any deadline its time has
   passed, so the outcome depends on time, never on when the Station
@@ -3792,12 +3795,15 @@ its re-sign alert ended once both hosts have each effect in force), and
 (#120 comment 7234876179)**: an own revoke recorded with no authenticated
 original time, its final at its `issued_at` plus 24 hours and nothing 1 ms
 before; a learn before any own revoke refused `unknown_revocation`; a
-restart between the record and the learn; a later date, the same date
-twice and a date after the final changing nothing; a date 2 hours earlier
-moving the deadline 2 hours earlier with nothing at once; two learns the
-same ledger in either order; a date 25 hours earlier, learned after
-host-b applied, the final at once, `deadline_passed` naming host-c, after
-host-b's report, and host-c's later ack still reported). They
+restart between the record and the learn; a later date and the same
+date twice changing nothing; a date 2 hours earlier moving the deadline 2
+hours earlier with nothing at once; two learns the same ledger in either
+order, two that would each end the window included; a date 25 hours
+earlier, learned after host-b applied, the final at once,
+`deadline_passed` naming host-c, after host-b's report; an earlier date
+after the final lowering only the stored start, with no report made or
+changed, and a later one changing nothing; and host-c's later ack still
+reported). They
 run in
 `crates/atem-client/tests/r9_fixtures.rs` against `AckLedger`, in the
 bindings' `tests/station.rs` and in the Swift, Kotlin and WASM conformance

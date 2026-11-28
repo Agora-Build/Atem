@@ -378,7 +378,7 @@ Auth). Every ledger call is made at the Station's clock.
 | step | meaning |
 |---|---|
 | `{"control_record": label, "revoked_at_ms"?: n, "covered_hosts": [host], "made": [report_id], "commit"?: false}` | the Station stores the record `label` in its feed and records it (`revoked_at_ms`: when the Portal revoked the integration, an authenticated original time, for the Station's own first revoke; the ledger keeps `min(revoked_at_ms, the record's issued_at + 1 hour)` as the deadline's start; absent, no authenticated original time (`None`): the start is the record's `issued_at`); `made`: the report ids the transition made, in order; `commit: false`: the Station dies before the commit, and the transition is lost |
-| `{"learn_revoked_at": principal, "revoked_at_ms": n, "made": [report_id], "commit"?: false, "refused"?: code}` | the Station learns an authenticated original time of `principal`'s revocation after it recorded its own revoke (`learn_revoked_at`): the start only lowers, before the final only; `refused`: the ledger refuses it with that code (`unknown_revocation`, `malformed`) and nothing changes |
+| `{"learn_revoked_at": principal, "revoked_at_ms": n, "made": [report_id], "commit"?: false, "refused"?: code}` | the Station learns an authenticated original time of `principal`'s revocation after it recorded its own revoke (`learn_revoked_at`): the start only lowers (after the final too, where it makes no report and changes none); `refused`: the ledger refuses it with that code (`unknown_revocation`, `malformed`) and nothing changes |
 | `{"control_ack": message, "link": name, "made": [report_id], "commit"?: false, "refused"?: code}` | a host's `control_ack` (the complete wire message, read with the strict reader) arrives on the link `name`; `refused`: the ledger refuses it whole with that code (`not_the_link`, `other_account`, `other_station`, `not_the_record`, `incomplete_link`, `malformed`) and nothing changes |
 | `{"tick": true, "made": [report_id], "commit"?: false}` | the Station's timer, at its clock |
 | `{"advance_ms": n}` | the Station's clock moves |
@@ -403,11 +403,12 @@ and host, derives each `expect_counts` from the steps alone (the
 records tracked and the acks taken), and the finals: the step that makes
 each `revoked` report, its outcome and pending hosts, and each
 `expect_start` (a revocation's start from its own revoke's `revoked_at_ms`
-or `issued_at`, lowered by learns before the final; the deadline 24 hours
+or `issued_at`, lowered by every learn; the deadline 24 hours
 after it). `r9-control-ack-late-start` (**Atem's proposal, for Astation's
 agreement, #120 comment 7234876179**): an own revoke recorded with no
 authenticated original time and the original time learned later, which
-only lowers the start, before the final only. `r9-control-ack-replacement-feed`
+only lowers the start (after the final too, where no report changes and
+none is sent twice). `r9-control-ack-replacement-feed`
 (Astation #114, items 2 and 6, agreed 2026-11-22): a Station's
 replacement feed carries a current manager's original stop unchanged
 (`M7_revoke_interrupt`, naming the old feed), a fresh ledger (no carried

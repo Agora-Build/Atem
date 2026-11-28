@@ -107,12 +107,13 @@
 //!   with no authenticated original time passes none, and the start is the
 //!   own revoke's `issued_at` (signed only once the Portal revoked); one
 //!   it learns later only lowers the start
-//!   ([`AckLedger::learn_revoked_at`], before the final only; Atem's
-//!   proposal, for Astation's agreement, #120 comment 7234876179). An ack,
-//!   a record or a learned date is applied after any deadline its `now_ms`
-//!   has passed, so the outcome depends on time, never on when the Station
-//!   ticked; an own revoke recorded after its own deadline, or a date that
-//!   ends the window, is final at once.
+//!   ([`AckLedger::learn_revoked_at`]: after the final too, where no report
+//!   changes and none is sent twice; Atem's proposal, for Astation's
+//!   agreement, #120 comment 7234876179). An ack, a record or a learned
+//!   date is applied after any deadline its `now_ms` has passed, so the
+//!   outcome depends on time, never on when the Station ticked; an own
+//!   revoke recorded after its own deadline, or a date that ends the
+//!   window, is final at once.
 //!
 //! **Report ids** come from the report's identity, never from time, order
 //! or a counter: `<kind>:<hex SHA-256 of enc([STATION_REPORT_ID, kind,
@@ -673,8 +674,8 @@ struct Revocation {
     integration_id: String,
     /// The deadline's start: the Station's `revoked_at_ms` (else the own
     /// revoke's `issued_at`), at most an hour after that `issued_at`
-    /// ([`REVOCATION_START_SLACK_MS`]), lowered by a date learned before
-    /// the final.
+    /// ([`REVOCATION_START_SLACK_MS`]), lowered by every learned date (after
+    /// the final too, where it makes nothing).
     revoked_at_ms: u64,
     covered: BTreeSet<String>,
     /// The `revoked` report made.
@@ -877,15 +878,17 @@ impl AckLedger {
     /// `min(start, revoked_at_ms)` (the start is at most an hour after the
     /// own revoke's `issued_at` already, so the deadline stays within the
     /// host's resends): an equal or later time changes nothing, so learns
-    /// are idempotent and, while the window is open, order-free. A date that
-    /// ends the window makes the final at once, after the per-host reports
-    /// already made. It acts before the final only: after it (all applied
-    /// or the deadline passed) the final stands and nothing changes, so of
-    /// two dates that would each end the window the first's start is kept
-    /// (the same reports either way). What is reported doesn't change: the
-    /// same reports, with the same `report_id`s; only the final's time
-    /// moves, and only earlier (Atem's proposal, for Astation's agreement,
-    /// #120 comment 7234876179). Refused: a value above 2^53 − 1
+    /// are idempotent, and the start is the `min` of every date, so they are
+    /// order-free: two learns give the same ledger in either order, byte
+    /// for byte, on any replica. A date that ends the window makes the
+    /// final at once, after the per-host reports already made. After the
+    /// final (all applied or the deadline passed) a learn still lowers the
+    /// stored start, but makes no report and changes no report or the
+    /// final: after the final, no report changes and none is sent twice.
+    /// What is reported doesn't change: the same reports, with the same
+    /// `report_id`s; only the final's time moves, and only earlier (Atem's
+    /// proposal, for Astation's agreement, #120 comment 7234876179).
+    /// Refused: a value above 2^53 − 1
     /// ([`LearnRefusal::Malformed`], checked first) and a principal with no
     /// own revoke recorded ([`LearnRefusal::UnknownRevocation`]: pass the
     /// date to `record` instead).
@@ -904,13 +907,13 @@ impl AckLedger {
         let mut next = self.clone();
         let mut intents = Vec::new();
         next.pass_deadlines(now_ms, &mut intents);
-        if let Some(r) = next.revocations.get_mut(principal)
-            && r.outcome.is_none()
-        {
+        // Lowered after the final too, where it makes nothing: the start is
+        // the `min` of every date, so learns are order-free on any replica.
+        if let Some(r) = next.revocations.get_mut(principal) {
             r.revoked_at_ms = r.revoked_at_ms.min(revoked_at_ms);
-            // Ended by this date: final at once.
-            next.pass_deadlines(now_ms, &mut intents);
         }
+        // Ended by this date: final at once.
+        next.pass_deadlines(now_ms, &mut intents);
         Ok(next.with(intents))
     }
 
@@ -4284,7 +4287,8 @@ mod ack_ledger_tests {
 
     /// A learned date that ends the window makes the final at once, after
     /// the per-host reports already made; a host that applies it later is
-    /// still reported, and a learn after the final changes nothing.
+    /// still reported. After the final a learn still lowers the stored
+    /// start, but makes no report and changes no report or the final.
     #[test]
     fn a_learned_date_that_ends_the_window_is_final_at_once() {
         let s = revoke(By::Own, false, 1);
@@ -4306,17 +4310,32 @@ mod ack_ledger_tests {
         );
         assert_eq!(f[0].not_before, ids(&a));
         assert_eq!(start(&l), json!(issued - 25 * HOUR));
-        // After the final: an earlier, an equal or a later date, then or
-        // later, changes nothing; the final stands and is made once.
+        // After the final: an equal or a later date, then or later,
+        // changes nothing; the final stands and is made once.
         let fin = l.clone();
         for (at, now) in [
-            (issued - 30 * HOUR, issued + 2 * HOUR),
             (issued - 25 * HOUR, issued + 3 * HOUR),
             (issued, issued + 2 * DAY),
         ] {
             let t = l.learn_revoked_at("service:svc-1", at, now).unwrap();
             assert_eq!((t.next, t.made), (fin.clone(), vec![]), "learned {at}");
         }
+        // An earlier one lowers the stored start, and nothing else: no
+        // report made, none changed, the final as it was.
+        let t = l
+            .learn_revoked_at("service:svc-1", issued - 30 * HOUR, issued + 2 * HOUR)
+            .unwrap();
+        assert_eq!((t.made, t.alerts), (vec![], vec![]));
+        assert_eq!(start(&t.next), json!(issued - 30 * HOUR));
+        assert_eq!(t.next.pending, fin.pending);
+        assert_eq!(
+            t.next.revocations["service:svc-1"].outcome,
+            Some(RevokedOutcome::DeadlinePassed)
+        );
+        let mut lowered = t.next.to_json();
+        lowered["revocations"]["service:svc-1"]["revoked_at_ms"] = json!(issued - 25 * HOUR);
+        assert_eq!(lowered, fin.to_json(), "only the start moved");
+        l = t.next;
         assert_eq!(l.tick_at(issued + 2 * DAY), vec![]);
         let b = l.ack_by(
             "b",
@@ -4332,10 +4351,9 @@ mod ack_ledger_tests {
         assert_eq!(l.pending_reports(), b);
     }
 
-    /// Two learns give the same ledger in either order while the window is
-    /// open, the second ending it included; once one ended it the other
-    /// changes nothing, so two that would each end it make the same reports
-    /// in either order, the start kept the first's.
+    /// Two learns give the same ledger in either order, byte for byte: the
+    /// start is their `min`, after the final too, and the final is made
+    /// once, by whichever ends the window first.
     #[test]
     fn learns_give_the_same_ledger_in_either_order() {
         let s = revoke(By::Own, false, 1);
@@ -4366,11 +4384,16 @@ mod ack_ledger_tests {
             assert_eq!(jcs(&l1.to_json()).unwrap(), jcs(&l2.to_json()).unwrap());
             assert_eq!(m1, m2, "learned {x} and {y}");
         }
+        // Two that would each end the window.
         let (x, y) = (issued - 25 * HOUR, issued - 30 * HOUR);
         let ((l1, m1), (l2, m2)) = (both(x, y), both(y, x));
+        assert_eq!(jcs(&l1.to_json()).unwrap(), jcs(&l2.to_json()).unwrap());
         assert_eq!(m1, m2);
-        assert_eq!(l1.pending, l2.pending);
-        assert_eq!((start(&l1), start(&l2)), (json!(x), json!(y)));
+        assert_eq!(
+            reports(&m1),
+            vec![revoked(RevokedOutcome::DeadlinePassed, &["b"])]
+        );
+        assert_eq!(start(&l1), json!(y));
     }
 
     /// A restart between the record and the learn: the learn acts on the

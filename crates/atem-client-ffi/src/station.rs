@@ -714,12 +714,14 @@ impl AckLedgerHandle {
     /// (`service:<id>`) learned after its own revoke was recorded (the
     /// integration's `revokedAt`, from a checkpoint or the feed), at
     /// `now_ms`: it only lowers the start (`min(start, revoked_at_ms)`; an
-    /// equal or later time changes nothing), and only before the final (after
-    /// it nothing changes); a date that ends the window makes the final at
-    /// once, after the per-host reports already made. The reports and their
-    /// ids don't change. `Invalid{code}`: `malformed` for a value above
-    /// 2^53 − 1, `unknown_revocation` for a principal with no own revoke
-    /// recorded (pass the date to `record` instead).
+    /// equal or later time changes nothing; two learns give the same state
+    /// in either order); a date that ends the window makes the final at
+    /// once, after the per-host reports already made. After the final it
+    /// still lowers the stored start, but makes no report and changes no
+    /// report or the final: no report changes and none is sent twice. The
+    /// reports and their ids don't change. `Invalid{code}`: `malformed` for
+    /// a value above 2^53 − 1, `unknown_revocation` for a principal with no
+    /// own revoke recorded (pass the date to `record` instead).
     pub fn learn_revoked_at(
         &self,
         principal: String,
