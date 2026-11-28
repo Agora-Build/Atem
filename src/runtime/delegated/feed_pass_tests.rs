@@ -1232,8 +1232,9 @@ fn control_alerts_and_unknown_outcome_alerts_stay_apart() {
     });
 }
 
-/// The delegated host-work design III.5 (Atem's proposal, for Astation's
-/// agreement, #120 7207832274): the App's record of the Station's
+/// The delegated host-work design III.5 (Atem's proposal, #120 7207832274,
+/// agreed with Astation, #120 7212501350 and 7213560895): the App's record
+/// of the Station's
 /// `service_suspended` on the host's routed link, handed to its Station
 /// link once and only for the link it came on, closes the gate at once and
 /// names the Station's text on the `Control feeds:` line; with the link

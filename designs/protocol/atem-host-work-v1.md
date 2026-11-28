@@ -3011,8 +3011,10 @@ host's call on the link with exactly one of:
   close an invalid or superseded link; a refusal creates no authority for
   it.
 - **A suspension isn't a call refusal** (the delegated host-work design
-  III.5; session-v1 R9.7b "Service suspended"; **Atem's proposal, for
-  Astation's agreement, #120 7207832274**). The built-in Station that
+  III.5; session-v1 R9.7b "Service suspended"; **Atem's proposal, #120
+  7207832274, agreed with Astation, #120 7212501350 and 7213560895**,
+  except the B-1 refusal of a proxy proof on Astation's local link, whose
+  recovery Atem proposed in #120 7234876630). The built-in Station that
   doesn't serve an account (disabled at Agora.Build, or no Agora.Build
   owner at this Station) never answers that host's calls with `forbidden`:
   it refuses the host's route proof with `host_route_refused{code:
@@ -4277,7 +4279,20 @@ record's `retired`, below): a retired key never waits.
 7086542274; **built behind the debug-only hook's `host.senders`**:
 `session_protocol/r9/host_enc.rs`, `runtime/delegated/host_key_pass.rs`;
 session-v1 R9.14 item 8). Readings of Atem's where the agreement is silent
-are marked **Atem's reading, for Astation's confirmation**.
+are marked **Atem's reading**, with Astation's answer where it gave one.
+**The seven readings Atem listed for Astation (#120 comment 7208126326)
+are agreed with Astation** (#120 comment 7208696433, confirmed again in
+7213175238, 7215394846, 7216889493 and 7234506568), with Astation's own
+statement of their residuals, agreed as written: retired-key mail has no
+delivery acknowledgment and expires at the sender; the 64 retained request
+mappings bound idempotency, and an evicted id can get a different key; a
+retry after promotion can still read `pending`; a fresh request can get
+`busy` while a committed key awaits promotion; voiding a generation erases
+its keys; the advisory covers `retire_previous`; and restoring the entire
+pairing directory can restore older state and stamp the window again.
+Still **for Astation's confirmation**: the host's unset current key
+answered to a new request, and the stamp with its window, to which Atem
+added the elapsed ceiling below as its follow-up to that review.
 
 - **The manager's request.** `host_enc_key_new{id, request_id}` (session-v1
   R9.14 item 8), from a native member holding `manage` at the host's head,
@@ -4294,13 +4309,16 @@ are marked **Atem's reading, for Astation's confirmation**.
     A retry whose key the host never managed to write (its key file write
     failed after the record) is answered as a new request, never with a key
     the host doesn't hold. `state` stays `pending` (no new wire value), also
-    on a retry after an entry set the key (**Atem's reading, for Astation's confirmation**: `pending` names a key
-    handed out for a rotation, not one the list doesn't hold yet; whether
-    the list holds it by now is for the manager's own log to say, where
-    `check_change` reports `enc_key_reused`). A request evicted from the 64
-    is a new request, and gets another key once its own was set (**Atem's reading, for Astation's confirmation**: the
-    bound on Astation's "a retry discovers the same durable key", for a
-    host that answers many requests).
+    on a retry after an entry set the key (**Atem's reading, agreed with
+    Astation, #120 comment 7208696433**: `pending` names a key handed out
+    for a rotation, not one the list doesn't hold yet, so a retry after the
+    promotion can still read `pending`; whether the list holds it by now is
+    for the manager's own log to say, where `check_change` reports
+    `enc_key_reused`). A request evicted from the 64 is a new request, and
+    gets another key once its own was set (**Atem's reading, agreed with
+    Astation, #120 comment 7208696433**: the 64 retained mappings bound
+    Astation's "a retry discovers the same durable key", for a host that
+    answers many requests, and an evicted id can get a different key).
   - **Otherwise the key no entry has set**, at most one at a time: the host's
     current key while no entry has set it (**Atem's reading, for Astation's
     confirmation**: so a stale `host_enc_key_get` answer can only name the
@@ -4310,8 +4328,9 @@ are marked **Atem's reading, for Astation's confirmation**.
     generation ends.
   - **`busy`**, `host encryption key unavailable`, while an entry the list
     committed sets the pending key and the host hasn't followed it yet (a
-    moment: the next pass does; **Atem's reading, for Astation's
-    confirmation**).
+    moment: the next pass does; **Atem's reading, agreed with Astation,
+    #120 comment 7208696433**: a fresh request can get `busy` while a
+    committed key awaits promotion).
 - **Before the answer**, durably, in this order: a fresh X25519 key's
   `enc_kid` is in neither the host's record (made or retired) nor among the
   keys the committed list set for the host since its `add_host` (drawn
@@ -4330,9 +4349,10 @@ are marked **Atem's reading, for Astation's confirmation**.
   is erased only when the list retired it (`retire_previous`), its window
   passed (or can't be established, below), a later entry replaced it as
   the previous key, or its generation ended (a newer `add_host`, a
-  `remove_host`: the pending key goes with it; **Atem's reading, for
-  Astation's confirmation:** the current key too, since no key of a voided
-  generation is accepted again). So a stale manager's entry setting a key
+  `remove_host`: the pending key goes with it; **Atem's reading, agreed
+  with Astation, #120 comment 7208696433:** the current key too, since no
+  key of a voided generation is accepted again: voiding a generation
+  erases its keys). So a stale manager's entry setting a key
   the host offered earlier makes that key current and the old one the
   previous key for its 24 h, and the host never ends with no key.
 - **The stamp** (**Atem's reading, for Astation's confirmation**, of the
@@ -4408,11 +4428,14 @@ are marked **Atem's reading, for Astation's confirmation**.
   rolled-back key file holds, and a retirement cut short (the id recorded,
   the file not yet replaced) is finished at the next pass, the secret
   meanwhile accepted nowhere. `retired` only grows within a generation.
-  **A residual** (**Atem's reading, for Astation's confirmation**, where Astation wrote "not resurrected by a
+  **A residual** (**Atem's reading, agreed with Astation, #120 comment
+  7208696433**, where Astation wrote "not resurrected by a
   restart/rollback"): a restore of the whole of `pairing/` from a backup
   taken before an entry (the key file, the record and the device list
   together) re-applies that entry and stamps it anew, as the project's other
-  whole-directory restores are residuals (session-v1 R9.13).
+  whole-directory restores are residuals (session-v1 R9.13): restoring the
+  entire pairing directory can restore older state and stamp the window
+  again.
   **Erasure at the deadline** waits for the next pass at which the list
   serves and `D` reads (the hook on; the pass is due at the deadline on
   `D` and at the elapsed ceiling, or another boot, on the counter of the
@@ -4422,9 +4445,10 @@ are marked **Atem's reading, for Astation's confirmation**.
 - **Mail in flight**: after a routine rotation, mail sealed to the old key
   (a sender whose list is behind) still opens for 24 h. After a
   `retire_previous` it is refused `enc_key_not_accepted` and never
-  re-sealed by anyone but its sender. **Atem's reading, for Astation's
-  confirmation** (correcting Atem's proposal, which said "the sending host
-  records the refusal"): under the agreed check order that refusal is step
+  re-sealed by anyone but its sender. **Atem's reading, agreed with
+  Astation, #120 comment 7208696433** (correcting Atem's proposal, which
+  said "the sending host records the refusal"; retired-key mail has no
+  delivery acknowledgment and expires at the sender): under the agreed check order that refusal is step
   2's, before the copy is shown to be the sender's, so no status goes back
   (as for every such refusal, above). The sending host's delivery row stays
   `sent`, its envelope put again every 10 minutes (the same bytes), until
@@ -4446,8 +4470,8 @@ are marked **Atem's reading, for Astation's confirmation**.
   advisory, optimistic, since the host applies an entry after it is signed:
   a window the host opened late can still be open when it is no longer
   reported). Reported for a routine and a `retire_previous` rotation alike
-  (**Atem's reading, for Astation's confirmation**: the older key's window
-  ends either way). The bindings return it with `check_change`'s refusal,
+  (**Atem's reading, agreed with Astation, #120 comment 7208696433**: the
+  older key's window ends either way). The bindings return it with `check_change`'s refusal,
   if any.
 - **`atem status`** shows `Host key:` (the current key's `enc_kid`, a
   pending one, and the previous one with when its window ends: the earlier
@@ -5759,14 +5783,20 @@ is committed or its generation goes, old-key mail refused under
 with an explicit warning, and a 24 h window that a crash never restarts
 or lengthens); it is built behind the debug-only hook (§11.5, "The
 routine rotation of a host's key"; session-v1 R9.13 item 8, R9.14 item 8).
-Atem's readings there, each marked **for Astation's confirmation** where it
-is stated: the stamp as the evidence, the host's unset current key answered
-to a new request, `busy` while a committed key awaits the host, a voided
-generation's current key retired too, no status for old-key mail refused
-under `retire_previous` (and its results back), the advisory on a
-`retire_previous` rotation, `state: "pending"` on a retry after the entry
-set the key, the 64 requests a retry is matched against, and a restore of
-the whole of `pairing/` left as a residual.
+Of Atem's readings there, Astation agreed on 2026-11-27 the seven Atem
+listed (#120 comment 7208126326), each marked agreed where it is stated
+(#120 comment 7208696433, confirmed again in 7213175238, 7215394846,
+7216889493 and 7234506568), with its own statement of their residuals:
+`busy` while a committed key awaits the host, a voided generation's keys
+erased, no status for old-key mail refused under `retire_previous` (and
+its results back), the advisory on a `retire_previous` rotation, `state:
+"pending"` on a retry after the entry set the key, the 64 requests a retry
+is matched against, and a restore of the whole of `pairing/` left as a
+residual. Still **for Astation's confirmation**, each marked where it is
+stated: the host's unset current key answered to a new request, and the
+stamp as the evidence with its window, to which Atem added the elapsed
+ceiling (24 h of the boot-time counter on the stamp's boot, a reboot
+ending it) as its follow-up to that review.
 Earlier: the receiving host's mailbox readings
 ([#120 comment 6938206284][c-6938206284]) and this section's wire ([#120
 comment 6903887341][c-6903887341]). All of it runs only behind the

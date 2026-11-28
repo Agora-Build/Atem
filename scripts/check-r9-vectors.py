@@ -31,7 +31,8 @@ here and its set hashes recomputed from the journal's bodies (host-work-v1
 §11.1 "The signer report", Astation #114), and
 `r9-vectors-station-binding`, the same for a native manager's Station
 binding proof (delegated host-work III.5 (b); its orders Atem's proposal,
-#120 comment 7207827118, for Astation's agreement), Astation's three
+#120 comment 7207827118, agreed with Astation, Atem #210 comment
+7209922243), Astation's three
 posted examples included (their digests and both signatures).
 The other files'
 `expect` and each `reason` are checked by the Rust runner
@@ -4433,8 +4434,9 @@ def check_host_route(file, data, report, context):
 # host link (the delegated host-work design III.5), read here from the
 # contract: a verifier code alone, or the Station's `service_suspended` with
 # a required `text` (1 to 256 bytes of UTF-8, no character of General
-# Category Cc, Cf, Zl or Zp; Atem's proposal, for Astation's agreement, #120
-# 7207832274).
+# Category Cc, Cf, Zl or Zp; Atem's proposal, #120 7207832274, agreed with
+# Astation, #120 7212501350 and 7213560895, whose rule also requires it
+# nonblank: not checked here yet, as in the shared core).
 ROUTE_REFUSAL_CODES = [
     "malformed", "frozen", "wrong_account", "unknown_host", "bad_signature",
     "stale_log", "fork", "nonce_mismatch", "room_mismatch", "atem_id_mismatch",
@@ -5516,7 +5518,8 @@ def sb_claim_ok(v):
 
 def sb_expected_ok(o):
     """{state: never_bound} exactly, or a record in its state with its id,
-    version and owner (owner in every recorded state: Atem's proposal)."""
+    version and owner (owner in every recorded state: Atem's proposal,
+    agreed with Astation)."""
     if not isinstance(o, dict):
         return False
     if o.get("state") == "never_bound":
@@ -5610,7 +5613,8 @@ class SbList(VrList):
 def sb_verify(text, lst, expected, now):
     """verify_station_binding, from the file's note: the first failure in
     the order of Atem's answer (#120 comment 7207827118, Atem's proposal,
-    for Astation's agreement), or the verified binding."""
+    agreed with Astation, Atem #210 comment 7209922243), or the verified
+    binding."""
     body, sig = read_sb_proof(text)
     if lst.frozen:
         raise Refused("frozen")
@@ -5667,8 +5671,9 @@ def check_station_binding(file, data, report, context):
     examples (each challenge read, its signing input's digest, both
     signatures under the posted keys, over that input only); the chain's
     entries; each challenge text read or refused; each proof's code in the
-    order of Atem's answer (#120 comment 7207827118, Atem's proposal, for
-    Astation's agreement), or its verified fields, against log L and the case's
+    order of Atem's answer (#120 comment 7207827118, Atem's proposal, agreed
+    with Astation, Atem #210 comment 7209922243), or its verified fields,
+    against log L and the case's
     chain, the valid proofs' jcs, signing input and signature by their
     signer's key; the builder's held bodies and refusals; and the immutable
     request's finishes, signed here (P-256 with a fresh nonce)."""

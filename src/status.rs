@@ -2097,8 +2097,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// The delegated host-work design III.5 (Atem's proposal, for
-    /// Astation's agreement, #120 7207832274): the Station's suspension of
+    /// The delegated host-work design III.5 (Atem's proposal, #120
+    /// 7207832274, agreed with Astation, #120 7212501350 and 7213560895):
+    /// the Station's suspension of
     /// this host's service on the Relay line, its text as the Station sent
     /// it; Authorization keeps its rules.
     #[test]

@@ -300,8 +300,9 @@ fn a_proxy_proof_is_its_own_kind_and_never_a_relay_route() {
 }
 
 /// `service_suspended` (the delegated host-work design III.5; its `text`
-/// and the disclosure order are Atem's proposal, for Astation's agreement,
-/// #120 7207832274): a Station's refusal of a proof that verified, not a
+/// and the disclosure order are Atem's proposal, #120 7207832274, agreed
+/// with Astation, #120 7212501350 and 7213560895): a Station's refusal of
+/// a proof that verified, not a
 /// verifier code. It carries a required `text` (1 to 256 bytes of UTF-8,
 /// no Cc, Cf, Zl or Zp), and a verifier code carries none.
 #[test]

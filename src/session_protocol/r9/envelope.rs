@@ -32,8 +32,8 @@ pub mod reason {
     pub const EXPIRED: &str = "expired";
     /// The router's: the built-in Station closes every channel routed to a
     /// host whose account's service it suspended (the delegated host-work
-    /// design III.5; Atem's proposal, for Astation's agreement, #120
-    /// 7207832274).
+    /// design III.5; Atem's proposal, #120 7207832274, agreed with Astation,
+    /// #120 7212501350 and 7213560895).
     pub const SERVICE_SUSPENDED: &str = "service_suspended";
     /// The reasons a router's own `close` names (any other valid one reads
     /// as a plain router close): `too_large` and `service_suspended`.

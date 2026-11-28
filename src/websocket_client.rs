@@ -3374,8 +3374,9 @@ mod tests {
         handle
     }
 
-    /// The delegated host-work design III.5 (Atem's proposal, for
-    /// Astation's agreement, #120 7207832274): the Station's
+    /// The delegated host-work design III.5 (Atem's proposal, #120
+    /// 7207832274, agreed with Astation, #120 7212501350 and 7213560895):
+    /// the Station's
     /// `service_suspended` refusal of the relay link's proof, or its notice
     /// before Astation authenticated the link, fails the connect typed,
     /// with the Station's text and origin; a verifier code's refusal and a

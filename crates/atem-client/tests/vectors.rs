@@ -3143,8 +3143,9 @@ fn host_route() {
     }
 
     // The proxy kind (a Station's challenge through Astation's `:8080`;
-    // proposed, for Astation's agreement): the same cases under their own
-    // type and label, and the refusals across the kinds.
+    // agreed with Astation 2026-11-16, #174 comment 6919776085): the same
+    // cases under their own type and label, and the refusals across the
+    // kinds.
     let proxy = run.get("proxy");
     for case in proxy["valid"].as_array().unwrap() {
         let label = s(case, "label");
@@ -3281,8 +3282,8 @@ fn host_route() {
         );
         run.pass(format!("relay reply {label}: refused"));
     }
-    // The Station's notice on an open link (III.5; Atem's proposal, for
-    // Astation's agreement, #120 7207832274).
+    // The Station's notice on an open link (III.5; Atem's proposal, #120
+    // 7207832274, agreed with Astation, #120 7212501350 and 7213560895).
     let notices = run.get("service_suspended");
     for case in notices["valid"].as_array().unwrap() {
         use atem_client::station_notice::ServiceSuspended;
@@ -3392,7 +3393,7 @@ fn host_route_proxy_vectors(book: &Book, file: &Value) -> Value {
          "reason": "the relay at_head proof with its type changed to atem-host-route-proxy, its signature kept"},
     ]);
     json!({
-        "note": "R9.7b through Astation's :8080 proxy (the delegated host-work design I.5.8; proposed, for Astation's agreement): the proof's fields under their own type atem-host-route-proxy, signed by the host's host_channel_key over enc([\"atem-host-route-proxy-v1\", jcs(body)]), against the same log, chain, challenge and atem_id as the relay cases. Each `valid` case verifies as the proxy kind only (the relay verifier refuses it, malformed, its type); every relay `valid` case is refused by the proxy verifier the same way. `cross` cases are refused by the verifier of the kind they name (`verifier`), with `code`. A Station accepts a proxy proof only on Astation's native-bound forwarding connection, never as a relay route.",
+        "note": "R9.7b through Astation's :8080 proxy (the delegated host-work design I.5.8; agreed with Astation 2026-11-16, #174 comment 6919776085): the proof's fields under their own type atem-host-route-proxy, signed by the host's host_channel_key over enc([\"atem-host-route-proxy-v1\", jcs(body)]), against the same log, chain, challenge and atem_id as the relay cases. Each `valid` case verifies as the proxy kind only (the relay verifier refuses it, malformed, its type); every relay `valid` case is refused by the proxy verifier the same way. `cross` cases are refused by the verifier of the kind they name (`verifier`), with `code`. A Station accepts a proxy proof only on Astation's native-bound forwarding connection, never as a relay route.",
         "valid": valid,
         "cross": cross,
     })

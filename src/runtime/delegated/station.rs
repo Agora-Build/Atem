@@ -50,8 +50,8 @@
 //! refusal of every call kind, its 30-second backoff included, its
 //! acknowledgment and done holds ending once the Station serves the link
 //! again. Never a trust or state change (no cursor, mark, fence or
-//! identity moves). **Atem's proposal, for Astation's agreement (#120
-//! 7207832274).**
+//! identity moves). **Atem's proposal (#120 7207832274), agreed with
+//! Astation (#120 7212501350 and 7213560895).**
 use super::fetch::{DeviceListFetch, FetchApply};
 use super::mailbox::MailboxClient;
 use super::puts::PutClient;
@@ -567,9 +567,10 @@ mod tests {
 
     const TEXT: &str = "service suspended: account disabled at Agora.Build";
 
-    /// The delegated host-work design III.5 (Atem's proposal, for
-    /// Astation's agreement, #120 7207832274): the Station's
-    /// `service_suspended` on a routed (or relay) link retires the fetch in
+    /// The delegated host-work design III.5 (Atem's proposal, #120
+    /// 7207832274, agreed with Astation, #120 7212501350 and 7213560895):
+    /// the Station's `service_suspended` on a routed (or relay) link
+    /// retires the fetch in
     /// flight (its result is carried nowhere), and nothing read on that
     /// socket counts any more (a `heads` asks nothing, announces nothing);
     /// a link on a new socket fetches again. With no link nothing applies.

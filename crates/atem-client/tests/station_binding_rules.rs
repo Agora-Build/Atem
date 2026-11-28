@@ -333,7 +333,7 @@ fn each_minted_challenge_has_a_fresh_nonce() {
 }
 
 /// The orders of Atem's answer (#120 comment 7207827118): Atem's proposal,
-/// for Astation's agreement.
+/// agreed with Astation (Atem #210 comment 7209922243).
 #[test]
 fn the_orders_are_atems_proposal() {
     assert_eq!(
@@ -852,7 +852,7 @@ fn a_challenge_is_exactly_its_fields() {
 
 /// The record's fields when the expected binding names one: all four, each
 /// in its grammar. `owner` is named in every state but `never_bound`
-/// (Atem's proposal, for Astation's agreement).
+/// (Atem's proposal, agreed with Astation, Atem #210 comment 7209922243).
 #[test]
 fn a_recorded_binding_names_its_id_version_and_owner() {
     let v = Vectors::load();

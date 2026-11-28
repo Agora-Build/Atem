@@ -43,7 +43,9 @@
 //! up for more than 10 s (an immediate reconnect is a sure refusal).
 //!
 //! The `text` field, the disclosure order and the 10 s drop are **Atem's
-//! proposal, for Astation's agreement (#120 7207832274)**.
+//! proposal (#120 7207832274), agreed with Astation (#120 7212501350 and
+//! 7213560895)**, except B-1 on Astation's local link, whose recovery Atem
+//! proposed in #120 7234876630.
 use super::App;
 use crate::websocket_client::{LinkVia, ServiceSuspendedError};
 use std::collections::VecDeque;
@@ -123,8 +125,8 @@ impl Suspension {
 /// The Station's `text` as `atem status` shows it: as sent when it begins
 /// `service suspended:` (III.5's texts do: "service suspended: account
 /// disabled at Agora.Build"), otherwise with `service suspended: ` before
-/// it. Exact, case-sensitive. **Atem's reading, for Astation's agreement
-/// (#120 7207832274).**
+/// it. Exact, case-sensitive. **Atem's reading (#120 7207832274), agreed
+/// with Astation (#120 7212501350 and 7213560895).**
 pub fn shown(text: &str) -> String {
     if text.starts_with("service suspended:") {
         text.to_owned()
@@ -365,7 +367,7 @@ impl App {
 mod tests {
     use super::*;
 
-    /// The status rule (Atem's reading, for Astation's agreement): the
+    /// The status rule (Atem's reading, agreed with Astation): the
     /// text as sent when it begins `service suspended:`, exactly; else
     /// prefixed. A relay's record while the local link is up is shown as
     /// the relay's last answer (review M3).

@@ -19,8 +19,8 @@
 //!   [`verify_host_route`] (its `proof`), against the log it verified.
 //!
 //! A Station's challenge that Astation's local `:8080` proxy forwards (the
-//! delegated host-work design I.5.8; **proposed, for Astation's
-//! agreement**) is answered with a proof of its own kind,
+//! delegated host-work design I.5.8; **agreed with Astation 2026-11-16,
+//! #174 comment 6919776085**) is answered with a proof of its own kind,
 //! [`RouteKind::Proxy`]: `atem-host-route-proxy`, the same fields signed over
 //! `enc(["atem-host-route-proxy-v1", jcs(body)])`, built by
 //! [`sign_host_route_as`] and verified by [`verify_host_route_message_as`]
@@ -40,9 +40,9 @@
 //! returns it, and [`REFUSAL_CODES`] stay the verifier's ten), so a proof
 //! that doesn't verify gets its verifier code and no unverified connection
 //! learns an account's service state (least disclosure, D26). The `text`
-//! and that order are **Atem's proposal, for Astation's agreement (#120
-//! 7207832274)**. The open link's notice of the same is
-//! [`crate::station_notice`].
+//! and that order are **Atem's proposal (#120 7207832274), agreed with
+//! Astation (#120 7212501350 and 7213560895)**. The open link's notice of
+//! the same is [`crate::station_notice`].
 use serde_json::{Map, Value, json};
 
 use crate::canonical::{self, Numbers};
@@ -250,8 +250,9 @@ pub enum RouteKind {
     /// kind gives a relay route (carrier B).
     Relay,
     /// A Station's challenge that Astation's local `:8080` proxy forwards
-    /// (the delegated host-work design I.5.8; **proposed, for Astation's
-    /// agreement**): `atem-host-route-proxy`, signed over
+    /// (the delegated host-work design I.5.8; **agreed with Astation
+    /// 2026-11-16, #174 comment 6919776085**): `atem-host-route-proxy`,
+    /// signed over
     /// `enc(["atem-host-route-proxy-v1", jcs(body)])`. A Station accepts it
     /// only on Astation's native-bound forwarding connection, never as a
     /// relay route.
@@ -416,8 +417,10 @@ pub const MAX_SERVICE_TEXT_BYTES: usize = 256;
 /// runtime.log): 1 to [`MAX_SERVICE_TEXT_BYTES`] bytes of UTF-8 with no
 /// character of General Category Cc, Cf, Zl or Zp (the pinned Unicode
 /// data's), so no terminal escape, bidi control or line break reaches a
-/// terminal. **Atem's proposal, for Astation's agreement (#120
-/// 7207832274).**
+/// terminal. **Atem's proposal (#120 7207832274), agreed with Astation
+/// (#120 7212501350 and 7213560895)**, whose rule also requires the text
+/// nonblank (item 3 of 7213560895): not checked here yet (a text of nothing
+/// but White_Space passes), a follow-up with its boundary vectors.
 pub fn service_text_ok(text: &str) -> bool {
     use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
     !text.is_empty()

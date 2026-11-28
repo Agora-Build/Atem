@@ -894,8 +894,9 @@ mod tests {
         assert_eq!(r8.on_reply(&refused), None);
     }
 
-    /// The delegated host-work design III.5 (Atem's proposal, for
-    /// Astation's agreement, #120 7207832274): a Station's
+    /// The delegated host-work design III.5 (Atem's proposal, #120
+    /// 7207832274, agreed with Astation, #120 7212501350 and 7213560895,
+    /// except the local link's B-1, still open: #120 7234876630): a Station's
     /// `service_suspended` refusal is this link's verdict as any refusal
     /// is (only after its own proof, once), with its text; a malformed one
     /// (no text, a verifier code with a text) is no verdict. Through
