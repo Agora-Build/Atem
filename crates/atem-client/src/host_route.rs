@@ -19,8 +19,8 @@
 //!   [`verify_host_route`] (its `proof`), against the log it verified.
 //!
 //! A Station's challenge that Astation's local `:8080` proxy forwards (the
-//! delegated host-work design I.5.8; **proposed, for Astation's
-//! agreement**) is answered with a proof of its own kind,
+//! delegated host-work design I.5.8; **agreed with Astation 2026-11-16,
+//! #174 comment 6919776085**) is answered with a proof of its own kind,
 //! [`RouteKind::Proxy`]: `atem-host-route-proxy`, the same fields signed over
 //! `enc(["atem-host-route-proxy-v1", jcs(body)])`, built by
 //! [`sign_host_route_as`] and verified by [`verify_host_route_message_as`]
@@ -40,9 +40,9 @@
 //! returns it, and [`REFUSAL_CODES`] stay the verifier's ten), so a proof
 //! that doesn't verify gets its verifier code and no unverified connection
 //! learns an account's service state (least disclosure, D26). The `text`
-//! and that order are **Atem's proposal, for Astation's agreement (#120
-//! 7207832274)**. The open link's notice of the same is
-//! [`crate::station_notice`].
+//! and that order are **Atem's proposal (#120 7207832274), agreed with
+//! Astation (#120 7212501350 and 7213560895)**. The open link's notice of
+//! the same is [`crate::station_notice`].
 use serde_json::{Map, Value, json};
 
 use crate::canonical::{self, Numbers};
@@ -249,12 +249,12 @@ pub enum RouteKind {
     /// signed over `enc(["atem-host-route-v1", jcs(body)])`. Only this
     /// kind gives a relay route (carrier B).
     Relay,
-    /// A Station's challenge that Astation's local `:8080` proxy forwards
-    /// (the delegated host-work design I.5.8; **proposed, for Astation's
-    /// agreement**): `atem-host-route-proxy`, signed over
+    /// A Station's challenge that Astation's local `:8080` proxy forwards (the
+    /// delegated host-work design I.5.8; **agreed with Astation 2026-11-16,
+    /// #174 comment 6919776085**): `atem-host-route-proxy`, signed over
     /// `enc(["atem-host-route-proxy-v1", jcs(body)])`. A Station accepts it
-    /// only on Astation's native-bound forwarding connection, never as a
-    /// relay route.
+    /// only on Astation's native-bound forwarding connection, never as a relay
+    /// route.
     Proxy,
 }
 
@@ -413,15 +413,23 @@ pub const STATION_REFUSAL_CODES: [&str; 1] = [SERVICE_SUSPENDED];
 pub const MAX_SERVICE_TEXT_BYTES: usize = 256;
 
 /// Whether `text` is a Station's text a host may show (`atem status`,
-/// runtime.log): 1 to [`MAX_SERVICE_TEXT_BYTES`] bytes of UTF-8 with no
-/// character of General Category Cc, Cf, Zl or Zp (the pinned Unicode
-/// data's), so no terminal escape, bidi control or line break reaches a
-/// terminal. **Atem's proposal, for Astation's agreement (#120
-/// 7207832274).**
+/// runtime.log): 1 to [`MAX_SERVICE_TEXT_BYTES`] bytes of UTF-8, nonblank
+/// (not every character White_Space, Unicode 18.0.0's, the framing module's
+/// table: [`crate::session::framing::is_white_space`]; around a visible
+/// character it stays, as sent), with no character of General Category Cc,
+/// Cf, Zl or Zp (the pinned Unicode data's), so no terminal escape, bidi
+/// control, line break or text of nothing but White_Space reaches a
+/// terminal (invisible characters that aren't White_Space, such as U+3164
+/// or U+2800, still read: Astation's rule is White_Space). **Atem's
+/// proposal (#120 7207832274), agreed with Astation (#120 7212501350 and
+/// 7213560895; nonblank: item 3 of 7213560895)**. Every reader and builder
+/// of both forms checks it ([`RelayReply::suspended`],
+/// [`RelayReply::parse`], `station_notice::ServiceSuspended`).
 pub fn service_text_ok(text: &str) -> bool {
     use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
     !text.is_empty()
         && text.len() <= MAX_SERVICE_TEXT_BYTES
+        && !text.chars().all(crate::session::framing::is_white_space)
         && !text.chars().any(|c| {
             matches!(
                 c.general_category(),

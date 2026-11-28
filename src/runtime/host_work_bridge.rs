@@ -178,6 +178,18 @@ struct SessionInput {
     project_unread: bool,
 }
 
+/// What the host key pass last brought the key file to: the identity and
+/// list head, when, and the previous key's deadline on `D` and its elapsed
+/// ceiling on the boot-time counter, if any.
+type HostKeyChecked = (
+    HostTarget,
+    u64,
+    atem_client::encoding::Hash32,
+    Instant,
+    Option<u64>,
+    Option<crate::session_protocol::r9::host_enc::BootAt>,
+);
+
 pub(super) struct State {
     available: bool,
     dir: PathBuf,
@@ -265,16 +277,8 @@ pub(super) struct State {
     /// rotation's promotion, a retirement): the keys this host accepts may
     /// have, so the waiting objects are judged again.
     host_keys_changed: u64,
-    /// What the host key pass last brought the key file to (`host_key_pass`):
-    /// the identity and list head, when, and the previous key's deadline on
-    /// `D`, if any.
-    host_key_checked: Option<(
-        HostTarget,
-        u64,
-        atem_client::encoding::Hash32,
-        Instant,
-        Option<u64>,
-    )>,
+    /// What the host key pass last brought the key file to (`host_key_pass`).
+    host_key_checked: Option<HostKeyChecked>,
     /// When the waiting objects were last judged again for an expiry
     /// (at most every `MAIL_REJUDGE_EVERY` while the list stands still).
     mail_rejudge_at: Option<Instant>,
@@ -1129,18 +1133,19 @@ impl HostBridge {
     /// journal's halt while `host.delegated` is on.
     fn take_reading(&mut self) -> Option<u64> {
         self.work.read_due = Instant::now() + READ_EVERY;
-        let now_d = self
+        let reading = self
             .work
             .clock
             .as_ref()
             .filter(|c| !c.damaged())
-            .and_then(|c| c.reading())
-            .map(|n| n.d_ms);
+            .and_then(|c| c.reading_with_boot());
+        let now_d = reading.map(|(n, _)| n.d_ms);
         if self.features.delegated {
             let halted = self.host.journal_halted();
             let clock = self.work.clock.as_ref().and_then(HostClock::snapshot);
             let mut view = self.start_view();
             view.now_d_ms = now_d;
+            view.now_boot = reading.and_then(|(_, boot)| boot);
             view.clock = clock;
             view.halted = halted;
         }

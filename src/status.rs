@@ -440,8 +440,11 @@ pub fn gather_full(
         clock,
         feeds,
         delegated,
-        host_key: crate::session_protocol::r9::host_enc::status_text(&src.paths.pairing)
-            .map(Line::new),
+        host_key: crate::session_protocol::r9::host_enc::status_text(
+            &src.paths.pairing,
+            crate::runtime::host_clock::status_reading,
+        )
+        .map(Line::new),
         notes,
     }
 }
@@ -2094,10 +2097,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// The delegated host-work design III.5 (Atem's proposal, for
-    /// Astation's agreement, #120 7207832274): the Station's suspension of
-    /// this host's service on the Relay line, its text as the Station sent
-    /// it; Authorization keeps its rules.
+    /// The delegated host-work design III.5 (Atem's proposal, #120 7207832274,
+    /// agreed with Astation, #120 7212501350 and 7213560895): the Station's
+    /// suspension of this host's service on the Relay line, its text as the
+    /// Station sent it; Authorization keeps its rules.
     #[test]
     fn a_suspended_service_is_shown_on_the_relay_line() {
         const TEXT: &str = "service suspended: account disabled at Agora.Build";

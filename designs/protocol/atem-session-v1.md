@@ -3569,8 +3569,9 @@ sender. Between 2 and 4 MiB Atem applies the bound itself (the row above).
 client frame over the envelope bound, refused at the router) or
 `service_suspended` (the built-in Station closes every channel routed to a
 host whose account's service it suspended, to both ends, before it closes
-the host's link: the delegated host-work design III.5; **Atem's proposal,
-for Astation's agreement, #120 7207832274**); any other valid reason reads
+the host's link: the delegated host-work design III.5; **Atem's proposal
+(#120 7207832274), agreed with Astation, #120 7212501350 and
+7213560895**); any other valid reason reads
 as a plain router close. Either way only that channel's attachment is
 fenced (lifecycle 4), and a reason of the router's own gets a runtime.log
 line naming it (rate-limited per link). Vectors: `r9-envelope-vectors`'s
@@ -3797,9 +3798,17 @@ N`, `host_route refused: <code>`).
 Station refuses relay service to the hosts of an account disabled at
 Agora.Build, or with no Agora.Build owner at this Station; built on
 Atem's side in every build, not behind a hook; the `text` field, its
-disclosure order and the host's 10 s drop are **Atem's proposal, for
-Astation's agreement, #120 7207832274**). Three forms, each from the
-shared core (`atem_client::host_route::RelayReply::Suspended`,
+disclosure order and the host's 10 s drop are Atem's proposal, #120
+7207832274, **agreed with Astation, #120 7212501350 and 7213560895, and
+#211**: the text rule in both forms, the route proof verified before any
+reason is disclosed, the open-link notice after the affected channels
+close, the 10 s close deadline, the normal 30 s retry, the status display
+and the Station's two fixed nonblank texts, below; **except B-1 on
+Astation's local link**, still open: Atem proposed its recovery signal, a
+fresh challenge answered on the same local authentication generation 30 s
+after the previous verdict, in #120 7234876630, for Astation's agreement).
+Three forms, each from the shared core
+(`atem_client::host_route::RelayReply::Suspended`,
 `atem_client::station_notice::ServiceSuspended`):
 
 - **B-1, the route refusal**:
@@ -3812,9 +3821,25 @@ shared core (`atem_client::host_route::RelayReply::Suspended`,
   verification gets its verifier code, so no unverified connection learns
   an account's service state (least disclosure, D26). `text` is required
   with `service_suspended` and absent with every verifier code: 1–256 bytes
-  of UTF-8 with no character of General Category Cc, Cf, Zl or Zp
-  (`host_route::service_text_ok`), so no terminal escape, bidi control or
-  line break reaches `atem status`. Then the relay closes the connection.
+  of UTF-8, nonblank (not every character White_Space, Unicode 18.0.0's:
+  the framing module's generated table, #120 7213560895 item 3; whitespace
+  around a visible character stays, as sent), with no character of
+  General Category Cc, Cf, Zl or Zp (`host_route::service_text_ok`, which
+  every reader and builder of both forms checks), so no terminal escape,
+  bidi control, line break or text of nothing but White_Space reaches
+  `atem status` (a text of invisible characters that aren't White_Space,
+  such as U+3164 or U+2800, still reads, within Astation's rule; `atem
+  status` puts `service suspended: ` before any text that doesn't begin
+  with it, so its line is never empty). The
+  Station's two fixed texts are "service suspended: account disabled at
+  Agora.Build" and "service suspended: no Agora.Build owner at this
+  Station". Then the relay closes the connection. A reply or notice the
+  shared reader refuses (a blank text among them) is no suspension, as any
+  unreadable Station message: a refused verdict is ignored with a
+  runtime.log line (the connect then fails as the relay closes it, with no
+  text recorded), a refused notice is dropped and counted, and nothing of
+  trust or state changes. Vectors: `r9-vectors-host-route`'s blank cases
+  in `relay_replies` and `service_suspended`.
 - **B-2, the open-link notice**:
   `{"type":"relay","op":"service_suspended","v":1,"text":"…"}`, exactly
   these fields, the same `text`, at most 1 KiB as received.
@@ -3830,7 +3855,7 @@ What the host does:
 | event | the host |
 |---|---|
 | B-1 on a relay link (its own proof's verdict, once, as above) | the connect fails: no route, no Astation authentication on that socket (an authentication waiting for Astation's reply ends there); the text recorded; the next attempt 30 s after it, the normal connect loop's pace after a suspension, never at once; one runtime.log line per text an hour (`relay: service suspended: <text>; retrying`), at most 4 such lines an hour in all |
-| B-1 through Astation's `:8080` proxy (`host.delegated`) | as every refusal there: the link stays, the Station refuses its calls, its gate stays closed; the text recorded |
+| B-1 through Astation's `:8080` proxy (`host.delegated`) | as every refusal there: the link stays, the Station refuses its calls, its gate stays closed; the text recorded (**not agreed yet**: how it recovers on the same local authentication generation, Astation's question in #120 7213935951; Atem's proposal, #120 7234876630, for Astation's agreement) |
 | B-2 on a relay or routed link | the text recorded with its socket; with `host.delegated`, every live Station call on that socket retired (the control sync, the device-list fetch, the mailbox's syncs and dones, the puts; the acknowledgments sent on any connection of that socket go again on the next link), the origin's gate closed at once, nothing more asked on that socket and nothing read on it reopening the gate; if the Station hasn't closed the socket within 10 s the host drops it; the next attempt 30 s later, the normal connect loop's pace after a suspension (even when the link had been up for more than 10 s), never at once |
 | B-2 on Astation's local link | as a Station refusal of every call kind (`host.delegated`: retired, the gate closed, the 30 s backoff, acknowledgments held on that connection and mailbox dones held); the text recorded; the link (Astation's) stays; the suspended Station keeps announcing its `heads` and refuses each call, and those refusals are the suspension's (the holds stay the suspension's, and its text the gate's reason); once the Station serves the link again (the first page asked after the latest refusal's backoff that reads) or the link generation ends, the holds end, and what they held goes, once |
 | B-3 | as any router close: only that channel's attachment fenced, a runtime.log line naming the reason |
@@ -3864,8 +3889,8 @@ backoff).
 <text>; retrying)`, and on a link still up the text inside its
 parentheses. The text is shown as sent when it begins `service
 suspended:` (III.5's texts do), otherwise with `service suspended: `
-before it (**Atem's reading, for Astation's agreement, #120
-7207832274**). With `host.delegated` on it also shows `Control feeds:
+before it (**Atem's reading, #120 7207832274, agreed with Astation, #120
+7212501350 and 7213560895**). With `host.delegated` on it also shows `Control feeds:
 revocations not yet checked (<origin>: service suspended: <text>;
 retrying)`, as the gate's reason only while no Station link is up or for
 the link the suspension came on (never a relay's as the local link's
@@ -4575,7 +4600,7 @@ key, head and fences don't depend on the Mac or the cred agent. Fixtures:
 | `unsupported_version` | session | also: `hello` without `revision: 9`; the removed outer `transportPolicy`/`transportPolicyAck` (R9.8a) |
 | `request_id_reused` | session | also: a `host_policy_set` reusing a `request_id` with another body (R9.8a); a `request_id` recorded under another submitter when either is the `host-work` principal (R9.14 item 7; built, behind the unadvertised `host.delegated`) |
 | relay `push_hint` refusals | relay | `skew`, `invalid_times`, `duplicate`, `bad_signature`, `stale` |
-| relay `host_route` refusals | relay | `malformed`, `frozen`, `wrong_account`, `unknown_host`, `bad_signature`, `stale_log`, `fork`, `nonce_mismatch`, `room_mismatch`, `atem_id_mismatch` (R9.7b; the verifier's codes, sent to the host in `host_route_refused` with no `text`); and the Station's own `service_suspended` with its required `text`, only for a proof that verified (R9.7b "Service suspended"; **Atem's proposal, for Astation's agreement, #120 7207832274**) |
+| relay `host_route` refusals | relay | `malformed`, `frozen`, `wrong_account`, `unknown_host`, `bad_signature`, `stale_log`, `fork`, `nonce_mismatch`, `room_mismatch`, `atem_id_mismatch` (R9.7b; the verifier's codes, sent to the host in `host_route_refused` with no `text`); and the Station's own `service_suspended` with its required `text`, only for a proof that verified (R9.7b "Service suspended"; **Atem's proposal, #120 7207832274, agreed with Astation, #120 7212501350 and 7213560895**) |
 | relay `service_suspended` | relay | the Station's notice on an open host link, `{"type":"relay","op":"service_suspended","v":1,"text"}` (R9.7b "Service suspended"); channels routed to the host close with the router's reason `service_suspended` (R9.7a) |
 
 **The order of a service's `hello` refusals** (with the unadvertised
@@ -5358,11 +5383,13 @@ below. Item 8's request stays open.
        - **A retry under the same `request_id` gets the same key**, before
          or after an entry set it (the host records the last 64 requests it
          answered, written with the key before the answer; a request past
-         them is a new one: **Atem's reading, for Astation's
-         confirmation**). `state: "pending"` names a key handed out for a
-         rotation, on a retry after an entry set it too (**Atem's reading,
-         for Astation's confirmation**); whether the list holds it by now
-         is for the manager's own log to say (no other wire value).
+         them is a new one, which can get a different key: **Atem's
+         reading, agreed with Astation, #120 comment 7208696433**). `state:
+         "pending"` names a key handed out for a rotation, on a retry after
+         an entry set it too, so a retry after the promotion can still read
+         `pending` (**Atem's reading, agreed with Astation, #120 comment
+         7208696433**); whether the list holds it by now is for the
+         manager's own log to say (no other wire value).
        - **One key no entry has set, per trust generation.** A new request
          gets the host's current key while no entry has set it (**Atem's
          reading, for Astation's confirmation**: a stale `host_enc_key_get`
@@ -5373,7 +5400,8 @@ below. Item 8's request stays open.
          replaced or minted in the background. While the list has committed
          the entry setting the pending key and the host hasn't followed it
          yet, a new request is `busy`, `host encryption key unavailable`
-         (**Atem's reading, for Astation's confirmation**).
+         (**Atem's reading, agreed with Astation, #120 comment
+         7208696433**).
        - **Before the answer**: a fresh key's `enc_kid` is neither in the
          host's record nor among the keys the committed list set for it
          since its `add_host`; the request (and a fresh key's id) is
@@ -5396,7 +5424,10 @@ below. Item 8's request stays open.
          refusal with it).
        - **What the host does with the entry** (the key file following the
          committed list entry by entry, the stamp, the 24 h window on the
-         delegated clock and what ends it early, retirement and the record
+         delegated clock, its elapsed ceiling (24 h of the boot-time counter
+         on the stamp's boot, a reboot ending it: Atem's follow-up to
+         Astation's review, #120 comment 7208696433) and what ends it
+         early, retirement and the record
          of retired keys, the receiver's view following the committed list
          only, mail in flight and results back under `retire_previous`):
          host-work-v1 §11.5, "The routine rotation of a host's key".

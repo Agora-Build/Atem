@@ -31,11 +31,11 @@ here and its set hashes recomputed from the journal's bodies (host-work-v1
 §11.1 "The signer report", Astation #114), and
 `r9-vectors-station-binding`, the same for a native manager's Station
 binding proof (delegated host-work III.5 (b); its orders Atem's proposal,
-#120 comment 7207827118, for Astation's agreement), Astation's three
-posted examples included (their digests and both signatures).
-The other files'
-`expect` and each `reason` are checked by the Rust runner
-(`crates/atem-client/tests/vectors.rs`) and the binding suites.
+#120 comment 7207827118, agreed with Astation, Atem #210 comment
+7209922243), Astation's three posted examples included (their digests and
+both signatures). The other files' `expect` and each `reason` are checked
+by the Rust runner (`crates/atem-client/tests/vectors.rs`) and the binding
+suites.
 It also recomputes every Station report id of the acknowledgment fixtures
 (`r9-control-ack-*`, host-work-v1 §11.4): the known answers of the
 reference ledger's `report_id`, and derives their `expect_counts` (the
@@ -2010,12 +2010,21 @@ def delegated_task(facts):
     )
 
 
-# Unicode's White_Space property (PropList.txt), written out: an alert's
-# reason must carry something else (host-work-v1 §11.3).
-WHITE_SPACE = set(
-    "\t\n\x0b\x0c\r \x85\xa0\u1680" + "".join(chr(c) for c in range(0x2000, 0x200B))
-    + "\u2028\u2029\u202f\u205f\u3000"
-)
+# Unicode's White_Space property (PropList.txt, Unicode 18.0.0), as
+# inclusive code point ranges, written out from the core's generated table
+# (`crates/atem-client/src/session/framing/unicode_data.rs`'s WHITE_SPACE,
+# made by `scripts/gen-framing-unicode.py`) so this checker doesn't depend on
+# Python's own Unicode data: `str.isspace()` is another set (it adds U+001C
+# to U+001F). `cargo test -p atem-client --test vectors
+# checker_white_space_is_the_framing_modules` holds them equal. An alert's
+# reason (host-work-v1 §11.3), a failed resolution's detail (§11.2) and a
+# Station's text (session-v1 R9.7b) must each carry something else.
+WHITE_SPACE_RANGES = [
+    (0x0009, 0x000D), (0x0020, 0x0020), (0x0085, 0x0085), (0x00A0, 0x00A0),
+    (0x1680, 0x1680), (0x2000, 0x200A), (0x2028, 0x2029), (0x202F, 0x202F),
+    (0x205F, 0x205F), (0x3000, 0x3000),
+]
+WHITE_SPACE = {chr(c) for a, b in WHITE_SPACE_RANGES for c in range(a, b + 1)}
 
 
 # General_Category Cf (format characters) of Unicode 18.0.0, as inclusive
@@ -4432,9 +4441,9 @@ def check_host_route(file, data, report, context):
 # The relay's verdicts on a proof (R9.7b) and the Station's notice on an open
 # host link (the delegated host-work design III.5), read here from the
 # contract: a verifier code alone, or the Station's `service_suspended` with
-# a required `text` (1 to 256 bytes of UTF-8, no character of General
-# Category Cc, Cf, Zl or Zp; Atem's proposal, for Astation's agreement, #120
-# 7207832274).
+# a required `text` (1 to 256 bytes of UTF-8, nonblank, no character of
+# General Category Cc, Cf, Zl or Zp; Atem's proposal, #120 7207832274,
+# agreed with Astation, #120 7212501350 and 7213560895).
 ROUTE_REFUSAL_CODES = [
     "malformed", "frozen", "wrong_account", "unknown_host", "bad_signature",
     "stale_log", "fork", "nonce_mismatch", "room_mismatch", "atem_id_mismatch",
@@ -4446,11 +4455,13 @@ SERVICE_NOTICE_MAX = 1024
 
 
 def service_text_ok(text):
-    """A Station's text a host shows: 1-256 bytes of UTF-8, no Cc, Cf, Zl
-    (U+2028) or Zp (U+2029) character."""
+    """A Station's text a host shows: 1-256 bytes of UTF-8, nonblank
+    (something besides White_Space, WHITE_SPACE above: Astation's item 3,
+    #120 7213560895), no Cc, Cf, Zl (U+2028) or Zp (U+2029) character."""
     return (
         isinstance(text, str)
         and 1 <= len(text.encode("utf-8")) <= SERVICE_TEXT_MAX
+        and any(c not in WHITE_SPACE for c in text)
         and not any(is_control(c) or is_format(c) or c in "\u2028\u2029" for c in text)
     )
 
@@ -5516,7 +5527,8 @@ def sb_claim_ok(v):
 
 def sb_expected_ok(o):
     """{state: never_bound} exactly, or a record in its state with its id,
-    version and owner (owner in every recorded state: Atem's proposal)."""
+    version and owner (owner in every recorded state: Atem's proposal,
+    agreed with Astation)."""
     if not isinstance(o, dict):
         return False
     if o.get("state") == "never_bound":
@@ -5610,7 +5622,8 @@ class SbList(VrList):
 def sb_verify(text, lst, expected, now):
     """verify_station_binding, from the file's note: the first failure in
     the order of Atem's answer (#120 comment 7207827118, Atem's proposal,
-    for Astation's agreement), or the verified binding."""
+    agreed with Astation, Atem #210 comment 7209922243), or the verified
+    binding."""
     body, sig = read_sb_proof(text)
     if lst.frozen:
         raise Refused("frozen")
@@ -5667,8 +5680,9 @@ def check_station_binding(file, data, report, context):
     examples (each challenge read, its signing input's digest, both
     signatures under the posted keys, over that input only); the chain's
     entries; each challenge text read or refused; each proof's code in the
-    order of Atem's answer (#120 comment 7207827118, Atem's proposal, for
-    Astation's agreement), or its verified fields, against log L and the case's
+    order of Atem's answer (#120 comment 7207827118, Atem's proposal, agreed
+    with Astation, Atem #210 comment 7209922243), or its verified fields,
+    against log L and the case's
     chain, the valid proofs' jcs, signing input and signature by their
     signer's key; the builder's held bodies and refusals; and the immutable
     request's finishes, signed here (P-256 with a fresh nonce)."""
@@ -5809,8 +5823,6 @@ WORK_STATES = {
 }
 OPAQUE_ID = r"[A-Za-z0-9._:-]{1,128}"
 MAX_REQUEST_BYTES = 256 * 1024
-# Unicode's White_Space property (PropList.txt).
-WHITE_SPACE = set(map(chr, [*range(0x09, 0x0E), 0x20, 0x85, 0xA0, 0x1680, *range(0x2000, 0x200B), 0x2028, 0x2029, 0x202F, 0x205F, 0x3000]))
 
 
 def task_snapshot_ok(s):

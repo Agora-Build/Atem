@@ -2661,6 +2661,58 @@ fn checker_format_ranges_are_the_framing_modules() {
     assert_eq!(theirs, ours, "the checker's CF_RANGES");
 }
 
+/// The independent checker writes out White_Space (`WHITE_SPACE_RANGES` in
+/// `scripts/check-r9-vectors.py`; Python's `str.isspace()` is another set,
+/// which adds U+001C to U+001F) for its nonblank rules (an alert's reason,
+/// a failed detail, a Station's text): it must be exactly the set the
+/// core's `framing::is_white_space` gives (Unicode 18.0.0, the generated
+/// `unicode_data::WHITE_SPACE`).
+#[test]
+fn checker_white_space_is_the_framing_modules() {
+    use atem_client::session::framing::is_white_space;
+    let script = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/check-r9-vectors.py"),
+    )
+    .unwrap();
+    let start = script
+        .find("WHITE_SPACE_RANGES = [")
+        .expect("WHITE_SPACE_RANGES in the checker");
+    assert_eq!(
+        script.matches("WHITE_SPACE_RANGES = [").count(),
+        1,
+        "one definition"
+    );
+    assert_eq!(
+        script.matches("\nWHITE_SPACE = ").count(),
+        1,
+        "one WHITE_SPACE, from the ranges"
+    );
+    let end = start + script[start..].find("\n]").unwrap();
+    let hex = |t: &str| u32::from_str_radix(t.trim().trim_start_matches("0x"), 16).unwrap();
+    let theirs: Vec<(u32, u32)> = script[start..end]
+        .split('(')
+        .skip(1)
+        .map(|pair| {
+            let pair = pair.split(')').next().unwrap();
+            let (a, b) = pair.split_once(',').unwrap();
+            (hex(a), hex(b))
+        })
+        .collect();
+    let mut ours: Vec<(u32, u32)> = Vec::new();
+    for cp in 0..=0x10FFFFu32 {
+        let Some(c) = char::from_u32(cp) else {
+            continue;
+        };
+        if is_white_space(c) {
+            match ours.last_mut() {
+                Some(r) if r.1 + 1 == cp => r.1 = cp,
+                _ => ours.push((cp, cp)),
+            }
+        }
+    }
+    assert_eq!(theirs, ours, "the checker's WHITE_SPACE_RANGES");
+}
+
 /// The `outcome_unknown` entries of `r9-vectors-push-hint` (kept apart from
 /// the file's other fields, whose bytes never move): hints for two alerts,
 /// their `details`, ack entries and refused cases. Every value comes from the
@@ -3143,8 +3195,9 @@ fn host_route() {
     }
 
     // The proxy kind (a Station's challenge through Astation's `:8080`;
-    // proposed, for Astation's agreement): the same cases under their own
-    // type and label, and the refusals across the kinds.
+    // agreed with Astation 2026-11-16, #174 comment 6919776085): the same
+    // cases under their own type and label, and the refusals across the
+    // kinds.
     let proxy = run.get("proxy");
     for case in proxy["valid"].as_array().unwrap() {
         let label = s(case, "label");
@@ -3281,8 +3334,8 @@ fn host_route() {
         );
         run.pass(format!("relay reply {label}: refused"));
     }
-    // The Station's notice on an open link (III.5; Atem's proposal, for
-    // Astation's agreement, #120 7207832274).
+    // The Station's notice on an open link (III.5; Atem's proposal, #120
+    // 7207832274, agreed with Astation, #120 7212501350 and 7213560895).
     let notices = run.get("service_suspended");
     for case in notices["valid"].as_array().unwrap() {
         use atem_client::station_notice::ServiceSuspended;
@@ -3392,29 +3445,54 @@ fn host_route_proxy_vectors(book: &Book, file: &Value) -> Value {
          "reason": "the relay at_head proof with its type changed to atem-host-route-proxy, its signature kept"},
     ]);
     json!({
-        "note": "R9.7b through Astation's :8080 proxy (the delegated host-work design I.5.8; proposed, for Astation's agreement): the proof's fields under their own type atem-host-route-proxy, signed by the host's host_channel_key over enc([\"atem-host-route-proxy-v1\", jcs(body)]), against the same log, chain, challenge and atem_id as the relay cases. Each `valid` case verifies as the proxy kind only (the relay verifier refuses it, malformed, its type); every relay `valid` case is refused by the proxy verifier the same way. `cross` cases are refused by the verifier of the kind they name (`verifier`), with `code`. A Station accepts a proxy proof only on Astation's native-bound forwarding connection, never as a relay route.",
+        "note": "R9.7b through Astation's :8080 proxy (the delegated host-work design I.5.8; agreed with Astation 2026-11-16, #174 comment 6919776085): the proof's fields under their own type atem-host-route-proxy, signed by the host's host_channel_key over enc([\"atem-host-route-proxy-v1\", jcs(body)]), against the same log, chain, challenge and atem_id as the relay cases. Each `valid` case verifies as the proxy kind only (the relay verifier refuses it, malformed, its type); every relay `valid` case is refused by the proxy verifier the same way. `cross` cases are refused by the verifier of the kind they name (`verifier`), with `code`. A Station accepts a proxy proof only on Astation's native-bound forwarding connection, never as a relay route.",
         "valid": valid,
         "cross": cross,
     })
 }
 
+/// `r9-vectors-host-route`'s own form: Python's `json.dumps(indent=2,
+/// sort_keys=True, ensure_ascii=True)` and a newline, the form #211's
+/// hand-written `relay_replies` and `service_suspended` sections were
+/// written in: serde's sorted pretty form with every character from U+007F
+/// up written `\uXXXX` (lowercase hex; a surrogate pair beyond the BMP).
+fn host_route_form(value: &Value) -> String {
+    let mut out = String::new();
+    for c in serde_json::to_string_pretty(value).unwrap().chars() {
+        if (c as u32) < 0x7f {
+            out.push(c);
+        } else {
+            let mut units = [0u16; 2];
+            for unit in c.encode_utf16(&mut units) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    out + "\n"
+}
+
+/// The file is exactly its own form, so a writer that rewrites it moves
+/// nothing it didn't make (review N6).
+#[test]
+fn host_route_file_is_its_own_form() {
+    let text = std::fs::read_to_string(fixtures_dir().join("r9-vectors-host-route.json")).unwrap();
+    let file: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(host_route_form(&file), text);
+}
+
 /// Writes `proxy` into `r9-vectors-host-route` (the rest of the file as it
-/// is: the file is serde's sorted pretty form, checked first).
+/// is: the file is its own form, [`host_route_form`], checked first).
 #[test]
 #[ignore = "writes the host route proxy-kind vectors"]
 fn write_host_route_proxy_vectors() {
     let path = fixtures_dir().join("r9-vectors-host-route.json");
     let text = std::fs::read_to_string(&path).unwrap();
     let mut file: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(host_route_form(&file), text, "the file is its own form");
     let mut before = file.clone();
     before.as_object_mut().unwrap().remove("proxy");
-    let proxy = host_route_proxy_vectors(&Book::load(), &before);
-    let unchanged = serde_json::to_string_pretty(&before).unwrap() + "\n";
-    if file.get("proxy").is_none() {
-        assert_eq!(unchanged, text, "the file is serde's pretty form");
-    }
-    file["proxy"] = proxy;
-    std::fs::write(path, serde_json::to_string_pretty(&file).unwrap() + "\n").unwrap();
+    file["proxy"] = host_route_proxy_vectors(&Book::load(), &before);
+    std::fs::write(path, host_route_form(&file)).unwrap();
 }
 
 // ------------------------------------- delegated host-work: device-list actions

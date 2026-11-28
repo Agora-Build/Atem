@@ -43,6 +43,7 @@ fn mb_host(rig: &mut LocalRig, root: &Path, os: &ManualOs) -> MbHost {
         Some(crate::session_protocol::r9::host_enc::DNow {
             d_ms: host_now().wall_ms,
             clock: 0,
+            boot: None,
         }),
     )
     .unwrap();

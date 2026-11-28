@@ -122,9 +122,12 @@ unit_enum! {
         /// account (`account_id`), the Agora.Build account in `subject`
         /// (for a transfer, the old owner too, `expected_binding.owner`), and
         /// one line: "This decides which Agora.Build account's state
-        /// controls whether <Station> serves this account's hosts." The body
-        /// is the Station's challenge, exactly (`body_json` shows it); the
-        /// core checks every field before it asks.
+        /// controls whether <Station> serves this account's hosts." For a
+        /// bind, also say that rooms of other Agora.Build accounts move only
+        /// with their owners' consent (the body names no rooms; **Atem's
+        /// request (#120 7234876387 point 2), for Astation's agreement**).
+        /// The body is the Station's challenge, exactly (`body_json` shows
+        /// it); the core checks every field before it asks.
         StationBinding,
     }
 }
@@ -518,8 +521,8 @@ unit_enum! {
     /// released R9 account to `subject`; `Transfer` a bound one to
     /// `subject`, the intended new owner; `Unbind` a bound one, `subject`
     /// its current owner (the same proof as a bind: owner decision
-    /// 2026-11-27; Auth/Portal's agreement pending, Portal #41 comment
-    /// 7208892757).
+    /// 2026-11-27; agreed by Auth/Portal, owner-approved, Portal #41
+    /// comment 7212286584).
     pub enum BindingAction {
         Bind,
         Transfer,
@@ -532,12 +535,12 @@ data_enum! {
     /// (`expected_binding`): none yet (`NeverBound`), or the record in its
     /// state with its `binding_id` (1–128 bytes of `[A-Za-z0-9._:-]`),
     /// `version` (1 to 2^53 − 1) and `owner`, the exact `sub` of the
-    /// Agora.Build account it names (the owner, or the owner let go). A
-    /// `Bind` names `NeverBound`, `Unbound` or `Released`; a `Transfer` and
-    /// an `Unbind` name `Bound`. `owner` in every recorded state: Atem's
-    /// proposal, for Astation's agreement. In JS: `{type: "never_bound"}` or
-    /// `{type: "bound" | "unbound" | "released", bindingId, version,
-    /// owner}`.
+    /// Agora.Build account it names (the owner, or the owner let go). A `Bind`
+    /// names `NeverBound`, `Unbound` or `Released`; a `Transfer` and an
+    /// `Unbind` name `Bound`. `owner` in every recorded state: Atem's proposal,
+    /// agreed with Astation (Atem #210 comment 7209922243). In JS: `{type:
+    /// "never_bound"}` or `{type: "bound" | "unbound" | "released", bindingId,
+    /// version, owner}`.
     pub enum ExpectedBinding {
         NeverBound,
         Bound {
@@ -563,12 +566,12 @@ record! {
     /// Station verified: its exact `iss` (`issuer`) and `sub` (`subject`),
     /// 1–256 bytes of printable ASCII, and its `auth_time` in Unix
     /// **seconds**. The app hands `StationBindingRequest` what it was told:
-    /// its own token's for a bind or an unbind, and for a transfer the new
-    /// owner it was shown (Atem's proposal, for Astation's agreement).
-    /// **Never fill it from the challenge or anything the Station sent**:
-    /// take it from the app's own token, or, for a transfer, from what the
-    /// user chose before the challenge was fetched; else `binding_mismatch`
-    /// can never fire.
+    /// always its own login's, for a transfer too, since the new owner's
+    /// authenticated session makes a transfer request (Atem's proposal,
+    /// agreed with Astation, Atem #210 comment 7209922243; Astation's
+    /// answer, #120 comments 7210632733 and 7234537291). **Never fill it
+    /// from the challenge or anything the Station sent**; else
+    /// `binding_mismatch` can never fire.
     pub struct AuthClaims {
         pub issuer: String,
         pub subject: String,

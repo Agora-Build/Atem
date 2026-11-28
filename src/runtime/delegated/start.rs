@@ -250,6 +250,10 @@ pub struct StartView {
     /// a damaged one; deadlines aren't compared then, and the dispatch
     /// waits).
     pub now_d_ms: Option<u64>,
+    /// The boot-time counter and its boot at the reading that gave
+    /// `now_d_ms` (none without one): the host key pass's due check on a
+    /// previous key's ceiling on the counter.
+    pub now_boot: Option<crate::session_protocol::r9::host_enc::BootAt>,
     /// The delegated clock as that pass observed it (none: no clock, or a
     /// damaged one): a later reading from it is a fresh `D` (host senders'
     /// key stamps), and its latest repair or lowering.
@@ -284,6 +288,7 @@ impl StartView {
             senders: false,
             host_applied: None,
             now_d_ms: None,
+            now_boot: None,
             clock: None,
             live: HashMap::new(),
             refused: HashMap::new(),

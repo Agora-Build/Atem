@@ -57,17 +57,17 @@
 //! - [`FakeStation::suspend`] and [`FakeStation::restore`]: a Station that
 //!   suspends the account's service (the delegated host-work design III.5;
 //!   the `text`, the disclosure order and the host's 10 s drop are Atem's
-//!   proposal, for Astation's agreement, #120 7207832274), as the built-in
-//!   Station does for a disabled or unowned account: on a relay fake each
-//!   channel the test names is closed `service_suspended` (B-3), the
-//!   host's link gets the `service_suspended` notice (B-2) and is closed,
-//!   and every new host connection's proof is refused `service_suspended`
-//!   with the text (B-1, the relay's own: `FakeAstation::suspension`); on
-//!   Astation's local link the notice, the link kept. While suspended the
-//!   Station still announces its `heads`, every call gets its typed
-//!   refusal (a mailbox sync or done too; a put no answer), and a proof
-//!   that verifies gets the suspension's refusal (one that doesn't its
-//!   verifier code). Built from the shared core's builders.
+//!   proposal (#120 7207832274), agreed with Astation (#120 7212501350 and
+//!   7213560895)), as the built-in Station does for a disabled or unowned
+//!   account: on a relay fake each channel the test names is closed
+//!   `service_suspended` (B-3), the host's link gets the `service_suspended`
+//!   notice (B-2) and is closed, and every new host connection's proof is
+//!   refused `service_suspended` with the text (B-1, the relay's own:
+//!   `FakeAstation::suspension`); on Astation's local link the notice, the
+//!   link kept. While suspended the Station still announces its `heads`,
+//!   every call gets its typed refusal (a mailbox sync or done too; a put no
+//!   answer), and a proof that verifies gets the suspension's refusal (one
+//!   that doesn't its verifier code). Built from the shared core's builders.
 //! - [`FakeStation::require_proof`]: a Station that requires the host's
 //!   fresh route proof on each link before it serves the link's calls (the
 //!   delegated host-work design I.5.8, "Which host is calling": session-v1

@@ -3374,12 +3374,13 @@ mod tests {
         handle
     }
 
-    /// The delegated host-work design III.5 (Atem's proposal, for
-    /// Astation's agreement, #120 7207832274): the Station's
+    /// The delegated host-work design III.5 (Atem's proposal, #120 7207832274,
+    /// agreed with Astation, #120 7212501350 and 7213560895): the Station's
     /// `service_suspended` refusal of the relay link's proof, or its notice
-    /// before Astation authenticated the link, fails the connect typed,
-    /// with the Station's text and origin; a verifier code's refusal and a
-    /// malformed suspension are no suspension.
+    /// before Astation authenticated the link, fails the connect typed, with
+    /// the Station's text and origin; a verifier code's refusal and a malformed
+    /// suspension (a blank text included) are no suspension: the connect fails
+    /// as for any unreadable reply, with no text recorded.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_suspended_route_fails_the_relay_connect_with_its_text() {
@@ -3413,6 +3414,9 @@ mod tests {
             RelayReply::refused(&HostRouteRefusal::UnknownHost).to_json().to_string(),
             r#"{"type":"relay","op":"host_route_refused","v":1,"code":"service_suspended"}"#.to_string(),
             r#"{"type":"relay","op":"service_suspended","v":1,"text":""}"#.to_string(),
+            // A blank text (#120 7213560895 item 3), in both forms.
+            r#"{"type":"relay","op":"host_route_refused","v":1,"code":"service_suspended","text":" "}"#.to_string(),
+            r#"{"type":"relay","op":"service_suspended","v":1,"text":"\u3000\u00a0"}"#.to_string(),
         ] {
             let (base, server) = answering_relay("mac-room", reply.clone()).await;
             let error = client

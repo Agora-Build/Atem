@@ -28,7 +28,8 @@
 //!   applied head;
 //! - `signer`: `member:<device_id>` only: a `service:`, `host:` or
 //!   `browser:` signer is `malformed`, unlike the reports' `unknown_signer`
-//!   (Atem's reading of that grammar);
+//!   (Atem's reading of that grammar, agreed with Astation, Atem #210
+//!   comment 7209922243);
 //! - `expected_binding`: `{"state":"never_bound"}`, or `{"state": "bound" |
 //!   "unbound" | "released", "binding_id", "version", "owner"}`
 //!   ([`ExpectedBinding`]): the record the Station holds;
@@ -40,12 +41,22 @@
 //! `transfer` names `bound` and the intended new owner as `subject`
 //! (`subject ≠ owner`); an `unbind` names `bound` and the current owner as
 //! `subject` (`subject = owner`). An unbind needs the same proof as a bind
-//! or a transfer (owner decision 2026-11-27; Auth/Portal's agreement
-//! pending, Portal #41 comment 7208892757): it suspends every host of the
-//! R9 account at that Station, so a stolen Agora.Build session alone can't
-//! do it. Strict I-JSON, exact fields at every level, no `null`, no
-//! duplicate keys (escaped ones included), a challenge text at most 4,096
-//! bytes, the body's `jcs` at most 4,096 bytes and the proof at most 16 KiB.
+//! or a transfer (owner decision 2026-11-27; agreed by Auth/Portal,
+//! owner-approved, Portal #41 comment 7212286584: the current owner's valid
+//! Agora.Build session and a current manager's fresh, signed confirmation
+//! with `action: "unbind"`; D27's admin release and account deletion keep
+//! their separate rules): it suspends every host of the R9 account at that
+//! Station, so a stolen Agora.Build session alone can't do it. A first
+//! binding of a legacy room (a never-bound account whose rooms the Station's
+//! lookup resolves to other Agora.Build accounts) is a `bind` naming
+//! `never_bound`, its `subject` the new owner; each foreign room owner's
+//! authenticated consent to that stored challenge, and the commit-time
+//! recheck of the room owners, are the Station's, and no field is added to
+//! the proof (Astation's reading (#120 7211915578, built in Astation #229),
+//! confirmed by Atem (#120 7234876387)). Strict I-JSON, exact fields at
+//! every level, no `null`, no duplicate keys (escaped ones included), a
+//! challenge text at most 4,096 bytes, the body's `jcs` at most 4,096 bytes
+//! and the proof at most 16 KiB.
 //!
 //! - **The manager's app** builds with [`station_binding_request`], which
 //!   takes nothing that matters from its caller: it checks every field of
@@ -54,12 +65,18 @@
 //!   ([`AuthClaims`]), then holds the challenge as the body; it signs
 //!   through a [`KeyProvider`] ([`sign_station_binding`]) or hands a later
 //!   signature to [`StationBindingRequest::finish`]. **Never fill
-//!   `expected` from the challenge or anything the Station sent**: take it
-//!   from the app's own token, or, for a transfer, from what the user chose
-//!   before the challenge was fetched; else `binding_mismatch` can never
-//!   fire. The builder takes no intended action: before it prompts, the
-//!   app compares the challenge's `action` (and, for a transfer, its
-//!   `expected_binding.owner`) with what the user started.
+//!   `expected` from the challenge or anything the Station sent**: it
+//!   always comes from the app's own login, for a transfer too, since the
+//!   new owner's authenticated session makes a transfer request (Astation's
+//!   answer, #120 comments 7210632733 and 7234537291: the previous owner
+//!   consents to the same challenge on its own, and the Station checks both
+//!   owners, the binding version and the fresh manager proof at commit);
+//!   else `binding_mismatch` can never fire. The builder takes no intended
+//!   action: before it prompts, the app compares the challenge's `action`
+//!   (and, for a transfer, its `expected_binding.owner`) with what the user
+//!   started. It fetches the 30-second challenge immediately before the
+//!   fresh confirmation; an expired one needs a new challenge and a new
+//!   confirmation.
 //! - **The Station** verifies with [`verify_station_binding`] against its
 //!   log at its current head and the challenge it stored, and requires
 //!   `at_head`.
@@ -72,11 +89,12 @@
 //! `expected_binding`, committed with its route invalidations and the
 //! `binding_changed` intent) and exact retries.
 //!
-//! **Atem's proposals, for Astation's agreement** (asked in the post):
-//! `owner` is named in the `unbound` and `released` states too, not only in
-//! `bound`; the builder compares a transfer's `subject`, like every
-//! action's, with the `subject` the app supplies in [`AuthClaims`] (the new
-//! owner it was shown); and both refusal orders, [`BINDING_VERIFY_ORDER`]
+//! **Atem's proposals, agreed with Astation** (Atem #210 comment
+//! 7209922243; #120 comments 7209926358 and 7208696433): `owner` is named in
+//! the `unbound` and `released` states too, not only in `bound` (they keep
+//! the last owner); the builder compares a transfer's `subject`, like every
+//! action's, with the `subject` the app supplies in [`AuthClaims`] (its own
+//! login: the new owner); and both refusal orders, [`BINDING_VERIFY_ORDER`]
 //! and [`BINDING_BUILD_ORDER`], are those of Atem's answer (#120 comment
 //! 7207827118).
 use serde_json::{Map, Value, json};
@@ -103,7 +121,8 @@ pub const MAX_CLAIM_BYTES: usize = 256;
 
 /// The verifier's refusal codes in the order its checks run: the first
 /// that fails is the code ([`verify_station_binding`]). The order of Atem's
-/// answer (#120 comment 7207827118), for Astation's agreement.
+/// answer (#120 comment 7207827118), agreed with Astation (Atem #210
+/// comment 7209922243).
 pub const BINDING_VERIFY_ORDER: [&str; 10] = [
     "malformed",
     "frozen",
@@ -119,7 +138,7 @@ pub const BINDING_VERIFY_ORDER: [&str; 10] = [
 
 /// The builder's refusal codes in the order its checks run
 /// ([`station_binding_request`]). The order of Atem's answer (#120 comment
-/// 7207827118), for Astation's agreement.
+/// 7207827118), agreed with Astation (Atem #210 comment 7209922243).
 pub const BINDING_BUILD_ORDER: [&str; 11] = [
     "malformed",
     "frozen",
@@ -225,7 +244,8 @@ impl BindingRecord {
 
 /// The record the Station expects to change (`expected_binding`): none yet,
 /// or one in its state. `owner` is named in every recorded state (Atem's
-/// proposal, for Astation's agreement).
+/// proposal, agreed with Astation, Atem #210 comment 7209922243: `unbound`
+/// and `released` keep the last owner).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExpectedBinding {
     /// `{"state":"never_bound"}`.
@@ -302,12 +322,11 @@ impl ExpectedBinding {
 /// The Agora.Build sign-in a binding names, from the token the Station
 /// verified: its exact `iss` and `sub` (1–256 bytes of printable ASCII) and
 /// its `auth_time` in Unix seconds. The app hands the builder what it was
-/// told: its own token's for a bind or an unbind, and for a transfer the
-/// new owner it was shown (Atem's proposal, for Astation's agreement).
-/// Never fill it from the challenge or anything the Station sent: take it
-/// from the app's own token, or, for a transfer, from what the user chose
-/// before the challenge was fetched; else `binding_mismatch` can never
-/// fire.
+/// told: always its own login's, for a transfer too, since the new owner's
+/// authenticated session makes a transfer request (Atem's proposal, agreed
+/// with Astation, Atem #210 comment 7209922243; Astation's answer, #120
+/// comments 7210632733 and 7234537291). Never fill it from the challenge or
+/// anything the Station sent; else `binding_mismatch` can never fire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthClaims {
     pub issuer: String,

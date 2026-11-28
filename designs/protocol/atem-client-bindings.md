@@ -85,7 +85,9 @@ keeps the last 64 requests; one past them is a new request); `state:
 "pending"` names a key handed out for a rotation, on a retry after an
 entry set it too, and whether the list holds it by now is for the
 manager's own log (`check_change`'s `enc_key_reused`) to say (both Atem's
-readings, for Astation's confirmation: host-work-v1 §11.5).
+readings, agreed with Astation, #120 comment 7208696433: an evicted id can
+get a different key, and a retry after promotion can still read
+`pending`; host-work-v1 §11.5).
 
 Persist launch request IDs and immutable message/task identities before sending.
 Recover uncertain results with their query operations; a retry uses a fresh
@@ -918,8 +920,11 @@ on the reports' core). How a native manager binds, transfers or unbinds an
 R9 account's Agora.Build owner at a Station: it decides which Agora.Build
 account's state controls whether that Station serves the account's hosts.
 **A voluntary unbind needs the same proof as a bind or a transfer** (owner
-decision 2026-11-27; Auth/Portal's agreement pending, Portal #41 comment
-7208892757). The Station mints the whole body and stores it; the
+decision 2026-11-27; **agreed by Auth/Portal, owner-approved**, Portal #41
+comment 7212286584: the current owner's valid Agora.Build session and a
+current manager's fresh, signed `atem-station-binding` confirmation with
+`action: "unbind"`; D27's admin release and account deletion keep their
+separate rules). The Station mints the whole body and stores it; the
 manager signs exactly what was minted. The proof is `{"body":<the
 challenge>,"sig":…}`, signed over `enc(["atem-station-binding-v1",
 jcs(body)])` by the manager's `auth_key`. **The token's validation, the
@@ -931,11 +936,11 @@ Station's**; these calls are the primitive only:
 |---|---|
 | `station_binding_challenge(action, origin, claims, account_id, genesis_hash, head, signer, expected_binding, issued_at, expires_at)` (JS `stationBindingChallenge`, `claims` `{issuer, subject, authTime}`, `head` `{seq, hash}`, `expectedBinding` `{type: "never_bound"}` or `{type: "bound" \| "unbound" \| "released", bindingId, version, owner}`) | the Station's challenge as canonical JSON, a fresh 32-byte nonce from the OS CSPRNG: `action: BindingAction` (`Bind`, `Transfer`, `Unbind`), `origin` the Station (normalized here), `claims: AuthClaims{issuer, subject, auth_time}` the token's exact `iss` and `sub` (1–256 bytes of printable ASCII) and its `auth_time` in Unix **seconds** (`auth_time × 1000 ≤ issued_at`), `account_id` (1–128 bytes of `[A-Za-z0-9._:-]`), `genesis_hash` and `head` the R9 account at the Station's applied head, `signer` `member:<device_id>`, `expected_binding: ExpectedBinding` (`NeverBound`, or `Bound`, `Unbound`, `Released` with `binding_id`, `version`, `owner`), `0 < expires_at − issued_at ≤ 30000` ms. Per action: a `Bind` names `NeverBound`, `Unbound` or `Released`; a `Transfer` `Bound` with `subject ≠ owner`; an `Unbind` `Bound` with `subject = owner`. Store it |
 | `parse_station_binding_challenge(challenge_json)` | `StationBindingChallenge{action, origin, issuer, subject, auth_time, account_id, genesis_hash, head, signer, expected_binding, nonce, issued_at, expires_at}` (`nonce` base64url), read strictly: at most 4,096 bytes, exactly the fifteen fields at every level (`type` `atem-station-binding`, `v` 1), each one's grammar and the per-action rules. For the confirmation, and for the Station to check what it minted |
-| `StationBindingRequest(log, challenge_json, signer, origin, expected, key_id, now_ms)` | an immutable handle (UniFFI Object, a WASM class) holding the challenge as the body, once the core checked it against `log`, `signer` (this app, `member:<id>`), `origin` (its configured Station) and `expected: AuthClaims` (the sign-in it was told: its own token's for a bind or an unbind, and for a transfer the new owner it was shown). **Never fill `expected` from the challenge or anything the Station sent; take it from the app's own token, or, for a transfer, from what the user chose before the challenge was fetched**: else `binding_mismatch` can never fire. Refused, in this order (Atem's proposal, for Astation's agreement): `malformed` (the challenge, `signer`, `origin` or `expected` outside its grammar), `frozen`, `wrong_account` (another R9 account or genesis), `origin_mismatch` (another Station), `signer_mismatch`, `unknown_signer` (a `member:` that isn't a current native member: removed, never added, a service named as a member, `recovery`, the subject of a `recovery_add` still waiting; a `service:`, `host:` or `browser:` signer is outside the grammar, `malformed`), `not_a_manager` (no `manage` at the log's head), `stale_log` (the challenge's head beyond the log's: fetch first) or `fork`, `binding_mismatch` (`issuer`, `subject` or `auth_time` other than `expected`), `expired` |
+| `StationBindingRequest(log, challenge_json, signer, origin, expected, key_id, now_ms)` | an immutable handle (UniFFI Object, a WASM class) holding the challenge as the body, once the core checked it against `log`, `signer` (this app, `member:<id>`), `origin` (its configured Station) and `expected: AuthClaims` (the sign-in it was told: always the app's own login, for a transfer too, since the new owner's authenticated session makes a transfer request). **Never fill `expected` from the challenge or anything the Station sent; it always comes from the app's own login**: else `binding_mismatch` can never fire. Refused, in this order (Atem's proposal, agreed with Astation, Atem #210 comment 7209922243): `malformed` (the challenge, `signer`, `origin` or `expected` outside its grammar), `frozen`, `wrong_account` (another R9 account or genesis), `origin_mismatch` (another Station), `signer_mismatch`, `unknown_signer` (a `member:` that isn't a current native member: removed, never added, a service named as a member, `recovery`, the subject of a `recovery_add` still waiting; a `service:`, `host:` or `browser:` signer is outside the grammar, `malformed`), `not_a_manager` (no `manage` at the log's head), `stale_log` (the challenge's head beyond the log's: fetch first) or `fork`, `binding_mismatch` (`issuer`, `subject` or `auth_time` other than `expected`), `expired` |
 | `request.sign_request()` / `request.body_json()` / `request.challenge()` | the `SignRequest` for `key_id` (purpose `StationBinding`, `fresh_confirmation: true`, label `atem-station-binding-v1`, `input` = `enc([label, body])`, `body_json` the held body, the challenge's canonical JSON); the held body, read only; the challenge's fields, for the confirmation |
 | `request.finish(signature)` | the proof (canonical `{"body":<held body>,"sig":…}`) once `signature` (P-256 64-byte `r‖s`, either S, normalized to low S; or Ed25519) verifies under the signer's key at the log's head over the held body; anything else is `Report{bad_signature}`. The handle never changes |
 | `sign_station_binding(provider, log, challenge_json, signer, origin, expected, key_id, now_ms)` (Swift, Kotlin; JS `signStationBinding(store, …)` with a `SoftwareKeyStore`, for tests and tools: a native's key is never a software key) | the request's checks, then the provider signs at once after the owner's fresh confirmation (no binding lock held meanwhile): the proof, or `Report{signing_failed}` when the owner cancels or the provider fails, `Report{bad_signature}` when `key_id` isn't the signer's key in the log |
-| `verify_station_binding(log, proof_json, expected_challenge_json, now_ms)` | `VerifiedStationBinding{action, signer, head, at_head, account_id, genesis_hash, issuer, subject, auth_time, expected_binding, nonce, expires_at}` against `log` at its current head and the challenge the Station stored, or `Report{code}`: the first failure (in the order of Atem's answer, for Astation's agreement) of `malformed`, `frozen`, `wrong_account`, `unknown_signer`, `not_a_manager` (at the verifier's head, so a manager demoted after it signed fails), `bad_signature`, `stale_log`, `fork`, `challenge_mismatch` (the body isn't the stored challenge, compared on its canonical JSON), `expired`. **The Station requires `at_head`**, as its commit-time recheck does. An expected challenge that doesn't read is `Invalid{malformed}` |
+| `verify_station_binding(log, proof_json, expected_challenge_json, now_ms)` | `VerifiedStationBinding{action, signer, head, at_head, account_id, genesis_hash, issuer, subject, auth_time, expected_binding, nonce, expires_at}` against `log` at its current head and the challenge the Station stored, or `Report{code}`: the first failure (in the order of Atem's answer, agreed with Astation, Atem #210 comment 7209922243) of `malformed`, `frozen`, `wrong_account`, `unknown_signer`, `not_a_manager` (at the verifier's head, so a manager demoted after it signed fails), `bad_signature`, `stale_log`, `fork`, `challenge_mismatch` (the body isn't the stored challenge, compared on its canonical JSON), `expired`. **The Station requires `at_head`**, as its commit-time recheck does. An expected challenge that doesn't read is `Invalid{malformed}` |
 
 The purpose `StationBinding` asks a **fresh confirmation every time**:
 never the 5-minute reuse, never in the background or a notification
@@ -946,21 +951,37 @@ Agora.Build account's state controls whether <Station> serves this
 account's hosts." The builder takes no intended action: before it
 prompts, the app compares the challenge's `action` (and, for a transfer,
 its `expected_binding.owner`) with what the user started. The lease is at
-most 30 s: fetch the challenge right before the prompt. The rooms that move aren't in the body (the nonce names
-the Station's frozen context; they are all the R9 account's): say so in
-the confirmation.
+most 30 s: fetch the challenge immediately before the fresh confirmation;
+an expired one needs a new challenge and a new confirmation (agreed with
+Astation, #120 comment 7208696433). The rooms that move aren't in the
+body (the nonce names the Station's frozen context; they are all the R9
+account's): say so in the confirmation. For a bind, also say that rooms of
+other Agora.Build accounts move only with their owners' consent (**Atem's
+request (#120 7234876387 point 2), for Astation's agreement**).
 
-**Atem's proposals, for Astation's agreement** (asked on #120 comment
-7207827118; each is fail-closed and changes if Astation reads it
-otherwise):
+**The first binding of a legacy room** (Astation's reading (#120
+7211915578, built in Astation #229), confirmed by Atem (#120 7234876387)):
+the proof is a `bind` naming `never_bound`, each foreign room owner
+consents to that stored challenge at the Station with its own native
+login, and no field is added to the proof.
+
+**A transfer** (Astation's answer, #120 comments 7210632733 and
+7234537291): the new owner's authenticated session starts it, its expected
+subject from the app's own login; the previous owner independently
+consents to the same challenge; at commit the Station checks both owners,
+the binding version and the fresh native manager proof.
+
+**Atem's proposals, agreed with Astation** (asked on #120 comment
+7207827118; agreed on Atem #210 comment 7209922243 and #120 comments
+7209926358 and 7208696433):
 
 - `owner` is named in the `unbound` and `released` states too, not only in
   `bound`: an `ExpectedBinding.Unbound` or `.Released` without its owner
   is `malformed`.
 - The builder compares a transfer's `subject`, like every action's, with
-  the `subject` the app supplies in `expected` (the new owner it was
-  shown); which session makes a transfer request is Astation's to answer.
-  Never fill `expected` from the challenge or anything the Station sent.
+  the `subject` the app supplies in `expected`: the new owner, the app's
+  own signed-in user, whose session makes a transfer request. Never fill
+  `expected` from the challenge or anything the Station sent.
 - A binding's `signer` is `member:<device_id>` only, so a `service:`,
   `host:` or `browser:` signer is `malformed`, where the reports answer
   `unknown_signer` (Atem's reading of that grammar).

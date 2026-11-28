@@ -508,6 +508,7 @@ fn the_recipient_is_the_pairings_with_the_generations_key_and_record() {
     let now = Some(host_enc::DNow {
         d_ms: crate::session_protocol::membership::r9log::host_now().wall_ms,
         clock: 0,
+        boot: None,
     });
     let got = host_enc::recipient(&src, &log.log, now).unwrap();
     assert!(got.recipient.keys.is_empty(), "no entry set it yet");

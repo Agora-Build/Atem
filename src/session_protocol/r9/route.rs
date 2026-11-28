@@ -894,12 +894,15 @@ mod tests {
         assert_eq!(r8.on_reply(&refused), None);
     }
 
-    /// The delegated host-work design III.5 (Atem's proposal, for
-    /// Astation's agreement, #120 7207832274): a Station's
+    /// The delegated host-work design III.5 (Atem's proposal, #120
+    /// 7207832274, agreed with Astation, #120 7212501350 and 7213560895,
+    /// except the local link's B-1, still open: #120 7234876630): a Station's
     /// `service_suspended` refusal is this link's verdict as any refusal
     /// is (only after its own proof, once), with its text; a malformed one
-    /// (no text, a verifier code with a text) is no verdict. Through
-    /// Astation's local link the same, for the authentication's proof.
+    /// (no text, a blank text, a verifier code with a text) is no verdict,
+    /// as any reply the shared reader refuses: ignored with a line, no
+    /// trust change. Through Astation's local link the same, for the
+    /// authentication's proof.
     #[test]
     fn a_suspension_is_the_verdict_on_the_links_own_proof_with_its_text() {
         let mut log = TestLog::genesis("acct-1", &secret("route astation"));
@@ -916,6 +919,13 @@ mod tests {
         let with_text =
             r#"{"type":"relay","op":"host_route_refused","v":1,"code":"fork","text":"x"}"#;
         assert_eq!(link.on_reply(with_text), None, "malformed");
+        // Nonblank (#120 7213560895 item 3): nothing but White_Space.
+        for blank in [" ", "\u{3000}", "\u{a0}\u{2005} "] {
+            let reply = format!(
+                r#"{{"type":"relay","op":"host_route_refused","v":1,"code":"service_suspended","text":"{blank}"}}"#
+            );
+            assert_eq!(link.on_reply(&reply), None, "blank: {blank}");
+        }
         assert_eq!(
             link.on_reply(&suspended),
             Some(RouteResult::Suspended(text.into()))

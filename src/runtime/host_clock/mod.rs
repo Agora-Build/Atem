@@ -56,6 +56,7 @@ pub mod state;
 use self::os::{OsReading, Synced};
 use self::state::{Change, ChangeKind, ClockEvent, ClockState, StationStep, Step};
 use crate::runtime::host_work::Store;
+use crate::session_protocol::r9::host_enc::{BootAt, DNow};
 use rusqlite::types::Value;
 use std::sync::Arc;
 
@@ -137,9 +138,17 @@ impl std::fmt::Debug for ClockSnapshot {
 impl ClockSnapshot {
     /// `D` at a reading taken now (the last reading observed when the
     /// hook's file has none; none without either).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn d_ms(&self) -> Option<u64> {
+        self.key_now().map(|(d_ms, _)| d_ms)
+    }
+
+    /// `D` and the boot-time counter with its boot at one reading taken
+    /// now (as [`ClockSnapshot::d_ms`]): host senders' key stamps and every
+    /// check of a previous key's window read both from the same reading.
+    pub fn key_now(&self) -> Option<(u64, BootAt)> {
         let r = (self.read)().or_else(|| self.last.clone())?;
-        Some(self.state.deadline_ms(&r))
+        Some((self.state.deadline_ms(&r), boot_at(&r)))
     }
 
     /// The latest repair or lowering the record keeps (§11.6): `D` just
@@ -170,26 +179,75 @@ pub fn mark_of(state: &ClockState) -> u64 {
     u64::from_be_bytes(digest[..8].try_into().expect("8 bytes"))
 }
 
+/// The boot's mark: 64 bits of SHA-256 over the boot id, the machine
+/// identity and the boot-time namespace offset of `r`, the three that make
+/// one boot for the clock (§11.6, "One boot"). Host senders' key stamps
+/// keep it with the boot-time counter (host-work-v1 §11.5, the routine
+/// rotation: the previous key's elapsed ceiling holds on the stamp's boot
+/// only, and another boot retires it at once).
+pub fn boot_mark(r: &OsReading) -> u64 {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(atem_client::encoding::enc(&[
+        BOOT_LABEL.as_bytes(),
+        r.boot_id.as_bytes(),
+        &r.machine,
+        &r.timens_boot_ns.to_be_bytes(),
+    ]));
+    u64::from_be_bytes(digest[..8].try_into().expect("8 bytes"))
+}
+
+/// [`boot_mark`]'s domain label.
+const BOOT_LABEL: &str = "atem-host-clock-boot-v1";
+
+/// `r`'s boot-time counter (ms) and its boot ([`boot_mark`]).
+pub fn boot_at(r: &OsReading) -> BootAt {
+    BootAt {
+        boot: boot_mark(r),
+        ms: r.boot_ns / 1_000_000,
+    }
+}
+
+/// `atem status`'s reading for the `Host key:` line (taken only when a
+/// previous key's ceiling on the counter is to be shown): the boot-time
+/// counter with its boot, and the wall clock, at one reading of the OS (the
+/// debug hook's when it is set; none while its file has none). Read only.
+pub fn status_reading() -> Option<(BootAt, u64)> {
+    status_reading_of(&system_reading()?)
+}
+
+/// [`status_reading`] of `r`: none for a boot the OS can't name
+/// (`os::UNKNOWN_BOOT_PREFIX`, one id per process), whose mark the
+/// runtime's process doesn't share, so the status can't compare it with a
+/// stamp.
+fn status_reading_of(r: &OsReading) -> Option<(BootAt, u64)> {
+    (!r.boot_id.starts_with(os::UNKNOWN_BOOT_PREFIX)).then(|| (boot_at(r), r.wall_ms))
+}
+
 /// A fresh start's epoch (`ClockState::set_epoch`).
 fn new_epoch() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
-/// `D` and the clock's mark at a runtime's start, before the host-work
-/// store opens (the device list's replay of a carriage record at its open):
-/// the clock's record read from the store at `state` (read only) and a
-/// reading taken now, observed as `HostClock` observes one (its
-/// follow-downs included: re-review I1), so `D` is the one the first pass
-/// reads. None without a store, a record, a readable record or a reading.
-pub fn start_reading(state: &std::path::Path) -> Option<(u64, u64)> {
+/// `D`, the clock's mark and the boot-time counter with its boot at a
+/// runtime's start, before the host-work store opens (the device list's
+/// replay of a carriage record at its open): the clock's record read from
+/// the store at `state` (read only) and a reading taken now, observed as
+/// `HostClock` observes one (its follow-downs included: re-review I1), so
+/// `D` is the one the first pass reads. None without a store, a record, a
+/// readable record or a reading.
+pub fn start_reading(state: &std::path::Path) -> Option<DNow> {
     start_reading_at(state, &system_reading()?)
 }
 
 /// [`start_reading`] at the reading `r`.
-fn start_reading_at(state: &std::path::Path, r: &OsReading) -> Option<(u64, u64)> {
+fn start_reading_at(state: &std::path::Path, r: &OsReading) -> Option<DNow> {
     let value = Store::clock_at(state).ok()??;
     let next = parse(&value).ok()?.observe(r).next;
-    Some((next.deadline_ms(r), mark_of(&next)))
+    Some(DNow {
+        d_ms: next.deadline_ms(r),
+        clock: mark_of(&next),
+        boot: Some(boot_at(r)),
+    })
 }
 
 /// What became of a Station's `station_time` ([`HostClock::station_time`]).
@@ -521,15 +579,26 @@ impl HostClock {
     /// OS's, whose machine and boot aren't the hook's (PR 4 review D1). None
     /// without a record either.
     pub fn reading(&self) -> Option<DelegatedNow> {
+        self.reading_with_boot().map(|(now, _)| now)
+    }
+
+    /// [`HostClock::reading`] with the boot-time counter and its boot from
+    /// the same reading (none for the record's own values): the pass's
+    /// reading, which host senders' key pass compares with a previous
+    /// key's ceiling on the counter (review N5).
+    pub fn reading_with_boot(&self) -> Option<(DelegatedNow, Option<BootAt>)> {
         match (self.read)().or_else(|| self.last.clone()) {
-            Some(r) => Some(DelegatedNow {
-                h_ms: self.state.h_ms(&r),
-                d_ms: self.state.deadline_ms(&r),
-            }),
+            Some(r) => Some((
+                DelegatedNow {
+                    h_ms: self.state.h_ms(&r),
+                    d_ms: self.state.deadline_ms(&r),
+                },
+                Some(boot_at(&r)),
+            )),
             None => self
                 .state
                 .stored_ms()
-                .map(|(h_ms, d_ms)| DelegatedNow { h_ms, d_ms }),
+                .map(|(h_ms, d_ms)| (DelegatedNow { h_ms, d_ms }, None)),
         }
     }
 
