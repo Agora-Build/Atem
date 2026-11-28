@@ -885,9 +885,10 @@ impl AckLedger {
     /// order-free: at the same `now_ms`, two learns give the same ledger in
     /// either order, byte for byte, on any replica. It never raises a
     /// start: a date up to an hour after the own revoke's `issued_at` that
-    /// `record` would have kept leaves a `None` record's `issued_at` (late,
-    /// never early; the final up to an hour later than if the date had come
-    /// with the record). A date that ends the window makes the final at
+    /// `record` would have kept leaves a `None` record's `issued_at` (the
+    /// final up to an hour earlier than if the date had come with the
+    /// record, yet never before the revocation's own deadline: the Station
+    /// signs its own revoke only after the Portal revoked). A date that ends the window makes the final at
     /// once, after the per-host reports already made. After the final (all
     /// applied or the deadline passed) a learn still lowers the stored
     /// start, but makes no report and changes no report or the final: after

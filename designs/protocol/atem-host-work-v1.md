@@ -3353,8 +3353,10 @@ own Station's feed:
   window makes the final at once, after the per-host reports already
   made. A learn never raises a start: a date up to an hour after
   `issued_at` that `record` would have kept leaves a `None` record's
-  `issued_at`, so the same date gives a final up to an hour later when it
-  comes after the record (late, never early). After the final a learn
+  `issued_at`, so the same date gives a final up to an hour earlier when
+  it comes after the record, yet never before the revocation's own
+  deadline (the Station signs its own revoke only after the Portal
+  revoked). After the final a learn
   still lowers the stored start, but makes no report and changes no
   report or the final: after the final, no report changes and none is
   sent twice. A learn and an ack don't commute when the date ends the
