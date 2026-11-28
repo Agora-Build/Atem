@@ -249,13 +249,12 @@ pub enum RouteKind {
     /// signed over `enc(["atem-host-route-v1", jcs(body)])`. Only this
     /// kind gives a relay route (carrier B).
     Relay,
-    /// A Station's challenge that Astation's local `:8080` proxy forwards
-    /// (the delegated host-work design I.5.8; **agreed with Astation
-    /// 2026-11-16, #174 comment 6919776085**): `atem-host-route-proxy`,
-    /// signed over
+    /// A Station's challenge that Astation's local `:8080` proxy forwards (the
+    /// delegated host-work design I.5.8; **agreed with Astation 2026-11-16,
+    /// #174 comment 6919776085**): `atem-host-route-proxy`, signed over
     /// `enc(["atem-host-route-proxy-v1", jcs(body)])`. A Station accepts it
-    /// only on Astation's native-bound forwarding connection, never as a
-    /// relay route.
+    /// only on Astation's native-bound forwarding connection, never as a relay
+    /// route.
     Proxy,
 }
 
@@ -415,14 +414,16 @@ pub const MAX_SERVICE_TEXT_BYTES: usize = 256;
 
 /// Whether `text` is a Station's text a host may show (`atem status`,
 /// runtime.log): 1 to [`MAX_SERVICE_TEXT_BYTES`] bytes of UTF-8, nonblank
-/// (not every character White_Space, Unicode 18.0.0's, the framing
-/// module's table: [`crate::session::framing::is_white_space`]; around a
-/// visible character it stays, as sent), with no character of General
-/// Category Cc, Cf, Zl or Zp (the pinned Unicode data's), so no terminal
-/// escape, bidi control or line break reaches a terminal, and no blank
-/// line. **Atem's proposal (#120 7207832274), agreed with Astation (#120
-/// 7212501350 and 7213560895; nonblank: item 3 of 7213560895)**. Every
-/// reader and builder of both forms checks it ([`RelayReply::suspended`],
+/// (not every character White_Space, Unicode 18.0.0's, the framing module's
+/// table: [`crate::session::framing::is_white_space`]; around a visible
+/// character it stays, as sent), with no character of General Category Cc,
+/// Cf, Zl or Zp (the pinned Unicode data's), so no terminal escape, bidi
+/// control, line break or text of nothing but White_Space reaches a
+/// terminal (invisible characters that aren't White_Space, such as U+3164
+/// or U+2800, still read: Astation's rule is White_Space). **Atem's
+/// proposal (#120 7207832274), agreed with Astation (#120 7212501350 and
+/// 7213560895; nonblank: item 3 of 7213560895)**. Every reader and builder
+/// of both forms checks it ([`RelayReply::suspended`],
 /// [`RelayReply::parse`], `station_notice::ServiceSuspended`).
 pub fn service_text_ok(text: &str) -> bool {
     use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};

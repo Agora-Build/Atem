@@ -1,23 +1,22 @@
 //! A native manager's Station binding proof (`atem_client::station_binding`;
-//! delegated host-work III.5 (b), Atem's answer on #120 comment
-//! 7207827118): the signed proof that binds, transfers or unbinds an R9
-//! account's Agora.Build owner at a Station. It decides which Agora.Build
-//! account's state controls whether that Station serves the account's
-//! hosts; an unbind needs the same proof as a bind (owner decision
-//! 2026-11-27; agreed by Auth/Portal, owner-approved, Portal #41 comment
-//! 7212286584: the current owner's session and a current manager's fresh
-//! confirmation with `action: "unbind"`).
+//! delegated host-work III.5 (b), Atem's answer on #120 comment 7207827118):
+//! the signed proof that binds, transfers or unbinds an R9 account's
+//! Agora.Build owner at a Station. It decides which Agora.Build account's
+//! state controls whether that Station serves the account's hosts; an unbind
+//! needs the same proof as a bind (owner decision 2026-11-27; agreed by
+//! Auth/Portal, owner-approved, Portal #41 comment 7212286584: the current
+//! owner's session and a current manager's fresh confirmation with `action:
+//! "unbind"`).
 //!
 //! - **The Station** mints the whole body, a single-use challenge, with
 //!   `station_binding_challenge` (a fresh nonce; canonical JSON: store it,
-//!   carry it) and verifies the answer with `verify_station_binding`
-//!   against its log at its current head and the challenge it stored: a
+//!   carry it) and verifies the answer with `verify_station_binding` against
+//!   its log at its current head and the challenge it stored: a
 //!   `VerifiedStationBinding` (**require `at_head`**), or `Report{code}`
 //!   with the first failure in the order of Atem's answer (#120 comment
 //!   7207827118, agreed with Astation, Atem #210 comment 7209922243). Its
-//!   token checks, the
-//!   nonce's single use, a transfer's consent and the commit-time recheck
-//!   stay its own.
+//!   token checks, the nonce's single use, a transfer's consent and the
+//!   commit-time recheck stay its own.
 //! - **The manager's app** reads the challenge it received
 //!   (`parse_station_binding_challenge`, for the confirmation) and signs it
 //!   with `sign_station_binding` (its own key through the app's provider),
@@ -26,29 +25,27 @@
 //!   `finish`.
 //!
 //! The request takes nothing that matters from its caller: the body is the
-//! challenge, and the core checks every field first against the app's
-//! log, its own `member:` id, its configured Station and the Agora.Build
-//! sign-in it was told (`AuthClaims`). **Never fill `expected` from the
-//! challenge or anything the Station sent**: it always comes from the
-//! app's own login, for a transfer too, since the new owner's
-//! authenticated session makes a transfer request (Astation's answer, #120
-//! comments 7210632733 and 7234537291); else `binding_mismatch` can never
-//! fire. The
-//! request takes no intended action: before it prompts, the app compares
-//! the challenge's `action` (and, for a transfer, its
-//! `expected_binding.owner`) with what the user started. A `service:`,
-//! `host:` or `browser:` signer is `Report{malformed}` (the grammar is
-//! `member:<device_id>` only), unlike the reports' `unknown_signer`. The
-//! provider sees purpose
-//! `StationBinding`: **a fresh confirmation every time**, never the
-//! 5-minute reuse, never in the background; an owner who cancels gives
-//! `signing_failed`. Show the Station (`origin`), the action, the R9
-//! account (`account_id`), the Agora.Build account in `subject` (for a
-//! transfer, the old owner too, `expected_binding.owner`), and the line
-//! "This decides which Agora.Build account's state controls whether
-//! <Station> serves this account's hosts." For a bind, also say that rooms
-//! of other Agora.Build accounts move only with their owners' consent (the
-//! body names no rooms; a legacy room's first binding, #120 7234876387).
+//! challenge, and the core checks every field first against the app's log,
+//! its own `member:` id, its configured Station and the Agora.Build sign-in
+//! it was told (`AuthClaims`). **Never fill `expected` from the challenge or
+//! anything the Station sent**: it always comes from the app's own login,
+//! for a transfer too, since the new owner's authenticated session makes a
+//! transfer request (Astation's answer, #120 comments 7210632733 and
+//! 7234537291); else `binding_mismatch` can never fire. The request takes no
+//! intended action: before it prompts, the app compares the challenge's
+//! `action` (and, for a transfer, its `expected_binding.owner`) with what
+//! the user started. A `service:`, `host:` or `browser:` signer is
+//! `Report{malformed}` (the grammar is `member:<device_id>` only), unlike
+//! the reports' `unknown_signer`. The provider sees purpose
+//! `StationBinding`: **a fresh confirmation every time**, never the 5-minute
+//! reuse, never in the background; an owner who cancels gives
+//! `signing_failed`. Show the Station (`origin`), the action, the R9 account
+//! (`account_id`), the Agora.Build account in `subject` (for a transfer, the
+//! old owner too, `expected_binding.owner`), and the line "This decides
+//! which Agora.Build account's state controls whether <Station> serves this
+//! account's hosts." For a bind, also say that rooms of other Agora.Build
+//! accounts move only with their owners' consent (the body names no rooms;
+//! **Atem's request (#120 7234876387 point 2), for Astation's agreement**).
 //! Fetch the challenge immediately before the prompt: its lease is at most
 //! 30 s, and an expired one needs a new challenge and a new confirmation.
 //!

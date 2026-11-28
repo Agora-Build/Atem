@@ -953,14 +953,17 @@ prompts, the app compares the challenge's `action` (and, for a transfer,
 its `expected_binding.owner`) with what the user started. The lease is at
 most 30 s: fetch the challenge immediately before the fresh confirmation;
 an expired one needs a new challenge and a new confirmation (agreed with
-Astation, #120 comment 7208696433). The rooms that move aren't in the body (the nonce names
-the Station's frozen context; they are all the R9 account's): say so in
-the confirmation, and for a bind that rooms of other Agora.Build accounts
-move only with their owners' consent (the first binding of a legacy room:
-Astation's reading (#120 7211915578, built in Astation #229), confirmed by
-Atem (#120 7234876387); the proof is a `bind` naming `never_bound`, each
-foreign room owner consents to that stored challenge at the Station with
-its own native login, and no field is added to the proof).
+Astation, #120 comment 7208696433). The rooms that move aren't in the
+body (the nonce names the Station's frozen context; they are all the R9
+account's): say so in the confirmation. For a bind, also say that rooms of
+other Agora.Build accounts move only with their owners' consent (**Atem's
+request (#120 7234876387 point 2), for Astation's agreement**).
+
+**The first binding of a legacy room** (Astation's reading (#120
+7211915578, built in Astation #229), confirmed by Atem (#120 7234876387)):
+the proof is a `bind` naming `never_bound`, each foreign room owner
+consents to that stored challenge at the Station with its own native
+login, and no field is added to the proof.
 
 **A transfer** (Astation's answer, #120 comments 7210632733 and
 7234537291): the new owner's authenticated session starts it, its expected

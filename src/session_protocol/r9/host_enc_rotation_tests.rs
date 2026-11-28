@@ -717,12 +717,16 @@ fn the_stamp_is_kept_at_its_first_time() {
 
 /// `atem status`'s `Host key:` text: the current key's id, a pending one,
 /// and the previous one with its deadline: the earlier of its 24 h on the
-/// delegated clock and its 24 h of elapsed time (the boot-time counter's,
-/// placed on the wall clock of the status's own reading), and that a
-/// reboot ends it (after one it is retired at the next check).
+/// delegated clock and its 24 h of the boot-time counter (placed on the
+/// wall clock of the status's own reading), and that a reboot ends it
+/// (after one, or with the counter below its stamp, it is retired at the
+/// next check). The reading is taken only for a previous key whose stamp
+/// has its boot (review L3: a status with no key file, or no previous key,
+/// reads no clock); with none, only the end on `D` is shown, as such.
 #[test]
 fn the_status_names_the_keys() {
     use host_enc::BootAt;
+    let unread = || -> Option<(BootAt, u64)> { panic!("no clock is read for this status") };
     let mut r = rot();
     let current = pub_of(&r, "current");
     let at_hour = Some((
@@ -733,29 +737,29 @@ fn the_status_names_the_keys() {
         D0 + HOUR,
     ));
     assert_eq!(
-        host_enc::status_text(&r.pairing, at_hour).unwrap(),
+        host_enc::status_text(&r.pairing, unread).unwrap(),
         format!("enc_kid {} (current)", kid(&current))
     );
     let (new, _) = new_key(&r).unwrap();
     assert_eq!(
-        host_enc::status_text(&r.pairing, at_hour).unwrap(),
+        host_enc::status_text(&r.pairing, unread).unwrap(),
         format!("enc_kid {} (current); {} pending", kid(&current), kid(&new))
     );
     commit_rotation(&mut r, &new, false, Some(D0));
     reconcile(&r, Some(D0)).unwrap();
+    let status = |now: Option<(BootAt, u64)>| host_enc::status_text(&r.pairing, || now).unwrap();
     let head = format!(
         "enc_kid {} (current); {} previous",
         kid(&new),
         kid(&current)
     );
-    let window =
-        "(24 h on the delegated clock or elapsed, whichever ends first), or until a reboot";
+    let window = "(24 h on the delegated clock or of the boot-time counter, whichever ends first), or until a reboot";
     // The counter keeping pace with the wall clock: both end at D0 + 24 h.
     assert_eq!(
-        host_enc::status_text(&r.pairing, at_hour).unwrap(),
+        status(at_hour),
         format!("{head} until 2027-01-16T08:00:00Z {window}")
     );
-    // The wall clock 500 ppm slow, 12 h on: the elapsed end comes 21.6 s
+    // The wall clock 500 ppm slow, 12 h on: the counter's end comes 21.6 s
     // earlier.
     let slow = Some((
         BootAt {
@@ -765,7 +769,7 @@ fn the_status_names_the_keys() {
         D0 + 12 * HOUR - 21_600,
     ));
     assert_eq!(
-        host_enc::status_text(&r.pairing, slow).unwrap(),
+        status(slow),
         format!("{head} until 2027-01-16T07:59:38Z {window}")
     );
     // The wall clock ahead: the end on `D` comes first.
@@ -777,7 +781,7 @@ fn the_status_names_the_keys() {
         D0 + 5 * HOUR,
     ));
     assert_eq!(
-        host_enc::status_text(&r.pairing, fast).unwrap(),
+        status(fast),
         format!("{head} until 2027-01-16T08:00:00Z {window}")
     );
     // Another boot: it goes at the next check.
@@ -789,9 +793,33 @@ fn the_status_names_the_keys() {
         D0 + HOUR,
     ));
     assert_eq!(
-        host_enc::status_text(&r.pairing, rebooted).unwrap(),
+        status(rebooted),
         format!("{head}, retired at the next check (the host rebooted since its application)")
     );
+    // The counter below the stamp's on its boot: it goes at the next check.
+    let below = Some((
+        BootAt {
+            boot: BOOT,
+            ms: B0 - 1,
+        },
+        D0 + HOUR,
+    ));
+    assert_eq!(
+        status(below),
+        format!(
+            "{head}, retired at the next check (the boot-time counter reads below its application)"
+        )
+    );
+    // No reading (none, or a boot the OS can't name): the end on `D` only.
+    assert_eq!(
+        status(None),
+        format!(
+            "{head} until 2027-01-16T08:00:00Z on the delegated clock at the latest (the boot-time counter isn't read here), or until a reboot"
+        )
+    );
+    // No key file: nothing, and no clock read.
+    std::fs::remove_file(&r.pairing.host_enc_key).unwrap();
+    assert_eq!(host_enc::status_text(&r.pairing, unread), None);
 }
 
 /// A record that can't be read (or is lost) doesn't stall the receiver: it
@@ -1054,13 +1082,14 @@ fn a_clock_repair_after_the_stamp_retires_the_previous_key() {
 }
 
 /// Astation's review of the rotation (#120 comment 7208696433): the
-/// window is a strict 24 h of elapsed time. `D` follows a slow wall clock
-/// down at up to 500 ppm (§11.6), which the clock's mark doesn't count, so
-/// on `D` alone the previous key would still open mail up to 43 s after
-/// 24 h. On the boot its stamp was taken on, 24 h of the boot-time counter
-/// since the stamp retires it first: accepted 1 ms before, refused at 24 h
-/// elapsed, while `D` still reads short of the stamp's `D` + 24 h. The
-/// stamp keeps the boot and the counter, and the previous key takes them.
+/// window is at most 24 h of the host's boot-time counter. `D` follows a
+/// slow wall clock down at up to 500 ppm (§11.6), which the clock's mark
+/// doesn't count, so on `D` alone the previous key would still open mail up
+/// to 43 s after 24 h of the counter. On the boot its stamp was taken on,
+/// 24 h of the counter since the stamp retires it first: accepted 1 ms
+/// before, refused at 24 h of it, while `D` still reads short of the
+/// stamp's `D` + 24 h. The stamp keeps the boot and the counter, and the
+/// previous key takes them.
 #[test]
 fn a_slow_clock_retires_the_previous_key_at_24_hours_elapsed() {
     use crate::runtime::host_clock::state::RHO_PPM;

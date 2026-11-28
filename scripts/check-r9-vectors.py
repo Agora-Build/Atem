@@ -32,11 +32,10 @@ here and its set hashes recomputed from the journal's bodies (host-work-v1
 `r9-vectors-station-binding`, the same for a native manager's Station
 binding proof (delegated host-work III.5 (b); its orders Atem's proposal,
 #120 comment 7207827118, agreed with Astation, Atem #210 comment
-7209922243), Astation's three
-posted examples included (their digests and both signatures).
-The other files'
-`expect` and each `reason` are checked by the Rust runner
-(`crates/atem-client/tests/vectors.rs`) and the binding suites.
+7209922243), Astation's three posted examples included (their digests and
+both signatures). The other files' `expect` and each `reason` are checked
+by the Rust runner (`crates/atem-client/tests/vectors.rs`) and the binding
+suites.
 It also recomputes every Station report id of the acknowledgment fixtures
 (`r9-control-ack-*`, host-work-v1 §11.4): the known answers of the
 reference ledger's `report_id`, and derives their `expect_counts` (the

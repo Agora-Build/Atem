@@ -567,13 +567,12 @@ mod tests {
 
     const TEXT: &str = "service suspended: account disabled at Agora.Build";
 
-    /// The delegated host-work design III.5 (Atem's proposal, #120
-    /// 7207832274, agreed with Astation, #120 7212501350 and 7213560895):
-    /// the Station's `service_suspended` on a routed (or relay) link
-    /// retires the fetch in
-    /// flight (its result is carried nowhere), and nothing read on that
-    /// socket counts any more (a `heads` asks nothing, announces nothing);
-    /// a link on a new socket fetches again. With no link nothing applies.
+    /// The delegated host-work design III.5 (Atem's proposal, #120 7207832274,
+    /// agreed with Astation, #120 7212501350 and 7213560895): the Station's
+    /// `service_suspended` on a routed (or relay) link retires the fetch in
+    /// flight (its result is carried nowhere), and nothing read on that socket
+    /// counts any more (a `heads` asks nothing, announces nothing); a link on a
+    /// new socket fetches again. With no link nothing applies.
     #[test]
     fn a_suspension_ends_a_relay_sockets_calls() {
         let mut s = Station::new();

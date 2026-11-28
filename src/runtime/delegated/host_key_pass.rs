@@ -3,15 +3,15 @@
 //! with `host.delegated` and `host.senders` on, the key file is brought to
 //! the committed device list on the pass where the list's head moved, when
 //! the previous key's window ends on the delegated clock's `D` or on its
-//! boot-time counter (its elapsed ceiling, or another boot: the counter at
-//! the clock's last reading), and once a minute besides; the receiver's view does the same before any mail is
-//! opened (`mail_receiver`). A change of the key file (a promotion, a
-//! retirement) has the waiting objects judged again. The commit watch the
-//! device list runs just before it writes a commit (`commit_watch`)
-//! stamps a pending key's application with `D` read then (`view_now`:
-//! the later of the pass's reading and a fresh one, as every check of the
-//! key's window reads it) and the boot-time counter with its boot at that
-//! fresh reading.
+//! boot-time counter (its ceiling there, or another boot: the counter at
+//! the pass's reading, with `D`), and once a minute besides; the receiver's
+//! view does the same before any mail is opened (`mail_receiver`). A change
+//! of the key file (a promotion, a retirement) has the waiting objects
+//! judged again. The commit watch the device list runs just before it
+//! writes a commit (`commit_watch`) stamps a pending key's application with
+//! `D` read then (`view_now`: the later of the pass's reading and a fresh
+//! one, as every check of the key's window reads it) and the boot-time
+//! counter with its boot at that fresh reading.
 //!
 //! Nothing runs with the hook off, or while the list doesn't serve.
 use super::*;
@@ -31,13 +31,9 @@ impl HostBridge {
         let Some(pairing) = self.pairing.clone() else {
             return;
         };
-        let (list, now_d, last_boot) = {
+        let (list, now_d, now_boot) = {
             let view = self.start_view();
-            (
-                view.list.clone(),
-                view.now_d_ms,
-                view.clock.as_ref().and_then(|c| c.last_boot()),
-            )
+            (view.list.clone(), view.now_d_ms, view.now_boot)
         };
         let Some(list) = list.filter(FeedStore::serves) else {
             return;
@@ -52,7 +48,7 @@ impl HostBridge {
                     || at.elapsed() >= HOST_KEY_EVERY
                     || retire_at.zip(now_d).is_some_and(|(due, now)| now >= due)
                     || retire_boot
-                        .zip(last_boot)
+                        .zip(now_boot)
                         .is_some_and(|(due, now)| now.boot != due.boot || now.ms >= due.ms)
             }
             None => true,
@@ -107,11 +103,11 @@ impl HostBridge {
 /// gets no stamp), else `D` the later of that reading and one taken now
 /// from the clock as the start view last observed it
 /// (`ClockSnapshot::key_now`; review L2: never a reading a sleep made
-/// stale), and the counter that fresh reading's. The stamp, the key pass and the receiver's view all read
-/// it so: a stamp is never above the `D` a later check compares it with,
-/// as a stamp read fresh after the pass's reading would be above that
-/// reading, which reads as a clock below the application and retires the
-/// previous key at once.
+/// stale), and the counter that fresh reading's. The stamp, the key pass
+/// and the receiver's view all read it so: a stamp is never above the `D` a
+/// later check compares it with, as a stamp read fresh after the pass's
+/// reading would be above that reading, which reads as a clock below the
+/// application and retires the previous key at once.
 pub(crate) fn view_now(view: &StartView) -> Option<host_enc::DNow> {
     let clock = view.clock.as_ref();
     let fresh = clock.and_then(|c| c.key_now());

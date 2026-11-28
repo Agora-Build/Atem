@@ -4404,21 +4404,31 @@ added the elapsed ceiling below as its follow-up to that review.
   ruling R63; fix round 2, re-review N1), and so does `D` reading below
   the stamp. The follow-downs of `wall_hw` (when the wall clock is
   behind it) and of the floor (500 ppm, at most 43 s a day each) are not
-  counted by the mark, so on `D` alone a continuously slow clock could
-  keep the key up to 43 s past 24 h of elapsed time (Astation's review,
-  #120 comment 7208696433). **The elapsed ceiling** (Atem's follow-up to
-  that review; **Atem's reading, for Astation's confirmation**, where it
-  goes beyond the agreed text): the window also ends once the boot-time
-  counter, on the boot the stamp was taken on, reaches the stamp's counter
-  plus 24 h; a check on another boot (a reboot inside the window) retires
-  the key at once, since elapsed time across a reboot can't be
-  established (fail closed, as a crash before the stamp), and so does a
-  counter below the stamp's on its boot. So the window ends at the first
-  of 24 h on `D` and 24 h elapsed, and never runs longer than 24 h of real
-  time. A restart on the same boot keeps both, measured from the stamp
-  (a binary test kills the runtime between the list's commit and the
-  promotion, then moves the counter alone).
-- **Retirement**: at the deadline (24 h on `D` or 24 h elapsed, the first;
+  counted by the mark, so on `D` alone a wall clock running slow behind
+  the boot-time counter could keep the key up to 43 s past 24 h of that
+  counter (Astation's review, #120 comment 7208696433). **The elapsed
+  ceiling** (Atem's follow-up to that review; **Atem's reading, for
+  Astation's confirmation**, where it goes beyond the agreed text): the
+  window also ends once the host's boot-time counter (§11.6's, which
+  counts a suspend), on the boot the stamp was taken on, reaches the
+  stamp's counter plus 24 h; a check on another boot (a reboot inside the
+  window) retires the key at once, since elapsed time across a reboot
+  can't be established (fail closed, as a crash before the stamp), and so
+  does a counter below the stamp's on its boot. So the window ends at the
+  first of 24 h on `D` and 24 h of the host's boot-time counter. A restart
+  on the same boot keeps both, measured from the stamp (a binary test
+  kills the runtime between the list's commit and the promotion, then
+  moves the counter alone). **A residual:** the guarantee is the host's
+  own elapsed time. The counter runs at its oscillator's rate, so it
+  matches real time only within that oscillator's error, which §11.6
+  bounds at 500 ppm ("The counter's assumptions"). On a host whose clock
+  is synchronized, `D` follows the true wall clock up and the rule on `D`
+  ends the window first, within 24 h of real time. On one whose clock
+  isn't synchronized and whose oscillator runs slow, the wall clock and
+  the counter are both slow, and the window can run up to the same 43 s
+  past 24 h of real time at the 500 ppm bound (about 8.6 s at 100 ppm).
+- **Retirement**: at the deadline (24 h on `D` or 24 h of the boot-time
+  counter, the first;
   or the clock's mark changed: a repair, a lowering, a fresh start; or `D`
   below the stamp; or another boot, or the counter below the stamp's), at
   a `retire_previous`, at a newer rotation, and for every key of
@@ -4438,8 +4448,8 @@ added the elapsed ceiling below as its follow-up to that review.
   again.
   **Erasure at the deadline** waits for the next pass at which the list
   serves and `D` reads (the hook on; the pass is due at the deadline on
-  `D` and at the elapsed ceiling, or another boot, on the counter of the
-  clock's last reading): nothing is opened with the key meanwhile, since
+  `D` and at the ceiling on the counter, or another boot, both read from
+  the pass's own reading): nothing is opened with the key meanwhile, since
   every open brings the key file to the list first and judges the window
   on `D` and the counter (review L6).
 - **Mail in flight**: after a routine rotation, mail sealed to the old key

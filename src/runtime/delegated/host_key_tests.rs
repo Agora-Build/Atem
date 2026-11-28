@@ -230,10 +230,10 @@ fn the_window_runs_on_the_delegated_clock_through_sleep_and_a_clock_set_back() {
 /// Astation's review (#120 comment 7208696433) in the bridge, on a slow
 /// clock: the wall clock 500 ppm slow behind the boot-time counter, so `D`
 /// follows it down (§11.6) and reads about 43 s short of the stamp's `D` +
-/// 24 h once 24 h have elapsed. B's mail sealed to the old key opens
-/// before that elapsed ceiling and is refused `enc_key_not_accepted` at
+/// 24 h once 24 h of the counter have passed. B's mail sealed to the old
+/// key opens before that ceiling and is refused `enc_key_not_accepted` at
 /// it, the key pass erasing the old secret then (its due check on the
-/// counter); the new key's mail still opens.
+/// counter of the pass's own reading); the new key's mail still opens.
 #[test]
 fn on_a_slow_clock_the_old_key_goes_at_24_hours_elapsed() {
     local_test(async |root| {
@@ -272,8 +272,15 @@ fn on_a_slow_clock_the_old_key_goes_at_24_hours_elapsed() {
             hk_file(&rig).get("previous").is_some(),
             "still in its window"
         );
-        // 24 h elapsed on the counter; `D` short of its deadline.
-        slow(&mut rig, 10_000);
+        // 24 h on the counter; `D` short of its deadline. Only the pass's
+        // 100 ms reading has seen it, not the clock's 1 s tick (review N5):
+        // the key pass is due on that reading's counter.
+        {
+            let mut r = os.0.lock().unwrap();
+            r.boot_ns += 10_000 * 1_000_000;
+            r.wall_ms += 10_000 - 10_000 * RHO_PPM / 1_000_000;
+        }
+        rig.bridge.take_reading();
         let boot = os.0.lock().unwrap().boot_ns / 1_000_000;
         assert_eq!(boot, b0 + RETAIN_MS);
         let d = rig.bridge.start_view().now_d_ms.unwrap();

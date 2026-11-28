@@ -1350,3 +1350,23 @@ fn the_boot_mark_names_the_clocks_one_boot() {
         }
     );
 }
+
+/// `atem status`'s reading for the `Host key:` line (review N1): a boot the
+/// OS can't name (`unknown-<uuid>`, one per process) gives none, since the
+/// status's process would never share the runtime's mark and would always
+/// read as another boot; a named boot gives its mark, counter and wall
+/// clock.
+#[test]
+fn the_status_reading_names_only_a_boot_the_os_names() {
+    let os = Os::new(T, 100 * SEC, "boot-a", Synced::Yes);
+    let r = os.now();
+    assert_eq!(super::status_reading_of(&r), Some((super::boot_at(&r), T)));
+    let unknown = OsReading {
+        boot_id: format!(
+            "{}0c8f1a52-0000-4000-8000-000000000001",
+            os::UNKNOWN_BOOT_PREFIX
+        ),
+        ..r
+    };
+    assert_eq!(super::status_reading_of(&unknown), None);
+}

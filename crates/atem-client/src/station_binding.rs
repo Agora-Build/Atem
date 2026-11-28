@@ -47,15 +47,16 @@
 //! with `action: "unbind"`; D27's admin release and account deletion keep
 //! their separate rules): it suspends every host of the R9 account at that
 //! Station, so a stolen Agora.Build session alone can't do it. A first
-//! binding of a legacy room (a never-bound account whose rooms the
-//! Station's lookup resolves to other Agora.Build accounts) is a `bind`
-//! naming `never_bound`, its `subject` the new owner; each foreign room
-//! owner's authenticated consent to that stored challenge, and the
-//! commit-time recheck of the room owners, are the Station's, and no field
-//! is added to the proof (Astation's reading (#120 7211915578, built in
-//! Astation #229), confirmed by Atem (#120 7234876387)). Strict I-JSON, exact fields at every level, no `null`, no
-//! duplicate keys (escaped ones included), a challenge text at most 4,096
-//! bytes, the body's `jcs` at most 4,096 bytes and the proof at most 16 KiB.
+//! binding of a legacy room (a never-bound account whose rooms the Station's
+//! lookup resolves to other Agora.Build accounts) is a `bind` naming
+//! `never_bound`, its `subject` the new owner; each foreign room owner's
+//! authenticated consent to that stored challenge, and the commit-time
+//! recheck of the room owners, are the Station's, and no field is added to
+//! the proof (Astation's reading (#120 7211915578, built in Astation #229),
+//! confirmed by Atem (#120 7234876387)). Strict I-JSON, exact fields at
+//! every level, no `null`, no duplicate keys (escaped ones included), a
+//! challenge text at most 4,096 bytes, the body's `jcs` at most 4,096 bytes
+//! and the proof at most 16 KiB.
 //!
 //! - **The manager's app** builds with [`station_binding_request`], which
 //!   takes nothing that matters from its caller: it checks every field of

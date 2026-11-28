@@ -3451,23 +3451,48 @@ fn host_route_proxy_vectors(book: &Book, file: &Value) -> Value {
     })
 }
 
+/// `r9-vectors-host-route`'s own form: Python's `json.dumps(indent=2,
+/// sort_keys=True, ensure_ascii=True)` and a newline, the form #211's
+/// hand-written `relay_replies` and `service_suspended` sections were
+/// written in: serde's sorted pretty form with every character from U+007F
+/// up written `\uXXXX` (lowercase hex; a surrogate pair beyond the BMP).
+fn host_route_form(value: &Value) -> String {
+    let mut out = String::new();
+    for c in serde_json::to_string_pretty(value).unwrap().chars() {
+        if (c as u32) < 0x7f {
+            out.push(c);
+        } else {
+            let mut units = [0u16; 2];
+            for unit in c.encode_utf16(&mut units) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    out + "\n"
+}
+
+/// The file is exactly its own form, so a writer that rewrites it moves
+/// nothing it didn't make (review N6).
+#[test]
+fn host_route_file_is_its_own_form() {
+    let text = std::fs::read_to_string(fixtures_dir().join("r9-vectors-host-route.json")).unwrap();
+    let file: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(host_route_form(&file), text);
+}
+
 /// Writes `proxy` into `r9-vectors-host-route` (the rest of the file as it
-/// is: the file is serde's sorted pretty form, checked first).
+/// is: the file is its own form, [`host_route_form`], checked first).
 #[test]
 #[ignore = "writes the host route proxy-kind vectors"]
 fn write_host_route_proxy_vectors() {
     let path = fixtures_dir().join("r9-vectors-host-route.json");
     let text = std::fs::read_to_string(&path).unwrap();
     let mut file: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(host_route_form(&file), text, "the file is its own form");
     let mut before = file.clone();
     before.as_object_mut().unwrap().remove("proxy");
-    let proxy = host_route_proxy_vectors(&Book::load(), &before);
-    let unchanged = serde_json::to_string_pretty(&before).unwrap() + "\n";
-    if file.get("proxy").is_none() {
-        assert_eq!(unchanged, text, "the file is serde's pretty form");
-    }
-    file["proxy"] = proxy;
-    std::fs::write(path, serde_json::to_string_pretty(&file).unwrap() + "\n").unwrap();
+    file["proxy"] = host_route_proxy_vectors(&Book::load(), &before);
+    std::fs::write(path, host_route_form(&file)).unwrap();
 }
 
 // ------------------------------------- delegated host-work: device-list actions

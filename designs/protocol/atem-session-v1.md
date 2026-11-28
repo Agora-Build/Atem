@@ -3826,7 +3826,11 @@ Three forms, each from the shared core
   around a visible character stays, as sent), with no character of
   General Category Cc, Cf, Zl or Zp (`host_route::service_text_ok`, which
   every reader and builder of both forms checks), so no terminal escape,
-  bidi control, line break or blank line reaches `atem status`. The
+  bidi control, line break or text of nothing but White_Space reaches
+  `atem status` (a text of invisible characters that aren't White_Space,
+  such as U+3164 or U+2800, still reads, within Astation's rule; `atem
+  status` puts `service suspended: ` before any text that doesn't begin
+  with it, so its line is never empty). The
   Station's two fixed texts are "service suspended: account disabled at
   Agora.Build" and "service suspended: no Agora.Build owner at this
   Station". Then the relay closes the connection. A reply or notice the

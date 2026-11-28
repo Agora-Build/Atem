@@ -151,12 +151,6 @@ impl ClockSnapshot {
         Some((self.state.deadline_ms(&r), boot_at(&r)))
     }
 
-    /// The boot-time counter and its boot at the last reading observed (no
-    /// reading taken; none before one): the host key pass's due check.
-    pub fn last_boot(&self) -> Option<BootAt> {
-        self.last.as_ref().map(boot_at)
-    }
-
     /// The latest repair or lowering the record keeps (§11.6): `D` just
     /// after it.
     pub fn change(&self) -> Option<u64> {
@@ -213,11 +207,20 @@ pub fn boot_at(r: &OsReading) -> BootAt {
     }
 }
 
-/// `atem status`'s reading for the `Host key:` line: the boot-time counter
-/// with its boot, and the wall clock, at one reading of the OS (the debug
-/// hook's when it is set; none while its file has none). Read only.
+/// `atem status`'s reading for the `Host key:` line (taken only when a
+/// previous key's ceiling on the counter is to be shown): the boot-time
+/// counter with its boot, and the wall clock, at one reading of the OS (the
+/// debug hook's when it is set; none while its file has none). Read only.
 pub fn status_reading() -> Option<(BootAt, u64)> {
-    system_reading().map(|r| (boot_at(&r), r.wall_ms))
+    status_reading_of(&system_reading()?)
+}
+
+/// [`status_reading`] of `r`: none for a boot the OS can't name
+/// (`os::UNKNOWN_BOOT_PREFIX`, one id per process), whose mark the
+/// runtime's process doesn't share, so the status can't compare it with a
+/// stamp.
+fn status_reading_of(r: &OsReading) -> Option<(BootAt, u64)> {
+    (!r.boot_id.starts_with(os::UNKNOWN_BOOT_PREFIX)).then(|| (boot_at(r), r.wall_ms))
 }
 
 /// A fresh start's epoch (`ClockState::set_epoch`).
@@ -576,15 +579,26 @@ impl HostClock {
     /// OS's, whose machine and boot aren't the hook's (PR 4 review D1). None
     /// without a record either.
     pub fn reading(&self) -> Option<DelegatedNow> {
+        self.reading_with_boot().map(|(now, _)| now)
+    }
+
+    /// [`HostClock::reading`] with the boot-time counter and its boot from
+    /// the same reading (none for the record's own values): the pass's
+    /// reading, which host senders' key pass compares with a previous
+    /// key's ceiling on the counter (review N5).
+    pub fn reading_with_boot(&self) -> Option<(DelegatedNow, Option<BootAt>)> {
         match (self.read)().or_else(|| self.last.clone()) {
-            Some(r) => Some(DelegatedNow {
-                h_ms: self.state.h_ms(&r),
-                d_ms: self.state.deadline_ms(&r),
-            }),
+            Some(r) => Some((
+                DelegatedNow {
+                    h_ms: self.state.h_ms(&r),
+                    d_ms: self.state.deadline_ms(&r),
+                },
+                Some(boot_at(&r)),
+            )),
             None => self
                 .state
                 .stored_ms()
-                .map(|(h_ms, d_ms)| DelegatedNow { h_ms, d_ms }),
+                .map(|(h_ms, d_ms)| (DelegatedNow { h_ms, d_ms }, None)),
         }
     }
 

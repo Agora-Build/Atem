@@ -1144,9 +1144,9 @@ fn attachments_are_fenced_alone_and_a_principal_together() {
 /// account's service it suspended (the delegated host-work design III.5:
 /// `close{reason:"service_suspended"}`, R9.7a's router reasons; Atem's
 /// proposal, #120 7207832274, agreed with Astation, #120 7212501350 and
-/// 7213560895): as any router
-/// close, only that channel's attachment is fenced, with one runtime.log
-/// line naming the reason; the other channel and the host's state stay.
+/// 7213560895): as any router close, only that channel's attachment is
+/// fenced, with one runtime.log line naming the reason; the other channel
+/// and the host's state stay.
 #[test]
 fn a_router_close_for_a_suspended_service_fences_only_its_channel() {
     let mut rig = Rig::new();

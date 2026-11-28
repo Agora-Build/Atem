@@ -1133,18 +1133,19 @@ impl HostBridge {
     /// journal's halt while `host.delegated` is on.
     fn take_reading(&mut self) -> Option<u64> {
         self.work.read_due = Instant::now() + READ_EVERY;
-        let now_d = self
+        let reading = self
             .work
             .clock
             .as_ref()
             .filter(|c| !c.damaged())
-            .and_then(|c| c.reading())
-            .map(|n| n.d_ms);
+            .and_then(|c| c.reading_with_boot());
+        let now_d = reading.map(|(n, _)| n.d_ms);
         if self.features.delegated {
             let halted = self.host.journal_halted();
             let clock = self.work.clock.as_ref().and_then(HostClock::snapshot);
             let mut view = self.start_view();
             view.now_d_ms = now_d;
+            view.now_boot = reading.and_then(|(_, boot)| boot);
             view.clock = clock;
             view.halted = halted;
         }

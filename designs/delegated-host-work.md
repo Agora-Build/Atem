@@ -2053,8 +2053,9 @@ and the routine rotation (agreed with Astation on 2026-11-23, #120 comment 70894
 `host_enc_key_new` gets the same key on a retry under its `request_id`, else the one key no entry has set (the host's
 current key while unset, else a pending one), made durable before the answer; the host stamps when it applied each
 entry that makes a key it holds the previous one, its key file follows the committed list entry by entry (a key no
-entry has set is never erased), it keeps the old key 24 h on the delegated clock (erased at once with
-`retire_previous`, when that time can't be established, or after a repair, a lowering or a fresh start of that clock), records every
+entry has set is never erased), it keeps the old key 24 h on the delegated clock and at most 24 h of the boot-time
+counter on its boot, a reboot ending it (erased at once with `retire_previous`, when that time can't be established,
+or after a repair, a lowering or a fresh start of that clock), records every
 retired key so none comes back, and accepts only the keys its committed list holds (host-work-v1 §11.5, "The routine
 rotation of a host's key"; session-v1 R9.13 item 8, R9.14 item 8); `check_change_advisories` reports
 `previous_key_window` before a second rotation within 24 h of the first.
@@ -2978,7 +2979,7 @@ review.** A disable must reach every account's hosts, including those of an R9 a
       background. The confirmation shows the Station's origin, the action, the R9 account, the Agora.Build account
       in `subject` (for a transfer, the old owner too) and the line "This decides which Agora.Build account's state
       controls whether <Station> serves this account's hosts." The body names no rooms, so for a bind it should also
-      say that rooms of other Agora.Build accounts move only with their owners' consent (Atem, #120 7234876387).
+      say that rooms of other Agora.Build accounts move only with their owners' consent (**Atem's request (#120 7234876387 point 2), for Astation's agreement**).
     - **The manager's builder** (`station_binding_request`) takes the log, the challenge, its own `member:` id, its
       configured Station and the Agora.Build sign-in it was told, and refuses, in this order: `malformed`, `frozen`,
       `wrong_account`, `origin_mismatch`, `signer_mismatch`, `unknown_signer`, `not_a_manager` (no `manage` at its
@@ -3060,8 +3061,10 @@ The transitions:
     `binding_attempt` notice;
   - no field is added to the proof: its 15 fields name no room and no room owner;
   - "moves only as a transfer from C" above names the conditions of a room's move (a fresh manager proof, both
-    authenticated, C consenting, neither disabled), not the proof's `transfer` action, which needs a `bound` record;
-  - the manager's confirmation says that rooms of other Agora.Build accounts move only with their owners' consent;
+    authenticated, C consenting, neither disabled), not the proof's `transfer` action, which needs a `bound` record.
+
+  Not part of that reading: that the manager's confirmation says rooms of other Agora.Build accounts move only with
+  their owners' consent ((b) above, **Atem's request (#120 7234876387 point 2), for Astation's agreement**);
 - **bound(A) → unbound:** A unbinds ("stop using the built-in Station for that R9 account"), or A's account deletion
   unbinds. **Owner decision 2026-11-27:** a voluntary unbind needs the same proof as a bind or a transfer: A's valid
   authentication (`subject` = `owner`) and a current manager's fresh confirmation (`atem-station-binding`, `action`

@@ -105,16 +105,19 @@
 //!   ([`RETAIN_MS`]) and, on the boot its stamp was taken on, the boot-time
 //!   counter reaching its stamp's plus 24 h (Atem's follow-up to Astation's
 //!   review, #120 comment 7208696433: `D` follows a slow wall clock down at
-//!   up to 500 ppm, so the window is also a strict 24 h of elapsed time);
-//!   with no stamp naming the entry the list holds, `D` below the stamp,
-//!   the clock's mark changed since the stamp (a repair, a lowering, or a
-//!   fresh start: a damaged record started afresh, a record read as none),
-//!   another boot (a reboot: elapsed time across it can't be established),
-//!   or the counter below the stamp's, it is erased at once (fail closed:
-//!   never a fresh or longer window). A
-//!   crash between the list's commit and the key file following it never
-//!   restarts or lengthens the window: the stamp is absolute. Each erasure
-//!   writes the ids to `retired` first, then the key file.
+//!   up to 500 ppm, so the window is also at most 24 h of the host's
+//!   boot-time counter: its own elapsed time, real time within its
+//!   oscillator's error; on an unsynchronized host whose oscillator runs
+//!   slow, up to the same 43 s a day at the 500 ppm bound); with no stamp
+//!   naming the entry the list holds, `D` below the stamp, the clock's mark
+//!   changed since the stamp (a repair, a lowering, or a fresh start: a
+//!   damaged record started afresh, a record read as none), another boot (a
+//!   reboot: elapsed time across it can't be established), or the counter
+//!   below the stamp's, it is erased at once (fail closed: never a fresh or
+//!   longer window). A crash between the list's commit and the key file
+//!   following it never restarts or lengthens the window: the stamp is
+//!   absolute. Each erasure writes the ids to `retired` first, then the key
+//!   file.
 //! - **The receiver's view** ([`recipient_at`]): this host's id and
 //!   pairing generation; the accepted keys are the committed list's current
 //!   key, and its previous key while the list doesn't retire it and its
@@ -300,15 +303,15 @@ impl Previous {
         })
     }
 
-    /// Why its window is over at `now`, if it is: on `D` (passed, `D` below
-    /// its application, or the clock repaired, lowered or started afresh
-    /// since: its mark differs), or on the boot-time counter (Atem's
-    /// follow-up to Astation's review, #120 comment 7208696433: `D`
-    /// follows a slow wall clock down at up to 500 ppm, which the mark
-    /// doesn't count, so the window is also a strict [`RETAIN_MS`] of
+    /// Why its window is over at `now`, if it is: on `D` (passed, `D` below its
+    /// application, or the clock repaired, lowered or started afresh since: its
+    /// mark differs), or on the boot-time counter (Atem's follow-up to
+    /// Astation's review, #120 comment 7208696433: `D` follows a slow wall
+    /// clock down at up to 500 ppm, which the mark doesn't count, so the window
+    /// is also at most [`RETAIN_MS`] of the host's boot-time counter, its own
     /// elapsed time; a boot other than its stamp's, a counter below its
-    /// stamp's, or a counter or stamp missing can't establish that time
-    /// and ends it at once).
+    /// stamp's, or a counter or stamp missing can't establish that time and
+    /// ends it at once).
     fn over(&self, now: &DNow) -> Option<&'static str> {
         if now.d_ms < self.applied_d_ms {
             Some("the delegated clock reads below its application; its window can't be established")
@@ -1705,12 +1708,18 @@ pub(crate) fn recipient_with(
 /// `atem status`'s `Host key:` text, read from the files (no lock: each is
 /// replaced whole): the current key's id, a pending one, and the previous
 /// one with when its window ends, the earlier of its end on the delegated
-/// clock and its elapsed ceiling, placed on the wall clock of `now` (the
-/// boot-time counter and the wall clock at one reading,
-/// `host_clock::status_reading`; none: the end on `D` only), and that a
-/// reboot ends it (one since its stamp: it goes at the next check). `None`
-/// without a key file (the hook never made one).
-pub fn status_text(pairing: &PairingPaths, now: Option<(BootAt, u64)>) -> Option<String> {
+/// clock and its ceiling on the boot-time counter, placed on the wall clock
+/// of `now`'s reading, and that a reboot ends it. `now` (the boot-time
+/// counter and the wall clock at one reading, `host_clock::status_reading`)
+/// is called only for a previous key whose stamp has its boot, so a status
+/// without one reads no clock; none (no reading, or a boot the OS can't
+/// name) shows the end on `D` only, as such. A reboot since the stamp, or
+/// the counter below it, says it goes at the next check. `None` without a
+/// key file (the hook never made one).
+pub fn status_text(
+    pairing: &PairingPaths,
+    now: impl FnOnce() -> Option<(BootAt, u64)>,
+) -> Option<String> {
     let store = Store::new(pairing, &journal_of(pairing));
     let ring = match read_ring(&store) {
         Held::Missing => return None,
@@ -1726,23 +1735,29 @@ pub fn status_text(pairing: &PairingPaths, now: Option<(BootAt, u64)>) -> Option
     }
     if let Some(previous) = &ring.previous {
         let kid = hex(&previous.slot.kid);
-        parts.push(match (previous.retire_boot(), now) {
-            (None, _) => format!(
-                "{kid} previous, retired at the next check (its application's boot isn't recorded)"
-            ),
-            (Some(ceiling), Some((now, _))) if now.boot != ceiling.boot => format!(
-                "{kid} previous, retired at the next check (the host rebooted since its application)"
-            ),
-            (Some(ceiling), now) => {
-                let elapsed_end = now.map(|(now, wall_ms)| {
-                    wall_ms.saturating_add(ceiling.ms.saturating_sub(now.ms))
-                });
-                let end = elapsed_end.map_or(previous.retire_at(), |e| e.min(previous.retire_at()));
-                format!(
-                    "{kid} previous until {} (24 h on the delegated clock or elapsed, whichever ends first), or until a reboot",
-                    utc(end)
-                )
-            }
+        let next_check = |why: &str| format!("{kid} previous, retired at the next check ({why})");
+        parts.push(match previous.boot {
+            None => next_check("its application's boot isn't recorded"),
+            Some(stamp) => match now() {
+                None => format!(
+                    "{kid} previous until {} on the delegated clock at the latest (the boot-time counter isn't read here), or until a reboot",
+                    utc(previous.retire_at())
+                ),
+                Some((now, _)) if now.boot != stamp.boot => {
+                    next_check("the host rebooted since its application")
+                }
+                Some((now, _)) if now.ms < stamp.ms => {
+                    next_check("the boot-time counter reads below its application")
+                }
+                Some((now, wall_ms)) => {
+                    let ceiling = stamp.ms.saturating_add(RETAIN_MS);
+                    let counter_end = wall_ms.saturating_add(ceiling.saturating_sub(now.ms));
+                    format!(
+                        "{kid} previous until {} (24 h on the delegated clock or of the boot-time counter, whichever ends first), or until a reboot",
+                        utc(counter_end.min(previous.retire_at()))
+                    )
+                }
+            },
         });
     }
     Some(parts.join("; "))

@@ -2752,14 +2752,13 @@ const SUSPENDED: &str = "service suspended: account disabled at Agora.Build";
 
 /// The delegated host-work design III.5 (Atem's proposal, #120 7207832274,
 /// agreed with Astation, #120 7212501350 and 7213560895): the Station's
-/// `service_suspended` on a
-/// relay or routed link. The live call is retired (its page drained when
-/// it comes), the gate closes at once with the Station's text, and nothing
-/// more is asked or applied on that socket: its `heads` and the pass ask
-/// nothing, a new link generation on it neither. Nothing durable moves
-/// (the cursor and the standings stay). A link on a new socket reads on
-/// from the committed cursor, never from 0, and only that read opens the
-/// gate.
+/// `service_suspended` on a relay or routed link. The live call is retired
+/// (its page drained when it comes), the gate closes at once with the
+/// Station's text, and nothing more is asked or applied on that socket: its
+/// `heads` and the pass ask nothing, a new link generation on it neither.
+/// Nothing durable moves (the cursor and the standings stay). A link on a
+/// new socket reads on from the committed cursor, never from 0, and only
+/// that read opens the gate.
 #[test]
 fn a_suspension_on_a_relay_socket_ends_its_association_until_a_new_socket() {
     let mut rig = rig();

@@ -1,17 +1,17 @@
 //! The Station's `service_suspended` in the real runtime (the delegated
 //! host-work design III.5; session-v1 R9.7b and R9.7a; the `text`, the
-//! disclosure order and the host's 10 s drop are Atem's proposal, for
-//! Astation's agreement, #120 7207832274): the built-in Station refuses
-//! relay service to a disabled or unowned account's hosts. A temp profile
-//! with a pinned device list and agent hosting on; the fake Astation as a
-//! relay that routes the host on its proof (or as Astation's local link);
-//! the fake Station's `suspend` and `restore` (tests/support/station.rs),
-//! which close the host's channels (B-3), send the open link's notice (B-2)
-//! and refuse the next connections' proofs (B-1). The host reads it, shows
-//! it and retries at the normal pace; nothing of its trust or state moves.
-//! The host-side reading works in release builds; only its `Control
-//! feeds:` line, and what its Station link does, need `host.delegated`
-//! (the debug hook).
+//! disclosure order and the host's 10 s drop are Atem's proposal (#120
+//! 7207832274), agreed with Astation (#120 7212501350 and 7213560895)): the
+//! built-in Station refuses relay service to a disabled or unowned account's
+//! hosts. A temp profile with a pinned device list and agent hosting on; the
+//! fake Astation as a relay that routes the host on its proof (or as
+//! Astation's local link); the fake Station's `suspend` and `restore`
+//! (tests/support/station.rs), which close the host's channels (B-3), send
+//! the open link's notice (B-2) and refuse the next connections' proofs
+//! (B-1). The host reads it, shows it and retries at the normal pace;
+//! nothing of its trust or state moves. The host-side reading works in
+//! release builds; only its `Control feeds:` line, and what its Station link
+//! does, need `host.delegated` (the debug hook).
 #![cfg(target_os = "linux")]
 mod support;
 
