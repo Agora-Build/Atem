@@ -387,3 +387,62 @@ fn a_service_suspended_refusal_carries_its_text_and_is_no_verifier_code() {
         );
     }
 }
+
+/// A Station's text must be nonblank (Astation's item 3, #120 7213560895):
+/// a text of nothing but White_Space (Unicode 18.0.0, the framing module's
+/// table) is refused as an empty one is, by both readers and both builders
+/// (the route refusal and the open-link notice). The new refusal is the
+/// all-Zs case: the other White_Space characters are Cc, Zl or Zp, already
+/// refused. Whitespace around a visible character stays valid, as sent.
+#[test]
+fn a_blank_service_text_is_refused_by_every_reader_and_builder() {
+    use atem_client::host_route::{RelayReply, service_text_ok};
+    use atem_client::station_notice::ServiceSuspended;
+    let blank = [
+        "\u{20}".to_owned(),
+        "\u{3000}".to_owned(),
+        "\u{a0}".to_owned(),
+        "\u{1680}".to_owned(),
+        "\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}"
+            .to_owned(),
+        "\u{202f}\u{205f}".to_owned(),
+        "\u{20}\u{a0}\u{1680}\u{2005}\u{3000}".to_owned(),
+        "\u{a0}".repeat(128),
+    ];
+    assert_eq!(blank[7].len(), 256);
+    for text in &blank {
+        assert!(!service_text_ok(text), "{text:?}");
+        assert!(RelayReply::suspended(text).is_err(), "{text:?}");
+        assert!(ServiceSuspended::new(text).is_err(), "{text:?}");
+        let reply = json!({"type": "relay", "op": "host_route_refused", "v": 1,
+            "code": "service_suspended", "text": text})
+        .to_string();
+        let parsed = RelayReply::parse(reply.as_bytes());
+        assert!(
+            matches!(parsed, Some(Err(ref e)) if e.code() == "malformed"),
+            "{text:?}: {parsed:?}"
+        );
+        let notice =
+            json!({"type": "relay", "op": "service_suspended", "v": 1, "text": text}).to_string();
+        assert_eq!(
+            ServiceSuspended::parse(notice.as_bytes()).map_err(|e| e.code()),
+            Err("malformed"),
+            "{text:?}"
+        );
+    }
+    for text in [
+        "x",
+        "\u{3000} x \u{a0}",
+        "  service suspended: account disabled at Agora.Build  ",
+        "\u{a0}.",
+    ] {
+        assert!(service_text_ok(text), "{text:?}");
+        let reply = RelayReply::suspended(text).unwrap();
+        let wire = reply.to_json().to_string();
+        assert_eq!(RelayReply::parse(wire.as_bytes()), Some(Ok(reply)));
+        let notice = ServiceSuspended::new(text).unwrap();
+        assert_eq!(notice.text(), text, "kept as sent");
+        let wire = notice.to_json().to_string();
+        assert_eq!(ServiceSuspended::parse(wire.as_bytes()), Ok(notice));
+    }
+}

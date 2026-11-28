@@ -11,9 +11,9 @@
 //! these fields, at most [`MAX_SERVICE_SUSPENDED_BYTES`], the `text` of
 //! [`crate::host_route::service_text_ok`]'s grammar. The host shows it and
 //! retries; it is never a revocation and changes no R9 state. The bound and
-//! the text's grammar are **Atem's proposal (#120 7207832274), agreed with
-//! Astation (#120 7212501350 and 7213560895)**; the agreed text is also
-//! nonblank, which [`crate::host_route::service_text_ok`] doesn't check yet.
+//! the text's grammar (nonblank included: item 3 of 7213560895) are **Atem's
+//! proposal (#120 7207832274), agreed with Astation (#120 7212501350 and
+//! 7213560895)**.
 use serde_json::{Value, json};
 
 use crate::canonical::{self, Numbers, StrictError};

@@ -3821,15 +3821,21 @@ Three forms, each from the shared core
   verification gets its verifier code, so no unverified connection learns
   an account's service state (least disclosure, D26). `text` is required
   with `service_suspended` and absent with every verifier code: 1–256 bytes
-  of UTF-8 with no character of General Category Cc, Cf, Zl or Zp
-  (`host_route::service_text_ok`), so no terminal escape, bidi control or
-  line break reaches `atem status`; the agreed rule also requires it
-  nonblank (#120 7213560895 item 3), which the shared reader and builders
-  don't check yet (a text of nothing but White_Space reads: a follow-up,
-  with the boundary vectors Astation asked for). The Station's two fixed
-  texts are "service suspended: account disabled at Agora.Build" and
-  "service suspended: no Agora.Build owner at this Station". Then the relay
-  closes the connection.
+  of UTF-8, nonblank (not every character White_Space, Unicode 18.0.0's:
+  the framing module's generated table, #120 7213560895 item 3; whitespace
+  around a visible character stays, as sent), with no character of
+  General Category Cc, Cf, Zl or Zp (`host_route::service_text_ok`, which
+  every reader and builder of both forms checks), so no terminal escape,
+  bidi control, line break or blank line reaches `atem status`. The
+  Station's two fixed texts are "service suspended: account disabled at
+  Agora.Build" and "service suspended: no Agora.Build owner at this
+  Station". Then the relay closes the connection. A reply or notice the
+  shared reader refuses (a blank text among them) is no suspension, as any
+  unreadable Station message: a refused verdict is ignored with a
+  runtime.log line (the connect then fails as the relay closes it, with no
+  text recorded), a refused notice is dropped and counted, and nothing of
+  trust or state changes. Vectors: `r9-vectors-host-route`'s blank cases
+  in `relay_replies` and `service_suspended`.
 - **B-2, the open-link notice**:
   `{"type":"relay","op":"service_suspended","v":1,"text":"…"}`, exactly
   these fields, the same `text`, at most 1 KiB as received.

@@ -2661,6 +2661,58 @@ fn checker_format_ranges_are_the_framing_modules() {
     assert_eq!(theirs, ours, "the checker's CF_RANGES");
 }
 
+/// The independent checker writes out White_Space (`WHITE_SPACE_RANGES` in
+/// `scripts/check-r9-vectors.py`; Python's `str.isspace()` is another set,
+/// which adds U+001C to U+001F) for its nonblank rules (an alert's reason,
+/// a failed detail, a Station's text): it must be exactly the set the
+/// core's `framing::is_white_space` gives (Unicode 18.0.0, the generated
+/// `unicode_data::WHITE_SPACE`).
+#[test]
+fn checker_white_space_is_the_framing_modules() {
+    use atem_client::session::framing::is_white_space;
+    let script = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/check-r9-vectors.py"),
+    )
+    .unwrap();
+    let start = script
+        .find("WHITE_SPACE_RANGES = [")
+        .expect("WHITE_SPACE_RANGES in the checker");
+    assert_eq!(
+        script.matches("WHITE_SPACE_RANGES = [").count(),
+        1,
+        "one definition"
+    );
+    assert_eq!(
+        script.matches("\nWHITE_SPACE = ").count(),
+        1,
+        "one WHITE_SPACE, from the ranges"
+    );
+    let end = start + script[start..].find("\n]").unwrap();
+    let hex = |t: &str| u32::from_str_radix(t.trim().trim_start_matches("0x"), 16).unwrap();
+    let theirs: Vec<(u32, u32)> = script[start..end]
+        .split('(')
+        .skip(1)
+        .map(|pair| {
+            let pair = pair.split(')').next().unwrap();
+            let (a, b) = pair.split_once(',').unwrap();
+            (hex(a), hex(b))
+        })
+        .collect();
+    let mut ours: Vec<(u32, u32)> = Vec::new();
+    for cp in 0..=0x10FFFFu32 {
+        let Some(c) = char::from_u32(cp) else {
+            continue;
+        };
+        if is_white_space(c) {
+            match ours.last_mut() {
+                Some(r) if r.1 + 1 == cp => r.1 = cp,
+                _ => ours.push((cp, cp)),
+            }
+        }
+    }
+    assert_eq!(theirs, ours, "the checker's WHITE_SPACE_RANGES");
+}
+
 /// The `outcome_unknown` entries of `r9-vectors-push-hint` (kept apart from
 /// the file's other fields, whose bytes never move): hints for two alerts,
 /// their `details`, ack entries and refused cases. Every value comes from the

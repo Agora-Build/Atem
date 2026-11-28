@@ -414,17 +414,21 @@ pub const STATION_REFUSAL_CODES: [&str; 1] = [SERVICE_SUSPENDED];
 pub const MAX_SERVICE_TEXT_BYTES: usize = 256;
 
 /// Whether `text` is a Station's text a host may show (`atem status`,
-/// runtime.log): 1 to [`MAX_SERVICE_TEXT_BYTES`] bytes of UTF-8 with no
-/// character of General Category Cc, Cf, Zl or Zp (the pinned Unicode
-/// data's), so no terminal escape, bidi control or line break reaches a
-/// terminal. **Atem's proposal (#120 7207832274), agreed with Astation
-/// (#120 7212501350 and 7213560895)**, whose rule also requires the text
-/// nonblank (item 3 of 7213560895): not checked here yet (a text of nothing
-/// but White_Space passes), a follow-up with its boundary vectors.
+/// runtime.log): 1 to [`MAX_SERVICE_TEXT_BYTES`] bytes of UTF-8, nonblank
+/// (not every character White_Space, Unicode 18.0.0's, the framing
+/// module's table: [`crate::session::framing::is_white_space`]; around a
+/// visible character it stays, as sent), with no character of General
+/// Category Cc, Cf, Zl or Zp (the pinned Unicode data's), so no terminal
+/// escape, bidi control or line break reaches a terminal, and no blank
+/// line. **Atem's proposal (#120 7207832274), agreed with Astation (#120
+/// 7212501350 and 7213560895; nonblank: item 3 of 7213560895)**. Every
+/// reader and builder of both forms checks it ([`RelayReply::suspended`],
+/// [`RelayReply::parse`], `station_notice::ServiceSuspended`).
 pub fn service_text_ok(text: &str) -> bool {
     use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
     !text.is_empty()
         && text.len() <= MAX_SERVICE_TEXT_BYTES
+        && !text.chars().all(crate::session::framing::is_white_space)
         && !text.chars().any(|c| {
             matches!(
                 c.general_category(),

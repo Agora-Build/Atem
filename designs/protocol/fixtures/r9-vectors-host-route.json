@@ -957,6 +957,31 @@
         "text": "{\"code\":\"service_suspended\",\"op\":\"host_route_refused\",\"text\":\"\",\"type\":\"relay\",\"v\":1}"
       },
       {
+        "label": "suspended_text_space",
+        "reason": "one space (U+0020): a blank text",
+        "text": "{\"code\":\"service_suspended\",\"op\":\"host_route_refused\",\"text\":\" \",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "label": "suspended_text_ideographic_space",
+        "reason": "an ideographic space alone (U+3000): a blank text",
+        "text": "{\"code\":\"service_suspended\",\"op\":\"host_route_refused\",\"text\":\"\u3000\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "label": "suspended_text_no_break_space",
+        "reason": "a no-break space alone (U+00A0): a blank text",
+        "text": "{\"code\":\"service_suspended\",\"op\":\"host_route_refused\",\"text\":\"\u00a0\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "label": "suspended_text_mixed_white_space",
+        "reason": "nothing but White_Space, several Zs (U+0020, U+00A0, U+1680, U+2000, U+2005, U+200A, U+202F, U+205F, U+3000): a blank text",
+        "text": "{\"code\":\"service_suspended\",\"op\":\"host_route_refused\",\"text\":\" \u00a0\u1680\u2000\u2005\u200a\u202f\u205f\u3000\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "label": "suspended_text_256_bytes_of_white_space",
+        "reason": "256 bytes of nothing but White_Space (128 no-break spaces): a blank text",
+        "text": "{\"code\":\"service_suspended\",\"op\":\"host_route_refused\",\"text\":\"\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
         "label": "suspended_text_257_bytes",
         "reason": "a text of 257 bytes",
         "text": "{\"code\":\"service_suspended\",\"op\":\"host_route_refused\",\"text\":\"\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9\u00e9a\",\"type\":\"relay\",\"v\":1}"
@@ -1022,7 +1047,7 @@
         "text": "{\"code\":\"service_suspended\",\"op\":\"host_route_refused\",\"text\":\"a\",\"text\":\"b\",\"type\":\"relay\",\"v\":1}"
       }
     ],
-    "note": "The relay's reply after verifying a proof: host_route_ok (the verified host_id and the proof's head), host_route_refused with one of the verifier's codes and no other field, or the Station's host_route_refused with code service_suspended and a required text (1 to 256 bytes of UTF-8, no character of General Category Cc, Cf, Zl or Zp) for a proof that verified, when the Station doesn't serve the route's account (the delegated host-work design III.5; never a verifier code: verify_host_route never returns it, so an unverified connection learns nothing of an account's service state). The relay closes the connection after any refusal. Strictly parsed; `invalid` texts are refused as malformed. The service_suspended form, its text and that order are Atem's proposal (#120 7207832274), agreed with Astation (#120 7212501350 and 7213560895); the agreed text is also nonblank, which the shared reader doesn't check yet.",
+    "note": "The relay's reply after verifying a proof: host_route_ok (the verified host_id and the proof's head), host_route_refused with one of the verifier's codes and no other field, or the Station's host_route_refused with code service_suspended and a required text (1 to 256 bytes of UTF-8, nonblank, no character of General Category Cc, Cf, Zl or Zp) for a proof that verified, when the Station doesn't serve the route's account (the delegated host-work design III.5; never a verifier code: verify_host_route never returns it, so an unverified connection learns nothing of an account's service state). The relay closes the connection after any refusal. Strictly parsed; `invalid` texts are refused as malformed. The service_suspended form, its text and that order are Atem's proposal (#120 7207832274), agreed with Astation (#120 7212501350 and 7213560895); nonblank means not every character White_Space (Unicode 18.0.0; #120 7213560895 item 3): the blank suspended_text_* cases are refused, refused_service_suspended_one_visible_character reads.",
     "valid": [
       {
         "expect": {
@@ -1098,6 +1123,21 @@
           "v": 1
         },
         "note": "a text of exactly 256 bytes (128 two-byte characters)"
+      },
+      {
+        "expect": {
+          "code": "service_suspended",
+          "text": "\u3000 x \u00a0"
+        },
+        "label": "refused_service_suspended_one_visible_character",
+        "message": {
+          "code": "service_suspended",
+          "op": "host_route_refused",
+          "text": "\u3000 x \u00a0",
+          "type": "relay",
+          "v": 1
+        },
+        "note": "one visible character among White_Space (U+3000, U+0020, U+00A0): not blank"
       }
     ]
   },
@@ -1115,6 +1155,36 @@
         "label": "empty_text",
         "reason": "an empty text",
         "text": "{\"op\":\"service_suspended\",\"text\":\"\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "code": "malformed",
+        "label": "text_space",
+        "reason": "one space (U+0020): a blank text",
+        "text": "{\"op\":\"service_suspended\",\"text\":\" \",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "code": "malformed",
+        "label": "text_ideographic_space",
+        "reason": "an ideographic space alone (U+3000): a blank text",
+        "text": "{\"op\":\"service_suspended\",\"text\":\"\u3000\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "code": "malformed",
+        "label": "text_no_break_space",
+        "reason": "a no-break space alone (U+00A0): a blank text",
+        "text": "{\"op\":\"service_suspended\",\"text\":\"\u00a0\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "code": "malformed",
+        "label": "text_mixed_white_space",
+        "reason": "nothing but White_Space, several Zs (U+0020, U+00A0, U+1680, U+2000, U+2005, U+200A, U+202F, U+205F, U+3000): a blank text",
+        "text": "{\"op\":\"service_suspended\",\"text\":\" \u00a0\u1680\u2000\u2005\u200a\u202f\u205f\u3000\",\"type\":\"relay\",\"v\":1}"
+      },
+      {
+        "code": "malformed",
+        "label": "text_256_bytes_of_white_space",
+        "reason": "256 bytes of nothing but White_Space (128 no-break spaces): a blank text",
+        "text": "{\"op\":\"service_suspended\",\"text\":\"\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\",\"type\":\"relay\",\"v\":1}"
       },
       {
         "code": "malformed",
@@ -1207,7 +1277,7 @@
         "text": "{\"op\":\"service_suspended\",\"text\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"type\":\"relay\",\"v\":1}                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        "
       }
     ],
-    "note": "The Station's notice on a host's open link (the delegated host-work design III.5): {\"type\":\"relay\",\"op\":\"service_suspended\",\"v\":1,\"text\"}, exactly these fields, strict I-JSON, at most 1024 bytes as received, its text of the same grammar as host_route_refused's (1 to 256 bytes of UTF-8, no character of General Category Cc, Cf, Zl or Zp). Relay-originated only, never forwarded between room members; on a relay or routed host link the Station sends it after closing the host's channels (close{reason: service_suspended}, R9.7a), then closes the socket. `valid` cases parse to `expect` and rebuild to `message` (`text` cases are raw bytes); `invalid` ones are refused with `code` (the shared core's error code: malformed, not_strict_json or too_large). Atem's proposal (#120 7207832274), agreed with Astation (#120 7212501350 and 7213560895).",
+    "note": "The Station's notice on a host's open link (the delegated host-work design III.5): {\"type\":\"relay\",\"op\":\"service_suspended\",\"v\":1,\"text\"}, exactly these fields, strict I-JSON, at most 1024 bytes as received, its text of the same grammar as host_route_refused's (1 to 256 bytes of UTF-8, nonblank, no character of General Category Cc, Cf, Zl or Zp: the blank text_* cases are refused, one_visible_character reads). Relay-originated only, never forwarded between room members; on a relay or routed host link the Station sends it after closing the host's channels (close{reason: service_suspended}, R9.7a), then closes the socket. `valid` cases parse to `expect` and rebuild to `message` (`text` cases are raw bytes); `invalid` ones are refused with `code` (the shared core's error code: malformed, not_strict_json or too_large). Atem's proposal (#120 7207832274), agreed with Astation (#120 7212501350 and 7213560895).",
     "valid": [
       {
         "expect": {
@@ -1252,6 +1322,19 @@
         "label": "at_the_bound",
         "note": "1024 bytes as received (trailing whitespace counts)",
         "text": "{\"op\":\"service_suspended\",\"text\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"type\":\"relay\",\"v\":1}                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       "
+      },
+      {
+        "expect": {
+          "text": "\u3000 x \u00a0"
+        },
+        "label": "one_visible_character",
+        "message": {
+          "op": "service_suspended",
+          "text": "\u3000 x \u00a0",
+          "type": "relay",
+          "v": 1
+        },
+        "note": "one visible character among White_Space (U+3000, U+0020, U+00A0): not blank"
       }
     ]
   },
