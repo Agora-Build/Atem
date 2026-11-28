@@ -47,11 +47,24 @@ fn control() -> Value {
     load("r9-vectors-host-work-control")
 }
 
+/// Each label's entry: the control vectors' own `entries` first, else the
+/// membership log's.
 fn wires(v: &Vectors, labels: &[&str]) -> Vec<String> {
-    labels.iter().map(|l| v.wire(l).to_string()).collect()
+    let own = control()["entries"].clone();
+    labels
+        .iter()
+        .map(|l| {
+            own.as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["label"] == *l)
+                .map_or_else(|| v.wire(l).to_string(), |e| e["entry"].to_string())
+        })
+        .collect()
 }
 
-/// Log L, then a chain of membership-log labels.
+/// Log L, then a chain of membership-log labels or of the control vectors'
+/// own entries.
 fn log_after(v: &Vectors, chain: &[String]) -> Arc<MembershipLog> {
     let log = MembershipLog::verify(ACCOUNT.into(), genesis_hash().to_hex(), wires(v, &L), now())
         .unwrap();

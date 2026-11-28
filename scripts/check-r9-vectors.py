@@ -339,6 +339,8 @@ KEY_LABELS = {
     "host-a/host_key": "host-a host_channel_key",
     "host-evil/host_key": "host-evil host_key",
     "svc-discord/auth": "svc-discord auth",
+    # The control vectors' second service (their own chain enrols it).
+    "svc-other/auth": "svc-other auth",
     "browser/": "browser key",
     "K-gen-3/": "K-gen-3",
     "K-evil/": "K-evil",
@@ -785,11 +787,15 @@ def check_host_work_control(file, data, report, context):
     Rust runner's and the binding suites' (R9.12)."""
     keys = context["keys"]
     mlog = context["membership_log"]
-    entries = {v["label"]: v["entry"]["body"] for v in mlog["log"] + mlog["others"]}
+    # The chains name membership-log labels, or this file's own entries.
+    entries = {v["label"]: v["entry"]["body"] for v in mlog["log"] + mlog["others"] + data.get("entries", [])}
 
     def replay(chain):
         return Replay([entries[label] for label in LOG_L + list(chain)])
 
+    with report.case(file, "entries") as case:
+        check_report_entries(case, data, mlog)
+        case.check(all(e["label"] not in {v["label"] for v in mlog["log"] + mlog["others"]} for e in data["entries"]), "the file's own labels")
     with report.case(file, "account") as case:
         case.equal(data["account_id"], mlog["account_id"], "log L's account_id")
         case.equal(data["genesis_hash"], mlog["genesis_hash"], "log L's genesis_hash")
@@ -5659,11 +5665,94 @@ def rc_intent(o, c, candidate):
     return None, feed
 
 
+def rc_verify_control(body, sig, lst, bodies):
+    """verify_control's verdict on a control record, derived here from the
+    replayed list (I.5.4): the account; the principal's own key (a host's
+    never; a service's from its history, its principal_key naming it); a
+    member: signer's standing (a current native manager signs revoke and
+    interrupt_running only; one not yet in the list waits; a native without
+    manage, or one that lost it or was removed, is refused once what the
+    list doesn't hold yet waited); the principal (a service of the list with
+    the key named; a host's revoke_seq naming its host_sender_revoke); the
+    signature. {"verdict": "valid", "signer"} or {"verdict", "reason"}."""
+    def refused(reason):
+        return {"verdict": "refused", "reason": reason}
+
+    def pending(reason):
+        return {"verdict": "pending", "reason": reason}
+
+    if body["account_id"] != lst.account_id or body["genesis_hash"] != lst.genesis_hash:
+        return refused("wrong_account")
+    message = enc([CONTROL_LABEL, jcs(body)])
+
+    def signed(key):
+        return verify(key["alg"], b64u_decode(key["pub"]), sig, message)
+
+    principal, signer = body["principal"], body["signer"]
+
+    def service_key(pid):
+        member = lst.members.get(pid)
+        if member is None:
+            return pending("principal_unknown")
+        if member["kind"] != "service":
+            return refused("not_a_service")
+        for key in rc_keys_ever(lst, bodies, pid):
+            if sha256(b64u_decode(key["pub"])).hex() == body.get("principal_key"):
+                return key
+        return refused("key_mismatch")
+
+    def principal_check():
+        if principal.startswith("service:"):
+            key = service_key(principal[len("service:"):])
+            return key if "verdict" in key else None
+        host_id, seq = principal[len("host:"):], body["revoke_seq"]
+        if seq <= len(bodies):
+            entry = bodies[seq - 1]
+            ok = entry["action"] == "host_sender_revoke" and entry.get("host_id") == host_id
+            return None if ok else refused("not_a_revoke")
+        added = any(b["action"] == "add_host" and b["host"]["host_id"] == host_id for b in bodies)
+        return pending("revoke_not_in_list" if added else "principal_unknown")
+
+    if signer == principal:
+        if principal.startswith("host:"):
+            return refused("host_key_signed")
+        key = service_key(principal[len("service:"):])
+        if "verdict" in key:
+            return key
+        return {"verdict": "valid", "signer": principal} if signed(key) else refused("bad_signature")
+    device_id = signer[len("member:"):]
+    if body["action"] not in ("revoke", "interrupt_running"):
+        return refused("signer_not_allowed")
+    member = lst.members.get(device_id)
+
+    def not_a_manager():
+        if device_id not in lst.managed:
+            return "signer_not_allowed"
+        return "removed_manager" if any(signed(k) for k in rc_keys_ever(lst, bodies, device_id)) else "bad_signature"
+
+    if member is not None and member["standing"] == "active" and member["kind"] == "native" and "manage" in member["roles"]:
+        standing = "manager"
+    elif member is None or member["standing"] == "pending":
+        standing = "unknown"
+    elif member["kind"] == "native" and member["standing"] == "active":
+        standing = "not_manager"
+    else:
+        return refused(not_a_manager())
+    wrong = principal_check()
+    if wrong is not None:
+        return wrong
+    if standing == "unknown":
+        return pending("signer_unknown")
+    if standing == "not_manager":
+        return refused(not_a_manager())
+    return {"verdict": "valid", "signer": signer} if signed(member["auth_key"]) else refused("bad_signature")
+
+
 def rc_check(c, lst, bodies, copy_verdict):
     """check_resigned_copy, from the file's note: {"code", "detail"?} of the
     first check that fails, or the copy. `copy_verdict` gives the copy's
-    verify_control verdict on the case's list (the file's `checks`, as the
-    snapshot checks take theirs)."""
+    verify_control verdict on the case's list (rc_verify_control, derived
+    here; the file's `checks` only cross-check it)."""
     def refused(code, detail=None):
         return {"code": code, **({"detail": detail} if detail is not None else {})}
 
@@ -5681,16 +5770,18 @@ def rc_check(c, lst, bodies, copy_verdict):
         return refused("malformed", "list frozen")
     if o["action"] not in ("revoke", "interrupt_running"):
         return refused("not_a_stop")
-    # The original's signature under any key its signer had.
+    # A former or current manager's stop: a member: signer that held manage
+    # at some seq, its signature under any key it had; never the principal's
+    # own key.
     if o["signer"] == o["principal"]:
-        if o["principal"].startswith("host:"):
-            return refused("original_invalid", "host_key_signed")
-        signer_id = o["principal"][len("service:"):]
-    else:
-        signer_id = o["signer"][len("member:"):]
+        kind = "host_key_signed" if o["principal"].startswith("host:") else "service_key_signed"
+        return refused("original_invalid", kind)
+    signer_id = o["signer"][len("member:"):]
     keys = rc_keys_ever(lst, bodies, signer_id)
     if not keys:
         return refused("original_invalid", "unknown_signer")
+    if signer_id not in lst.managed:
+        return refused("original_invalid", "not_a_manager")
     message = enc([CONTROL_LABEL, jcs(o)])
     if not any(verify(key["alg"], b64u_decode(key["pub"]), osig, message) for key in keys):
         return refused("original_invalid", "bad_signature")
@@ -5752,6 +5843,12 @@ def check_resigned_copy(file, data, report, context):
                     case.check(True, "refused by the strict reading")
             else:
                 case.equal(enc([CONTROL_LABEL, text]).hex(), rec["signing_input_hex"], "signing input")
+                # Each verdict derived here from the replayed chain; `checks`
+                # is the cross-check.
+                for check in rec["checks"]:
+                    chain = {"chain": check["chain"]}
+                    derived = rc_verify_control(wire["body"], b64u_decode(wire["sig"]), report_list(chain, data, mlog, SrList), report_bodies(data, mlog, check["chain"]))
+                    case.equal(derived, {k: check[k] for k in ("verdict", "signer", "reason") if k in check}, f"verify_control on L + {check['chain']}")
     codes, fields = set(), set()
     for c in data["cases"]:
         with report.case(file, f"case {c['label']}") as case:
@@ -5759,8 +5856,8 @@ def check_resigned_copy(file, data, report, context):
             bodies = report_bodies(data, mlog, c["chain"])
 
             def copy_verdict():
-                found = [v for v in by_label[c["copy"]]["checks"] if v["chain"] == c["chain"]]
-                return found[0] if len(found) == 1 else {"verdict": "unknown", "reason": "none"}
+                k, ksig = rc_read(c["copy_json"])
+                return rc_verify_control(k, ksig, lst, bodies)
 
             for key in ("original", "copy"):
                 if key in c:
@@ -5792,7 +5889,8 @@ def check_resigned_copy(file, data, report, context):
             }
 
             def copy_verdict():
-                return next(v for v in by_label[p["copy"]]["checks"] if v["chain"] == p["chain"])
+                k, ksig = rc_read(pair["copy_json"])
+                return rc_verify_control(k, ksig, lst, bodies)
 
             case.equal(rc_check(pair, lst, bodies, copy_verdict), {"code": p["code"], "detail": p["detail"]}, "the copy check refuses it")
 

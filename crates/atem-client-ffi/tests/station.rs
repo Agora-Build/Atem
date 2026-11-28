@@ -1352,11 +1352,23 @@ fn matching_through_the_bindings() {
 
 // ------------------------------------------- the replacement feed's snapshot
 
-/// Log L, then a chain of membership-log labels.
+/// Log L, then a chain of membership-log labels or of the control vectors'
+/// own entries.
 fn log_after(chain: &[String]) -> Arc<atem_client_ffi::log::MembershipLog> {
     let v = Vectors::load();
-    let wires =
-        |labels: &[&str]| -> Vec<String> { labels.iter().map(|l| v.wire(l).to_string()).collect() };
+    let own = load("r9-vectors-host-work-control")["entries"].clone();
+    let wires = |labels: &[&str]| -> Vec<String> {
+        labels
+            .iter()
+            .map(|l| {
+                own.as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["label"] == *l)
+                    .map_or_else(|| v.wire(l).to_string(), |e| e["entry"].to_string())
+            })
+            .collect()
+    };
     let now = atem_client_ffi::types::HostClock {
         wall_ms: 1_793_264_001_000,
         mono_ms: 1_000,

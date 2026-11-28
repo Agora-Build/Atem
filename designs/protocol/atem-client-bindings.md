@@ -1515,9 +1515,11 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   provider asked under `ServiceControl` (no confirmation) for the
   integration's own key and `ControlRecord` (a fresh confirmation of the
   body) for a native manager.
-- **The copy check** (`tests/resigned_copy.rs`, Rust; two conformance
-  checks per language): every case of `r9-vectors-resigned-copy` through
-  `check_resigned_copy`, the copy or `Invalid` with its code and detail,
+- **The copy check** (`tests/resigned_copy.rs`, Rust; three conformance
+  checks per language): every record of `r9-vectors-resigned-copy`
+  through `verify_control_record` on each of its chains as its `checks`
+  say; every case through `check_resigned_copy` (on L, its chain and its
+  `freeze` carriage), the copy or `Invalid` with its code and detail,
   every code among them and `resigned_copy_codes` in their order; and its
   `checker_passes`: each snapshot consistent through
   `check_control_snapshot_consistency` while its stop is refused as a
@@ -2167,7 +2169,7 @@ you: what a rollback lost, nothing here can see (#114, items 1, 3 and 4).
 | `snapshot_json` | the snapshot's records, in publication order |
 | `marks` | `ControlSnapshotMark{principal, mark_ms}` per service principal, once each: a record its own key signs anew is issued strictly after `mark_ms` (`U_p` after a rollback, or the mark you sign above) |
 | `covered` | the principals the snapshot covers (`service:<id>`), once each: the services you currently cover at the cut (below) |
-| `provisioned` | the services you provisioned at your origin and haven't handed over (`service:<id>`, the identity `covered` uses), once each; required, and an empty list checks nothing (built for Astation's request, Astation #114 comment 7208700195): each must be in `covered`, revoked by a `revoke` of it the snapshot carries, or removed from the device list at the head, else `coverage_dropped` |
+| `provisioned` | the services you provisioned at your origin and haven't handed over (`service:<id>`, the identity `covered` uses), once each; required, and an empty list checks nothing (built for Astation's request, Astation #114 comment 7208700195): each must be in `covered`, revoked by a `revoke` of it the snapshot carries, or removed from the device list at the head, else `coverage_dropped`. A service the list doesn't hold at the head (its `service_add` not yet committed, a `recovery_add` still pending) is neither covered nor removed, so it is `coverage_dropped` (fail closed): leave it out until its `service_add` is in the list (**Atem's reading, for Astation's agreement**) |
 
 **What `covered` holds** (Atem's reading, **agreed with Astation
 (Astation #114 comments 7208700195 and 7209301522)**; host-work-v1 §11.1,
@@ -2211,7 +2213,8 @@ principal with no cover, `coverage_dropped` for a provisioned service (in
 sorted order) neither covered, nor revoked by the snapshot, nor removed at
 the head (no `record_id`; a Portal-only revoke, an expiry, an absent key
 or a missing reservation never clears coverage; its place in the order is
-Atem's choice), and each effect of each retained `revoke` or
+Atem's choice; one the list doesn't hold fails closed, Atem's reading
+above), and each effect of each retained `revoke` or
 `interrupt_running` that the snapshot alone doesn't keep on a fresh host
 (a revocation, or an interrupt due because its principal is revoked, in
 force; an interrupt not yet due, of a principal nothing revokes, an
@@ -2252,9 +2255,12 @@ record that reads strictly, a non-v4 `record_id` among them; the
 candidate feed isn't a UUID v4; the list is frozen; `detail`
 `original`, `copy`, `candidate_feed_id` or `list frozen`), `not_a_stop`
 (a `cover`, `hold` or `release` is never copied: you sign those anew
-with your own key), `original_invalid` (no `auth_key` its signer had in
-the list's history verifies it: `unknown_signer`, `host_key_signed`,
-`bad_signature`), `copy_invalid` (the copy isn't valid at the head with a
+with your own key), `original_invalid` (it isn't a manager's stop that
+verifies: `service_key_signed` or `host_key_signed` for the principal's
+own key, `unknown_signer` for a `member:` the list records no key of,
+`not_a_manager` for a native that never held `manage` at any `seq`,
+`bad_signature` when no `auth_key` that member had in the list's history
+verifies it), `copy_invalid` (the copy isn't valid at the head with a
 current native manager as its signer: the verifier's code, or
 `signed_by_principal`), `same_record_id`, then field by field in the
 body's order `intent_mismatch` (`detail` the first field that differs:
@@ -2264,8 +2270,10 @@ body's order `intent_mismatch` (`detail` the first field that differs:
 naming neither the original's feed nor `candidate_feed_id`). `signer`,
 `record_id` and `issued_at` may differ; `origin` never. `detail` is
 exactly what the refusal names, else empty. The field order, the
-details, the frozen list's refusal, `signed_by_principal` and the use of
-`Invalid` (no new error variant) are Atem's readings.
+details, the frozen list's refusal, `signed_by_principal`, the
+original's signer (a native that held `manage` at some `seq`, never the
+principal's own key) and the use of `Invalid` (no new error variant) are
+Atem's readings.
 
 **It is stricter than the snapshot checker, which stays effect-only.**
 `check_control_snapshot_consistency`'s `stop_not_resigned` fires only

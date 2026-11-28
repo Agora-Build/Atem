@@ -196,6 +196,14 @@
         "pub_hex": "40a3e522021710b7aab45e2e311d5673f3eac28d2588b458a24202abb23f68d1",
         "secret_hex": "fa1bed8571a892fe1c09489f44d0d352fe3e58ff7dcd80fa8f7236e649d15ca3"
       }
+    },
+    "svc-other": {
+      "auth": {
+        "alg": "ed25519",
+        "pub_hex": "290feabe59ea247965b4c2e6ef9af6571e42d5da6e1f63126bdc26fba3fd7abb",
+        "secret_hex": "e6e8babac8ab048d586dcd3095f535414938efaf7dd0b88d4cfb6b42f8e2d228"
+      },
+      "note": "a second service (label \"svc-other auth\"), enrolled only by the control vectors' own chain entry SO7_add_svc_other: two principals' coverage"
     }
   },
   "kind": "vectors",

@@ -387,10 +387,7 @@ pub(crate) fn check_body(body: &Value) -> Result<(SignLabel, String)> {
     if body.get("v").and_then(Value::as_u64) != Some(label.body_version()) {
         // A signer report is the one body at v2 (its process roster); its
         // v1 is refused, never read (no compatibility path).
-        return Err(Error::Malformed(match label.body_version() {
-            2 => "v must be 2",
-            _ => "v must be 1",
-        }));
+        return Err(Error::Malformed(label.version_refusal()));
     }
     check_value(body, &|path| array_rule(label, path))?;
     let jcs = jcs(body)?;

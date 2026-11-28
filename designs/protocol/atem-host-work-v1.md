@@ -1606,7 +1606,13 @@ missing `U_p`, nor the Station's own wish. A principal the snapshot
 revokes (or the device list removed) isn't currently covered: the
 snapshot carries its revoke and interrupts (as they are, a current
 manager's copies, or its own key's signed anew) and no cover, hold or
-release.
+release. A service the Station provisioned that the device list doesn't
+hold at the verifying head (its `service_add` not yet committed, or a
+`recovery_add` still pending) can be neither covered (its cover is
+`principal_unknown`) nor stopped by item 1 or 2, so the checker's
+`coverage_dropped` (below) fails closed for it: leave a service out of
+`provisioned` until its `service_add` is in the list (**Atem's reading,
+for Astation's agreement**).
 
 | p at the cut | The snapshot holds |
 |---|---|
@@ -1710,7 +1716,7 @@ effect?, revoke_seq?}`, the codes in the order they are checked:
 | `cover_not_first` | a covered principal's first record isn't its cover, or a hold or release comes before its principal's cover; after the last record (`index`: the snapshot's length), a covered principal with no cover |
 | `uncovered_cover` | a cover of a principal outside the covered set |
 | `not_above_mark` | a record signed anew with the service's own key is issued at or below its principal's mark, or the principal has none (a retained stop carried unchanged needs no mark) |
-| `coverage_dropped` | after the last record (`index`: the snapshot's length; no `record_id`): a principal in `provisioned`, in sorted order, that is neither in `covered`, nor revoked by a `revoke` of it the snapshot carries, nor removed from the device list at the head. Its place, after `cover_not_first` for a covered principal with no cover and before the retained stops' effects, is **Atem's choice** |
+| `coverage_dropped` | after the last record (`index`: the snapshot's length; no `record_id`): a principal in `provisioned`, in sorted order, that is neither in `covered`, nor revoked by a `revoke` of it the snapshot carries, nor removed from the device list at the head. Its place, after `cover_not_first` for a covered principal with no cover and before the retained stops' effects, is **Atem's choice**. A provisioned service the list doesn't hold at the head is neither covered nor removed: `coverage_dropped` (fail closed); leave a service out of `provisioned` until its `service_add` is in the list (**Atem's reading, for Astation's agreement**) |
 | `stop_lost` | after the last record: an effect of a retained `revoke` or `interrupt_running` that is valid at the head (its principal's revocation, and the interrupt with it) isn't kept by the snapshot alone applied to a fresh state, as the paragraph below says (`effect`: `revocation` or `interrupt`; `record_id`: that retained stop; `revoke_seq`: a host principal's interrupt) |
 | `stop_not_resigned` | the same for a retained stop refused `removed_manager` (`reason`), a genuine stop whose signature verifies under its signer's key from the list's history: a current manager signs it again (I.5.4). Effect-only: any valid stop that keeps the original's effects passes it; whether a stop is a conforming copy is `check_resigned_copy`'s, stricter, below |
 
@@ -2082,10 +2088,15 @@ core builds only the primitive.
      candidate feed isn't a UUID v4, or the list is frozen;
   2. `not_a_stop`: the original is a `cover`, `hold` or `release`, never
      copied (the Station signs those anew with its own key);
-  3. `original_invalid`: the original's signature verifies under no
-     `auth_key` its signer had in the list's history, at some `seq`
-     (`unknown_signer`, `host_key_signed`, `bad_signature`); its signer
-     may since have been removed or demoted, which is the point;
+  3. `original_invalid`: the original isn't a manager's stop that
+     verifies: its signer is a `member:` native that held `manage` at
+     some `seq` of the list (a viewer native's is `not_a_manager`, a
+     member the list records no key of `unknown_signer`), and its
+     signature verifies under an `auth_key` that member had in the
+     list's history (`bad_signature` otherwise); one signed with the
+     principal's own key is `service_key_signed` or `host_key_signed`.
+     Its signer may since have been removed or demoted, which is the
+     point;
   4. `copy_invalid`: the copy isn't valid at the head
      (`verify_control`) with a current native manager as its signer (the
      verifier's pending or refusal code, or `signed_by_principal` for a
@@ -2099,8 +2110,10 @@ core builds only the primitive.
      neither the original's feed nor the candidate. `signer`,
      `record_id` and `issued_at` may differ; `origin` never.
 
-  The field order, the details, the frozen list's refusal and
-  `signed_by_principal` are **Atem's reading**. **It is stricter than
+  The field order, the details, the frozen list's refusal,
+  `signed_by_principal` and the original's signer (a native that held
+  `manage` at some `seq`, never the principal's own key: only a
+  manager's stop is ever copied) are **Atem's reading**. **It is stricter than
   the snapshot checker**, which stays the consistency-only check agreed
   with #199: the checker's `stop_not_resigned` is an effect-only check,
   which any valid stop keeping the original's effects satisfies (a
@@ -2114,8 +2127,8 @@ core builds only the primitive.
   to discharge the original obligation" (#114 comment 7208700195), with
   the final author's exported signed copy and the complete checked
   snapshot. Vectors: `r9-vectors-resigned-copy` (below).
-- **The order of a recovery** (Atem's recommendation, **agreed with
-  Astation (Astation #114 comments 7208700195 and 7209301522)**): collect the retained,
+- **The order of a recovery** (Atem's recommendation, **agreed as part
+  of C (Astation #114 comments 7208700195 and 7209301522)**): collect the retained,
   imported and Portal evidence; take first the reports of the authors who
   can no longer sign copies (demoted managers); compute the originals that
   need copies (`stop_not_resigned`); current managers sign every copy and
@@ -2308,14 +2321,24 @@ removed manager's revoke for an uncovered principal
 the `P` cases, Astation's requested ones (#114 comment 7208700195): a
 service stopped by a carried manager's copy on either feed (no
 `coverage_dropped`), a revoked service whose snapshot misses an
-`interrupt_running` in force (`stop_lost`), two principals (a revoke of
-one never clears the other's coverage: `coverage_dropped` for the
-other), a revoke naming another key of the principal (`M12_revoke_another_key`,
+`interrupt_running` in force (`stop_lost`), two enrolled principals on
+the file's own chain entry `SO7_add_svc_other` (dev-mac's `service_add`
+of `svc-other` on L, its key `svc-other` in `r9-vectors-keys`; the
+records `SO1_cover`, `SO2_revoke` and `SO3_cover_a2` its own key's):
+svc-discord's revoke alone (`coverage_dropped` for svc-other, `P12`),
+svc-other's alone (`coverage_dropped` for svc-discord, `P13`), both
+(consistent, `P14`) and svc-other covered with svc-discord revoked
+(consistent, `P15`), so a revoke clears only its own principal's
+coverage; a provisioned principal the list doesn't hold
+(`P4_unenrolled_principal`: `coverage_dropped`, Atem's fail-closed
+reading above), a revoke naming another key of the principal (`M12_revoke_another_key`,
 refused `key_mismatch` before coverage is judged), a Portal-only revoke
 (`coverage_dropped`) and the same with nothing provisioned (consistent),
 a removal at the head, a provisioned principal that is covered, and
 `coverage_dropped`'s place (after a covered principal's missing cover,
 before a retained stop's lost effect).
+The file carries its own `entries` (`SO7_add_svc_other`), which the
+chains name beside `r9-vectors-membership-log`'s.
 `scripts/check-r9-vectors.py` derives each snapshot case's answer and
 `in_force` from the records' verdicts on its chain, with no state
 machine, and checks every code is exercised.
@@ -2326,7 +2349,8 @@ Every SDK package's checksum manifest lists the file.
 (c), agreed with Astation, #114 comments 7208700195 and 7209301522): log
 L of `r9-vectors-membership-log` and its own `entries` (`RC7_hs7_revoke`,
 HS7_revoke byte for byte; `RC7_demote_phone` and `RC8_demote_phone`,
-dev-phone demoted on L and after HS7); `records`, each with its
+dev-phone demoted on L and after HS7; `RC7_add_desk`, dev-desk added on
+L, a native without `manage`); `records`, each with its
 `verify_control` verdict on each of the file's chains (originals by
 dev-ipad, the manager E6 removed, and by dev-phone before its demotion;
 the same bodies but one field; originals that don't verify; dev-mac's
@@ -2336,7 +2360,9 @@ feed and on the candidate feed, a revoke with `interrupt_running`, a
 service's `interrupt_running`, a host principal's `interrupt_running`,
 a demoted manager's original) and every refusal (`malformed` in its
 forms, a non-v4 `record_id` among them; a cover and a hold never
-copied; originals forged, by an unknown member, by a host's key; copies
+copied; originals forged, by an unknown member, by a viewer native
+(`not_a_manager`), by the service's own key and by a host's key; a
+frozen list (its `freeze` carriage, `malformed` `list frozen`); copies
 by a demoted and a removed manager, by the service's key, a cover, by a
 member not yet in the list, a host principal's before its revoke; the
 same `record_id`; each field of the stop intent once, a third feed's
@@ -2346,9 +2372,11 @@ consistent whose stop the copy check refuses (a current manager's
 revoke with another `about.by`, the service's own revoke signed anew).
 Its runners are `crates/atem-client/tests/resigned_copy.rs` (which also
 checks that every conforming copy satisfies the snapshot checker), the
-FFI's, the binding conformance suites and `scripts/check-r9-vectors.py`,
-which derives every answer from the bytes (each copy's `verify_control`
-verdict taken from its `checks`). Every SDK package's checksum manifest
+FFI's and the binding conformance suites (each also runs every record's
+`checks` through `verify_control_record`), and
+`scripts/check-r9-vectors.py`, which derives every answer from the
+bytes, each record's `verify_control` verdict from the replayed list
+(its `checks` only a cross-check). Every SDK package's checksum manifest
 lists the file.
 
 **`r9-vectors-signer-report`** (the signer report above; agreed with

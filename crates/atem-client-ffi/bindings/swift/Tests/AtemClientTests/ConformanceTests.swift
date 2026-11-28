@@ -1463,6 +1463,10 @@ final class ConformanceTests: XCTestCase {
         // so a failed commit loses no effect); and a provider is asked under
         // the purpose the record's signer gives.
         let ctl = try load("r9-vectors-host-work-control")
+        // The entries the control vectors carry themselves (a second
+        // service's service_add, SO7), resolved by label in their chains as
+        // L's are.
+        for e in a(ctl["entries"]).map(o) { byLabel[s(e["label"])] = e }
         let ctlRecords = a(ctl["records"]).map(o)
         var ctlByLabel: [String: [String: Any]] = [:]
         for r in ctlRecords { ctlByLabel[s(r["label"])] = r }
@@ -1970,7 +1974,9 @@ final class ConformanceTests: XCTestCase {
             let at = HostClock(wallMs: u(c["now_ms"]), monoMs: 1000, bootId: "boot-1")
             let entries = a(rcopy["entries"]).map(o)
             let chain = a(c["chain"]).map { label in js(entries.first { s($0["label"]) == s(label) }!["entry"]!) }
-            return try MembershipLog.verify(accountId: account, genesisHash: genesis, entries: l + chain, now: at)
+            let log = try MembershipLog.verify(accountId: account, genesisHash: genesis, entries: l + chain, now: at)
+            if let freeze = c["freeze"] { _ = try log.extend(entries: [entry(s(freeze))], now: at) }
+            return log
         }
         func rcopyRecord(_ label: Any?) -> String {
             js(a(rcopy["records"]).map(o).first { s($0["label"]) == s(label) }!["record"]!)
@@ -1984,6 +1990,27 @@ final class ConformanceTests: XCTestCase {
                 return out
             }
             throw Failure(description: "expected a refusal, nothing thrown")
+        }
+        check("resigned copy: every record verifies on its chains as `checks` says") {
+            var verdicts = 0
+            let nowMs = o(a(rcopy["cases"])[0])["now_ms"]!
+            for r in a(rcopy["records"]).map(o) {
+                let label = s(r["label"])
+                let json = js(r["record"]!)
+                if let parseError = r["parse_error"] as? String {
+                    try throwsCode(parseError) { _ = try verifyControlRecord(log: try logL(), recordJson: json) }
+                    continue
+                }
+                for c in a(r["checks"]).map(o) {
+                    let log = try rcopyLog(["chain": c["chain"]!, "now_ms": nowMs])
+                    // The file's verdicts name the signer only (no key_seq).
+                    var got = verdictOf(a(c["chain"]), try verifyControlRecord(log: log, recordJson: json))
+                    got["key_seq"] = nil
+                    try eq(canon(got), canon(c), "\(label) on \(a(c["chain"]).map(s))")
+                    verdicts += 1
+                }
+            }
+            if verdicts < 100 { throw Failure(description: "\(verdicts) verdicts") }
         }
         check("resigned copy: every case through checkResignedCopy") {
             try eq(resignedCopyCodes(), a(rcopy["codes"]).map(s), "codes")
@@ -3224,6 +3251,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 159)
+        XCTAssertEqual(passed, 160)
     }
 }

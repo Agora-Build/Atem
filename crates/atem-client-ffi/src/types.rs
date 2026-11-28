@@ -1627,15 +1627,19 @@ data_enum! {
         /// `not_signed_anew`, `not_candidate_feed`, `cover_not_first`,
         /// `uncovered_cover`, `not_above_mark`, then `coverage_dropped` (a
         /// provisioned service neither covered, nor revoked by the
-        /// snapshot, nor removed at the head; no `record_id`), then
-        /// `stop_lost` or `stop_not_resigned` (a removed manager's
-        /// retained stop, `reason` `removed_manager`: a current manager
-        /// signs it again; `effect`: `revocation` or `interrupt`;
-        /// `revoke_seq`: a host principal's interrupt). `index` is otherwise the snapshot record's position
-        /// (from 0), or the snapshot's length for what only the whole
-        /// snapshot shows (a covered principal with no cover, a retained
-        /// stop's effect not kept). `record_id` is that snapshot
-        /// record's, or the retained record's.
+        /// snapshot, nor removed at the head; no `record_id`; Atem's
+        /// reading, for Astation's agreement: a provisioned service the
+        /// list doesn't hold at the head is neither, so it fails closed:
+        /// leave it out of `provisioned` until its `service_add` is in the
+        /// list), then `stop_lost` or `stop_not_resigned` (a removed
+        /// manager's retained stop, `reason` `removed_manager`: a current
+        /// manager signs it again; `effect`: `revocation` or `interrupt`;
+        /// `revoke_seq`: a host principal's interrupt). `index` is
+        /// otherwise the snapshot record's position (from 0), or the
+        /// snapshot's length for what only the whole snapshot shows (a
+        /// covered principal with no cover, `coverage_dropped`, a retained
+        /// stop's effect not kept). `record_id` is that snapshot record's,
+        /// or the retained record's.
         Inconsistent {
             index: u64,
             code: String,

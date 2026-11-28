@@ -93,6 +93,15 @@ impl SignLabel {
         }
     }
 
+    /// What a body of this label at another `v` is refused with: its
+    /// [`body_version`](Self::body_version), in words.
+    pub const fn version_refusal(self) -> &'static str {
+        match self.body_version() {
+            2 => "v must be 2",
+            _ => "v must be 1",
+        }
+    }
+
     /// The label of a signed body's `type` (§R9.1 table). The co-signature,
     /// the channel signatures and a host's `enc_sig` have no body type.
     pub fn of_body_type(body_type: &str) -> Option<Self> {

@@ -126,13 +126,10 @@ pub const SIGNER_REPORT_TYPE: &str = "atem-signer-report";
 /// A journal's `id`: 16 random bytes made with the journal, base64url.
 pub const JOURNAL_ID_BYTES: usize = 16;
 /// A journal's process roster at most, as the adapter hands it and as a
-/// report's roster is exported: 4,096 process generations. Nothing else a
-/// report carries is bounded as a list (the records export is bounded only
-/// by its count), so this is the brief's bound (Atem's reading, Astation
-/// #114 comment 7208700195 asked for one).
+/// report's roster is exported: 4,096 process generations. Atem's reading:
+/// nothing else a report carries is bounded as a list (the records export
+/// only by its count).
 pub const MAX_JOURNAL_PROCESSES: usize = 4096;
-/// The body's `v`: 2, the process roster's version (v1 refused).
-const SIGNER_REPORT_V: u64 = 2;
 /// A recovery's `generation` at most, 2^63 − 1 (at least 1), written as a
 /// canonical decimal string.
 pub const MAX_GENERATION: u64 = i64::MAX as u64;
@@ -904,7 +901,8 @@ pub fn signer_report_body(
     };
     let mut value: Map<String, Value> = common_body(log, &challenge.base, &process);
     value.insert("type".into(), json!(SIGNER_REPORT_TYPE));
-    value.insert("v".into(), json!(SIGNER_REPORT_V));
+    // 2, the process roster's version (v1 refused).
+    value.insert("v".into(), json!(SignLabel::SignerReport.body_version()));
     value.insert("recovery".into(), challenge.recovery.to_json());
     value.insert("journal".into(), summary.to_json());
     let held = HeldBody::new(

@@ -1,9 +1,56 @@
 {
   "account_id": "acct-test-1",
+  "entries": [
+    {
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "add",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "member": {
+            "auth_key": {
+              "alg": "ed25519",
+              "pub": "KQ_qvlnqJHlltMLm75r2Vx5C1dpuH2MSa9wm-6P9ers"
+            },
+            "device_id": "svc-other",
+            "expires_at": 1794992004000,
+            "kind": "service",
+            "roles": [
+              "service"
+            ],
+            "scope": {
+              "hosts": [
+                "host-a"
+              ],
+              "ops": [
+                "interrupt",
+                "prompt",
+                "view"
+              ],
+              "projects": [
+                "h1.b982533d.abababababababababababababababababababababababababababababababab"
+              ]
+            }
+          },
+          "prev_hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+          "seq": 7,
+          "signed_at": 1792400006500,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "WpY6uDto0wO9PURkEf8voQrU8mS5kGkfJRoD69_LOtFfjZPg1JJ_9Hlg2jt9KCCYXrm88iPTuxeIEmNuwCadpA"
+      },
+      "entry_hash": "9f35da5c3992106845560624005adf3f6415c5de6936bd6b8533992fed5bde2a",
+      "label": "SO7_add_svc_other",
+      "note": "add svc-other, a second service (E5's grant for its own device and key, label \"svc-other auth\"), on E6, by dev-mac: two principals' coverage",
+      "on": []
+    }
+  ],
   "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
   "kind": "vectors",
   "name": "r9-vectors-host-work-control",
-  "note": "Control records (delegated host-work I.5.3 to I.5.5, II.3.1; host-work-v1 §11.1; planned: host.senders, not advertised). Wire {\"body\":{…},\"sig\"}; signing input enc([\"atem-host-work-control-v1\", jcs(body)]) (R9.1). The device list is r9-vectors-membership-log's log L followed by `chain` (labels of its others); signers' keys are r9-vectors-keys' (`signed_with`). A service record's principal_key is the r9_svc of the principal's auth_key (SHA-256 of its raw bytes, decision 8), written beside it. `checks`: verify_control's verdict on each chain (valid with the verified signer and, for the principal's own key, the seq that enrolled it; pending or refused with its reason); `parse_error`: the record's parse refuses it (in a feed, refused per record and kept as evidence; over a channel the whole control_records message is invalid_request). `sequences`: ControlState::apply on one host, step by step (the record, the list of the transaction, its feed position or none over a channel, host-work's applied device-list seq) with the record's result, each effect's result, the host's actions and whether the record is kept as evidence; each step applies to the state the step before it left; `state` is ControlState::to_json after the last step (v2: one part per principal, `principals`; each part names its device list, account_id and genesis_hash, and its `records` are the [record_id, digest, issued_at] triples that counted, oldest first; `order` holds one feed per Station origin). A step's position is {origin, feed_id, feed_seq}: a record counts as read at its own feed's position only when origin and feed_id are its body's. Record ids are UUID v4 numbered by record (the X* records, V6_conflicting_id and S13_revoke_under_s4_id reuse another record's id on purpose). Atem's proposals, for Astation's and Auth/Portal's agreement: covers are ordered by (issued_at, record_id); a hold applies from any feed, a release only from the covering feed after its cover and after that feed's last hold or release; record ids are per principal, and another body under an id the same principal's record counted with is evidence (a stop still applies, a cover or release is refused). Each step's `standing` is ControlState::standing of its record's principal after it (held, interrupted, and revoked and coverage {origin, feed_id} when there are). Its `expect.why` is Applied::why's code (host-work-v1 §11.1: the verifier's pending or refusal reason, or list_frozen, not_revoked, revoke_not_applied, order, after_revoke, collision, not_newer, possible_replay, not_after_hold), present exactly when the record is pending or refused or kept as evidence. A sequence with `initial` starts from that state (ControlState::to_json) instead of a new one: its records of svc-discord that aren't the file's are the record `fill`'s body under those record ids (each signed by svc-discord's key and counted, at no position), so svc-discord's records start full. A principal keeps at most 256 counted record ids (MAX_RECORD_IDS): the next evicts the oldest, never the revocation's record nor the coverage's cover, and raises the part's `evicted_floor` to the newest issued_at evicted; a cover or release of a principal not revoked, under an id not counted and issued no later than the floor, is refused as a possible replay and kept as evidence; a hold, revoke or interrupt never is (decision 19, rulings T4a and T4d, agreed with Astation on 2026-11-13, #120 comment 6848326392). A service's part keeps `hold_issued_at`, the newest issued_at of every hold verified while it wasn't revoked (one that held or found it held, read out of order, from another feed, at no position or under a counted id), never lowered or cleared; a release taken in feed order while held lifts the hold only when issued strictly after it, else it is refused with why not_after_hold (no evidence) and takes no position in the feed's order (O1, requested in Astation's review of PR 2, #120 comment 6848326392; for Astation's sign-off). Each effect pending or refused in `expect` carries the step's why (O5, for Astation's sign-off). `snapshots` (Astation #114, items 2 and 6, agreed 2026-11-22): check_snapshot_consistency on station-dev's replacement feed (`candidate_feed_id`, stations.A2) against what the restored Station retained, on L + `chain`: `retained` (record labels, in its feed's order), `snapshot` (in publication order), `origin`, `marks` (each service principal's mark, ms: a record its own key signs is issued after it) `covered` (the services the Station currently covers at the cut, the caller's input: the D cases are Atem's reading of when that ends, agreed with Astation (Astation #114 comments 7208700195 and 7209301522): a service the snapshot itself revokes, by a revoke valid at the head it carries, or one the device list removed at the head, isn't covered, and the snapshot carries its retained stops and no cover, hold or release, covering it anyway being harmless; every other service the Station provisioned there, held or not, revoked in the Portal or not, is) and `provisioned` (the services the Station provisioned at its origin and hasn't handed over, the caller's input, requested by Astation, Astation #114 comment 7208700195; empty: no coverage_dropped check; the P cases); `expect` is {consistent: true} or the first inconsistency {consistent: false, index, code, principal, record_id?, reason?, effect?, revoke_seq?}: first invalid_retained (a retained record that doesn't verify at the head, but a removed manager's stop: reason verify_control's code, index its position in retained), then record by record, invalid_record (reason: verify_control's code), wrong_origin, not_signed_anew (a cover, hold or release whose signed object is a retained record's), not_candidate_feed, cover_not_first, uncovered_cover, not_above_mark; then, at index the snapshot's length, cover_not_first for a covered principal with no cover, coverage_dropped for a provisioned principal (in sorted order) that is neither in covered, nor revoked by a revoke of that principal the snapshot carries (valid at the head, as every snapshot record is by then), nor removed from the device list at the head (a Portal-only revoke, an expiry, an absent key or a missing reservation never clears coverage; its place in the order is Atem's choice), and each effect of each retained revoke or interrupt_running, in the retained order, that the snapshot alone doesn't keep on a fresh state (a revocation or a due interrupt in force; an interrupt not yet due, of a principal nothing revokes, an interrupt_running of that principal in the snapshot, which a new host holds pending): stop_lost when that retained stop is valid at the head, stop_not_resigned (reason removed_manager) when a removed manager signed it, with record_id that stop, effect `revocation` or `interrupt` and a host principal's revoke_seq. A retained revoke or interrupt_running carried unchanged (its signed object, body and sig, a retained record's) may name any feed of the origin and needs no mark, whoever signed it (Atem's reading of host-work-v1 §11.1 \"Resets\": a current manager's, agreed with Astation, #114 comment 7082464868, item 2; the service's own key's, agreed with Astation (Astation #114 comment 7089435073)); a cover, hold or release is always signed anew, and a record newly signed with the service's own key names the candidate feed and is issued after the mark. Consistency with what is retained only, never the completeness of a history or a clock. `in_force`: the stops each host state has in force (each principal's `revoked` and `interrupted`, only those with one) after the retained records (at no position), after the snapshot alone on a fresh state (a host that never read the old feed) and after the snapshot over the retained state (a host that did), at the list's head, a pending record applied once more after the rest.",
+  "note": "Control records (delegated host-work I.5.3 to I.5.5, II.3.1; host-work-v1 §11.1; planned: host.senders, not advertised). Wire {\"body\":{…},\"sig\"}; signing input enc([\"atem-host-work-control-v1\", jcs(body)]) (R9.1). The device list is r9-vectors-membership-log's log L followed by `chain` (labels of its others, or of this file's own `entries`: SO7_add_svc_other, dev-mac's add of svc-other, a second service, on E6); signers' keys are r9-vectors-keys' (`signed_with`). A service record's principal_key is the r9_svc of the principal's auth_key (SHA-256 of its raw bytes, decision 8), written beside it. `checks`: verify_control's verdict on each chain (valid with the verified signer and, for the principal's own key, the seq that enrolled it; pending or refused with its reason); `parse_error`: the record's parse refuses it (in a feed, refused per record and kept as evidence; over a channel the whole control_records message is invalid_request). `sequences`: ControlState::apply on one host, step by step (the record, the list of the transaction, its feed position or none over a channel, host-work's applied device-list seq) with the record's result, each effect's result, the host's actions and whether the record is kept as evidence; each step applies to the state the step before it left; `state` is ControlState::to_json after the last step (v2: one part per principal, `principals`; each part names its device list, account_id and genesis_hash, and its `records` are the [record_id, digest, issued_at] triples that counted, oldest first; `order` holds one feed per Station origin). A step's position is {origin, feed_id, feed_seq}: a record counts as read at its own feed's position only when origin and feed_id are its body's. Record ids are UUID v4 numbered by record (the X* records, V6_conflicting_id and S13_revoke_under_s4_id reuse another record's id on purpose). Atem's proposals, for Astation's and Auth/Portal's agreement: covers are ordered by (issued_at, record_id); a hold applies from any feed, a release only from the covering feed after its cover and after that feed's last hold or release; record ids are per principal, and another body under an id the same principal's record counted with is evidence (a stop still applies, a cover or release is refused). Each step's `standing` is ControlState::standing of its record's principal after it (held, interrupted, and revoked and coverage {origin, feed_id} when there are). Its `expect.why` is Applied::why's code (host-work-v1 §11.1: the verifier's pending or refusal reason, or list_frozen, not_revoked, revoke_not_applied, order, after_revoke, collision, not_newer, possible_replay, not_after_hold), present exactly when the record is pending or refused or kept as evidence. A sequence with `initial` starts from that state (ControlState::to_json) instead of a new one: its records of svc-discord that aren't the file's are the record `fill`'s body under those record ids (each signed by svc-discord's key and counted, at no position), so svc-discord's records start full. A principal keeps at most 256 counted record ids (MAX_RECORD_IDS): the next evicts the oldest, never the revocation's record nor the coverage's cover, and raises the part's `evicted_floor` to the newest issued_at evicted; a cover or release of a principal not revoked, under an id not counted and issued no later than the floor, is refused as a possible replay and kept as evidence; a hold, revoke or interrupt never is (decision 19, rulings T4a and T4d, agreed with Astation on 2026-11-13, #120 comment 6848326392). A service's part keeps `hold_issued_at`, the newest issued_at of every hold verified while it wasn't revoked (one that held or found it held, read out of order, from another feed, at no position or under a counted id), never lowered or cleared; a release taken in feed order while held lifts the hold only when issued strictly after it, else it is refused with why not_after_hold (no evidence) and takes no position in the feed's order (O1, requested in Astation's review of PR 2, #120 comment 6848326392; for Astation's sign-off). Each effect pending or refused in `expect` carries the step's why (O5, for Astation's sign-off). `snapshots` (Astation #114, items 2 and 6, agreed 2026-11-22): check_snapshot_consistency on station-dev's replacement feed (`candidate_feed_id`, stations.A2) against what the restored Station retained, on L + `chain`: `retained` (record labels, in its feed's order), `snapshot` (in publication order), `origin`, `marks` (each service principal's mark, ms: a record its own key signs is issued after it) `covered` (the services the Station currently covers at the cut, the caller's input: the D cases are Atem's reading of when that ends, agreed with Astation (Astation #114 comments 7208700195 and 7209301522): a service the snapshot itself revokes, by a revoke valid at the head it carries, or one the device list removed at the head, isn't covered, and the snapshot carries its retained stops and no cover, hold or release, covering it anyway being harmless; every other service the Station provisioned there, held or not, revoked in the Portal or not, is) and `provisioned` (the services the Station provisioned at its origin and hasn't handed over, the caller's input, requested by Astation, Astation #114 comment 7208700195; empty: no coverage_dropped check; the P cases; a provisioned service the list doesn't hold at the head is neither covered nor removed, so coverage_dropped fires for it, fail closed: leave a service out of provisioned until its add is in the list, Atem's reading, for Astation's agreement); `expect` is {consistent: true} or the first inconsistency {consistent: false, index, code, principal, record_id?, reason?, effect?, revoke_seq?}: first invalid_retained (a retained record that doesn't verify at the head, but a removed manager's stop: reason verify_control's code, index its position in retained), then record by record, invalid_record (reason: verify_control's code), wrong_origin, not_signed_anew (a cover, hold or release whose signed object is a retained record's), not_candidate_feed, cover_not_first, uncovered_cover, not_above_mark; then, at index the snapshot's length, cover_not_first for a covered principal with no cover, coverage_dropped for a provisioned principal (in sorted order) that is neither in covered, nor revoked by a revoke of that principal the snapshot carries (valid at the head, as every snapshot record is by then), nor removed from the device list at the head (a Portal-only revoke, an expiry, an absent key or a missing reservation never clears coverage; its place in the order is Atem's choice), and each effect of each retained revoke or interrupt_running, in the retained order, that the snapshot alone doesn't keep on a fresh state (a revocation or a due interrupt in force; an interrupt not yet due, of a principal nothing revokes, an interrupt_running of that principal in the snapshot, which a new host holds pending): stop_lost when that retained stop is valid at the head, stop_not_resigned (reason removed_manager) when a removed manager signed it, with record_id that stop, effect `revocation` or `interrupt` and a host principal's revoke_seq. A retained revoke or interrupt_running carried unchanged (its signed object, body and sig, a retained record's) may name any feed of the origin and needs no mark, whoever signed it (Atem's reading of host-work-v1 §11.1 \"Resets\": a current manager's, agreed with Astation, #114 comment 7082464868, item 2; the service's own key's, agreed with Astation (Astation #114 comment 7089435073)); a cover, hold or release is always signed anew, and a record newly signed with the service's own key names the candidate feed and is issued after the mark. Consistency with what is retained only, never the completeness of a history or a clock. `in_force`: the stops each host state has in force (each principal's `revoked` and `interrupted`, only those with one) after the retained records (at no position), after the snapshot alone on a fresh state (a host that never read the old feed) and after the snapshot over the retained state (a host that did), at the list's head, a pending record applied once more after the rest.",
   "records": [
     {
       "checks": [
@@ -16,6 +63,14 @@
         {
           "chain": [
             "E7"
+          ],
+          "key_seq": 5,
+          "signer": "service:svc-discord",
+          "verdict": "valid"
+        },
+        {
+          "chain": [
+            "SO7_add_svc_other"
           ],
           "key_seq": 5,
           "signer": "service:svc-discord",
@@ -620,6 +675,13 @@
       "checks": [
         {
           "chain": [],
+          "signer": "member:dev-mac",
+          "verdict": "valid"
+        },
+        {
+          "chain": [
+            "SO7_add_svc_other"
+          ],
           "signer": "member:dev-mac",
           "verdict": "valid"
         }
@@ -2769,6 +2831,131 @@
       },
       "signed_with": "dev-mac",
       "signing_input_hex": "000000196174656d2d686f73742d776f726b2d636f6e74726f6c2d76310000023f7b2261626f7574223a7b226279223a226f776e6572222c22696e746567726174696f6e5f6964223a22692d30316a63357a7139783877377636743573347233713270316e30227d2c226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a227265766f6b65222c22666565645f6964223a2239613862376336642d356534662d346133622d386332642d316530663961386237633664222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22696e746572727570745f72756e6e696e67223a66616c73652c226973737565645f6174223a313739333632313031313030302c226f726967696e223a2268747470733a2f2f73746174696f6e2d6465762e61676f72612e6275696c64222c227072696e636970616c223a22736572766963653a7376632d646973636f7264222c227072696e636970616c5f6b6579223a2265383633666266366536633235313635326439303937396266386538316334613834633633646461363233623438383035306338343266663534343166626665222c227265636f72645f6964223a2230303030303030302d303030302d343030302d383030302d303030303030303030303666222c227369676e6572223a226d656d6265723a6465762d6d6163222c2274797065223a226174656d2d686f73742d776f726b2d636f6e74726f6c222c2276223a317d"
+    },
+    {
+      "checks": [
+        {
+          "chain": [],
+          "reason": "principal_unknown",
+          "verdict": "pending"
+        },
+        {
+          "chain": [
+            "SO7_add_svc_other"
+          ],
+          "key_seq": 7,
+          "signer": "service:svc-other",
+          "verdict": "valid"
+        }
+      ],
+      "jcs": "{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793621012000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-other\",\"principal_key\":\"83abc39e96ac6387a1804428626ce5134f5177fe26ca1ad5e58381cc61381574\",\"record_id\":\"00000000-0000-4000-8000-000000000070\",\"signer\":\"service:svc-other\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "label": "SO1_cover",
+      "note": "station-dev covers svc-other (signed with its own service key) on the old feed",
+      "record": {
+        "body": {
+          "about": {
+            "by": "station",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+          },
+          "account_id": "acct-test-1",
+          "action": "cover",
+          "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "issued_at": 1793621012000,
+          "origin": "https://station-dev.agora.build",
+          "principal": "service:svc-other",
+          "principal_key": "83abc39e96ac6387a1804428626ce5134f5177fe26ca1ad5e58381cc61381574",
+          "record_id": "00000000-0000-4000-8000-000000000070",
+          "signer": "service:svc-other",
+          "type": "atem-host-work-control",
+          "v": 1
+        },
+        "sig": "Oc4Wh0VPfa1yKdvyPjAX_C5D8EPi_Jfpwn9Eh6J_hMTaPflP_wRM6-c5lkSQUS9ALBFJjyvme-SfIo8KrLriBw"
+      },
+      "signed_with": "svc-other",
+      "signing_input_hex": "000000196174656d2d686f73742d776f726b2d636f6e74726f6c2d7631000002277b2261626f7574223a7b226279223a2273746174696f6e222c22696e746567726174696f6e5f6964223a22692d30316a63357a7139783877377636743573347233713270316e30227d2c226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22636f766572222c22666565645f6964223a2236663163326233612d346435652d346636302d386137622d396330643165326633613462222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226973737565645f6174223a313739333632313031323030302c226f726967696e223a2268747470733a2f2f73746174696f6e2d6465762e61676f72612e6275696c64222c227072696e636970616c223a22736572766963653a7376632d6f74686572222c227072696e636970616c5f6b6579223a2238336162633339653936616336333837613138303434323836323663653531333466353137376665323663613161643565353833383163633631333831353734222c227265636f72645f6964223a2230303030303030302d303030302d343030302d383030302d303030303030303030303730222c227369676e6572223a22736572766963653a7376632d6f74686572222c2274797065223a226174656d2d686f73742d776f726b2d636f6e74726f6c222c2276223a317d"
+    },
+    {
+      "checks": [
+        {
+          "chain": [],
+          "reason": "principal_unknown",
+          "verdict": "pending"
+        },
+        {
+          "chain": [
+            "SO7_add_svc_other"
+          ],
+          "key_seq": 7,
+          "signer": "service:svc-other",
+          "verdict": "valid"
+        }
+      ],
+      "jcs": "{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793621013000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-other\",\"principal_key\":\"83abc39e96ac6387a1804428626ce5134f5177fe26ca1ad5e58381cc61381574\",\"record_id\":\"00000000-0000-4000-8000-000000000071\",\"signer\":\"service:svc-other\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "label": "SO2_revoke",
+      "note": "svc-other's own revoke on the old feed (retained, carried unchanged)",
+      "record": {
+        "body": {
+          "about": {
+            "by": "station",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+          },
+          "account_id": "acct-test-1",
+          "action": "revoke",
+          "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "interrupt_running": false,
+          "issued_at": 1793621013000,
+          "origin": "https://station-dev.agora.build",
+          "principal": "service:svc-other",
+          "principal_key": "83abc39e96ac6387a1804428626ce5134f5177fe26ca1ad5e58381cc61381574",
+          "record_id": "00000000-0000-4000-8000-000000000071",
+          "signer": "service:svc-other",
+          "type": "atem-host-work-control",
+          "v": 1
+        },
+        "sig": "ZNX9KDQafzGoDCACwk9DqEe5w-bjK2OUeFhM6gNmCMPi_fhMdh9ybKZyq2vlfI62XEWCzeX_VSIo9gOwyfB8BA"
+      },
+      "signed_with": "svc-other",
+      "signing_input_hex": "000000196174656d2d686f73742d776f726b2d636f6e74726f6c2d7631000002427b2261626f7574223a7b226279223a2273746174696f6e222c22696e746567726174696f6e5f6964223a22692d30316a63357a7139783877377636743573347233713270316e30227d2c226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a227265766f6b65222c22666565645f6964223a2236663163326233612d346435652d346636302d386137622d396330643165326633613462222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22696e746572727570745f72756e6e696e67223a66616c73652c226973737565645f6174223a313739333632313031333030302c226f726967696e223a2268747470733a2f2f73746174696f6e2d6465762e61676f72612e6275696c64222c227072696e636970616c223a22736572766963653a7376632d6f74686572222c227072696e636970616c5f6b6579223a2238336162633339653936616336333837613138303434323836323663653531333466353137376665323663613161643565353833383163633631333831353734222c227265636f72645f6964223a2230303030303030302d303030302d343030302d383030302d303030303030303030303731222c227369676e6572223a22736572766963653a7376632d6f74686572222c2274797065223a226174656d2d686f73742d776f726b2d636f6e74726f6c222c2276223a317d"
+    },
+    {
+      "checks": [
+        {
+          "chain": [
+            "SO7_add_svc_other"
+          ],
+          "key_seq": 7,
+          "signer": "service:svc-other",
+          "verdict": "valid"
+        }
+      ],
+      "jcs": "{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793621014000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-other\",\"principal_key\":\"83abc39e96ac6387a1804428626ce5134f5177fe26ca1ad5e58381cc61381574\",\"record_id\":\"00000000-0000-4000-8000-000000000072\",\"signer\":\"service:svc-other\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "label": "SO3_cover_a2",
+      "note": "svc-other's cover signed anew for the replacement feed A2, above its mark",
+      "record": {
+        "body": {
+          "about": {
+            "by": "station",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+          },
+          "account_id": "acct-test-1",
+          "action": "cover",
+          "feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "issued_at": 1793621014000,
+          "origin": "https://station-dev.agora.build",
+          "principal": "service:svc-other",
+          "principal_key": "83abc39e96ac6387a1804428626ce5134f5177fe26ca1ad5e58381cc61381574",
+          "record_id": "00000000-0000-4000-8000-000000000072",
+          "signer": "service:svc-other",
+          "type": "atem-host-work-control",
+          "v": 1
+        },
+        "sig": "VS7CZHd2SXfXOfFfh3al33ZhRAChrpK_BGFX5TchtQkzyS-4fTcOB33RY2iU2I45kJP3MNNxjeG3Jjwf860XAg"
+      },
+      "signed_with": "svc-other",
+      "signing_input_hex": "000000196174656d2d686f73742d776f726b2d636f6e74726f6c2d7631000002277b2261626f7574223a7b226279223a2273746174696f6e222c22696e746567726174696f6e5f6964223a22692d30316a63357a7139783877377636743573347233713270316e30227d2c226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22636f766572222c22666565645f6964223a2239613862376336642d356534662d346133622d386332642d316530663961386237633664222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226973737565645f6174223a313739333632313031343030302c226f726967696e223a2268747470733a2f2f73746174696f6e2d6465762e61676f72612e6275696c64222c227072696e636970616c223a22736572766963653a7376632d6f74686572222c227072696e636970616c5f6b6579223a2238336162633339653936616336333837613138303434323836323663653531333466353137376665323663613161643565353833383163633631333831353734222c227265636f72645f6964223a2230303030303030302d303030302d343030302d383030302d303030303030303030303732222c227369676e6572223a22736572766963653a7376632d6f74686572222c2274797065223a226174656d2d686f73742d776f726b2d636f6e74726f6c222c2276223a317d"
     }
   ],
   "requires": "r9",
@@ -22257,11 +22444,11 @@
           }
         }
       },
-      "label": "P4_two_principals",
+      "label": "P4_unenrolled_principal",
       "marks": {
         "service:svc-discord": 1793620913000
       },
-      "note": "svc-discord and svc-other provisioned (svc-other a second service this Station provisioned, not yet in the list), svc-discord's revoke carried: a revoke of one never clears the other's coverage",
+      "note": "svc-discord and svc-other provisioned, svc-other not in the list at the head (on L), svc-discord's revoke carried: a provisioned service the list doesn't hold is neither covered nor removed, and nothing in the snapshot can stop it, so coverage_dropped (fail closed; Atem's reading, for Astation's agreement: leave a service out of provisioned until its add is in the list)",
       "origin": "https://station-dev.agora.build",
       "provisioned": [
         "service:svc-discord",
@@ -22504,7 +22691,7 @@
       "marks": {
         "service:svc-discord": 1793620913000
       },
-      "note": "svc-other provisioned and not covered, svc-discord's retained revoke with interrupt_running dropped: coverage_dropped comes before the retained stops' effects",
+      "note": "svc-other provisioned (not in the list on L, P4's reading) and not covered, svc-discord's retained revoke with interrupt_running dropped: coverage_dropped comes before the retained stops' effects",
       "origin": "https://station-dev.agora.build",
       "provisioned": [
         "service:svc-other"
@@ -22514,6 +22701,222 @@
         "M7_revoke_interrupt"
       ],
       "snapshot": []
+    },
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [
+        "SO7_add_svc_other"
+      ],
+      "covered": [],
+      "expect": {
+        "code": "coverage_dropped",
+        "consistent": false,
+        "index": 1,
+        "principal": "service:svc-other"
+      },
+      "in_force": {
+        "retained": {
+          "service:svc-discord": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000014"
+          }
+        },
+        "snapshot": {
+          "service:svc-discord": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000014"
+          }
+        },
+        "snapshot_over_retained": {
+          "service:svc-discord": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000014"
+          }
+        }
+      },
+      "label": "P12_two_principals_one_revoked",
+      "marks": {
+        "service:svc-discord": 1793620913000
+      },
+      "note": "svc-discord and svc-other provisioned and enrolled (SO7), only svc-discord's revoke carried: svc-other's coverage isn't cleared",
+      "origin": "https://station-dev.agora.build",
+      "provisioned": [
+        "service:svc-discord",
+        "service:svc-other"
+      ],
+      "retained": [
+        "S1_cover",
+        "SO1_cover",
+        "M1_revoke"
+      ],
+      "snapshot": [
+        "M1_revoke"
+      ]
+    },
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [
+        "SO7_add_svc_other"
+      ],
+      "covered": [],
+      "expect": {
+        "code": "coverage_dropped",
+        "consistent": false,
+        "index": 1,
+        "principal": "service:svc-discord"
+      },
+      "in_force": {
+        "retained": {
+          "service:svc-other": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000071"
+          }
+        },
+        "snapshot": {
+          "service:svc-other": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000071"
+          }
+        },
+        "snapshot_over_retained": {
+          "service:svc-other": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000071"
+          }
+        }
+      },
+      "label": "P13_two_principals_the_other_revoked",
+      "marks": {
+        "service:svc-discord": 1793620913000
+      },
+      "note": "the same, only svc-other's own revoke carried unchanged: svc-discord's coverage isn't cleared",
+      "origin": "https://station-dev.agora.build",
+      "provisioned": [
+        "service:svc-discord",
+        "service:svc-other"
+      ],
+      "retained": [
+        "S1_cover",
+        "SO1_cover",
+        "SO2_revoke"
+      ],
+      "snapshot": [
+        "SO2_revoke"
+      ]
+    },
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [
+        "SO7_add_svc_other"
+      ],
+      "covered": [],
+      "expect": {
+        "consistent": true
+      },
+      "in_force": {
+        "retained": {
+          "service:svc-discord": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000014"
+          },
+          "service:svc-other": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000071"
+          }
+        },
+        "snapshot": {
+          "service:svc-discord": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000014"
+          },
+          "service:svc-other": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000071"
+          }
+        },
+        "snapshot_over_retained": {
+          "service:svc-discord": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000014"
+          },
+          "service:svc-other": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000071"
+          }
+        }
+      },
+      "label": "P14_two_principals_both_revoked",
+      "marks": {
+        "service:svc-discord": 1793620913000
+      },
+      "note": "both revokes carried: each one's coverage ends with its own revoke",
+      "origin": "https://station-dev.agora.build",
+      "provisioned": [
+        "service:svc-discord",
+        "service:svc-other"
+      ],
+      "retained": [
+        "S1_cover",
+        "SO1_cover",
+        "M1_revoke",
+        "SO2_revoke"
+      ],
+      "snapshot": [
+        "M1_revoke",
+        "SO2_revoke"
+      ]
+    },
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [
+        "SO7_add_svc_other"
+      ],
+      "covered": [
+        "service:svc-other"
+      ],
+      "expect": {
+        "consistent": true
+      },
+      "in_force": {
+        "retained": {
+          "service:svc-discord": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000014"
+          }
+        },
+        "snapshot": {
+          "service:svc-discord": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000014"
+          }
+        },
+        "snapshot_over_retained": {
+          "service:svc-discord": {
+            "interrupted": [],
+            "revoked": "00000000-0000-4000-8000-000000000014"
+          }
+        }
+      },
+      "label": "P15_one_covered_the_other_revoked",
+      "marks": {
+        "service:svc-discord": 1793620913000,
+        "service:svc-other": 1793620913000
+      },
+      "note": "svc-other covered, its cover signed anew first for A2 above its mark, and svc-discord revoked: each provisioned service covered or stopped",
+      "origin": "https://station-dev.agora.build",
+      "provisioned": [
+        "service:svc-discord",
+        "service:svc-other"
+      ],
+      "retained": [
+        "S1_cover",
+        "SO1_cover",
+        "M1_revoke"
+      ],
+      "snapshot": [
+        "SO3_cover_a2",
+        "M1_revoke"
+      ]
     }
   ],
   "stations": {

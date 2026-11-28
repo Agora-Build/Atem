@@ -101,7 +101,10 @@ fun main(args: Array<String>) {
     val genesis = mlog["genesis_hash"].s()
     val vectors = mlog["log"].arr() + mlog["others"].arr()
     val byLabel = vectors.associateBy { it["label"].s() }
-    fun entry(label: String) = Json.write(byLabel.getValue(label)["entry"])
+    // Entries a vector file carries itself (the control vectors' SO7),
+    // resolved by label in its chains as L's are.
+    val carried = mutableMapOf<String, Any?>()
+    fun entry(label: String) = Json.write((byLabel[label] ?: carried.getValue(label))["entry"])
     val l = mlog["log"].arr().map { Json.write(it["entry"]) }
     val now = HostClock(1793264001000uL, 1000uL, "boot-1")
     fun logL() = MembershipLog.verify(account, genesis, l, now)
@@ -1189,6 +1192,7 @@ fun main(args: Array<String>) {
     // commit loses no effect); and a provider is asked under the purpose
     // the record's signer gives.
     val ctl = load("r9-vectors-host-work-control")
+    for (e in ctl["entries"].arr()) carried[e["label"].s()] = e
     val ctlRecords = ctl["records"].arr()
     val ctlByLabel = ctlRecords.associateBy { it["label"].s() }
     val controlFields = setOf("type", "v", "account_id", "genesis_hash", "origin", "feed_id", "principal", "principal_key",
@@ -1643,7 +1647,9 @@ fun main(args: Array<String>) {
     fun rcopyLog(c: Any?): MembershipLog {
         val at = HostClock(c["now_ms"].l().toULong(), 1000uL, "boot-1")
         val chain = c["chain"].arr().map { label -> Json.write(rcopy["entries"].arr().first { it["label"] == label }["entry"]) }
-        return MembershipLog.verify(account, genesis, l + chain, at)
+        val log = MembershipLog.verify(account, genesis, l + chain, at)
+        c.obj()["freeze"]?.let { log.extend(listOf(entry(it.s())), at) }
+        return log
     }
     fun rcopyRecord(label: Any?) = Json.write(rcopy["records"].arr().first { it["label"] == label }["record"])
     fun copyRefusal(f: () -> Unit): Map<String, Any?> {
@@ -1653,6 +1659,26 @@ fun main(args: Array<String>) {
             return linkedMapOf<String, Any?>("code" to e.code).also { if (e.detail.isNotEmpty()) it["detail"] = e.detail }
         }
         throw AssertionError("expected a refusal, nothing thrown")
+    }
+    check("resigned copy: every record verifies on its chains as `checks` says") {
+        var verdicts = 0
+        val at = mapOf("now_ms" to rcopy["cases"][0]["now_ms"])
+        for (r in rcopy["records"].arr()) {
+            val label = r["label"].s()
+            val json = Json.write(r["record"])
+            val parseError = r.obj()["parse_error"]
+            if (parseError != null) {
+                throwsCode(parseError.s()) { verifyControlRecord(logL(), json) }
+                continue
+            }
+            for (c in r["checks"].arr()) {
+                // The file's verdicts name the signer only (no key_seq).
+                val got = verdictOf(c["chain"], verifyControlRecord(rcopyLog(at + ("chain" to c["chain"])), json)) - "key_seq"
+                eq(got, c.obj(), "$label on ${c["chain"]}")
+                verdicts++
+            }
+        }
+        check(verdicts >= 100) { "$verdicts verdicts" }
     }
     check("resigned copy: every case through checkResignedCopy") {
         eq(resignedCopyCodes(), strs(rcopy["codes"]), "codes")

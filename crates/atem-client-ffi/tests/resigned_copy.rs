@@ -12,9 +12,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use atem_client_ffi::AtemError;
-use atem_client_ffi::control::{check_resigned_copy, resigned_copy_codes};
+use atem_client_ffi::control::{check_resigned_copy, resigned_copy_codes, verify_control_record};
 use atem_client_ffi::log::MembershipLog;
-use atem_client_ffi::types::{HostClock, ResignedCopy};
+use atem_client_ffi::types::{ControlCheckInfo, HostClock, ResignedCopy};
 use serde_json::{Value, json};
 use support::*;
 
@@ -25,7 +25,8 @@ fn file() -> Value {
     .unwrap()
 }
 
-/// L, then the case's chain (the file's entries), as an app builds its log.
+/// L, then the case's chain (the file's entries), then its `freeze`
+/// carriage, as an app builds its log.
 fn log_of(file: &Value, case: &Value) -> Arc<MembershipLog> {
     let v = Vectors::load();
     let now = HostClock {
@@ -46,7 +47,13 @@ fn log_of(file: &Value, case: &Value) -> Arc<MembershipLog> {
             .unwrap();
         entries.push(entry["entry"].to_string());
     }
-    MembershipLog::verify(ACCOUNT.into(), v.hash("E1").to_hex(), entries, now).unwrap()
+    let log =
+        MembershipLog::verify(ACCOUNT.into(), v.hash("E1").to_hex(), entries, now.clone()).unwrap();
+    if let Some(label) = case.get("freeze").and_then(Value::as_str) {
+        log.extend(vec![v.wire(label).to_string()], now).unwrap();
+        assert!(log.frozen().is_some());
+    }
+    log
 }
 
 fn copy_json(c: &ResignedCopy) -> Value {
@@ -122,4 +129,48 @@ fn copies_through_the_production_binding() {
             p["label"]
         );
     }
+}
+
+/// Every record of the file verifies on each of its chains as its `checks`
+/// say, through the production `verify_control_record`; a record the
+/// parse refuses is `Invalid` with its `parse_error`.
+#[test]
+fn every_record_verifies_as_its_checks_say() {
+    let file = file();
+    let mut verdicts = 0;
+    for rec in file["records"].as_array().unwrap() {
+        let label = rec["label"].as_str().unwrap();
+        let wire = rec["record"].to_string();
+        let Some(checks) = rec.get("checks") else {
+            let code = rec["parse_error"].as_str().unwrap();
+            let got = verify_control_record(
+                log_of(&file, &json!({"chain": [], "now_ms": 1_793_620_850_000u64})),
+                wire,
+            );
+            assert!(
+                matches!(&got, Err(AtemError::Invalid { code: c, .. }) if c == code),
+                "{label}: {got:?}"
+            );
+            continue;
+        };
+        for check in checks.as_array().unwrap() {
+            let case = json!({"chain": check["chain"], "now_ms": 1_793_620_850_000u64});
+            let got = match verify_control_record(log_of(&file, &case), wire.clone()).unwrap() {
+                ControlCheckInfo::Valid { signer, .. } => {
+                    json!({"verdict": "valid", "signer": signer})
+                }
+                ControlCheckInfo::Pending { reason } => {
+                    json!({"verdict": "pending", "reason": reason})
+                }
+                ControlCheckInfo::Refused { reason } => {
+                    json!({"verdict": "refused", "reason": reason})
+                }
+            };
+            let mut want = check.clone();
+            want.as_object_mut().unwrap().remove("chain");
+            assert_eq!(got, want, "{label} on L + {}", check["chain"]);
+            verdicts += 1;
+        }
+    }
+    assert!(verdicts > 100, "{verdicts}");
 }

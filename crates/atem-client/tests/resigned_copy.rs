@@ -28,14 +28,16 @@ use atem_client::control::{
     check_snapshot_consistency, principal_key_of, verify_control,
 };
 use atem_client::encoding::hex;
-use atem_client::membership::{Action, HostNow, Membership, Role, RolesChange, sign_entry};
+use atem_client::membership::{
+    Action, HostNow, Member, MemberKind, Membership, Role, RolesChange, sign_entry,
+};
 use atem_client::{KeyId, KeyProvider, PublicKey, SignedObject, SoftwareKeys};
 use serde_json::{Map, Value, json};
 use support::{Book, Vectors, fixtures_dir, load, strict};
 
 const FILE: &str = "r9-vectors-resigned-copy";
 
-const NOTE: &str = "A current native manager's re-signed copy of a stop that a removed or demoted manager signed (host-work-v1 §11.1 \"A current manager's copy of a former manager's stop\", condition (c); agreed with Astation, Astation #114 comments 7208700195 and 7209301522): check_resigned_copy(list, original_json, copy_json, candidate_feed_id) (bindings check_resigned_copy, JS checkResignedCopy), one shared judgement so the Mac and the Station judge a copy alike. Pure: no clock, no storage. Records are control records (r9-vectors-host-work-control's form, wire {\"body\":{…},\"sig\"}, signing input enc([\"atem-host-work-control-v1\", jcs(body)])), each with `signed_with` (r9-vectors-keys' test key) and `checks`, verify_control's verdict on each of the file's chains (valid with the verified signer, member:<id> for a current manager or the principal for its own key; pending or refused with its reason). Device lists: log L of r9-vectors-membership-log followed by `chain` (labels of `entries`, signed by dev-mac on L but RC7_hs7_revoke, r9-vectors-membership-log's HS7_revoke byte for byte: host-a revoked at seq 7; RC7_demote_phone and RC8_demote_phone take manage from dev-phone, on L and on RC7_hs7_revoke), each verified at `now_ms`. dev-ipad is the manager E6 removed, dev-phone the one the RC entries demote, dev-mac the current manager that signs the copies. `cases`: check_resigned_copy on the case's list with `original_json`, `copy_json` (exact texts; `original` and `copy` name the file's records when they are) and `candidate_feed_id`: `expect` {original_record_id, copy_record_id, signer (the copy's, member:<id>), principal, action, feed: original | candidate, absent for a host principal's record, which names no feed}, or `code` with `detail` where it has one. The checks, in this order, the first that fails the answer: malformed (either object isn't a signed control record that reads strictly, a non-v4 record_id among them; a candidate_feed_id that isn't a UUID v4; detail which); not_a_stop (the original's action isn't revoke or interrupt_running: a cover, hold or release is never copied, the Station signs those anew with its own key); original_invalid (the original's signature doesn't verify under any auth_key its signer had in the list's history, at some seq: its signer may since have been removed or demoted; detail unknown_signer when the list records no key of it, host_key_signed for a host's own key, bad_signature); copy_invalid (the copy isn't valid at the list's head with a current native manager as its signer: detail verify_control's pending or refusal reason, or signed_by_principal for a record valid under the principal's own key); same_record_id (the copy's record_id is the original's); then the stop intent, field by field in the body's order, the first that differs the answer: intent_mismatch with that field as detail (account_id, genesis_hash, origin, principal, principal_key, action, interrupt_running, revoke_seq, about.integration_id, about.by), but a service's feed_id, which may be the original's (feed original) or candidate_feed_id (feed candidate), else feed_mismatch at its place (after origin). signer, record_id and issued_at may differ; origin never. The field order, the details, the frozen list's refusal (malformed, as the snapshot checker refuses one) and signed_by_principal are Atem's readings. What it says: the copy, by a current manager, carries exactly the original's stop intent, so it discharges the original's obligation; whether the original needs one, and the publication's other conditions (the copy in its author's final verified signer report, the final snapshot checked), are the Station's. `checker_passes`: two snapshots check_snapshot_consistency (r9-vectors-host-work-control's snapshot checker, its station-dev origin and candidate feed) finds consistent although their stop isn't a conforming copy of the removed manager's retained original: the checker is effect-only (stop_not_resigned fires only when the snapshot alone drops an effect of the original), and a conforming copy always keeps every effect, so the two never disagree the other way; the copy rule is the adapter's publication rule, built on check_resigned_copy. Each gives its snapshot inputs ({retained, snapshot, marks, covered, provisioned} by record label) with the checker's `expect`, and the copy check's `code` and `detail` for (original, copy).";
+const NOTE: &str = "A current native manager's re-signed copy of a stop that a removed or demoted manager signed (host-work-v1 §11.1 \"A current manager's copy of a former manager's stop\", condition (c); agreed with Astation, Astation #114 comments 7208700195 and 7209301522): check_resigned_copy(list, original_json, copy_json, candidate_feed_id) (bindings check_resigned_copy, JS checkResignedCopy), one shared judgement so the Mac and the Station judge a copy alike. Pure: no clock, no storage. Records are control records (r9-vectors-host-work-control's form, wire {\"body\":{…},\"sig\"}, signing input enc([\"atem-host-work-control-v1\", jcs(body)])), each with `signed_with` (r9-vectors-keys' test key) and `checks`, verify_control's verdict on each of the file's chains (valid with the verified signer, member:<id> for a current manager or the principal for its own key; pending or refused with its reason). Device lists: log L of r9-vectors-membership-log followed by `chain` (labels of `entries`, signed by dev-mac on L but RC7_hs7_revoke, r9-vectors-membership-log's HS7_revoke byte for byte: host-a revoked at seq 7; RC7_demote_phone and RC8_demote_phone take manage from dev-phone, on L and on RC7_hs7_revoke; RC7_add_desk adds dev-desk, a native without manage, on L), then the carriage `freeze` (a label of r9-vectors-membership-log's others) when a case names one, which freezes it, each verified at `now_ms`. dev-ipad is the manager E6 removed, dev-phone the one the RC entries demote, dev-mac the current manager that signs the copies. `cases`: check_resigned_copy on the case's list with `original_json`, `copy_json` (exact texts; `original` and `copy` name the file's records when they are) and `candidate_feed_id`: `expect` {original_record_id, copy_record_id, signer (the copy's, member:<id>), principal, action, feed: original | candidate, absent for a host principal's record, which names no feed}, or `code` with `detail` where it has one. The checks, in this order, the first that fails the answer: malformed (either object isn't a signed control record that reads strictly, a non-v4 record_id among them; a candidate_feed_id that isn't a UUID v4; detail which); not_a_stop (the original's action isn't revoke or interrupt_running: a cover, hold or release is never copied, the Station signs those anew with its own key); original_invalid (the original isn't a former or current manager's stop that verifies: detail service_key_signed for the service's own key, host_key_signed for a host's own key, unknown_signer when the list records no key of its member:, not_a_manager for a member that never held manage at any seq, bad_signature when no auth_key that member had in the list's history verifies it; its signer may since have been removed or demoted); copy_invalid (the copy isn't valid at the list's head with a current native manager as its signer: detail verify_control's pending or refusal reason, or signed_by_principal for a record valid under the principal's own key); same_record_id (the copy's record_id is the original's); then the stop intent, field by field in the body's order, the first that differs the answer: intent_mismatch with that field as detail (account_id, genesis_hash, origin, principal, principal_key, action, interrupt_running, revoke_seq, about.integration_id, about.by), but a service's feed_id, which may be the original's (feed original) or candidate_feed_id (feed candidate), else feed_mismatch at its place (after origin). signer, record_id and issued_at may differ; origin never. The field order, the details, the frozen list's refusal (malformed, detail list frozen, as the snapshot checker refuses one), signed_by_principal and the original's signer (a native that held manage at some seq, never the principal's own key) are Atem's readings. What it says: the copy, by a current manager, carries exactly the original's stop intent, so it discharges the original's obligation; whether the original needs one, and the publication's other conditions (the copy in its author's final verified signer report, the final snapshot checked), are the Station's. `checker_passes`: two snapshots check_snapshot_consistency (r9-vectors-host-work-control's snapshot checker, its station-dev origin and candidate feed) finds consistent although their stop isn't a conforming copy of the removed manager's retained original: the checker is effect-only (stop_not_resigned fires only when the snapshot alone drops an effect of the original), and a conforming copy always keeps every effect, so the two never disagree the other way; the copy rule is the adapter's publication rule, built on check_resigned_copy. Each gives its snapshot inputs ({retained, snapshot, marks, covered, provisioned} by record label) with the checker's `expect`, and the copy check's `code` and `detail` for (original, copy).";
 
 const ORIGIN: &str = "https://station-dev.agora.build";
 /// The old feed the originals name (the control vectors' `A`).
@@ -64,7 +66,9 @@ const L: &[&str] = &[];
 const DEMOTED: &[&str] = &["RC7_demote_phone"];
 const HOST: &[&str] = &["RC7_hs7_revoke"];
 const HOST_DEMOTED: &[&str] = &["RC7_hs7_revoke", "RC8_demote_phone"];
-const CHAINS: [&[&str]; 4] = [L, DEMOTED, HOST, HOST_DEMOTED];
+/// dev-desk added without `manage`: a native that never managed.
+const VIEWER: &[&str] = &["RC7_add_desk"];
+const CHAINS: [&[&str]; 5] = [L, DEMOTED, HOST, HOST_DEMOTED, VIEWER];
 
 fn record_id(n: u64) -> String {
     format!("00000000-0000-4000-8000-{n:012x}")
@@ -76,6 +80,17 @@ fn host_now() -> HostNow {
         mono_ms: 1_000,
         boot_id: "boot-1".into(),
     }
+}
+
+/// L of `v`, then `chain`, then the carriage `freeze` (a label of
+/// r9-vectors-membership-log's others) when given, verified at NOW.
+fn frozen_by(v: &Vectors, log: Membership, freeze: Option<&str>) -> Membership {
+    let Some(label) = freeze else {
+        return log;
+    };
+    let log = log.evaluate(&[strict(v.wire(label))], &host_now()).next;
+    assert!(log.frozen().is_some(), "{label} freezes the list");
+    log
 }
 
 /// L of `v`, then `chain`, verified at NOW.
@@ -114,6 +129,9 @@ struct Case {
     label: &'static str,
     note: &'static str,
     chain: &'static [&'static str],
+    /// A carriage of r9-vectors-membership-log's `others` that freezes the
+    /// list (applied after the chain).
+    freeze: Option<&'static str>,
     original: Obj,
     copy: Obj,
     candidate: &'static str,
@@ -185,6 +203,23 @@ impl Gen {
             HOST,
             1_793_620_808_000,
             demote(),
+        );
+        let desk = Action::Add {
+            member: Member {
+                device_id: "dev-desk".into(),
+                auth_key: made.public("dev-desk/auth"),
+                kind: MemberKind::Native {
+                    enc_key: made.public("dev-desk/enc"),
+                    roles: [Role::Control, Role::View].into_iter().collect(),
+                },
+            },
+        };
+        made.push(
+            "RC7_add_desk",
+            "add dev-desk, a native member with roles [control, view] (never manage), on E6, by dev-mac",
+            L,
+            1_792_400_006_000,
+            desk,
         );
         made.records = made.records();
         made
@@ -475,6 +510,26 @@ impl Gen {
                 ),
             ),
             r(
+                "B4_viewer",
+                "dev-desk's revoke of svc-discord at the old feed (O1's intent): dev-desk is a native that never held manage",
+                "dev-desk/auth",
+                self.signed(
+                    "dev-desk/auth",
+                    &edit(&o1, 24, &|b| {
+                        b.signer = ControlSigner::Member("dev-desk".into())
+                    }),
+                ),
+            ),
+            r(
+                "B5_service_key",
+                "svc-discord's own revoke at the old feed (O1's intent, its own key): no manager's stop to copy",
+                "svc-discord/auth",
+                self.signed(
+                    "svc-discord/auth",
+                    &edit(&o1, 25, &|b| b.signer = ControlSigner::Principal),
+                ),
+            ),
+            r(
                 "B3_host_key",
                 "O4 signed as host-a itself, by its host_key: a host's own key signs no control record",
                 "host-a/host_key",
@@ -628,6 +683,7 @@ impl Gen {
             label,
             note,
             chain,
+            freeze: None,
             original: Obj::Rec(original),
             copy: Obj::Rec(copy),
             candidate: CANDIDATE,
@@ -759,6 +815,33 @@ impl Gen {
                 "B2_unknown_signer",
                 "C1_revoke",
                 code("original_invalid", Some("unknown_signer")),
+            ),
+            Case {
+                freeze: Some("C6_mac"),
+                ..c(
+                    "frozen_list",
+                    "the list frozen by C6_mac (a current manager's conflicting entry at seq 6): it verifies nothing new, so it judges no copy",
+                    L,
+                    "O1_revoke",
+                    "C1_revoke",
+                    code("malformed", Some("list frozen")),
+                )
+            },
+            c(
+                "original_by_a_viewer",
+                "the original's signer is a native that never held manage (dev-desk, RC7_add_desk): no manager's stop, so no obligation to copy",
+                VIEWER,
+                "B4_viewer",
+                "C1_revoke",
+                code("original_invalid", Some("not_a_manager")),
+            ),
+            c(
+                "original_by_the_service_key",
+                "the original is svc-discord's own revoke: a stop the Station signs with the service's key, never a manager's to copy",
+                L,
+                "B5_service_key",
+                "C1_revoke",
+                code("original_invalid", Some("service_key_signed")),
             ),
             c(
                 "original_by_a_hosts_key",
@@ -1036,6 +1119,28 @@ fn copy_json(copy: &ResignedCopy) -> Value {
     out
 }
 
+/// The snapshot checker's answer as the control vectors write it.
+fn consistency_json(answer: &SnapshotConsistency) -> Value {
+    let SnapshotConsistency::Inconsistent(i) = answer else {
+        return json!({"consistent": true});
+    };
+    let mut v = json!({"consistent": false, "index": i.index, "code": i.code.code(),
+                       "principal": i.principal});
+    if let Some(id) = &i.record_id {
+        v["record_id"] = json!(id);
+    }
+    if let Some(r) = &i.reason {
+        v["reason"] = json!(r);
+    }
+    if let Some(e) = i.effect {
+        v["effect"] = json!(e.code());
+    }
+    if let Some(seq) = i.revoke_seq {
+        v["revoke_seq"] = json!(seq);
+    }
+    v
+}
+
 fn refusal_json(refusal: &CopyRefusal) -> Value {
     let mut out = json!({"code": refusal.code()});
     if let Some(detail) = refusal.detail() {
@@ -1060,13 +1165,16 @@ fn resigned_copy_vectors() -> Value {
         .into_iter()
         .map(|case| {
             let (original, copy) = (made.text(&case.original), made.text(&case.copy));
-            let log = made.log(case.chain);
+            let log = frozen_by(&made.v, made.log(case.chain), case.freeze);
             let got =
                 check_resigned_copy(&log, original.as_bytes(), copy.as_bytes(), case.candidate);
             let mut out = Map::new();
             out.insert("label".into(), json!(case.label));
             out.insert("note".into(), json!(case.note));
             out.insert("chain".into(), json!(case.chain));
+            if let Some(freeze) = case.freeze {
+                out.insert("freeze".into(), json!(freeze));
+            }
             out.insert("now_ms".into(), json!(NOW));
             if let Obj::Rec(label) = case.original {
                 out.insert("original".into(), json!(label));
@@ -1197,7 +1305,8 @@ fn resigned_copy_file_is_what_the_generator_makes() {
     );
 }
 
-/// L, then the file's `chain` entries, at the case's `now_ms`.
+/// L, then the file's `chain` entries, then the case's `freeze`, at the
+/// case's `now_ms`.
 fn case_log(v: &Vectors, file: &Value, case: &Value) -> Membership {
     let chain: Vec<SignedObject> = case["chain"]
         .as_array()
@@ -1214,7 +1323,11 @@ fn case_log(v: &Vectors, file: &Value, case: &Value) -> Membership {
         })
         .collect();
     assert_eq!(case["now_ms"], NOW);
-    log_of(v, &chain)
+    frozen_by(
+        v,
+        log_of(v, &chain),
+        case.get("freeze").and_then(Value::as_str),
+    )
 }
 
 /// Every case as the file says, read from the file; every code among them,
@@ -1316,6 +1429,14 @@ fn resigned_copy_vectors_run_through_the_shared_core() {
             .iter()
             .map(|(k, v)| (k.clone(), v.as_u64().unwrap()))
             .collect();
+        let principals = |key: &str| -> BTreeSet<String> {
+            snap[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p.as_str().unwrap().to_owned())
+                .collect()
+        };
         let answer = check_snapshot_consistency(&SnapshotInput {
             list: &log,
             origin: snap["origin"].as_str().unwrap(),
@@ -1323,11 +1444,11 @@ fn resigned_copy_vectors_run_through_the_shared_core() {
             retained: &records("retained"),
             snapshot: &records("snapshot"),
             marks: &marks,
-            covered: &BTreeSet::new(),
-            provisioned: &BTreeSet::new(),
+            covered: &principals("covered"),
+            provisioned: &principals("provisioned"),
         })
         .unwrap();
-        assert_eq!(answer, SnapshotConsistency::Consistent, "{label}");
+        assert_eq!(consistency_json(&answer), snap["expect"], "{label}");
         let (original, copy) = (rec(&p["original"]), rec(&p["copy"]));
         let got = check_resigned_copy(
             &log,

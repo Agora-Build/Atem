@@ -56,7 +56,12 @@
 //!    missing reservation never clears coverage. An empty `provisioned`
 //!    checks nothing here. Its place, after the covered principals'
 //!    missing covers and before the retained stops' effects, is Atem's
-//!    choice.
+//!    choice. Atem's reading, for Astation's agreement: a provisioned
+//!    service the device list doesn't hold at the head (its `service_add`
+//!    not yet committed, or a `recovery_add` still pending) is neither
+//!    covered (its cover would be `invalid_record`, `principal_unknown`)
+//!    nor removed, so it is `coverage_dropped`: fail closed. Leave a
+//!    service out of `provisioned` until its `service_add` is in the list.
 //! 10. `stop_lost` or `stop_not_resigned`: an effect of a retained `revoke`
 //!    or `interrupt_running` (its principal's revocation, and the
 //!    interrupt with it) that the snapshot alone, applied to a fresh state
@@ -136,7 +141,9 @@ pub struct SnapshotInput<'a> {
     /// The services the Station provisioned at `origin` and hasn't handed
     /// over (`service:<id>`, the identity `covered` uses): each must be
     /// covered, revoked by the snapshot or removed at the head
-    /// (`coverage_dropped`). Required; empty checks nothing.
+    /// (`coverage_dropped`; one the list doesn't hold at the head is
+    /// neither, so it fails closed: Atem's reading, module docs, check 9).
+    /// Required; empty checks nothing.
     pub provisioned: &'a BTreeSet<String>,
 }
 
@@ -190,6 +197,11 @@ pub enum InconsistencyCode {
     CoverNotFirst,
     UncoveredCover,
     NotAboveMark,
+    /// A provisioned service neither covered, nor revoked by the snapshot,
+    /// nor removed at the head; one the device list doesn't hold at the
+    /// head counts as neither, so it fails closed (Atem's reading, for
+    /// Astation's agreement: leave it out of `provisioned` until its
+    /// `service_add` is in the list).
     CoverageDropped,
     StopLost,
     StopNotResigned,
@@ -372,7 +384,9 @@ fn check_input(input: &SnapshotInput<'_>) -> Result<()> {
 
 /// Whether the provisioned service `principal` lost its coverage: not in
 /// `covered`, no `revoke` of it in the snapshot (each verified at the head
-/// already), and not removed from the device list at the head.
+/// already), and not removed from the device list at the head. A service
+/// the list doesn't hold at all isn't removed: it lost its coverage (fail
+/// closed, Atem's reading).
 fn coverage_dropped(input: &SnapshotInput<'_>, principal: &str) -> bool {
     if input.covered.contains(principal) {
         return false;

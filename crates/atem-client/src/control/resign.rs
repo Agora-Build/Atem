@@ -17,9 +17,14 @@
 //!    nothing new, R9.4; the snapshot checker refuses one too).
 //! 2. `not_a_stop`: the original is a `cover`, `hold` or `release`. Those
 //!    are never copied: the Station signs them anew with its own key.
-//! 3. `original_invalid`: the original's signature doesn't verify under any
-//!    `auth_key` its signer had in the list's history, at some `seq`. Its
-//!    signer may since have been removed or demoted: that is the point.
+//! 3. `original_invalid`: the original isn't a manager's stop that verifies.
+//!    Its signer is the principal's own key (`service_key_signed`,
+//!    `host_key_signed`), or a `member:` the list never held
+//!    (`unknown_signer`), or one that never held `manage` at any `seq`
+//!    (`not_a_manager`: the obligation is a former or current manager's
+//!    stop), or its signature verifies under no `auth_key` that member had
+//!    in the list's history (`bad_signature`). Its signer may since have
+//!    been removed or demoted: that is the point.
 //! 4. `copy_invalid`: the copy isn't valid at the list's head
 //!    ([`verify_control`]) with a current native manager as its signer (a
 //!    record valid under the principal's own key is no manager's copy).
@@ -34,8 +39,10 @@
 //!    `feed_mismatch`. `signer`, `record_id` and `issued_at` may differ;
 //!    `origin` never.
 //!
-//! The field order, the details, the frozen list's refusal and
-//! `signed_by_principal` are Atem's readings.
+//! The field order, the details, the frozen list's refusal,
+//! `signed_by_principal` and the original's signer (a native that held
+//! `manage` at some `seq`, never the principal's own key) are Atem's
+//! readings.
 //!
 //! **What it says, and what it doesn't.** A copy that passes carries the
 //! original's stop intent and is a current manager's valid stop: it keeps
@@ -78,10 +85,13 @@ pub enum CopyRefusal {
     Malformed(&'static str),
     /// The original's action is `cover`, `hold` or `release`.
     NotAStop,
-    /// The original's signature verifies under no `auth_key` its signer had
-    /// in the list's history: `unknown_signer` (the list records no key of
-    /// it), `host_key_signed` (a host's own key signs no control record),
-    /// `bad_signature`.
+    /// The original isn't a former or current manager's stop that
+    /// verifies: `service_key_signed` (the service's own key: the Station's
+    /// stop, never a manager's to copy), `host_key_signed` (a host's own key
+    /// signs no control record), `unknown_signer` (the list records no key
+    /// of its `member:`), `not_a_manager` (a member that never held
+    /// `manage` at any `seq`), `bad_signature` (no key that member had in
+    /// the list's history verifies it).
     OriginalInvalid(&'static str),
     /// The copy isn't a current native manager's stop valid at the head:
     /// [`verify_control`]'s pending or refusal code, or
@@ -191,7 +201,7 @@ pub fn check_resigned_copy(
 }
 
 /// The checks after the reading, on records already parsed.
-pub(crate) fn judge(
+fn judge(
     log: &Membership,
     original: &ControlRecord,
     copy: &ControlRecord,
@@ -232,18 +242,25 @@ fn is_stop(action: ControlAction) -> bool {
     )
 }
 
-/// The original's signature under a key its signer had in the list's
-/// history (any `seq`): its signer's `auth_key` as an `add` (or a
-/// `recovery_add` that took effect) recorded it.
+/// The original a manager's: a `member:` signer that held `manage` at
+/// some `seq` of the list (removed or demoted since, or still a manager),
+/// its signature under a key it had in the list's history (any `seq`): its
+/// `auth_key` as an `add` (or a `recovery_add` that took effect) recorded
+/// it. The principal's own key is no manager's (Atem's reading).
 fn original_signed(log: &Membership, rec: &ControlRecord) -> Result<(), &'static str> {
     let id = match (rec.signer(), rec.principal()) {
         (ControlSigner::Member(id), _) => id.as_str(),
-        (ControlSigner::Principal, ControlPrincipal::Service(id)) => id.as_str(),
+        (ControlSigner::Principal, ControlPrincipal::Service(_)) => {
+            return Err("service_key_signed");
+        }
         (ControlSigner::Principal, ControlPrincipal::Host(_)) => return Err("host_key_signed"),
     };
     let keys = log.keys_ever(id);
     if keys.is_empty() {
         return Err("unknown_signer");
+    }
+    if !log.was_manager(id) {
+        return Err("not_a_manager");
     }
     if keys.iter().any(|(_, key)| rec.object().verify(key).is_ok()) {
         Ok(())

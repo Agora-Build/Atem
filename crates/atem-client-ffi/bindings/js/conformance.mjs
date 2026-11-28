@@ -971,6 +971,9 @@ check("station binding: the synchronous signer, with a software key", () => {
 // again, whole or from its parts per principal, only for its own device
 // list; and a handle never changes, so a failed commit loses no effect.
 const ctl = load("r9-vectors-host-work-control");
+// The entries the control vectors carry themselves (a second service's
+// service_add, SO7), resolved by label in their chains as L's are.
+for (const e of ctl.entries) byLabel[e.label] = e;
 const ctlByLabel = Object.fromEntries(ctl.records.map((r) => [r.label, r]));
 const CONTROL_FIELDS = ["type", "v", "account_id", "genesis_hash", "origin", "feed_id", "principal", "principal_key", "signer", "action", "interrupt_running", "revoke_seq", "record_id", "issued_at", "about"];
 // The typed body of a record's body JSON (null: a field the body doesn't have).
@@ -1363,10 +1366,13 @@ check("control snapshots: every case through checkControlSnapshotConsistency", (
 // check's code and detail), and the snapshots the effect-only checker
 // passes whose stop the copy check refuses.
 const rcopy = load("r9-vectors-resigned-copy");
+// L, the case's chain (the file's entries), then its freeze carriage.
 const rcopyLog = (c) => {
   const now = { wallMs: c.now_ms, monoMs: 1000, bootId: "boot-1" };
   const chain = c.chain.map((label) => str(rcopy.entries.find((e) => e.label === label).entry));
-  return m.MembershipLog.verify(ACCOUNT, GENESIS, [...L, ...chain], now);
+  const log = m.MembershipLog.verify(ACCOUNT, GENESIS, [...L, ...chain], now);
+  if (c.freeze !== undefined) log.extend([entry(c.freeze)], now);
+  return log;
 };
 const rcopyRecord = (label) => str(rcopy.records.find((r) => r.label === label).record);
 const copyRefusal = (f) => {
@@ -1378,6 +1384,23 @@ const copyRefusal = (f) => {
   }
   throw new Error("expected a refusal, nothing thrown");
 };
+check("resigned copy: every record verifies on its chains as `checks` says", () => {
+  let verdicts = 0;
+  for (const r of rcopy.records) {
+    const json = str(r.record);
+    if (r.parse_error !== undefined) {
+      throwsCode(() => m.verifyControlRecord(logL(), json), r.parse_error);
+      continue;
+    }
+    for (const c of r.checks) {
+      // The file's verdicts name the signer only (no key_seq).
+      const { key_seq: _, ...got } = verdictOf(c.chain, m.verifyControlRecord(rcopyLog({ chain: c.chain, now_ms: rcopy.cases[0].now_ms }), json));
+      same(got, c, `${r.label} on ${c.chain}`);
+      verdicts++;
+    }
+  }
+  if (verdicts < 100) throw new Error(`${verdicts} verdicts`);
+});
 check("resigned copy: every case through checkResignedCopy", () => {
   same(m.resignedCopyCodes(), rcopy.codes, "codes");
   const codes = new Set();

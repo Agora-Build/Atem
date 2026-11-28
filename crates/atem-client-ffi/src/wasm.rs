@@ -2389,7 +2389,10 @@ impl AckTransition {
 /// history, a clock or an author's stops are complete. `marks` is an array
 /// of `{principal, markMs}`; `covered` the principals the snapshot covers;
 /// `provisioned` the services the Station provisioned at its origin and
-/// hasn't handed over (`coverage_dropped`; may be empty). Returns `{type:
+/// hasn't handed over (`coverage_dropped`; may be empty; one the list
+/// doesn't hold at the head is neither covered nor removed, so it fails
+/// closed, Atem's reading for Astation's agreement: leave it out until its
+/// `service_add` is in the list). Returns `{type:
 /// "consistent"}` or `{type: "inconsistent", index, code, principal,
 /// recordId, reason, effect, revokeSeq}` (`null` where none).
 #[wasm_bindgen(js_name = checkControlSnapshotConsistency)]

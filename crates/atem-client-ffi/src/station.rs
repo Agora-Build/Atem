@@ -890,20 +890,23 @@ impl AckLedgerHandle {
 /// principal's cover comes first, a hold or release after it),
 /// `uncovered_cover`, `not_above_mark` (signed anew with the service's own
 /// key, issued at or below its principal's mark or with none); then a
-/// covered principal with no cover (`cover_not_first`), then each effect
-/// of each retained `revoke` or `interrupt_running` that the snapshot
-/// alone doesn't keep on a fresh state (a revocation, or an interrupt due
-/// because its principal is revoked, in force; an interrupt not yet due,
-/// of a principal nothing revokes, an `interrupt_running` of that
-/// principal in the snapshot, which a new host holds pending as a host
-/// that read the old feed does), after `coverage_dropped` for a
-/// provisioned service (in sorted order) that is neither covered, nor
-/// revoked by a `revoke` of it the snapshot carries, nor removed from the
-/// device list at the head (a Portal-only revoke, an expiry, an absent key
-/// or a missing reservation never clears coverage; agreed with Astation,
-/// Astation #114 comments 7208700195 and 7209301522; its place in the
-/// order Atem's choice):
-/// `stop_lost` when that retained stop is valid at the head,
+/// covered principal with no cover (`cover_not_first`); then
+/// `coverage_dropped` for a provisioned service (in sorted order) that is
+/// neither covered, nor revoked by a `revoke` of it the snapshot carries,
+/// nor removed from the device list at the head (a Portal-only revoke, an
+/// expiry, an absent key or a missing reservation never clears coverage;
+/// agreed with Astation, Astation #114 comments 7208700195 and
+/// 7209301522; its place in the order Atem's choice; and Atem's reading,
+/// for Astation's agreement: a provisioned service the list doesn't hold
+/// at the head is neither covered nor removed, so it fails closed: leave a
+/// service out of `provisioned` until its `service_add` is in the list);
+/// then each effect of each retained `revoke` or `interrupt_running` that
+/// the snapshot alone doesn't keep on a fresh state (a revocation, or an
+/// interrupt due because its principal is revoked, in force; an interrupt
+/// not yet due, of a principal nothing revokes, an `interrupt_running` of
+/// that principal in the snapshot, which a new host holds pending as a
+/// host that read the old feed does): `stop_lost` when that retained stop
+/// is valid at the head,
 /// `stop_not_resigned` (`reason` `removed_manager`) when a removed manager
 /// signed it, a genuine stop a current manager signs again (I.5.4). It is
 /// effect-only: whether a snapshot stop is a conforming copy of a removed

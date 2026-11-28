@@ -220,6 +220,48 @@
     },
     {
       "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [],
+      "code": "malformed",
+      "copy": "C1_revoke",
+      "copy_json": "{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620900031,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-00000000001f\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"Wd3Ub79UPrljR74u4yFxcCPAGBqBuWNztzgYs3E9s1sxOlJ_jdIP74PGYfT5HFoal0BgG-VIt6Vzgv05SLAr2g\"}",
+      "detail": "list frozen",
+      "freeze": "C6_mac",
+      "label": "frozen_list",
+      "note": "the list frozen by C6_mac (a current manager's conflicting entry at seq 6): it verifies nothing new, so it judges no copy",
+      "now_ms": 1793620850000,
+      "original": "O1_revoke",
+      "original_json": "{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1792400004500,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-ipad\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"qCGsmPmpCFol5SP8CO7IEY6xufcMAgXnhkduzq9iDVVc-UA6OWh489gqoncN9_nNp6QyjysfMsQxfBrs7rVZkw\"}"
+    },
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [
+        "RC7_add_desk"
+      ],
+      "code": "original_invalid",
+      "copy": "C1_revoke",
+      "copy_json": "{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620900031,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-00000000001f\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"Wd3Ub79UPrljR74u4yFxcCPAGBqBuWNztzgYs3E9s1sxOlJ_jdIP74PGYfT5HFoal0BgG-VIt6Vzgv05SLAr2g\"}",
+      "detail": "not_a_manager",
+      "label": "original_by_a_viewer",
+      "note": "the original's signer is a native that never held manage (dev-desk, RC7_add_desk): no manager's stop, so no obligation to copy",
+      "now_ms": 1793620850000,
+      "original": "B4_viewer",
+      "original_json": "{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1792400004500,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000018\",\"signer\":\"member:dev-desk\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"6ZlDLTqu747Dgwy2IipjsvCHrkskZBJbRCii7iDlF1X6psngUKDCyUjTkV17GV6iTGpW1bRrQeYSLDW6dsJ0DA\"}"
+    },
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "chain": [],
+      "code": "original_invalid",
+      "copy": "C1_revoke",
+      "copy_json": "{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620900031,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-00000000001f\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"Wd3Ub79UPrljR74u4yFxcCPAGBqBuWNztzgYs3E9s1sxOlJ_jdIP74PGYfT5HFoal0BgG-VIt6Vzgv05SLAr2g\"}",
+      "detail": "service_key_signed",
+      "label": "original_by_the_service_key",
+      "note": "the original is svc-discord's own revoke: a stop the Station signs with the service's key, never a manager's to copy",
+      "now_ms": 1793620850000,
+      "original": "B5_service_key",
+      "original_json": "{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1792400004500,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000019\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"W4w7VI5F3ExFsFkIW-4dkopkYq_5QDbj0wwoIj6VQxuQsxSZRXuJRG1y0USTWVp1fq3Qu5Ol7riQX1LjUsbNCQ\"}"
+    },
+    {
+      "candidate_feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
       "chain": [
         "RC7_hs7_revoke"
       ],
@@ -626,11 +668,47 @@
       "on": [
         "RC7_hs7_revoke"
       ]
+    },
+    {
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "add",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "member": {
+            "auth_key": {
+              "alg": "ed25519",
+              "pub": "ClSCPm-_A1IHetLYdjzAfleq0z7Af8y2jTD2TeWbvEw"
+            },
+            "device_id": "dev-desk",
+            "enc_key": {
+              "alg": "x25519",
+              "pub": "ochcNgkIT72nNct6bke3GLJVthiEnQkZKGRmSfkK_kg"
+            },
+            "kind": "native",
+            "roles": [
+              "control",
+              "view"
+            ]
+          },
+          "prev_hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+          "seq": 7,
+          "signed_at": 1792400006000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "L1utGI5quVku0f6xcAKTI7U2GXHbJPMM92UaVrimGWdw6qGuNaLB1E_OZOcXlNZER-DoT1Uqwc9hcmv_LUuvpg"
+      },
+      "entry_hash": "55c8d13365bdd6b79b758f910a0bacb0c6e3e99c4a483c4fa5ded9f0962f5ecb",
+      "label": "RC7_add_desk",
+      "note": "add dev-desk, a native member with roles [control, view] (never manage), on E6, by dev-mac",
+      "on": []
     }
   ],
   "kind": "vectors",
   "name": "r9-vectors-resigned-copy",
-  "note": "A current native manager's re-signed copy of a stop that a removed or demoted manager signed (host-work-v1 §11.1 \"A current manager's copy of a former manager's stop\", condition (c); agreed with Astation, Astation #114 comments 7208700195 and 7209301522): check_resigned_copy(list, original_json, copy_json, candidate_feed_id) (bindings check_resigned_copy, JS checkResignedCopy), one shared judgement so the Mac and the Station judge a copy alike. Pure: no clock, no storage. Records are control records (r9-vectors-host-work-control's form, wire {\"body\":{…},\"sig\"}, signing input enc([\"atem-host-work-control-v1\", jcs(body)])), each with `signed_with` (r9-vectors-keys' test key) and `checks`, verify_control's verdict on each of the file's chains (valid with the verified signer, member:<id> for a current manager or the principal for its own key; pending or refused with its reason). Device lists: log L of r9-vectors-membership-log followed by `chain` (labels of `entries`, signed by dev-mac on L but RC7_hs7_revoke, r9-vectors-membership-log's HS7_revoke byte for byte: host-a revoked at seq 7; RC7_demote_phone and RC8_demote_phone take manage from dev-phone, on L and on RC7_hs7_revoke), each verified at `now_ms`. dev-ipad is the manager E6 removed, dev-phone the one the RC entries demote, dev-mac the current manager that signs the copies. `cases`: check_resigned_copy on the case's list with `original_json`, `copy_json` (exact texts; `original` and `copy` name the file's records when they are) and `candidate_feed_id`: `expect` {original_record_id, copy_record_id, signer (the copy's, member:<id>), principal, action, feed: original | candidate, absent for a host principal's record, which names no feed}, or `code` with `detail` where it has one. The checks, in this order, the first that fails the answer: malformed (either object isn't a signed control record that reads strictly, a non-v4 record_id among them; a candidate_feed_id that isn't a UUID v4; detail which); not_a_stop (the original's action isn't revoke or interrupt_running: a cover, hold or release is never copied, the Station signs those anew with its own key); original_invalid (the original's signature doesn't verify under any auth_key its signer had in the list's history, at some seq: its signer may since have been removed or demoted; detail unknown_signer when the list records no key of it, host_key_signed for a host's own key, bad_signature); copy_invalid (the copy isn't valid at the list's head with a current native manager as its signer: detail verify_control's pending or refusal reason, or signed_by_principal for a record valid under the principal's own key); same_record_id (the copy's record_id is the original's); then the stop intent, field by field in the body's order, the first that differs the answer: intent_mismatch with that field as detail (account_id, genesis_hash, origin, principal, principal_key, action, interrupt_running, revoke_seq, about.integration_id, about.by), but a service's feed_id, which may be the original's (feed original) or candidate_feed_id (feed candidate), else feed_mismatch at its place (after origin). signer, record_id and issued_at may differ; origin never. The field order, the details, the frozen list's refusal (malformed, as the snapshot checker refuses one) and signed_by_principal are Atem's readings. What it says: the copy, by a current manager, carries exactly the original's stop intent, so it discharges the original's obligation; whether the original needs one, and the publication's other conditions (the copy in its author's final verified signer report, the final snapshot checked), are the Station's. `checker_passes`: two snapshots check_snapshot_consistency (r9-vectors-host-work-control's snapshot checker, its station-dev origin and candidate feed) finds consistent although their stop isn't a conforming copy of the removed manager's retained original: the checker is effect-only (stop_not_resigned fires only when the snapshot alone drops an effect of the original), and a conforming copy always keeps every effect, so the two never disagree the other way; the copy rule is the adapter's publication rule, built on check_resigned_copy. Each gives its snapshot inputs ({retained, snapshot, marks, covered, provisioned} by record label) with the checker's `expect`, and the copy check's `code` and `detail` for (original, copy).",
+  "note": "A current native manager's re-signed copy of a stop that a removed or demoted manager signed (host-work-v1 §11.1 \"A current manager's copy of a former manager's stop\", condition (c); agreed with Astation, Astation #114 comments 7208700195 and 7209301522): check_resigned_copy(list, original_json, copy_json, candidate_feed_id) (bindings check_resigned_copy, JS checkResignedCopy), one shared judgement so the Mac and the Station judge a copy alike. Pure: no clock, no storage. Records are control records (r9-vectors-host-work-control's form, wire {\"body\":{…},\"sig\"}, signing input enc([\"atem-host-work-control-v1\", jcs(body)])), each with `signed_with` (r9-vectors-keys' test key) and `checks`, verify_control's verdict on each of the file's chains (valid with the verified signer, member:<id> for a current manager or the principal for its own key; pending or refused with its reason). Device lists: log L of r9-vectors-membership-log followed by `chain` (labels of `entries`, signed by dev-mac on L but RC7_hs7_revoke, r9-vectors-membership-log's HS7_revoke byte for byte: host-a revoked at seq 7; RC7_demote_phone and RC8_demote_phone take manage from dev-phone, on L and on RC7_hs7_revoke; RC7_add_desk adds dev-desk, a native without manage, on L), then the carriage `freeze` (a label of r9-vectors-membership-log's others) when a case names one, which freezes it, each verified at `now_ms`. dev-ipad is the manager E6 removed, dev-phone the one the RC entries demote, dev-mac the current manager that signs the copies. `cases`: check_resigned_copy on the case's list with `original_json`, `copy_json` (exact texts; `original` and `copy` name the file's records when they are) and `candidate_feed_id`: `expect` {original_record_id, copy_record_id, signer (the copy's, member:<id>), principal, action, feed: original | candidate, absent for a host principal's record, which names no feed}, or `code` with `detail` where it has one. The checks, in this order, the first that fails the answer: malformed (either object isn't a signed control record that reads strictly, a non-v4 record_id among them; a candidate_feed_id that isn't a UUID v4; detail which); not_a_stop (the original's action isn't revoke or interrupt_running: a cover, hold or release is never copied, the Station signs those anew with its own key); original_invalid (the original isn't a former or current manager's stop that verifies: detail service_key_signed for the service's own key, host_key_signed for a host's own key, unknown_signer when the list records no key of its member:, not_a_manager for a member that never held manage at any seq, bad_signature when no auth_key that member had in the list's history verifies it; its signer may since have been removed or demoted); copy_invalid (the copy isn't valid at the list's head with a current native manager as its signer: detail verify_control's pending or refusal reason, or signed_by_principal for a record valid under the principal's own key); same_record_id (the copy's record_id is the original's); then the stop intent, field by field in the body's order, the first that differs the answer: intent_mismatch with that field as detail (account_id, genesis_hash, origin, principal, principal_key, action, interrupt_running, revoke_seq, about.integration_id, about.by), but a service's feed_id, which may be the original's (feed original) or candidate_feed_id (feed candidate), else feed_mismatch at its place (after origin). signer, record_id and issued_at may differ; origin never. The field order, the details, the frozen list's refusal (malformed, detail list frozen, as the snapshot checker refuses one), signed_by_principal and the original's signer (a native that held manage at some seq, never the principal's own key) are Atem's readings. What it says: the copy, by a current manager, carries exactly the original's stop intent, so it discharges the original's obligation; whether the original needs one, and the publication's other conditions (the copy in its author's final verified signer report, the final snapshot checked), are the Station's. `checker_passes`: two snapshots check_snapshot_consistency (r9-vectors-host-work-control's snapshot checker, its station-dev origin and candidate feed) finds consistent although their stop isn't a conforming copy of the removed manager's retained original: the checker is effect-only (stop_not_resigned fires only when the snapshot alone drops an effect of the original), and a conforming copy always keeps every effect, so the two never disagree the other way; the copy rule is the adapter's publication rule, built on check_resigned_copy. Each gives its snapshot inputs ({retained, snapshot, marks, covered, provisioned} by record label) with the checker's `expect`, and the copy check's `code` and `detail` for (original, copy).",
   "records": [
     {
       "checks": [
@@ -657,6 +735,13 @@
           "chain": [
             "RC7_hs7_revoke",
             "RC8_demote_phone"
+          ],
+          "reason": "removed_manager",
+          "verdict": "refused"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
           ],
           "reason": "removed_manager",
           "verdict": "refused"
@@ -718,6 +803,13 @@
           ],
           "reason": "removed_manager",
           "verdict": "refused"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
+          ],
+          "reason": "removed_manager",
+          "verdict": "refused"
         }
       ],
       "jcs": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1792400004501,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000002\",\"signer\":\"member:dev-ipad\",\"type\":\"atem-host-work-control\",\"v\":1}",
@@ -773,6 +865,13 @@
           "chain": [
             "RC7_hs7_revoke",
             "RC8_demote_phone"
+          ],
+          "reason": "removed_manager",
+          "verdict": "refused"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
           ],
           "reason": "removed_manager",
           "verdict": "refused"
@@ -833,6 +932,13 @@
           ],
           "reason": "removed_manager",
           "verdict": "refused"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
+          ],
+          "reason": "not_a_revoke",
+          "verdict": "refused"
         }
       ],
       "jcs": "{\"about\":{\"by\":\"owner\"},\"account_id\":\"acct-test-1\",\"action\":\"interrupt_running\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620807500,\"principal\":\"host:host-a\",\"record_id\":\"00000000-0000-4000-8000-000000000004\",\"revoke_seq\":7,\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
@@ -887,6 +993,13 @@
           ],
           "reason": "removed_manager",
           "verdict": "refused"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
+          ],
+          "signer": "member:dev-phone",
+          "verdict": "valid"
         }
       ],
       "jcs": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1792400004503,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000005\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
@@ -942,6 +1055,13 @@
           "chain": [
             "RC7_hs7_revoke",
             "RC8_demote_phone"
+          ],
+          "signer": "service:svc-discord",
+          "verdict": "valid"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
           ],
           "signer": "service:svc-discord",
           "verdict": "valid"
@@ -1002,6 +1122,13 @@
           ],
           "signer": "service:svc-discord",
           "verdict": "valid"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
+          ],
+          "signer": "service:svc-discord",
+          "verdict": "valid"
         }
       ],
       "jcs": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"hold\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1792400004500,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000007\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1}",
@@ -1056,6 +1183,13 @@
           "chain": [
             "RC7_hs7_revoke",
             "RC8_demote_phone"
+          ],
+          "reason": "wrong_account",
+          "verdict": "refused"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
           ],
           "reason": "wrong_account",
           "verdict": "refused"
@@ -1117,6 +1251,13 @@
           ],
           "reason": "wrong_account",
           "verdict": "refused"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
+          ],
+          "reason": "wrong_account",
+          "verdict": "refused"
         }
       ],
       "jcs": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"f9244b1b5b4f4eb1ff4aaebad021a0a66ab1a3164762673cb71bba6c74541b94\",\"interrupt_running\":false,\"issued_at\":1792400004500,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-00000000000c\",\"signer\":\"member:dev-ipad\",\"type\":\"atem-host-work-control\",\"v\":1}",
@@ -1172,6 +1313,13 @@
           "chain": [
             "RC7_hs7_revoke",
             "RC8_demote_phone"
+          ],
+          "reason": "removed_manager",
+          "verdict": "refused"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
           ],
           "reason": "removed_manager",
           "verdict": "refused"
@@ -1233,6 +1381,13 @@
           ],
           "reason": "removed_manager",
           "verdict": "refused"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
+          ],
+          "reason": "removed_manager",
+          "verdict": "refused"
         }
       ],
       "jcs": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1792400004500,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"e863fbf6e6c251652d90979bf8e81c4a84c63dda623b488050c842ff5441fbfe\",\"record_id\":\"00000000-0000-4000-8000-00000000000e\",\"signer\":\"member:dev-ipad\",\"type\":\"atem-host-work-control\",\"v\":1}",
@@ -1288,6 +1443,13 @@
           "chain": [
             "RC7_hs7_revoke",
             "RC8_demote_phone"
+          ],
+          "reason": "removed_manager",
+          "verdict": "refused"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
           ],
           "reason": "removed_manager",
           "verdict": "refused"
@@ -1349,6 +1511,13 @@
           ],
           "reason": "removed_manager",
           "verdict": "refused"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
+          ],
+          "reason": "removed_manager",
+          "verdict": "refused"
         }
       ],
       "jcs": "{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1792400004500,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000010\",\"signer\":\"member:dev-ipad\",\"type\":\"atem-host-work-control\",\"v\":1}",
@@ -1407,6 +1576,13 @@
           ],
           "reason": "revoke_not_in_list",
           "verdict": "pending"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
+          ],
+          "reason": "revoke_not_in_list",
+          "verdict": "pending"
         }
       ],
       "jcs": "{\"about\":{\"by\":\"owner\"},\"account_id\":\"acct-test-1\",\"action\":\"interrupt_running\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620807500,\"principal\":\"host:host-a\",\"record_id\":\"00000000-0000-4000-8000-000000000011\",\"revoke_seq\":12,\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
@@ -1458,6 +1634,13 @@
           "chain": [
             "RC7_hs7_revoke",
             "RC8_demote_phone"
+          ],
+          "reason": "bad_signature",
+          "verdict": "refused"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
           ],
           "reason": "bad_signature",
           "verdict": "refused"
@@ -1519,6 +1702,13 @@
           ],
           "reason": "signer_unknown",
           "verdict": "pending"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
+          ],
+          "reason": "signer_unknown",
+          "verdict": "pending"
         }
       ],
       "jcs": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1792400004500,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000016\",\"signer\":\"member:dev-evil\",\"type\":\"atem-host-work-control\",\"v\":1}",
@@ -1553,6 +1743,136 @@
       "checks": [
         {
           "chain": [],
+          "reason": "signer_unknown",
+          "verdict": "pending"
+        },
+        {
+          "chain": [
+            "RC7_demote_phone"
+          ],
+          "reason": "signer_unknown",
+          "verdict": "pending"
+        },
+        {
+          "chain": [
+            "RC7_hs7_revoke"
+          ],
+          "reason": "signer_unknown",
+          "verdict": "pending"
+        },
+        {
+          "chain": [
+            "RC7_hs7_revoke",
+            "RC8_demote_phone"
+          ],
+          "reason": "signer_unknown",
+          "verdict": "pending"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
+          ],
+          "reason": "signer_not_allowed",
+          "verdict": "refused"
+        }
+      ],
+      "jcs": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1792400004500,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000018\",\"signer\":\"member:dev-desk\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "label": "B4_viewer",
+      "note": "dev-desk's revoke of svc-discord at the old feed (O1's intent): dev-desk is a native that never held manage",
+      "record": {
+        "body": {
+          "about": {
+            "by": "owner",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+          },
+          "account_id": "acct-test-1",
+          "action": "revoke",
+          "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "interrupt_running": false,
+          "issued_at": 1792400004500,
+          "origin": "https://station-dev.agora.build",
+          "principal": "service:svc-discord",
+          "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+          "record_id": "00000000-0000-4000-8000-000000000018",
+          "signer": "member:dev-desk",
+          "type": "atem-host-work-control",
+          "v": 1
+        },
+        "sig": "6ZlDLTqu747Dgwy2IipjsvCHrkskZBJbRCii7iDlF1X6psngUKDCyUjTkV17GV6iTGpW1bRrQeYSLDW6dsJ0DA"
+      },
+      "signed_with": "dev-desk/auth",
+      "signing_input_hex": "000000196174656d2d686f73742d776f726b2d636f6e74726f6c2d7631000002407b2261626f7574223a7b226279223a226f776e6572222c22696e746567726174696f6e5f6964223a22692d30316a63357a7139783877377636743573347233713270316e30227d2c226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a227265766f6b65222c22666565645f6964223a2236663163326233612d346435652d346636302d386137622d396330643165326633613462222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22696e746572727570745f72756e6e696e67223a66616c73652c226973737565645f6174223a313739323430303030343530302c226f726967696e223a2268747470733a2f2f73746174696f6e2d6465762e61676f72612e6275696c64222c227072696e636970616c223a22736572766963653a7376632d646973636f7264222c227072696e636970616c5f6b6579223a2235646239343963353730343038376665613236656366313964326566303966646133616462343465343835636636333436643233623833376637616666376635222c227265636f72645f6964223a2230303030303030302d303030302d343030302d383030302d303030303030303030303138222c227369676e6572223a226d656d6265723a6465762d6465736b222c2274797065223a226174656d2d686f73742d776f726b2d636f6e74726f6c222c2276223a317d"
+    },
+    {
+      "checks": [
+        {
+          "chain": [],
+          "signer": "service:svc-discord",
+          "verdict": "valid"
+        },
+        {
+          "chain": [
+            "RC7_demote_phone"
+          ],
+          "signer": "service:svc-discord",
+          "verdict": "valid"
+        },
+        {
+          "chain": [
+            "RC7_hs7_revoke"
+          ],
+          "signer": "service:svc-discord",
+          "verdict": "valid"
+        },
+        {
+          "chain": [
+            "RC7_hs7_revoke",
+            "RC8_demote_phone"
+          ],
+          "signer": "service:svc-discord",
+          "verdict": "valid"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
+          ],
+          "signer": "service:svc-discord",
+          "verdict": "valid"
+        }
+      ],
+      "jcs": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1792400004500,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000019\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "label": "B5_service_key",
+      "note": "svc-discord's own revoke at the old feed (O1's intent, its own key): no manager's stop to copy",
+      "record": {
+        "body": {
+          "about": {
+            "by": "owner",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+          },
+          "account_id": "acct-test-1",
+          "action": "revoke",
+          "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "interrupt_running": false,
+          "issued_at": 1792400004500,
+          "origin": "https://station-dev.agora.build",
+          "principal": "service:svc-discord",
+          "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+          "record_id": "00000000-0000-4000-8000-000000000019",
+          "signer": "service:svc-discord",
+          "type": "atem-host-work-control",
+          "v": 1
+        },
+        "sig": "W4w7VI5F3ExFsFkIW-4dkopkYq_5QDbj0wwoIj6VQxuQsxSZRXuJRG1y0USTWVp1fq3Qu5Ol7riQX1LjUsbNCQ"
+      },
+      "signed_with": "svc-discord/auth",
+      "signing_input_hex": "000000196174656d2d686f73742d776f726b2d636f6e74726f6c2d7631000002447b2261626f7574223a7b226279223a226f776e6572222c22696e746567726174696f6e5f6964223a22692d30316a63357a7139783877377636743573347233713270316e30227d2c226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a227265766f6b65222c22666565645f6964223a2236663163326233612d346435652d346636302d386137622d396330643165326633613462222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22696e746572727570745f72756e6e696e67223a66616c73652c226973737565645f6174223a313739323430303030343530302c226f726967696e223a2268747470733a2f2f73746174696f6e2d6465762e61676f72612e6275696c64222c227072696e636970616c223a22736572766963653a7376632d646973636f7264222c227072696e636970616c5f6b6579223a2235646239343963353730343038376665613236656366313964326566303966646133616462343465343835636636333436643233623833376637616666376635222c227265636f72645f6964223a2230303030303030302d303030302d343030302d383030302d303030303030303030303139222c227369676e6572223a22736572766963653a7376632d646973636f7264222c2274797065223a226174656d2d686f73742d776f726b2d636f6e74726f6c222c2276223a317d"
+    },
+    {
+      "checks": [
+        {
+          "chain": [],
           "reason": "host_key_signed",
           "verdict": "refused"
         },
@@ -1574,6 +1894,13 @@
           "chain": [
             "RC7_hs7_revoke",
             "RC8_demote_phone"
+          ],
+          "reason": "host_key_signed",
+          "verdict": "refused"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
           ],
           "reason": "host_key_signed",
           "verdict": "refused"
@@ -1628,6 +1955,13 @@
           "chain": [
             "RC7_hs7_revoke",
             "RC8_demote_phone"
+          ],
+          "signer": "member:dev-mac",
+          "verdict": "valid"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
           ],
           "signer": "member:dev-mac",
           "verdict": "valid"
@@ -1689,6 +2023,13 @@
           ],
           "signer": "member:dev-mac",
           "verdict": "valid"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
+          ],
+          "signer": "member:dev-mac",
+          "verdict": "valid"
         }
       ],
       "jcs": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620900032,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000020\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1}",
@@ -1744,6 +2085,13 @@
           "chain": [
             "RC7_hs7_revoke",
             "RC8_demote_phone"
+          ],
+          "signer": "member:dev-mac",
+          "verdict": "valid"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
           ],
           "signer": "member:dev-mac",
           "verdict": "valid"
@@ -1805,6 +2153,13 @@
           ],
           "signer": "member:dev-mac",
           "verdict": "valid"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
+          ],
+          "signer": "member:dev-mac",
+          "verdict": "valid"
         }
       ],
       "jcs": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"interrupt_running\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620900034,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000022\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1}",
@@ -1862,6 +2217,13 @@
           ],
           "signer": "member:dev-mac",
           "verdict": "valid"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
+          ],
+          "reason": "not_a_revoke",
+          "verdict": "refused"
         }
       ],
       "jcs": "{\"about\":{\"by\":\"owner\"},\"account_id\":\"acct-test-1\",\"action\":\"interrupt_running\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620900035,\"principal\":\"host:host-a\",\"record_id\":\"00000000-0000-4000-8000-000000000023\",\"revoke_seq\":7,\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1}",
@@ -1913,6 +2275,13 @@
           "chain": [
             "RC7_hs7_revoke",
             "RC8_demote_phone"
+          ],
+          "signer": "member:dev-mac",
+          "verdict": "valid"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
           ],
           "signer": "member:dev-mac",
           "verdict": "valid"
@@ -1974,6 +2343,13 @@
           ],
           "signer": "member:dev-mac",
           "verdict": "valid"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
+          ],
+          "signer": "member:dev-mac",
+          "verdict": "valid"
         }
       ],
       "jcs": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620900037,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000025\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1}",
@@ -2032,6 +2408,13 @@
           ],
           "reason": "removed_manager",
           "verdict": "refused"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
+          ],
+          "signer": "member:dev-phone",
+          "verdict": "valid"
         }
       ],
       "jcs": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620900038,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000026\",\"signer\":\"member:dev-phone\",\"type\":\"atem-host-work-control\",\"v\":1}",
@@ -2087,6 +2470,13 @@
           "chain": [
             "RC7_hs7_revoke",
             "RC8_demote_phone"
+          ],
+          "signer": "service:svc-discord",
+          "verdict": "valid"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
           ],
           "signer": "service:svc-discord",
           "verdict": "valid"
@@ -2148,6 +2538,13 @@
           ],
           "signer": "member:dev-mac",
           "verdict": "valid"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
+          ],
+          "signer": "member:dev-mac",
+          "verdict": "valid"
         }
       ],
       "jcs": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620900040,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1}",
@@ -2203,6 +2600,13 @@
           "chain": [
             "RC7_hs7_revoke",
             "RC8_demote_phone"
+          ],
+          "reason": "signer_not_allowed",
+          "verdict": "refused"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
           ],
           "reason": "signer_not_allowed",
           "verdict": "refused"
@@ -2263,6 +2667,13 @@
           ],
           "reason": "signer_unknown",
           "verdict": "pending"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
+          ],
+          "reason": "signer_unknown",
+          "verdict": "pending"
         }
       ],
       "jcs": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620900043,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-00000000002b\",\"signer\":\"member:dev-newmac\",\"type\":\"atem-host-work-control\",\"v\":1}",
@@ -2318,6 +2729,13 @@
           "chain": [
             "RC7_hs7_revoke",
             "RC8_demote_phone"
+          ],
+          "signer": "member:dev-mac",
+          "verdict": "valid"
+        },
+        {
+          "chain": [
+            "RC7_add_desk"
           ],
           "signer": "member:dev-mac",
           "verdict": "valid"

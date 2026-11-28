@@ -1986,12 +1986,12 @@ fn processes_mismatch_in_each_form() {
     };
     assert_eq!(check(&text, &roster), Ok(()));
     let mismatch = ReportRefusal::ProcessesMismatch;
-    let over: Vec<String> = (0..MAX_JOURNAL_PROCESSES + 1).map(|_| "?".into()).collect();
+    let flood: Vec<String> = (0..MAX_JOURNAL_PROCESSES + 1).map(|_| "?".into()).collect();
     let cases: Vec<(&str, Vec<String>, &str)> = vec![
         ("one missing", vec![own()], "count"),
         ("none", vec![], "count"),
         ("one extra", vec![earlier(), own(), later()], "count"),
-        ("over the bound, unread", over, "count"),
+        ("4,097 against the body's 2, unread", flood, "count"),
         (
             "another set of the same count",
             vec![later(), own()],
@@ -2031,6 +2031,23 @@ fn processes_mismatch_in_each_form() {
         check(&three, &[earlier(), own(), later()]),
         Err(mismatch("processes_hash"))
     );
+    // Over the bound: a body signed with 4,097 processes and their hash,
+    // its roster exported whole. The count matches; the bound refuses it
+    // before any id is read.
+    let over: Vec<String> = (1..=MAX_JOURNAL_PROCESSES as u32)
+        .map(|i| {
+            let mut id = [0u8; 16];
+            id[..4].copy_from_slice(&i.to_be_bytes());
+            b64u(&id)
+        })
+        .chain([own()])
+        .collect();
+    assert_eq!(over.len(), MAX_JOURNAL_PROCESSES + 1);
+    let too_many = resigned(keys, "dev-phone/auth", &text, |b| {
+        b["journal"]["processes"] = json!(over.len());
+        b["journal"]["processes_hash"] = json!(processes_hash(&over).to_hex());
+    });
+    assert_eq!(check(&too_many, &over), Err(mismatch("count")));
 }
 
 /// The v1 report is refused as `malformed` everywhere (the owner's rule:
