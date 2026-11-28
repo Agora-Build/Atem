@@ -50,7 +50,9 @@ pub enum SignLabel {
     /// `atem-signer-report` bodies (`member_report::signer`; host-work-v1
     /// §11.1 "The signer report", agreed with Astation, #114 comment
     /// 7089435073): a native manager's signed report of its control-record
-    /// signing journal, for a Station's recovery from a rollback.
+    /// signing journal, for a Station's recovery from a rollback. Version
+    /// 2 (its process roster, Astation #114 comment 7208700195): the only
+    /// body with `v: 2`, under `atem-signer-report-v2`; v1 is refused.
     SignerReport,
     /// `atem-station-binding` bodies (`station_binding`; delegated
     /// host-work design III.5 (b) "Creating it", Atem's answer on #120
@@ -77,8 +79,26 @@ impl SignLabel {
             SignLabel::Envelope => "atem-envelope-v1",
             SignLabel::Result => "atem-result-v1",
             SignLabel::VerifierReport => "atem-verifier-report-v1",
-            SignLabel::SignerReport => "atem-signer-report-v1",
+            SignLabel::SignerReport => "atem-signer-report-v2",
             SignLabel::StationBinding => "atem-station-binding-v1",
+        }
+    }
+
+    /// The `v` a body of this label carries: 1, but a signer report's 2 (its
+    /// process roster; the v1 report is refused, no compatibility path).
+    pub const fn body_version(self) -> u64 {
+        match self {
+            SignLabel::SignerReport => 2,
+            _ => 1,
+        }
+    }
+
+    /// What a body of this label at another `v` is refused with: its
+    /// [`body_version`](Self::body_version), in words.
+    pub const fn version_refusal(self) -> &'static str {
+        match self.body_version() {
+            2 => "v must be 2",
+            _ => "v must be 1",
         }
     }
 
@@ -173,6 +193,9 @@ pub const REFERENCE_MAILBOX_ID: &str = "atem-reference-mailbox-id-v1";
 pub const SIGNER_REPORT_RECORDS: &str = "atem-signer-report-records-v1";
 /// A signer report's `journal.drafts_hash`, the same over its drafts.
 pub const SIGNER_REPORT_DRAFTS: &str = "atem-signer-report-drafts-v1";
+/// A signer report's `journal.processes_hash`: SHA-256 over this label and
+/// the attached process generations (16 raw bytes each), sorted by bytes.
+pub const SIGNER_REPORT_PROCESSES: &str = "atem-signer-report-processes-v1";
 
 #[cfg(test)]
 mod tests {
@@ -275,18 +298,28 @@ mod tests {
     }
 
     /// A native manager's signed report of its signing journal (Astation
-    /// #114 item 4): its own body type and label, and its two set-hash
-    /// domains, distinct from every other domain string
-    /// (`every_domain_string_is_distinct`).
+    /// #114 item 4): its own body type and label, version 2 (its process
+    /// roster, #114 comment 7208700195), and its three set-hash domains,
+    /// distinct from every other domain string
+    /// (`every_domain_string_is_distinct`). The set-hash labels keep `-v1`:
+    /// only the report's own label moved.
     #[test]
     fn the_signer_report_has_its_own_label() {
         assert_eq!(
             SignLabel::of_body_type("atem-signer-report"),
             Some(SignLabel::SignerReport)
         );
-        assert_eq!(SignLabel::SignerReport.as_str(), "atem-signer-report-v1");
+        assert_eq!(SignLabel::SignerReport.as_str(), "atem-signer-report-v2");
+        assert_eq!(SignLabel::SignerReport.body_version(), 2);
         assert_eq!(SIGNER_REPORT_RECORDS, "atem-signer-report-records-v1");
         assert_eq!(SIGNER_REPORT_DRAFTS, "atem-signer-report-drafts-v1");
+        assert_eq!(SIGNER_REPORT_PROCESSES, "atem-signer-report-processes-v1");
+        // Every other body is still v1.
+        for label in LABELS {
+            if label != SignLabel::SignerReport {
+                assert_eq!(label.body_version(), 1, "{label:?}");
+            }
+        }
     }
 
     /// A native manager's Station binding proof (delegated host-work III.5
@@ -336,6 +369,9 @@ mod tests {
             REFERENCE_MAILBOX_ID,
             SIGNER_REPORT_RECORDS,
             SIGNER_REPORT_DRAFTS,
+            SIGNER_REPORT_PROCESSES,
+            // The signer report's retired v1 label: never reused.
+            "atem-signer-report-v1",
         ];
         let mut all: Vec<&str> = signing.iter().chain(others.iter()).copied().collect();
         let n = all.len();

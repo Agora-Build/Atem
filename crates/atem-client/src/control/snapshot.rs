@@ -5,7 +5,8 @@
 //!
 //! **What it never says.** [`SnapshotConsistency::Consistent`] means the
 //! snapshot contradicts nothing the caller handed in: the records the
-//! restored Station retained, the marks and the covered set. It is never a
+//! restored Station retained, the marks, the covered set and the
+//! provisioned set. It is never a
 //! statement that the retained records are the whole history, that a mark
 //! bounds every time the old deployment signed or reserved, or that every
 //! author's stops reached the Station: what the rollback lost, nothing
@@ -44,7 +45,24 @@
 //! Then, at `index` the snapshot's length:
 //! 8. `cover_not_first`: a covered principal the snapshot holds no cover
 //!    for.
-//! 9. `stop_lost` or `stop_not_resigned`: an effect of a retained `revoke`
+//! 9. `coverage_dropped`: a principal the Station provisioned at its origin
+//!    and hasn't handed over (`provisioned`, in sorted order) that is
+//!    neither covered, nor revoked by a `revoke` of that principal the
+//!    snapshot carries (every snapshot record verified at the head by
+//!    then), nor removed from the device list at the head (host-work-v1
+//!    §11.1, "Which principals a Station currently covers", agreed with
+//!    Astation, Astation #114 comments 7208700195 and 7209301522; the input
+//!    requested there). A Portal-only revoke, an expiry, an absent key or a
+//!    missing reservation never clears coverage. An empty `provisioned`
+//!    checks nothing here. Its place, after the covered principals'
+//!    missing covers and before the retained stops' effects, is Atem's
+//!    choice. Atem's reading, for Astation's agreement: a provisioned
+//!    service the device list doesn't hold at the head (its `service_add`
+//!    not yet committed, or not yet carried to this list) is neither
+//!    covered (its cover would be `invalid_record`, `principal_unknown`)
+//!    nor removed, so it is `coverage_dropped`: fail closed. Leave a
+//!    service out of `provisioned` until its `service_add` is in the list.
+//! 10. `stop_lost` or `stop_not_resigned`: an effect of a retained `revoke`
 //!    or `interrupt_running` (its principal's revocation, and the
 //!    interrupt with it) that the snapshot alone, applied to a fresh state
 //!    (a host that never read the old feed), doesn't keep (below), in the
@@ -63,6 +81,13 @@
 //!    principal's interrupt is in force when its device-list revoke itself
 //!    carried `interrupt_running`. Holds and releases aren't
 //!    compared: the Portal's current state decides those.
+//!    `stop_not_resigned` is effect-only: any valid snapshot stop that
+//!    keeps the original's effects passes it. Whether a stop is a
+//!    conforming copy of the original is
+//!    [`check_resigned_copy`](super::check_resigned_copy)'s, stricter: a
+//!    conforming copy always keeps every effect, so the two never disagree
+//!    in that direction, and the snapshots this passes and that refuses
+//!    are the adapter's to refuse.
 //!
 //! **Carried as it is** (Atem's reading of host-work-v1 §11.1, "Resets":
 //! the snapshot's revoke and interrupt records "as they are or signed
@@ -85,7 +110,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::canonical::MAX_SAFE_INTEGER;
 use crate::error::{Error, Result};
-use crate::membership::{Action, Membership};
+use crate::membership::{Action, MemberStatus, Membership};
 use crate::session::wire::is_uuid_v4;
 use crate::station_route::normalize_relay;
 
@@ -113,6 +138,13 @@ pub struct SnapshotInput<'a> {
     pub marks: &'a BTreeMap<String, u64>,
     /// The principals the snapshot covers (`service:<id>`).
     pub covered: &'a BTreeSet<String>,
+    /// The services the Station provisioned at `origin` and hasn't handed
+    /// over (`service:<id>`, the identity `covered` uses): each must be
+    /// covered, revoked by the snapshot or removed at the head
+    /// (`coverage_dropped`; one the list doesn't hold at the head is
+    /// neither, so it fails closed: Atem's reading, module docs, check 9).
+    /// Required; empty checks nothing.
+    pub provisioned: &'a BTreeSet<String>,
 }
 
 /// The answer: consistent with what was handed in, or the first
@@ -165,6 +197,12 @@ pub enum InconsistencyCode {
     CoverNotFirst,
     UncoveredCover,
     NotAboveMark,
+    /// A provisioned service neither covered, nor revoked by the snapshot,
+    /// nor removed at the head; one the device list doesn't hold at the
+    /// head counts as neither, so it fails closed (Atem's reading, for
+    /// Astation's agreement: leave it out of `provisioned` until its
+    /// `service_add` is in the list).
+    CoverageDropped,
     StopLost,
     StopNotResigned,
 }
@@ -181,6 +219,7 @@ impl InconsistencyCode {
             InconsistencyCode::CoverNotFirst => "cover_not_first",
             InconsistencyCode::UncoveredCover => "uncovered_cover",
             InconsistencyCode::NotAboveMark => "not_above_mark",
+            InconsistencyCode::CoverageDropped => "coverage_dropped",
             InconsistencyCode::StopLost => "stop_lost",
             InconsistencyCode::StopNotResigned => "stop_not_resigned",
         }
@@ -189,7 +228,7 @@ impl InconsistencyCode {
     /// Every code, in the order the checks first run (`cover_not_first`
     /// runs again after the last snapshot record, and `stop_lost` and
     /// `stop_not_resigned` interleave in the retained order).
-    pub const ALL: [InconsistencyCode; 10] = [
+    pub const ALL: [InconsistencyCode; 11] = [
         InconsistencyCode::InvalidRetained,
         InconsistencyCode::InvalidRecord,
         InconsistencyCode::WrongOrigin,
@@ -198,6 +237,7 @@ impl InconsistencyCode {
         InconsistencyCode::CoverNotFirst,
         InconsistencyCode::UncoveredCover,
         InconsistencyCode::NotAboveMark,
+        InconsistencyCode::CoverageDropped,
         InconsistencyCode::StopLost,
         InconsistencyCode::StopNotResigned,
     ];
@@ -207,9 +247,9 @@ impl InconsistencyCode {
 /// restored Station retained (the module docs give the checks, and what
 /// the answer never says). Input outside its grammar is
 /// [`Error::Malformed`]: an origin not in `normalize_relay`'s form, a
-/// candidate feed that isn't a UUID v4, a mark or covered principal that
-/// isn't a service's (`service:<id>`, canonical), a mark above 2^53 − 1,
-/// or a frozen device list (it verifies nothing new, R9.4).
+/// candidate feed that isn't a UUID v4, a mark, covered or provisioned
+/// principal that isn't a service's (`service:<id>`, canonical), a mark
+/// above 2^53 − 1, or a frozen device list (it verifies nothing new, R9.4).
 pub fn check_snapshot_consistency(input: &SnapshotInput<'_>) -> Result<SnapshotConsistency> {
     check_input(input)?;
     let found =
@@ -302,6 +342,13 @@ pub fn check_snapshot_consistency(input: &SnapshotInput<'_>) -> Result<SnapshotC
     if let Some(principal) = input.covered.iter().find(|p| !covers.contains(*p)) {
         return found(end, None, principal, Code::CoverNotFirst, None);
     }
+    if let Some(principal) = input
+        .provisioned
+        .iter()
+        .find(|p| coverage_dropped(input, p))
+    {
+        return found(end, None, principal, Code::CoverageDropped, None);
+    }
     Ok(match stop_lost(input, end) {
         Some(lost) => SnapshotConsistency::Inconsistent(lost),
         None => SnapshotConsistency::Consistent,
@@ -329,7 +376,29 @@ fn check_input(input: &SnapshotInput<'_>) -> Result<()> {
     if !input.covered.iter().all(|p| is_service(p)) {
         return Err(Error::Malformed("snapshot covered"));
     }
+    if !input.provisioned.iter().all(|p| is_service(p)) {
+        return Err(Error::Malformed("snapshot provisioned"));
+    }
     Ok(())
+}
+
+/// Whether the provisioned service `principal` lost its coverage: not in
+/// `covered`, no `revoke` of it in the snapshot (each verified at the head
+/// already), and not removed from the device list at the head. A service
+/// the list doesn't hold at all isn't removed: it lost its coverage (fail
+/// closed, Atem's reading).
+fn coverage_dropped(input: &SnapshotInput<'_>, principal: &str) -> bool {
+    if input.covered.contains(principal) {
+        return false;
+    }
+    let revoked = input.snapshot.iter().any(|r| {
+        matches!(r.action(), ControlAction::Revoke { .. }) && r.principal().name() == principal
+    });
+    let removed = principal
+        .strip_prefix("service:")
+        .and_then(|id| input.list.member(id))
+        .is_some_and(|state| state.status == MemberStatus::Removed);
+    !revoked && !removed
 }
 
 /// `service:<id>`, exactly as [`ControlPrincipal::name`] writes it.

@@ -17,6 +17,10 @@ pub enum AtemError {
     /// Input that isn't what it must be: not strict JSON, a bad key or
     /// signature, an unknown type (`atem_client::Error::code`: `malformed`,
     /// `bad_signature`, `high_s`, `wrong_alg`, `kit_tag_mismatch`, …).
+    /// `check_resigned_copy`'s refusals too: `malformed`, `not_a_stop`,
+    /// `original_invalid`, `copy_invalid`, `same_record_id`,
+    /// `intent_mismatch`, `feed_mismatch` (`detail`: what the refusal
+    /// names); `resigned_copy_codes()` lists them.
     Invalid { code: String, detail: String },
     /// A membership entry or chain the verifier refuses
     /// (`membership_invalid` details: `bad_signature`, `gap`,
@@ -74,11 +78,12 @@ pub enum AtemError {
     /// `expired`), and the reporter's `origin_mismatch` (a challenge for
     /// another Station) and `signing_failed` (the provider declined or
     /// failed). A manager's signer report (Astation #114 item 4) adds
-    /// `not_a_manager`, `recovery_mismatch` and `records_mismatch` in its
-    /// own order. A manager's Station binding proof (delegated host-work
-    /// III.5 (b)) uses `malformed`, `frozen`, `wrong_account`,
-    /// `unknown_signer`, `not_a_manager`, `bad_signature`, `stale_log`,
-    /// `fork`, `challenge_mismatch` and `expired` in its verifier's order,
+    /// `not_a_manager`, `recovery_mismatch`, `records_mismatch` and (v2,
+    /// its process roster) `processes_mismatch` in its own order. A
+    /// manager's Station binding proof (delegated host-work III.5 (b))
+    /// uses `malformed`, `frozen`, `wrong_account`, `unknown_signer`,
+    /// `not_a_manager`, `bad_signature`, `stale_log`, `fork`,
+    /// `challenge_mismatch` and `expired` in its verifier's order,
     /// and its builder adds `origin_mismatch`, `signer_mismatch` and
     /// `binding_mismatch` (an `issuer`, `subject` or `auth_time` other than
     /// the app was told). A new variant: an app that switches over
@@ -305,6 +310,21 @@ impl From<atem_client::control::RecordRefusal> for AtemError {
         AtemError::Invalid {
             code: e.code().into(),
             detail: e.to_string(),
+        }
+    }
+}
+
+impl From<atem_client::control::CopyRefusal> for AtemError {
+    /// A copy that doesn't discharge its original (`check_resigned_copy`):
+    /// `Invalid{code}`, `malformed`, `not_a_stop`, `original_invalid`,
+    /// `copy_invalid`, `same_record_id`, `intent_mismatch` or
+    /// `feed_mismatch`, `detail` exactly what the refusal names (the first
+    /// field of the intent that differs, the copy's verdict, the part that
+    /// doesn't read), else empty.
+    fn from(e: atem_client::control::CopyRefusal) -> Self {
+        AtemError::Invalid {
+            code: e.code().into(),
+            detail: e.detail().unwrap_or_default().into(),
         }
     }
 }

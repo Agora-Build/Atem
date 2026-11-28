@@ -855,14 +855,16 @@ Astation submits to the Station's feed and native devices also carry over their 
   that origin stays closed until the host has synced the new feed from position 0. The new feed starts with a
   **snapshot**: for each principal it covers, the latest `revoke`, hold or release and interrupt state, re-issued as
   records. The Station keeps those states for as long as the principal exists, so a reset never loses a stop.
-  **Atem's reading, for Astation's agreement (Astation #114, comment 7207811340):** a principal the snapshot revokes
+  Atem's reading, **agreed with Astation (Astation #114 comments 7208700195 and 7209301522):** a principal the snapshot revokes
   (or the device list removed) isn't currently covered: the snapshot carries its revoke and interrupts (as they are, a
   current manager's copies, or its own key's signed anew) and no cover, hold or release. At an origin, the Station
   stops covering a service only at a revoke of it that the snapshot carries and that verifies at the verifying head,
   at its removal from the device list, or when the Station hands it over or is removed; a lost or old cover, a missing
   service key, registration or `U_p`, an expiry, an offline host or the Station's own wish never ends coverage
   (host-work-v1 §11.1, "Which principals a Station currently covers", with the snapshot each state needs and why it
-  is safe).
+  is safe). The shared snapshot checker takes the services the Station provisioned there and hasn't handed over
+  (`provisioned`, Astation's request) and refuses one dropped from coverage without that stop or removal
+  (`coverage_dropped`).
 - **Coverage.** When the Station provisions an integration, it puts a `cover` record, signed with that service key,
   into its feed. A host gives delegated execution only to a principal covered by a feed it currently syncs. Every other
   remote service sender keeps v1 (I.1.3). If a principal becomes covered by another feed, that is a new coverage, and
@@ -953,12 +955,13 @@ identity, `account_id` and `genesis_hash` (R9.2), carried as push hints carry th
 - **Re-signing, for every principal.** When a native manager is removed or loses `manage`, Astation re-signs, with a
   current manager and that manager's fresh confirmation, every native control record the removed manager signed that
   the hosts haven't all applied: `revoke` and `interrupt_running` for a service, `interrupt_running` for a host
-  principal (the same body, a new `record_id`: **Atem's reading, for Astation's agreement (Astation #114, comment
-  7207806862; corrected in Astation #114, Atem's comment after it)**, every body field equal but `signer`,
-  `record_id`, `issued_at` and a service's `feed_id`, which names either the original's feed or the plan's candidate
-  feed of the same origin, `origin` always the original's, as the vectors' `M8_revoke_resigned_a2`,
-  `M11_interrupt_resigned_a2` and `M4_revoke_resigned` do; host-work-v1 §11.1, "A current manager's copy of a former
-  manager's stop"). It learns which from the hosts' acknowledgments: the Station's per-host reports for feeds, and the
+  principal (the same body, a new `record_id`: Atem's reading, **agreed with Astation (Astation #114 comments
+  7208700195 and 7209301522)**, every body field equal but `signer`, `record_id`, `issued_at` and a service's
+  `feed_id`, which names either the original's feed or the plan's candidate feed of the same origin, `origin` always
+  the original's, as the vectors' `M8_revoke_resigned_a2`, `M11_interrupt_resigned_a2` and `M4_revoke_resigned` do;
+  host-work-v1 §11.1, "A current manager's copy of a former manager's stop"; one judgement for the Mac and the
+  Station, the shared core's `check_resigned_copy`, vectors `r9-vectors-resigned-copy`). It learns which from the
+  hosts' acknowledgments: the Station's per-host reports for feeds, and the
   per-record results of `control_records` (II.3.1). Astation alerts the owner to re-sign. **Changed after Astation's
   review:** only a per-record application result of `applied` counts, never a cursor (I.5.8), and the alert stays
   until every covered host reports the re-signed record applied. **Owner decision 2026-11-07:** a host sender's revoke

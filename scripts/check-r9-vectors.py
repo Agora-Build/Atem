@@ -33,7 +33,10 @@ here and its set hashes recomputed from the journal's bodies (host-work-v1
 binding proof (delegated host-work III.5 (b); its orders Atem's proposal,
 #120 comment 7207827118, agreed with Astation, Atem #210 comment
 7209922243), Astation's three posted examples included (their digests and
-both signatures). The other files' `expect` and each `reason` are checked
+both signatures), and `r9-vectors-resigned-copy`, whose every copy check's
+code and detail, or copy, it derives from the bytes (host-work-v1 §11.1
+condition (c), Astation #114), each copy's verify_control verdict derived
+from the replayed chain (its `checks` only a cross-check). The other files' `expect` and each `reason` are checked
 by the Rust runner (`crates/atem-client/tests/vectors.rs`) and the binding
 suites.
 It also recomputes every Station report id of the acknowledgment fixtures
@@ -336,6 +339,8 @@ KEY_LABELS = {
     "host-a/host_key": "host-a host_channel_key",
     "host-evil/host_key": "host-evil host_key",
     "svc-discord/auth": "svc-discord auth",
+    # The control vectors' second service (their own chain enrols it).
+    "svc-other/auth": "svc-other auth",
     "browser/": "browser key",
     "K-gen-3/": "K-gen-3",
     "K-evil/": "K-evil",
@@ -773,7 +778,7 @@ def check_host_work_control(file, data, report, context):
     signing input and signature (by the test key named, and that key is the
     one the chain names for the body's signer wherever the chain holds
     it), each service record's principal_key against the r9_svc of the
-    principal's auth_key, each step's position against the stations, and
+    principal's auth_key on the record's own chains, each step's position against the stations, and
     the record digests a sequence's state keeps (by principal, then
     record_id: the SHA-256 of a body of that principal with that id), each
     `why` (of its kind, and on each effect exactly when it isn't in force),
@@ -782,11 +787,15 @@ def check_host_work_control(file, data, report, context):
     Rust runner's and the binding suites' (R9.12)."""
     keys = context["keys"]
     mlog = context["membership_log"]
-    entries = {v["label"]: v["entry"]["body"] for v in mlog["log"] + mlog["others"]}
+    # The chains name membership-log labels, or this file's own entries.
+    entries = {v["label"]: v["entry"]["body"] for v in mlog["log"] + mlog["others"] + data.get("entries", [])}
 
     def replay(chain):
         return Replay([entries[label] for label in LOG_L + list(chain)])
 
+    with report.case(file, "entries") as case:
+        check_report_entries(case, data, mlog)
+        case.check(all(e["label"] not in {v["label"] for v in mlog["log"] + mlog["others"]} for e in data["entries"]), "the file's own labels")
     with report.case(file, "account") as case:
         case.equal(data["account_id"], mlog["account_id"], "log L's account_id")
         case.equal(data["genesis_hash"], mlog["genesis_hash"], "log L's genesis_hash")
@@ -838,11 +847,16 @@ def check_host_work_control(file, data, report, context):
                         f"{body['signer']}'s key in L + {chain}",
                     )
 
-            # A service record's principal_key beside its key's r9_svc.
+            # A service record's principal_key beside its key's r9_svc, the
+            # key looked up on the record's own chains (the first that holds
+            # the principal: L for svc-discord, SO7 for svc-other; L for a
+            # record the parse refuses, which has none).
             if "r9_svc" in vector:
                 kind, _, name = body["principal"].partition(":")
-                key = replay([]).members.get(name)
-                case.check(kind == "service" and key is not None, "a service of log L")
+                chains = [c["chain"] for c in checks] or [[]]
+                held = [k for k in (replay(chain).members.get(name) for chain in chains) if k is not None]
+                case.check(kind == "service" and bool(held), "a service one of its chains holds")
+                key = held[0]
                 r9_svc = sha256(b64u_decode(key["pub"])).hex()
                 case.equal(r9_svc, vector["r9_svc"], "r9_svc = SHA-256 of the principal's auth_key")
                 if "key_mismatch" in reasons:
@@ -985,7 +999,7 @@ def check_host_work_control(file, data, report, context):
 # check_snapshot_consistency's codes, in the order its checks run.
 SNAPSHOT_CODES = [
     "invalid_retained", "invalid_record", "wrong_origin", "not_signed_anew", "not_candidate_feed",
-    "cover_not_first", "uncovered_cover", "not_above_mark", "stop_lost",
+    "cover_not_first", "uncovered_cover", "not_above_mark", "coverage_dropped", "stop_lost",
     "stop_not_resigned",
 ]
 
@@ -1042,7 +1056,10 @@ def derive_snapshot(case, snap, by_label, entries):
     not_above_mark (signed anew with the service's own key, issued at or
     below its principal's mark or with no mark). Then, at index the
     snapshot's length, cover_not_first for a covered principal with no
-    cover; then each effect of each retained revoke or interrupt_running
+    cover; then coverage_dropped for a provisioned service (in sorted
+    order) neither covered, nor revoked by a revoke of it the snapshot
+    carries, nor removed from the device list at the head (a `remove` of it
+    in L + chain); then each effect of each retained revoke or interrupt_running
     (valid, or a removed manager's), in the retained order (the revocation, then
     the interrupt), not in force after the snapshot alone (snapshot_stops;
     a service's interrupt is due once its principal is revoked by a
@@ -1056,6 +1073,24 @@ def derive_snapshot(case, snap, by_label, entries):
     `expect`, and `in_force` the stops derived after the retained records,
     the snapshot alone and both in order; a host that read the old feed
     keeps every stop. Returns the answer's code, or `consistent`."""
+    got, verdict, entry_at = snapshot_answer(case, snap, by_label, entries)
+    case.equal(got, snap["expect"], "the answer, derived from the verdicts, the feeds, the marks and the effects")
+    in_force = {
+        "retained": snapshot_stops(snap["retained"], verdict, by_label, entry_at),
+        "snapshot": snapshot_stops(snap["snapshot"], verdict, by_label, entry_at),
+        "snapshot_over_retained": snapshot_stops(snap["retained"] + snap["snapshot"], verdict, by_label, entry_at),
+    }
+    case.equal(in_force, snap["in_force"], "in_force: the stops after the retained records, the snapshot alone and both")
+    kept = all(in_force["snapshot_over_retained"].get(p) == s for p, s in in_force["retained"].items())
+    case.check(kept, "a host that read the old feed keeps every stop it had")
+    return got.get("code", "consistent")
+
+
+def snapshot_answer(case, snap, by_label, entries):
+    """check_snapshot_consistency's answer for a snapshot case (derive_snapshot's
+    rules), with the verdict and entry readers it used: (answer, verdict,
+    entry_at). `by_label` holds the records (each with its `checks`),
+    `entries` the device-list bodies by label (L's and the chain's)."""
     chain = snap["chain"]
     replay_bodies = [entries[label] for label in LOG_L + list(chain)]
 
@@ -1071,6 +1106,10 @@ def derive_snapshot(case, snap, by_label, entries):
 
     covered, marks = set(snap["covered"]), snap["marks"]
     case.equal(sorted(covered), snap["covered"], "covered: sorted, each once")
+    provisioned = snap["provisioned"]
+    case.equal(sorted(set(provisioned)), provisioned, "provisioned: sorted, each once")
+    case.check(all(sr_device_id(p, "service:") for p in provisioned), "provisioned: service principals")
+    removed = {b["device_id"] for b in replay_bodies if b["action"] == "remove"}
 
     def answer():
         def at(index, code, body=None, principal=None, reason=None, effect=None, revoke_seq=None):
@@ -1125,6 +1164,16 @@ def derive_snapshot(case, snap, by_label, entries):
         end = len(snap["snapshot"])
         for p in sorted(covered - covers):
             return at(end, "cover_not_first", principal=p)
+        # A provisioned service stops needing a cover only at a revoke of it
+        # the snapshot carries (each verified at the head by now) or its
+        # removal at the head.
+        for p in provisioned:
+            revoked_here = any(
+                by_label[l]["record"]["body"]["principal"] == p and by_label[l]["record"]["body"]["action"] == "revoke"
+                for l in snap["snapshot"]
+            )
+            if p not in covered and not revoked_here and p[len("service:"):] not in removed:
+                return at(end, "coverage_dropped", principal=p)
         fresh = snapshot_stops(snap["snapshot"], verdict, by_label, entry_at)
         revoked = {
             by_label[r]["record"]["body"]["principal"]
@@ -1171,17 +1220,7 @@ def derive_snapshot(case, snap, by_label, entries):
                 return at(end, code, body, p, reason, "interrupt")
         return {"consistent": True}
 
-    got = answer()
-    case.equal(got, snap["expect"], "the answer, derived from the verdicts, the feeds, the marks and the effects")
-    in_force = {
-        "retained": snapshot_stops(snap["retained"], verdict, by_label, entry_at),
-        "snapshot": snapshot_stops(snap["snapshot"], verdict, by_label, entry_at),
-        "snapshot_over_retained": snapshot_stops(snap["retained"] + snap["snapshot"], verdict, by_label, entry_at),
-    }
-    case.equal(in_force, snap["in_force"], "in_force: the stops after the retained records, the snapshot alone and both")
-    kept = all(in_force["snapshot_over_retained"].get(p) == s for p, s in in_force["retained"].items())
-    case.check(kept, "a host that read the old feed keeps every stop it had")
-    return got.get("code", "consistent")
+    return answer(), verdict, entry_at
 
 
 # Applied::why's codes (host-work-v1 §11.1), by what they explain.
@@ -4994,18 +5033,26 @@ def check_verifier_report(file, data, report, context):
 # A native manager's signed report of its control-record signing journal
 # (host-work-v1 §11.1 "The signer report"; Astation #114 item 4, agreed on
 # #114 comment 7089435073): the verifier report's core with a recovery and a
-# journal in place of the inventory.
+# journal in place of the inventory. Version 2 (Astation #114 comment
+# 7208700195): the journal commits to its process roster; v1 is refused.
 SR_BODY_FIELDS = sorted(["account_id", "challenge", "genesis_hash", "head", "journal", "process", "recovery", "signer", "slot", "type", "v"])
 SR_CHALLENGE_FIELDS = sorted(VR_CHALLENGE_FIELDS + ["recovery"])
 SR_RECOVERY_FIELDS = ["candidate_feed_id", "evidence_hash", "generation", "plan_id", "source_hash"]
-SR_JOURNAL_FIELDS = ["drafts", "drafts_hash", "id", "records", "records_hash", "revision", "since"]
-SR_LABEL = "atem-signer-report-v1"
+SR_JOURNAL_FIELDS = ["drafts", "drafts_hash", "id", "processes", "processes_hash", "records", "records_hash", "revision", "since"]
+SR_LABEL = "atem-signer-report-v2"
 SR_RECORDS = "atem-signer-report-records-v1"
 SR_DRAFTS = "atem-signer-report-drafts-v1"
+SR_PROCESSES = "atem-signer-report-processes-v1"
+# A roster holds at most this many process generations (as the adapter hands
+# it and as a report's is exported).
+SR_MAX_PROCESSES = 4096
+# The vectors' reports' own process (a builder's is its loaded core's).
+SR_PROCESS = b"vectors-process!"
 SR_MAX_GENERATION = 2**63 - 1
 SR_VERIFY_ORDER = [
     "malformed", "frozen", "wrong_account", "unknown_signer", "not_a_manager", "bad_signature", "stale_log", "fork",
-    "signer_mismatch", "slot_mismatch", "challenge_mismatch", "recovery_mismatch", "records_mismatch", "expired",
+    "signer_mismatch", "slot_mismatch", "challenge_mismatch", "recovery_mismatch", "records_mismatch",
+    "processes_mismatch", "expired",
 ]
 CONTROL_LABEL = "atem-host-work-control-v1"
 # A control record's body fields (record.rs, delegated host-work I.5.3).
@@ -5150,8 +5197,29 @@ def sr_journal_ok(o):
         return False
     return (
         vr_b64u(o["id"], 16) and vr_int(o["since"], 1) and vr_int(o["revision"]) and vr_int(o["records"]) and vr_int(o["drafts"])
-        and all(isinstance(o[k], str) and re.fullmatch(HEX64, o[k]) is not None for k in ("records_hash", "drafts_hash"))
+        and vr_int(o["processes"], 1)
+        and all(isinstance(o[k], str) and re.fullmatch(HEX64, o[k]) is not None for k in ("records_hash", "drafts_hash", "processes_hash"))
     )
+
+
+def sr_roster(ids):
+    """A roster as an adapter or an export hands it: at most 4,096 ids, each
+    16 bytes of base64url, none twice; the raw ids sorted by bytes, or the
+    rule that failed (count, id, duplicate)."""
+    if len(ids) > SR_MAX_PROCESSES:
+        raise Refused("count")
+    raw = []
+    for i in ids:
+        if not vr_b64u(i, 16):
+            raise Refused("id")
+        raw.append(b64u_decode(i))
+    if len(set(raw)) != len(raw):
+        raise Refused("duplicate")
+    return sorted(raw)
+
+
+def sr_processes_hash(raw):
+    return sha256(enc([SR_PROCESSES] + sorted(raw))).hex()
 
 
 def read_sr_challenge(text):
@@ -5186,7 +5254,7 @@ def read_sr_report(text):
         raise Refused("malformed")
     if not isinstance(body, dict) or not sr_flat(body):
         raise Refused("malformed")
-    if body.get("type") != "atem-signer-report" or type(body.get("v")) is not int or body["v"] != 1:
+    if body.get("type") != "atem-signer-report" or type(body.get("v")) is not int or body["v"] != 2:
         raise Refused("malformed")
     if len(jcs(body).encode("utf-8")) > MAX_BODY_BYTES or sorted(body) != SR_BODY_FIELDS:
         raise Refused("malformed")
@@ -5275,7 +5343,22 @@ def sr_exported(exported, journal, lst, member, origin, alg, public):
     return [jcs(vr_strict(t, VR_MAX_OBJECT_BYTES)) for t in exported]
 
 
-def sr_verify(text, lst, expected, exported, now):
+def sr_exported_processes(exported, journal, process):
+    """The exported roster against the report's processes: the count first
+    (and the bound), then each id, none twice, the processes_hash, and the
+    report's own process among them; the ids sorted by bytes."""
+    if len(exported) != journal["processes"]:
+        raise Refused("processes_mismatch")
+    try:
+        raw = sr_roster(exported)
+    except Refused:
+        raise Refused("processes_mismatch")
+    if sr_processes_hash(raw) != journal["processes_hash"] or b64u_decode(process) not in raw:
+        raise Refused("processes_mismatch")
+    return [b64u_encode(r) for r in raw]
+
+
+def sr_verify(text, lst, expected, exported, now, exported_processes):
     """verify_signer_report, from the file's note: the first failure in the
     agreed order, or the verified report."""
     body, sig = read_sr_report(text)
@@ -5301,12 +5384,13 @@ def sr_verify(text, lst, expected, exported, now):
         raise Refused("recovery_mismatch")
     member = body["signer"][len("member:"):]
     records = sr_exported(exported, body["journal"], lst, member, body["challenge"]["origin"], alg, public)
+    processes = sr_exported_processes(exported_processes, body["journal"], body["process"])
     if now >= expected["expires_at"]:
         raise Refused("expired")
     return {
         "signer": body["signer"], "slot": body["slot"], "process": body["process"],
         "connection": body["challenge"]["connection"], "head": head, "at_head": head == lst.head(),
-        "recovery": body["recovery"], "journal": body["journal"], "records": records,
+        "recovery": body["recovery"], "journal": body["journal"], "records": records, "processes": processes,
     }
 
 
@@ -5329,8 +5413,10 @@ def sr_digests(texts, lst, member, origin):
 
 
 def sr_build(case, lst):
-    """signer_report_body, from the file's note: the body but its process,
-    or Refused."""
+    """signer_report_body, from the file's note: the body but its process
+    and its journal.processes_hash (both the loaded core's own: the roster is
+    the journal's other ids and, when own_process, the builder's own), or
+    Refused."""
     signer, slot, now, challenge, journal = case["signer"], case["slot"], case["now_ms"], case["challenge"], case["journal"]
     m = re.fullmatch(VR_SIGNER, signer)
     if m is None or m.group(1) != "member" or re.fullmatch(OPAQUE_ID, slot) is None:
@@ -5353,14 +5439,23 @@ def sr_build(case, lst):
         raise Refused("malformed")
     records = sr_digests(journal["records"], lst, m.group(2), challenge["origin"])
     drafts = sr_digests(journal["drafts"], lst, m.group(2), challenge["origin"])
+    # The roster holds the builder's own process; its other ids in their
+    # grammar, none twice, the bound counting the own one.
+    if case["own_process"] is not True or len(journal["processes"]) + 1 > SR_MAX_PROCESSES:
+        raise Refused("malformed")
+    try:
+        sr_roster(journal["processes"])
+    except Refused:
+        raise Refused("malformed")
     return {
-        "type": "atem-signer-report", "v": 1, "account_id": lst.account_id, "genesis_hash": lst.genesis_hash,
+        "type": "atem-signer-report", "v": 2, "account_id": lst.account_id, "genesis_hash": lst.genesis_hash,
         "head": lst.head(), "signer": signer, "slot": slot,
         "challenge": {k: challenge[k] for k in VR_ECHO_FIELDS}, "recovery": challenge["recovery"],
         "journal": {
             "id": journal["id"], "since": journal["since"], "revision": journal["revision"],
             "records": len(records), "records_hash": sr_set_hash(SR_RECORDS, records),
             "drafts": len(drafts), "drafts_hash": sr_set_hash(SR_DRAFTS, drafts),
+            "processes": len(journal["processes"]) + 1,
         },
     }
 
@@ -5416,7 +5511,7 @@ def check_signer_report(file, data, report, context):
         with report.case(file, f"report {c['label']}") as case:
             expected = read_sr_challenge(json.dumps(c["challenge"]))
             try:
-                verified = sr_verify(c["report"], lst(c), expected, c["exported"], c["now_ms"])
+                verified = sr_verify(c["report"], lst(c), expected, c["exported"], c["now_ms"], c["exported_processes"])
                 case.equal(verified, c.get("expect"), "verified")
                 body = json.loads(c["report"])["body"]
                 case.equal(jcs(body), c["jcs"], "jcs")
@@ -5436,6 +5531,14 @@ def check_signer_report(file, data, report, context):
                     case.check(s_ > P256_N // 2, "S is high")
                     twin = sig[:32] + (P256_N - s_).to_bytes(32, "big")
                     case.check(verify("p256", keys.public("dev-phone", "auth"), twin, enc([SR_LABEL, jcs(report_["body"])])), "its low-S twin verifies")
+                if c["label"] == "v1_report":
+                    report_ = json.loads(c["report"])
+                    body = report_["body"]
+                    case.check(body["v"] == 1 and "processes" not in body["journal"], "a v1 body")
+                    case.check(
+                        verify("p256", keys.public("dev-phone", "auth"), b64u_decode(report_["sig"]), enc(["atem-signer-report-v1", jcs(body)])),
+                        "signed under the retired v1 label",
+                    )
     with report.case(file, "coverage") as case:
         case.equal(sorted(codes), sorted(SR_VERIFY_ORDER), "every verifier code")
         labels = {c["label"] for c in data["valid"] + data["invalid"]}
@@ -5444,6 +5547,9 @@ def check_signer_report(file, data, report, context):
             "not_a_manager", "recovered_manager", "pending_recovery_subject", "high_s_signature", "signer_mismatch", "slot_mismatch", "records_one_missing",
             "records_one_extra", "records_signed_after_report", "records_possibly_signed", "records_body_without_signature",
             "records_wrong_signer", "records_another_origin", "records_duplicate", "expired_at_expires_at",
+            "one_process", "several_processes", "processes_one_missing", "processes_one_extra", "processes_duplicate",
+            "processes_own_absent", "processes_count_mismatch", "processes_id_15_bytes", "processes_another_set",
+            "v1_report", "v_1",
         ):
             case.check(label in labels, f"{label} present")
         mismatched = {c["label"] for c in data["invalid"] if c["code"] == "recovery_mismatch"}
@@ -5468,17 +5574,24 @@ def check_signer_report(file, data, report, context):
             "hold_at_another_origin", "frozen_list", "demoted_manager", "origin_not_exact", "member_a_service",
         ):
             case.check(label in labels, f"{label} present")
+    built = set()
     for c in data["builder"] + data["request"]:
         with report.case(file, f"builder {c['label']}") as case:
             try:
                 body = sr_build(c, lst(c))
-                case.equal(body, c.get("body_but_process"), "the body but its process")
+                case.equal(body, c.get("body_but_process"), "the body but its process and its roster's hash")
             except Refused as e:
                 case.equal(e.code, c.get("code"), "refused")
+            built.add(c["label"])
+    with report.case(file, "builder roster coverage") as case:
+        for label in ("one_process", "several_processes", "no_own_process", "no_process", "process_twice", "process_id_15_bytes"):
+            case.check(label in built, f"{label} present")
     for c in data["request"]:
         with report.case(file, f"request {c['label']}") as case:
             case.equal(c["sign_request"], {"purpose": "signer_report", "fresh_confirmation": True, "label": SR_LABEL}, "sign request")
-            held = dict(c["body_but_process"], process=b64u_encode(b"vectors-process!"))
+            held = dict(c["body_but_process"], process=b64u_encode(SR_PROCESS))
+            roster = [b64u_decode(p) for p in c["journal"]["processes"]] + [SR_PROCESS]
+            held["journal"] = dict(held["journal"], processes_hash=sr_processes_hash(roster))
             signer_alg = keys.keys[c["key"].split("/")[0]]["auth"]["alg"]
             signer_pub = keys.public(c["key"].split("/")[0], "auth")
             for f in c["finishes"]:
@@ -5488,6 +5601,303 @@ def check_signer_report(file, data, report, context):
                 case.equal(ok, "code" not in f, f"{f['label']}: {'taken' if ok else 'refused'}")
                 if not ok:
                     case.equal(f["code"], "bad_signature", f"{f['label']}: bad_signature")
+
+
+# ------------------------------------------------ r9-vectors-resigned-copy
+
+# A current manager's re-signed copy of a removed or demoted manager's stop
+# (host-work-v1 §11.1, condition (c); agreed with Astation, Astation #114
+# comments 7208700195 and 7209301522): check_resigned_copy's codes in the
+# order its checks run.
+RC_CODES = [
+    "malformed", "not_a_stop", "original_invalid", "copy_invalid", "same_record_id", "intent_mismatch",
+    "feed_mismatch",
+]
+RC_INTENT_FIELDS = [
+    "about.by", "about.integration_id", "account_id", "action", "genesis_hash", "interrupt_running", "origin",
+    "principal", "principal_key", "revoke_seq",
+]
+
+
+def rc_read(text):
+    """A control record as check_resigned_copy reads one: strict I-JSON
+    within 16 KiB, exactly body and sig, the body exactly a control
+    record's (sr_control_body), or Refused("malformed")."""
+    value = vr_strict(text, VR_MAX_OBJECT_BYTES)
+    if not isinstance(value, dict) or sorted(value) != ["body", "sig"]:
+        raise Refused("malformed")
+    body = sr_control_body(value["body"])
+    try:
+        sig = b64u_decode(value["sig"])
+    except ValueError:
+        raise Refused("malformed")
+    return body, sig
+
+
+def rc_keys_ever(lst, bodies, device_id):
+    """Every auth_key `device_id` had in the list's history (an add, the
+    genesis, or a recovery_add that took effect)."""
+    keys = []
+    for body in bodies:
+        if body["action"] in ("genesis", "add") and body["member"]["device_id"] == device_id:
+            keys.append(body["member"]["auth_key"])
+        if body["action"] == "recovery_add" and body["member"]["device_id"] == device_id and device_id in lst.recovered:
+            keys.append(body["member"]["auth_key"])
+    return keys
+
+
+def rc_intent(o, c, candidate):
+    """The stop intent field by field in the body's order: (code, detail)
+    of the first that differs, or the feed a service's copy names (None for
+    a host principal's)."""
+    for field in ("account_id", "genesis_hash", "origin"):
+        if o.get(field) != c.get(field):
+            return ("intent_mismatch", field), None
+    feed = None
+    if "feed_id" in o:
+        if c["feed_id"] == o["feed_id"]:
+            feed = "original"
+        elif c["feed_id"] == candidate:
+            feed = "candidate"
+        else:
+            return ("feed_mismatch", None), None
+    for field in ("principal", "principal_key", "action", "interrupt_running", "revoke_seq"):
+        if o.get(field) != c.get(field):
+            return ("intent_mismatch", field), None
+    for sub in ("integration_id", "by"):
+        if o["about"].get(sub) != c["about"].get(sub):
+            return ("intent_mismatch", f"about.{sub}"), None
+    return None, feed
+
+
+def rc_verify_control(body, sig, lst, bodies):
+    """verify_control's verdict on a control record, derived here from the
+    replayed list (I.5.4): the account; the principal's own key (a host's
+    never; a service's from its history, its principal_key naming it); a
+    member: signer's standing (a current native manager signs revoke and
+    interrupt_running only; one not yet in the list waits; a native without
+    manage, or one that lost it or was removed, is refused once what the
+    list doesn't hold yet waited); the principal (a service of the list with
+    the key named; a host's revoke_seq naming its host_sender_revoke); the
+    signature. {"verdict": "valid", "signer"} or {"verdict", "reason"}."""
+    def refused(reason):
+        return {"verdict": "refused", "reason": reason}
+
+    def pending(reason):
+        return {"verdict": "pending", "reason": reason}
+
+    if body["account_id"] != lst.account_id or body["genesis_hash"] != lst.genesis_hash:
+        return refused("wrong_account")
+    message = enc([CONTROL_LABEL, jcs(body)])
+
+    def signed(key):
+        return verify(key["alg"], b64u_decode(key["pub"]), sig, message)
+
+    principal, signer = body["principal"], body["signer"]
+
+    def service_key(pid):
+        member = lst.members.get(pid)
+        if member is None:
+            return pending("principal_unknown")
+        if member["kind"] != "service":
+            return refused("not_a_service")
+        for key in rc_keys_ever(lst, bodies, pid):
+            if sha256(b64u_decode(key["pub"])).hex() == body.get("principal_key"):
+                return key
+        return refused("key_mismatch")
+
+    def principal_check():
+        if principal.startswith("service:"):
+            key = service_key(principal[len("service:"):])
+            return key if "verdict" in key else None
+        host_id, seq = principal[len("host:"):], body["revoke_seq"]
+        if seq <= len(bodies):
+            entry = bodies[seq - 1]
+            ok = entry["action"] == "host_sender_revoke" and entry.get("host_id") == host_id
+            return None if ok else refused("not_a_revoke")
+        added = any(b["action"] == "add_host" and b["host"]["host_id"] == host_id for b in bodies)
+        return pending("revoke_not_in_list" if added else "principal_unknown")
+
+    if signer == principal:
+        if principal.startswith("host:"):
+            return refused("host_key_signed")
+        key = service_key(principal[len("service:"):])
+        if "verdict" in key:
+            return key
+        return {"verdict": "valid", "signer": principal} if signed(key) else refused("bad_signature")
+    device_id = signer[len("member:"):]
+    if body["action"] not in ("revoke", "interrupt_running"):
+        return refused("signer_not_allowed")
+    member = lst.members.get(device_id)
+
+    def not_a_manager():
+        if device_id not in lst.managed:
+            return "signer_not_allowed"
+        return "removed_manager" if any(signed(k) for k in rc_keys_ever(lst, bodies, device_id)) else "bad_signature"
+
+    if member is not None and member["standing"] == "active" and member["kind"] == "native" and "manage" in member["roles"]:
+        standing = "manager"
+    elif member is None or member["standing"] == "pending":
+        standing = "unknown"
+    elif member["kind"] == "native" and member["standing"] == "active":
+        standing = "not_manager"
+    else:
+        return refused(not_a_manager())
+    wrong = principal_check()
+    if wrong is not None:
+        return wrong
+    if standing == "unknown":
+        return pending("signer_unknown")
+    if standing == "not_manager":
+        return refused(not_a_manager())
+    return {"verdict": "valid", "signer": signer} if signed(member["auth_key"]) else refused("bad_signature")
+
+
+def rc_check(c, lst, bodies, copy_verdict):
+    """check_resigned_copy, from the file's note: {"code", "detail"?} of the
+    first check that fails, or the copy. `copy_verdict` gives the copy's
+    verify_control verdict on the case's list (rc_verify_control, derived
+    here; the file's `checks` only cross-check it)."""
+    def refused(code, detail=None):
+        return {"code": code, **({"detail": detail} if detail is not None else {})}
+
+    try:
+        o, osig = rc_read(c["original_json"])
+    except Refused:
+        return refused("malformed", "original")
+    try:
+        k, _ = rc_read(c["copy_json"])
+    except Refused:
+        return refused("malformed", "copy")
+    if re.fullmatch(UUID_V4, c["candidate_feed_id"]) is None:
+        return refused("malformed", "candidate_feed_id")
+    if lst.frozen:
+        return refused("malformed", "list frozen")
+    if o["action"] not in ("revoke", "interrupt_running"):
+        return refused("not_a_stop")
+    # A former or current manager's stop: a member: signer that held manage
+    # at some seq, its signature under any key it had; never the principal's
+    # own key.
+    if o["signer"] == o["principal"]:
+        kind = "host_key_signed" if o["principal"].startswith("host:") else "service_key_signed"
+        return refused("original_invalid", kind)
+    signer_id = o["signer"][len("member:"):]
+    keys = rc_keys_ever(lst, bodies, signer_id)
+    if not keys:
+        return refused("original_invalid", "unknown_signer")
+    if signer_id not in lst.managed:
+        return refused("original_invalid", "not_a_manager")
+    message = enc([CONTROL_LABEL, jcs(o)])
+    if not any(verify(key["alg"], b64u_decode(key["pub"]), osig, message) for key in keys):
+        return refused("original_invalid", "bad_signature")
+    v = copy_verdict()
+    if v["verdict"] != "valid":
+        return refused("copy_invalid", v["reason"])
+    if not v["signer"].startswith("member:"):
+        return refused("copy_invalid", "signed_by_principal")
+    if k["record_id"] == o["record_id"]:
+        return refused("same_record_id")
+    mismatch, feed = rc_intent(o, k, c["candidate_feed_id"])
+    if mismatch is not None:
+        return refused(*mismatch)
+    out = {
+        "original_record_id": o["record_id"], "copy_record_id": k["record_id"], "signer": v["signer"],
+        "principal": k["principal"], "action": k["action"],
+    }
+    if feed is not None:
+        out["feed"] = feed
+    return out
+
+
+def check_resigned_copy(file, data, report, context):
+    """Every case's answer derived here from the file's note (check_resigned_copy,
+    host-work-v1 §11.1 condition (c)): the chain's entries; each record's
+    jcs, signing input and signature by its test key; each case's refusal
+    code and detail, or its copy, from the bytes (the strict reading, the
+    action, the original's signature under its signer's keys from the list's
+    history, the stop intent field by field), the copy's verify_control
+    verdict taken from its `checks`; and each checker_passes case: the
+    snapshot checker's answer (snapshot_answer, the control vectors' rules)
+    consistent while the copy check refuses."""
+    keys = context["keys"]
+    mlog = context["membership_log"]
+    by_label = {r["label"]: r for r in data["records"]}
+    with report.case(file, "entries") as case:
+        check_report_entries(case, data, mlog)
+        hs7 = next(v["entry"] for v in mlog["others"] if v["label"] == "HS7_revoke")
+        entries_by_label = {e["label"]: e for e in data["entries"]}
+        case.equal(jcs(entries_by_label["RC7_hs7_revoke"]["entry"]), jcs(hs7), "RC7_hs7_revoke is HS7_revoke, byte for byte")
+        case.equal(data["codes"], RC_CODES, "the codes in their order")
+    for rec in data["records"]:
+        with report.case(file, f"record {rec['label']}") as case:
+            wire = rec["record"]
+            case.equal(sorted(wire), ["body", "sig"], "wire {body, sig}")
+            text = jcs(wire["body"])
+            case.equal(text, rec["jcs"], "jcs")
+            name, part = rec["signed_with"].split("/")
+            entry = keys.keys[name][part]
+            case.check(
+                verify(entry.get("alg", "ed25519"), keys.public(name, part), b64u_decode(wire["sig"]), enc([CONTROL_LABEL, text])),
+                f"signed by {rec['signed_with']}",
+            )
+            if "parse_error" in rec:
+                try:
+                    rc_read(json.dumps(wire))
+                    case.fail("its record_id or a field out of its grammar: refused")
+                except Refused:
+                    case.check(True, "refused by the strict reading")
+            else:
+                case.equal(enc([CONTROL_LABEL, text]).hex(), rec["signing_input_hex"], "signing input")
+                # Each verdict derived here from the replayed chain; `checks`
+                # is the cross-check.
+                for check in rec["checks"]:
+                    chain = {"chain": check["chain"]}
+                    derived = rc_verify_control(wire["body"], b64u_decode(wire["sig"]), report_list(chain, data, mlog, SrList), report_bodies(data, mlog, check["chain"]))
+                    case.equal(derived, {k: check[k] for k in ("verdict", "signer", "reason") if k in check}, f"verify_control on L + {check['chain']}")
+    codes, fields = set(), set()
+    for c in data["cases"]:
+        with report.case(file, f"case {c['label']}") as case:
+            lst = report_list(c, data, mlog, SrList)
+            bodies = report_bodies(data, mlog, c["chain"])
+
+            def copy_verdict():
+                k, ksig = rc_read(c["copy_json"])
+                return rc_verify_control(k, ksig, lst, bodies)
+
+            for key in ("original", "copy"):
+                if key in c:
+                    case.equal(c[f"{key}_json"], jcs(by_label[c[key]]["record"]), f"{key}_json is {c[key]}")
+            got = rc_check(c, lst, bodies, copy_verdict)
+            want = c["expect"] if "expect" in c else {k: c[k] for k in ("code", "detail") if k in c}
+            case.equal(got, want, "the answer, derived from the bytes")
+            if "code" in got:
+                codes.add(got["code"])
+                if got["code"] == "intent_mismatch":
+                    fields.add(got["detail"])
+    with report.case(file, "coverage") as case:
+        case.equal(sorted(codes), sorted(RC_CODES), "every code")
+        case.equal(sorted(fields), RC_INTENT_FIELDS, "each field of the stop intent mismatched once")
+        valid = [c for c in data["cases"] if "expect" in c]
+        case.check({c["expect"].get("feed") for c in valid} == {"original", "candidate", None}, "both feeds and a host principal's")
+    entries = {v["label"]: v["entry"]["body"] for v in mlog["log"] + mlog["others"]}
+    for p in data["checker_passes"]:
+        with report.case(file, f"checker passes {p['label']}") as case:
+            snap = dict(p["snapshot"], chain=p["chain"])
+            got, _, _ = snapshot_answer(case, snap, by_label, entries)
+            case.equal(got, snap["expect"], "the snapshot checker's answer")
+            case.equal(got, {"consistent": True}, "consistent")
+            lst = report_list(p, data, mlog, SrList)
+            bodies = report_bodies(data, mlog, p["chain"])
+            pair = {
+                "original_json": jcs(by_label[p["original"]]["record"]), "copy_json": jcs(by_label[p["copy"]]["record"]),
+                "candidate_feed_id": p["candidate_feed_id"],
+            }
+
+            def copy_verdict():
+                k, ksig = rc_read(pair["copy_json"])
+                return rc_verify_control(k, ksig, lst, bodies)
+
+            case.equal(rc_check(pair, lst, bodies, copy_verdict), {"code": p["code"], "detail": p["detail"]}, "the copy check refuses it")
 
 
 # ----------------------------------------------- r9-vectors-station-binding
@@ -5511,7 +5921,7 @@ SB_BUILD_ORDER = [
 ]
 SB_LABELS = {
     "signed_under_verifier_report_label": VR_LABEL,
-    "signed_under_signer_report_label": "atem-signer-report-v1",
+    "signed_under_signer_report_label": "atem-signer-report-v2",
     "signed_under_route_label": "atem-host-route-v1",
     "signed_under_proxy_route_label": "atem-host-route-proxy-v1",
     "signed_under_sig_c_label": "atem-ch1-client-sig-v1",
@@ -6098,6 +6508,7 @@ CHECKERS = [
     ("r9-vectors-verifier-report", check_verifier_report),
     ("r9-vectors-signer-report", check_signer_report),
     ("r9-vectors-station-binding", check_station_binding),
+    ("r9-vectors-resigned-copy", check_resigned_copy),
 ]
 
 

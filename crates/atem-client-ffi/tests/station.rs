@@ -1352,11 +1352,23 @@ fn matching_through_the_bindings() {
 
 // ------------------------------------------- the replacement feed's snapshot
 
-/// Log L, then a chain of membership-log labels.
+/// Log L, then a chain of membership-log labels or of the control vectors'
+/// own entries.
 fn log_after(chain: &[String]) -> Arc<atem_client_ffi::log::MembershipLog> {
     let v = Vectors::load();
-    let wires =
-        |labels: &[&str]| -> Vec<String> { labels.iter().map(|l| v.wire(l).to_string()).collect() };
+    let own = load("r9-vectors-host-work-control")["entries"].clone();
+    let wires = |labels: &[&str]| -> Vec<String> {
+        labels
+            .iter()
+            .map(|l| {
+                own.as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["label"] == *l)
+                    .map_or_else(|| v.wire(l).to_string(), |e| e["entry"].to_string())
+            })
+            .collect()
+    };
     let now = atem_client_ffi::types::HostClock {
         wall_ms: 1_793_264_001_000,
         mono_ms: 1_000,
@@ -1416,6 +1428,7 @@ struct SnapshotArgs {
     snapshot: Vec<String>,
     marks: Vec<ControlSnapshotMark>,
     covered: Vec<String>,
+    provisioned: Vec<String>,
 }
 
 impl SnapshotArgs {
@@ -1442,6 +1455,7 @@ impl SnapshotArgs {
                 })
                 .collect(),
             covered: strs("covered"),
+            provisioned: strs("provisioned"),
         }
     }
 
@@ -1454,6 +1468,7 @@ impl SnapshotArgs {
             self.snapshot,
             self.marks,
             self.covered,
+            self.provisioned,
         )
     }
 }
@@ -1462,17 +1477,23 @@ impl SnapshotArgs {
 /// through the export beside the ledger gives the vector's answer; input
 /// outside its grammar is `Invalid`: a record its parse refuses (its
 /// code), and, `malformed`, an origin not in its exact form, a candidate
-/// feed that isn't a UUID v4, a mark or covered principal that isn't a
-/// service's, a principal marked twice or covered twice.
+/// feed that isn't a UUID v4, a mark, covered or provisioned principal
+/// that isn't a service's, a principal marked, covered or provisioned
+/// twice. Every code among the answers, `coverage_dropped` included.
 #[test]
 fn every_snapshot_case_through_the_binding() {
     let control = load("r9-vectors-host-work-control");
     let cases = control["snapshots"].as_array().unwrap();
     assert!(cases.len() >= 8);
+    let mut codes = std::collections::BTreeSet::new();
     for case in cases {
         let got = SnapshotArgs::of(case).check().unwrap();
         assert_eq!(consistency_json(&got), case["expect"], "{}", case["label"]);
+        if let ControlSnapshotConsistency::Inconsistent { code, .. } = got {
+            codes.insert(code);
+        }
     }
+    assert!(codes.contains("coverage_dropped"), "{codes:?}");
 
     let n1 = cases
         .iter()
@@ -1490,6 +1511,14 @@ fn every_snapshot_case_through_the_binding() {
     refused(&|a| a.candidate = a.candidate.to_uppercase(), "malformed");
     refused(&|a| a.covered.push("host:host-a".into()), "malformed");
     refused(&|a| a.covered.push(a.covered[0].clone()), "malformed");
+    refused(&|a| a.provisioned.push("host:host-a".into()), "malformed");
+    refused(
+        &|a| {
+            a.provisioned
+                .extend(["service:svc-discord".into(), "service:svc-discord".into()])
+        },
+        "malformed",
+    );
     refused(
         &|a| {
             a.marks.push(ControlSnapshotMark {

@@ -101,7 +101,10 @@ fun main(args: Array<String>) {
     val genesis = mlog["genesis_hash"].s()
     val vectors = mlog["log"].arr() + mlog["others"].arr()
     val byLabel = vectors.associateBy { it["label"].s() }
-    fun entry(label: String) = Json.write(byLabel.getValue(label)["entry"])
+    // Entries a vector file carries itself (the control vectors' SO7),
+    // resolved by label in its chains as L's are.
+    val carried = mutableMapOf<String, Any?>()
+    fun entry(label: String) = Json.write((byLabel[label] ?: carried.getValue(label))["entry"])
     val l = mlog["log"].arr().map { Json.write(it["entry"]) }
     val now = HostClock(1793264001000uL, 1000uL, "boot-1")
     fun logL() = MembershipLog.verify(account, genesis, l, now)
@@ -774,11 +777,13 @@ fun main(args: Array<String>) {
     }
     // A manager's signer report (host-work-v1 §11.1 "The signer report";
     // Astation #114 item 4): each challenge read or refused; each report
-    // verified with its exported records, or refused as Report(code); each
-    // builder case as a SignerReportRequest (its body but the process,
-    // which is this core's); the immutable request's finishes, signed here
-    // with the JDK (another body, another member: refused); and the
-    // synchronous signer through the app's provider.
+    // verified with its exported records and roster (v2), or refused as
+    // Report(code); each builder case as a SignerReportRequest (its body but
+    // the process and the roster's hash, which are this core's: the hash
+    // recomputed here over the case's roster and this core's process); the
+    // immutable request's finishes, signed here with the JDK (another body,
+    // another member: refused); and the synchronous signer through the app's
+    // provider.
     val srep = load("r9-vectors-signer-report")
     fun srepLog(c: Any?): MembershipLog {
         val at = HostClock(c["now_ms"].l().toULong(), 1000uL, "boot-1")
@@ -797,10 +802,23 @@ fun main(args: Array<String>) {
     fun recoveryIn(r: Any?) = SignerReportRecovery(
         r["generation"].s(), r["plan_id"].s(), r["candidate_feed_id"].s(), r["source_hash"].s(), r["evidence_hash"].s(),
     )
-    fun journalIn(j: Any?) = SignerJournalView(
-        j["id"].s(), j["since"].l().toULong(), j["revision"].l().toULong(),
-        j["records"].arr().map { it.s() }, j["drafts"].arr().map { it.s() },
-    )
+    // A builder case's journal: its roster the file's ids, then this core's
+    // own process when the case's own_process says so.
+    fun journalIn(c: Any?): SignerJournalView {
+        val j = c["journal"]
+        val own = if (c["own_process"] == true) listOf(verifierReportProcess()) else emptyList()
+        return SignerJournalView(
+            j["id"].s(), j["since"].l().toULong(), j["revision"].l().toULong(),
+            j["records"].arr().map { it.s() }, j["drafts"].arr().map { it.s() },
+            j["processes"].arr().map { it.s() } + own,
+        )
+    }
+    // SHA-256(enc(["atem-signer-report-processes-v1", p1…pn])) over the raw
+    // ids sorted by bytes.
+    fun processesHash(ids: List<String>): String {
+        val raw = ids.map { Base64.getUrlDecoder().decode(it) }.sortedWith { a, b -> java.util.Arrays.compareUnsigned(a, b) }
+        return hex(MessageDigest.getInstance("SHA-256").digest(encodeFields(listOf(utf8("atem-signer-report-processes-v1")) + raw)))
+    }
     fun srepOut(v: VerifiedSignerReport): Map<String, Any?> = mapOf(
         "signer" to v.signer,
         "slot" to v.slot,
@@ -813,11 +831,13 @@ fun main(args: Array<String>) {
             "id" to v.journal.id, "since" to v.journal.since.toLong(), "revision" to v.journal.revision.toLong(),
             "records" to v.journal.records.toLong(), "records_hash" to v.journal.recordsHash,
             "drafts" to v.journal.drafts.toLong(), "drafts_hash" to v.journal.draftsHash,
+            "processes" to v.journal.processes.toLong(), "processes_hash" to v.journal.processesHash,
         ),
         "records" to v.records,
+        "processes" to v.processes,
     )
     fun srepRequest(log: MembershipLog, c: Any?, challenge: Any?, slot: String, key: String) =
-        SignerReportRequest(log, Json.write(challenge), c["signer"].s(), slot, c["station"].s(), journalIn(c["journal"]), key, c["now_ms"].l().toULong())
+        SignerReportRequest(log, Json.write(challenge), c["signer"].s(), slot, c["station"].s(), journalIn(c), key, c["now_ms"].l().toULong())
     check("signer report: challenges") {
         for (c in srep["challenges"].arr()) {
             val fields = c.obj()["fields"]
@@ -848,7 +868,8 @@ fun main(args: Array<String>) {
     check("signer report: reports") {
         for (c in srep["valid"].arr() + srep["invalid"].arr()) {
             val verify = {
-                verifySignerReport(srepLog(c), c["report"].s(), Json.write(c["challenge"]), c["exported"].arr().map { it.s() }, c["now_ms"].l().toULong())
+                verifySignerReport(srepLog(c), c["report"].s(), Json.write(c["challenge"]), c["exported"].arr().map { it.s() },
+                    c["exported_processes"].arr().map { it.s() }, c["now_ms"].l().toULong())
             }
             val expect = c.obj()["expect"]
             if (expect != null) eq(srepOut(verify()), expect, c["label"].s())
@@ -860,6 +881,8 @@ fun main(args: Array<String>) {
         eq(byCase.getValue("records_possibly_signed")["code"], "records_mismatch", "records_possibly_signed")
         eq(byCase.getValue("not_a_manager")["code"], "not_a_manager", "not_a_manager")
         eq(byCase.getValue("high_s_signature")["code"], "bad_signature", "high_s_signature")
+        eq(byCase.getValue("processes_own_absent")["code"], "processes_mismatch", "processes_own_absent")
+        eq(byCase.getValue("v1_report")["code"], "malformed", "v1_report")
     }
     check("signer report: the builder") {
         for (c in srep["builder"].arr() + srep["request"].arr()) {
@@ -871,6 +894,9 @@ fun main(args: Array<String>) {
             }
             val body = LinkedHashMap(Json.parse(build().bodyJson()).obj())
             eq(body.remove("process"), verifierReportProcess(), "${c["label"].s()}: this core's process")
+            val journal = LinkedHashMap(body.getValue("journal").obj())
+            eq(journal.remove("processes_hash"), processesHash(journalIn(c).processes), "${c["label"].s()}: the roster's hash")
+            body["journal"] = journal
             eq(body, want, c["label"].s())
         }
     }
@@ -929,18 +955,24 @@ fun main(args: Array<String>) {
         val k = keys["dev-phone"]["auth"]
         keysUsed.addP256("dev-phone/auth", unhex(k["secret_hex"].s()), unhex(k["pub_hex"].s()))
         val report = signSignerReport(keysUsed, log, Json.write(c["challenge"]), c["signer"].s(), c["slot"].s(), c["station"].s(),
-            journalIn(c["journal"]), "dev-phone/auth", c["now_ms"].l().toULong())
+            journalIn(c), "dev-phone/auth", c["now_ms"].l().toULong())
         val records = listOf("phone_revoke", "phone_interrupt", "phone_host_interrupt").map { label ->
             canonicalJson(Json.write(srep["records"].arr().first { it["label"] == label }["record"]))
         }
-        val v = verifySignerReport(log, report, Json.write(c["challenge"]), records, c["now_ms"].l().toULong())
+        val roster = journalIn(c).processes
+        val v = verifySignerReport(log, report, Json.write(c["challenge"]), records, roster, c["now_ms"].l().toULong())
         eq(v.process, verifierReportProcess(), "process")
         eq(v.journal.records, 3uL, "records")
+        eq(v.journal.processes, roster.size.toULong(), "processes")
+        eq(v.processes.contains(verifierReportProcess()), true, "its own process in the verified roster")
+        reportError("processes_mismatch") {
+            verifySignerReport(log, report, Json.write(c["challenge"]), records, listOf(verifierReportProcess()), c["now_ms"].l().toULong())
+        }
         eq(keysUsed.requests.single().purpose, SigningPurpose.SIGNER_REPORT, "purpose")
         eq(keysUsed.requests.single().freshConfirmation, true, "a fresh confirmation")
         reportError("bad_signature") {
             signSignerReport(reporters, log, Json.write(c["challenge"]), c["signer"].s(), c["slot"].s(), c["station"].s(),
-                journalIn(c["journal"]), "dev-mac/auth", c["now_ms"].l().toULong())
+                journalIn(c), "dev-mac/auth", c["now_ms"].l().toULong())
         }
     }
     // A manager's Station binding proof (delegated host-work III.5 (b);
@@ -1160,6 +1192,7 @@ fun main(args: Array<String>) {
     // commit loses no effect); and a provider is asked under the purpose
     // the record's signer gives.
     val ctl = load("r9-vectors-host-work-control")
+    for (e in ctl["entries"].arr()) carried[e["label"].s()] = e
     val ctlRecords = ctl["records"].arr()
     val ctlByLabel = ctlRecords.associateBy { it["label"].s() }
     val controlFields = setOf("type", "v", "account_id", "genesis_hash", "origin", "feed_id", "principal", "principal_key",
@@ -1198,7 +1231,13 @@ fun main(args: Array<String>) {
     }
     check("control records: every record parses and verifies on its chains as the vectors say") {
         var verdicts = 0
-        val svc = ctl["services"]["svc-discord"]["auth_key"]
+        // A service's auth_key: the file's `services` (svc-discord), else the
+        // service_add among its own entries (svc-other, SO7).
+        fun serviceKey(principal: String): Any? {
+            val id = principal.removePrefix("service:")
+            return ctl["services"].obj()[id]?.get("auth_key")
+                ?: ctl["entries"].arr().map { it["entry"]["body"]["member"] }.first { it != null && it["device_id"] == id }["auth_key"]
+        }
         for (r in ctlRecords) {
             val label = r["label"].s()
             val json = Json.write(r["record"])
@@ -1214,6 +1253,7 @@ fun main(args: Array<String>) {
             eq(hex(info.signingInput), r["signing_input_hex"], label)
             eq(hex(signingInput(SignLabelKind.HOST_WORK_CONTROL, utf8(r["jcs"].s()))), r["signing_input_hex"], label)
             if (r.obj().containsKey("r9_svc")) {
+                val svc = serviceKey(r["record"]["body"]["principal"].s())
                 eq(serviceKeyFingerprint(PublicKeyData(KeyAlg.ED25519, b64u(svc["pub"].s()))), r["r9_svc"], label)
                 eq(r["record"]["body"]["principal_key"] == r["r9_svc"], r["checks"][0]["reason"] != "key_mismatch", "$label principal_key")
             }
@@ -1586,13 +1626,14 @@ fun main(args: Array<String>) {
     fun snapshotRun(c: Any?, origin: String = c["origin"].s(), candidate: String = c["candidate_feed_id"].s(),
                     snapshot: List<String> = strs(c["snapshot"]).map { ctlRecord(it) },
                     marks: List<ControlSnapshotMark> = c["marks"].obj().map { (p, m) -> ControlSnapshotMark(p, m.l().toULong()) },
-                    covered: List<String> = strs(c["covered"])) =
+                    covered: List<String> = strs(c["covered"]), provisioned: List<String> = strs(c["provisioned"])) =
         checkControlSnapshotConsistency(logAfter(strs(c["chain"])), origin, candidate,
-            strs(c["retained"]).map { ctlRecord(it) }, snapshot, marks, covered)
+            strs(c["retained"]).map { ctlRecord(it) }, snapshot, marks, covered, provisioned)
     check("control snapshots: every case through checkControlSnapshotConsistency") {
         val cases = ctl["snapshots"].arr()
         eq(cases.size >= 8, true, "snapshot cases")
         for (c in cases) eq(canon(snapshotOut(snapshotRun(c))), canon(c["expect"]), c["label"].s())
+        eq(cases.any { it["expect"].obj()["code"] == "coverage_dropped" }, true, "a coverage_dropped case")
         val n1 = cases.first { it["label"] == "N1_retained_native_revoke" }
         val mark = ControlSnapshotMark("service:svc-discord", n1["marks"]["service:svc-discord"].l().toULong())
         throwsCode("unknown_field") { snapshotRun(n1, snapshot = listOf(ctlRecord("A2_cover"), ctlRecord("P4_unknown_field"))) }
@@ -1601,6 +1642,82 @@ fun main(args: Array<String>) {
         throwsCode("malformed") { snapshotRun(n1, marks = listOf(mark, mark)) }
         throwsCode("malformed") { snapshotRun(n1, marks = listOf(ControlSnapshotMark("member:dev-mac", 1uL))) }
         throwsCode("malformed") { snapshotRun(n1, covered = listOf("service:svc-discord", "service:svc-discord")) }
+        throwsCode("malformed") { snapshotRun(n1, provisioned = listOf("host:host-a")) }
+        throwsCode("malformed") { snapshotRun(n1, provisioned = listOf("service:svc-discord", "service:svc-discord")) }
+    }
+    // A current manager's re-signed copy of a former manager's stop
+    // (r9-vectors-resigned-copy; host-work-v1 §11.1, condition (c)): each
+    // case through checkResignedCopy (the copy, or Invalid with the copy
+    // check's code and detail), and the snapshots the effect-only checker
+    // passes whose stop the copy check refuses.
+    val rcopy = load("r9-vectors-resigned-copy")
+    fun rcopyLog(c: Any?): MembershipLog {
+        val at = HostClock(c["now_ms"].l().toULong(), 1000uL, "boot-1")
+        val chain = c["chain"].arr().map { label -> Json.write(rcopy["entries"].arr().first { it["label"] == label }["entry"]) }
+        val log = MembershipLog.verify(account, genesis, l + chain, at)
+        c.obj()["freeze"]?.let { log.extend(listOf(entry(it.s())), at) }
+        return log
+    }
+    fun rcopyRecord(label: Any?) = Json.write(rcopy["records"].arr().first { it["label"] == label }["record"])
+    fun copyRefusal(f: () -> Unit): Map<String, Any?> {
+        try {
+            f()
+        } catch (e: AtemException.Invalid) {
+            return linkedMapOf<String, Any?>("code" to e.code).also { if (e.detail.isNotEmpty()) it["detail"] = e.detail }
+        }
+        throw AssertionError("expected a refusal, nothing thrown")
+    }
+    check("resigned copy: every record verifies on its chains as `checks` says") {
+        var verdicts = 0
+        val at = mapOf("now_ms" to rcopy["cases"][0]["now_ms"])
+        for (r in rcopy["records"].arr()) {
+            val label = r["label"].s()
+            val json = Json.write(r["record"])
+            val parseError = r.obj()["parse_error"]
+            if (parseError != null) {
+                throwsCode(parseError.s()) { verifyControlRecord(logL(), json) }
+                continue
+            }
+            for (c in r["checks"].arr()) {
+                // The file's verdicts name the signer only (no key_seq).
+                val got = verdictOf(c["chain"], verifyControlRecord(rcopyLog(at + ("chain" to c["chain"])), json)) - "key_seq"
+                eq(got, c.obj(), "$label on ${c["chain"]}")
+                verdicts++
+            }
+        }
+        check(verdicts >= 100) { "$verdicts verdicts" }
+    }
+    check("resigned copy: every case through checkResignedCopy") {
+        eq(resignedCopyCodes(), strs(rcopy["codes"]), "codes")
+        val codes = sortedSetOf<String>()
+        for (c in rcopy["cases"].arr()) {
+            val judge = { checkResignedCopy(rcopyLog(c), c["original_json"].s(), c["copy_json"].s(), c["candidate_feed_id"].s()) }
+            val expect = c.obj()["expect"]
+            if (expect == null) {
+                val got = copyRefusal { judge() }
+                val want = linkedMapOf<String, Any?>("code" to c["code"]).also { w -> c.obj()["detail"]?.let { w["detail"] = it } }
+                eq(canon(got), canon(want), c["label"].s())
+                codes.add(got.getValue("code") as String)
+                continue
+            }
+            val v = judge()
+            val out = linkedMapOf<String, Any?>("original_record_id" to v.originalRecordId, "copy_record_id" to v.copyRecordId,
+                "signer" to v.signer, "principal" to v.principal, "action" to v.action).also { o -> v.feed?.let { o["feed"] = it } }
+            eq(canon(out), canon(expect), c["label"].s())
+        }
+        eq(codes.toList(), strs(rcopy["codes"]).sorted(), "every code")
+    }
+    check("resigned copy: the snapshot checker passes what the copy check refuses") {
+        for (p in rcopy["checker_passes"].arr()) {
+            val snap = p["snapshot"]
+            val marks = snap["marks"].obj().map { (k, m) -> ControlSnapshotMark(k, m.l().toULong()) }
+            val a = checkControlSnapshotConsistency(rcopyLog(p), snap["origin"].s(), snap["candidate_feed_id"].s(),
+                snap["retained"].arr().map { rcopyRecord(it) }, snap["snapshot"].arr().map { rcopyRecord(it) }, marks, strs(snap["covered"]),
+                strs(snap["provisioned"]))
+            eq(canon(snapshotOut(a)), canon(snap["expect"]), "${p["label"].s()}: consistent")
+            val got = copyRefusal { checkResignedCopy(rcopyLog(p), rcopyRecord(p["original"]), rcopyRecord(p["copy"]), p["candidate_feed_id"].s()) }
+            eq(canon(got), canon(mapOf("code" to p["code"], "detail" to p["detail"])), "${p["label"].s()}: refused as a copy")
+        }
     }
     check("Station acks: a call never changes its handle; the state loads only as written") {
         val f = load("r9-control-ack-per-effect")

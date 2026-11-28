@@ -42,7 +42,8 @@
 //! [`signer`] is the second kind on the same core: a native manager's
 //! signed report of its control-record signing journal, for a Station
 //! recovering from a rollback (host-work-v1 §11.1 "The signer report";
-//! agreed with Astation, #114 comment 7089435073), re-exported here.
+//! agreed with Astation, #114 comment 7089435073; version 2, its process
+//! roster, #114 comment 7208700195), re-exported here.
 use std::sync::OnceLock;
 
 use serde_json::{Map, Value, json};
@@ -61,10 +62,10 @@ use crate::station_route::normalize_relay;
 pub mod signer;
 
 pub use signer::{
-    JOURNAL_ID_BYTES, JournalSummary, JournalView, MAX_GENERATION, OutOfPlan, PlanRecord,
-    RecoveryPlan, SIGNER_REPORT_TYPE, SIGNER_VERIFY_ORDER, SignerReportBody, SignerReportChallenge,
-    VerifiedSignerReport, sign_signer_report, signer_report_body, signer_report_plan_record,
-    verify_signer_report,
+    JOURNAL_ID_BYTES, JournalSummary, JournalView, MAX_GENERATION, MAX_JOURNAL_PROCESSES,
+    OutOfPlan, PlanRecord, RecoveryPlan, SIGNER_REPORT_TYPE, SIGNER_VERIFY_ORDER, SignerReportBody,
+    SignerReportChallenge, VerifiedSignerReport, sign_signer_report, signer_report_body,
+    signer_report_plan_record, verify_signer_report,
 };
 
 /// The body's `type`.
@@ -187,6 +188,11 @@ pub enum ReportRefusal {
     /// duplicate, or a count or `records_hash` other than the report's;
     /// the text names which.
     RecordsMismatch(&'static str),
+    /// A signer report's exported roster isn't exactly its `processes`: a
+    /// malformed id, a duplicate, a count or `processes_hash` other than
+    /// the report's, or a roster without the report's own `process`; the
+    /// text names which.
+    ProcessesMismatch(&'static str),
     /// `now_ms` is at or after the challenge's `expires_at`.
     Expired,
     /// The builder only: the challenge's `origin` isn't the reporter's
@@ -217,6 +223,7 @@ impl ReportRefusal {
             ReportRefusal::ChallengeMismatch => "challenge_mismatch",
             ReportRefusal::RecoveryMismatch => "recovery_mismatch",
             ReportRefusal::RecordsMismatch(_) => "records_mismatch",
+            ReportRefusal::ProcessesMismatch(_) => "processes_mismatch",
             ReportRefusal::Expired => "expired",
             ReportRefusal::OriginMismatch => "origin_mismatch",
             ReportRefusal::BindingMismatch => "binding_mismatch",
@@ -230,6 +237,7 @@ impl std::fmt::Display for ReportRefusal {
         match self {
             ReportRefusal::Malformed(what) => write!(f, "malformed ({what})"),
             ReportRefusal::RecordsMismatch(what) => write!(f, "records_mismatch ({what})"),
+            ReportRefusal::ProcessesMismatch(what) => write!(f, "processes_mismatch ({what})"),
             ReportRefusal::Signing(e) => write!(f, "signing_failed ({e})"),
             other => f.write_str(other.code()),
         }

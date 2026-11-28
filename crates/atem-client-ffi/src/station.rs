@@ -871,7 +871,9 @@ impl AckLedgerHandle {
 /// `snapshot_json` the snapshot's in publication order (each record's
 /// JSON, as the control parser reads it); `marks` each service
 /// principal's mark, once each; `covered` the principals the snapshot
-/// covers (`service:<id>`), once each.
+/// covers (`service:<id>`), once each; `provisioned` the services you
+/// provisioned at `origin` and haven't handed over (`service:<id>`, once
+/// each; may be empty, then nothing is checked against it).
 ///
 /// Checked first over the retained records: `invalid_retained` for one
 /// that isn't valid at the head, but a removed manager's stop (`reason` the
@@ -888,16 +890,27 @@ impl AckLedgerHandle {
 /// principal's cover comes first, a hold or release after it),
 /// `uncovered_cover`, `not_above_mark` (signed anew with the service's own
 /// key, issued at or below its principal's mark or with none); then a
-/// covered principal with no cover (`cover_not_first`), then each effect
-/// of each retained `revoke` or `interrupt_running` that the snapshot
-/// alone doesn't keep on a fresh state (a revocation, or an interrupt due
-/// because its principal is revoked, in force; an interrupt not yet due,
-/// of a principal nothing revokes, an `interrupt_running` of that
-/// principal in the snapshot, which a new host holds pending as a host
-/// that read the old feed does):
-/// `stop_lost` when that retained stop is valid at the head,
+/// covered principal with no cover (`cover_not_first`); then
+/// `coverage_dropped` for a provisioned service (in sorted order) that is
+/// neither covered, nor revoked by a `revoke` of it the snapshot carries,
+/// nor removed from the device list at the head (a Portal-only revoke, an
+/// expiry, an absent key or a missing reservation never clears coverage;
+/// agreed with Astation, Astation #114 comments 7208700195 and
+/// 7209301522; its place in the order Atem's choice; and Atem's reading,
+/// for Astation's agreement: a provisioned service the list doesn't hold
+/// at the head is neither covered nor removed, so it fails closed: leave a
+/// service out of `provisioned` until its `service_add` is in the list);
+/// then each effect of each retained `revoke` or `interrupt_running` that
+/// the snapshot alone doesn't keep on a fresh state (a revocation, or an
+/// interrupt due because its principal is revoked, in force; an interrupt
+/// not yet due, of a principal nothing revokes, an `interrupt_running` of
+/// that principal in the snapshot, which a new host holds pending as a
+/// host that read the old feed does): `stop_lost` when that retained stop
+/// is valid at the head,
 /// `stop_not_resigned` (`reason` `removed_manager`) when a removed manager
-/// signed it, a genuine stop a current manager signs again (I.5.4).
+/// signed it, a genuine stop a current manager signs again (I.5.4). It is
+/// effect-only: whether a snapshot stop is a conforming copy of a removed
+/// or demoted manager's original is `check_resigned_copy`'s, stricter.
 /// Holds and releases aren't compared: the Portal's current state
 /// decides them. A snapshot `revoke` or `interrupt_running` whose signed
 /// object (body and signature) is a retained record's is that stop
@@ -907,10 +920,12 @@ impl AckLedgerHandle {
 ///
 /// Errors: a record its parse refuses is `Invalid{code}` (its parse code);
 /// any other input outside its grammar (an origin not in its exact form, a
-/// candidate feed that isn't a UUID v4, a mark or covered principal that
-/// isn't `service:<id>`, a principal marked or covered twice, a mark above
-/// 2^53 − 1, a frozen list) is `Invalid{malformed}`.
+/// candidate feed that isn't a UUID v4, a mark, covered or provisioned
+/// principal that isn't `service:<id>`, a principal marked, covered or
+/// provisioned twice, a mark above 2^53 − 1, a frozen list) is
+/// `Invalid{malformed}`.
 #[cfg_attr(feature = "uniffi", uniffi::export)]
+#[allow(clippy::too_many_arguments)]
 pub fn check_control_snapshot_consistency(
     log: Arc<MembershipLog>,
     origin: String,
@@ -919,6 +934,7 @@ pub fn check_control_snapshot_consistency(
     snapshot_json: Vec<String>,
     marks: Vec<ControlSnapshotMark>,
     covered: Vec<String>,
+    provisioned: Vec<String>,
 ) -> Result<ControlSnapshotConsistency> {
     let records = |jsons: &[String]| -> Result<Vec<ControlRecord>> {
         jsons
@@ -938,6 +954,11 @@ pub fn check_control_snapshot_consistency(
     if covered.len() != count {
         return Err(AtemError::malformed("a principal covered twice"));
     }
+    let count = provisioned.len();
+    let provisioned: BTreeSet<String> = provisioned.into_iter().collect();
+    if provisioned.len() != count {
+        return Err(AtemError::malformed("a principal provisioned twice"));
+    }
     let list = log.lock();
     let answer = check_snapshot_consistency(&SnapshotInput {
         list: &list,
@@ -947,6 +968,7 @@ pub fn check_control_snapshot_consistency(
         snapshot: &snapshot,
         marks: &by_principal,
         covered: &covered,
+        provisioned: &provisioned,
     })?;
     Ok(match answer {
         SnapshotConsistency::Consistent => ControlSnapshotConsistency::Consistent,

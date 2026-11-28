@@ -656,12 +656,22 @@ check("verifier report: a bot signs with its own key", () => {
 // ------------------------------------------- a manager's signer report
 // r9-vectors-signer-report (host-work-v1 §11.1 "The signer report"; Astation
 // #114 item 4): each challenge read or refused; each report verified with
-// its exported records, or refused with kind report and its code; each
-// builder case as a SignerReportRequest (its body but the process, which is
-// this instance's); the immutable request's finishes, signed here with
-// Node's crypto (another body, another member: refused); and the
-// synchronous signer with a software key.
+// its exported records and roster (v2), or refused with kind report and its
+// code; each builder case as a SignerReportRequest (its body but the process
+// and the roster's hash, which are this instance's: the hash recomputed
+// here over the case's roster and this instance's process); the immutable
+// request's finishes, signed here with Node's crypto (another body, another
+// member: refused); and the synchronous signer with a software key.
 const srep = load("r9-vectors-signer-report");
+// A builder case's journal: its roster the file's ids, then this instance's
+// own process when the case's own_process says so.
+const srepJournal = (c) => ({ ...c.journal, processes: [...c.journal.processes, ...(c.own_process ? [m.verifierReportProcess()] : [])] });
+// SHA-256(enc(["atem-signer-report-processes-v1", p1…pn])) over the raw ids
+// sorted by bytes.
+const srepProcessesHash = (ids) => {
+  const raw = ids.map((p) => Buffer.from(p, "base64url")).sort(Buffer.compare);
+  return createHash("sha256").update(m.encodeFields([utf8("atem-signer-report-processes-v1"), ...raw])).digest("hex");
+};
 const srepLog = (c) => {
   const now = { wallMs: c.now_ms, monoMs: 1000, bootId: "boot-1" };
   const chain = c.chain.map((label) => str(srep.entries.find((e) => e.label === label).entry));
@@ -699,8 +709,11 @@ const srepOut = (v) => ({
     records_hash: v.journal.recordsHash,
     drafts: v.journal.drafts,
     drafts_hash: v.journal.draftsHash,
+    processes: v.journal.processes,
+    processes_hash: v.journal.processesHash,
   },
   records: v.records,
+  processes: v.processes,
 });
 check("signer report: challenges", () => {
   for (const c of srep.challenges) {
@@ -726,7 +739,7 @@ check("signer report: challenges", () => {
 });
 check("signer report: reports", () => {
   for (const c of [...srep.valid, ...srep.invalid]) {
-    const verify = () => m.verifySignerReport(srepLog(c), c.report, str(c.challenge), c.exported, c.now_ms);
+    const verify = () => m.verifySignerReport(srepLog(c), c.report, str(c.challenge), c.exported, c.exported_processes, c.now_ms);
     if (c.expect !== undefined) same(srepOut(verify()), c.expect, c.label);
     else reportError(verify, c.code);
   }
@@ -735,17 +748,21 @@ check("signer report: reports", () => {
   eq(byCase.records_possibly_signed.code, "records_mismatch", "records_possibly_signed");
   eq(byCase.not_a_manager.code, "not_a_manager", "not_a_manager");
   eq(byCase.high_s_signature.code, "bad_signature", "high_s_signature");
+  eq(byCase.processes_own_absent.code, "processes_mismatch", "processes_own_absent");
+  eq(byCase.v1_report.code, "malformed", "v1_report");
 });
 check("signer report: the builder", () => {
   for (const c of [...srep.builder, ...srep.request]) {
-    const build = () => new m.SignerReportRequest(srepLog(c), str(c.challenge), c.signer, c.slot, c.station, c.journal, "key", c.now_ms);
+    const build = () => new m.SignerReportRequest(srepLog(c), str(c.challenge), c.signer, c.slot, c.station, srepJournal(c), "key", c.now_ms);
     if (c.body_but_process === undefined) {
       reportError(build, c.code);
       continue;
     }
     const body = JSON.parse(build().bodyJson());
     eq(body.process, m.verifierReportProcess(), `${c.label}: this instance's process`);
+    eq(body.journal.processes_hash, srepProcessesHash(srepJournal(c).processes), `${c.label}: the roster's hash`);
     delete body.process;
+    delete body.journal.processes_hash;
     same(body, c.body_but_process, c.label);
   }
 });
@@ -768,7 +785,7 @@ check("signer report: the plan predicate", () => {
 check("signer report: the immutable request", () => {
   for (const c of srep.request) {
     const log = srepLog(c);
-    const request = (challenge, slot) => new m.SignerReportRequest(log, str(challenge), c.signer, slot, c.station, c.journal, c.key, c.now_ms);
+    const request = (challenge, slot) => new m.SignerReportRequest(log, str(challenge), c.signer, slot, c.station, srepJournal(c), c.key, c.now_ms);
     const held = request(c.challenge, c.slot);
     const body = held.bodyJson();
     const sr = held.signRequest();
@@ -793,11 +810,15 @@ check("signer report: the synchronous signer, with a software key", () => {
   store.insertP256("dev-phone/auth", unhex(keys["dev-phone"].auth.secret_hex));
   store.insertP256("dev-mac/auth", unhex(keys["dev-mac"].auth.secret_hex));
   const log = srepLog(c);
-  const sign = (key) => m.signSignerReport(store, log, str(c.challenge), c.signer, c.slot, c.station, c.journal, key, c.now_ms);
+  const sign = (key) => m.signSignerReport(store, log, str(c.challenge), c.signer, c.slot, c.station, srepJournal(c), key, c.now_ms);
   const records = ["phone_revoke", "phone_interrupt", "phone_host_interrupt"].map((l) => m.canonicalJson(str(srep.records.find((r) => r.label === l).record)));
-  const v = m.verifySignerReport(log, sign(c.key), str(c.challenge), records, c.now_ms);
+  const roster = srepJournal(c).processes;
+  const v = m.verifySignerReport(log, sign(c.key), str(c.challenge), records, roster, c.now_ms);
   eq(v.process, m.verifierReportProcess(), "process");
   eq(v.journal.records, 3, "records");
+  eq(v.journal.processes, roster.length, "processes");
+  if (!v.processes.includes(m.verifierReportProcess())) throw new Error("its own process in the verified roster");
+  reportError(() => m.verifySignerReport(log, sign(c.key), str(c.challenge), records, [m.verifierReportProcess()], c.now_ms), "processes_mismatch");
   reportError(() => sign("dev-mac/auth"), "bad_signature");
 });
 
@@ -950,6 +971,9 @@ check("station binding: the synchronous signer, with a software key", () => {
 // again, whole or from its parts per principal, only for its own device
 // list; and a handle never changes, so a failed commit loses no effect.
 const ctl = load("r9-vectors-host-work-control");
+// The entries the control vectors carry themselves (a second service's
+// service_add, SO7), resolved by label in their chains as L's are.
+for (const e of ctl.entries) byLabel[e.label] = e;
 const ctlByLabel = Object.fromEntries(ctl.records.map((r) => [r.label, r]));
 const CONTROL_FIELDS = ["type", "v", "account_id", "genesis_hash", "origin", "feed_id", "principal", "principal_key", "signer", "action", "interrupt_running", "revoke_seq", "record_id", "issued_at", "about"];
 // The typed body of a record's body JSON (null: a field the body doesn't have).
@@ -986,7 +1010,12 @@ const verdictOf = (chain, got) => {
 };
 check("control records: every record parses and verifies on its chains as the vectors say", () => {
   let verdicts = 0;
-  const svc = ctl.services["svc-discord"].auth_key;
+  // A service's auth_key: the file's `services` (svc-discord), else the
+  // service_add among its own entries (svc-other, SO7).
+  const serviceKey = (principal) => {
+    const id = principal.slice("service:".length);
+    return ctl.services[id]?.auth_key ?? ctl.entries.map((e) => e.entry.body.member).find((x) => x?.device_id === id).auth_key;
+  };
   for (const r of ctl.records) {
     const json = str(r.record);
     if (r.parse_error !== undefined) {
@@ -1000,6 +1029,7 @@ check("control records: every record parses and verifies on its chains as the ve
     eq(hex(info.signingInput), r.signing_input_hex, r.label);
     eq(hex(m.signingInput("host_work_control", utf8(r.jcs))), r.signing_input_hex, r.label);
     if (r.r9_svc !== undefined) {
+      const svc = serviceKey(r.record.body.principal);
       eq(m.serviceKeyFingerprint(svc.alg, b64u(svc.pub)), r.r9_svc, r.label);
       eq(r.record.body.principal_key === r.r9_svc, r.checks[0].reason !== "key_mismatch", `${r.label} principal_key`);
     }
@@ -1316,12 +1346,14 @@ check("control snapshots: every case through checkControlSnapshotConsistency", (
       snapshot: c.snapshot.map(ctlRecord),
       marks: Object.entries(c.marks).map(([principal, markMs]) => ({ principal, markMs })),
       covered: c.covered,
+      provisioned: c.provisioned,
       ...edit,
     };
-    return m.checkControlSnapshotConsistency(logAfter(c.chain), a.origin, a.candidate, a.retained, a.snapshot, a.marks, a.covered);
+    return m.checkControlSnapshotConsistency(logAfter(c.chain), a.origin, a.candidate, a.retained, a.snapshot, a.marks, a.covered, a.provisioned);
   };
   if (ctl.snapshots.length < 8) throw new Error(`${ctl.snapshots.length} snapshot cases`);
   for (const c of ctl.snapshots) same(snapshotOut(run(c)), c.expect, c.label);
+  if (!ctl.snapshots.some((c) => c.expect.code === "coverage_dropped")) throw new Error("a coverage_dropped case");
   const n1 = ctl.snapshots.find((c) => c.label === "N1_retained_native_revoke");
   const mark = { principal: "service:svc-discord", markMs: n1.marks["service:svc-discord"] };
   throwsCode(() => run(n1, { snapshot: [ctlRecord("A2_cover"), ctlRecord("P4_unknown_field")] }), "unknown_field");
@@ -1331,6 +1363,77 @@ check("control snapshots: every case through checkControlSnapshotConsistency", (
   throwsCode(() => run(n1, { marks: [{ principal: "member:dev-mac", markMs: 1 }] }), "malformed");
   throwsCode(() => run(n1, { marks: [{ ...mark, mark_ms: 1 }] }), "malformed");
   throwsCode(() => run(n1, { covered: ["service:svc-discord", "service:svc-discord"] }), "malformed");
+  throwsCode(() => run(n1, { provisioned: ["host:host-a"] }), "malformed");
+  throwsCode(() => run(n1, { provisioned: ["service:svc-discord", "service:svc-discord"] }), "malformed");
+});
+// A current manager's re-signed copy of a former manager's stop
+// (r9-vectors-resigned-copy; host-work-v1 §11.1, condition (c)): each case
+// through checkResignedCopy (the copy, or kind invalid with the copy
+// check's code and detail), and the snapshots the effect-only checker
+// passes whose stop the copy check refuses.
+const rcopy = load("r9-vectors-resigned-copy");
+// L, the case's chain (the file's entries), then its freeze carriage.
+const rcopyLog = (c) => {
+  const now = { wallMs: c.now_ms, monoMs: 1000, bootId: "boot-1" };
+  const chain = c.chain.map((label) => str(rcopy.entries.find((e) => e.label === label).entry));
+  const log = m.MembershipLog.verify(ACCOUNT, GENESIS, [...L, ...chain], now);
+  if (c.freeze !== undefined) log.extend([entry(c.freeze)], now);
+  return log;
+};
+const rcopyRecord = (label) => str(rcopy.records.find((r) => r.label === label).record);
+const copyRefusal = (f) => {
+  try {
+    f();
+  } catch (e) {
+    eq(e.kind, "invalid", "kind");
+    return { code: e.code, ...(e.detail !== "" ? { detail: e.detail } : {}) };
+  }
+  throw new Error("expected a refusal, nothing thrown");
+};
+check("resigned copy: every record verifies on its chains as `checks` says", () => {
+  let verdicts = 0;
+  for (const r of rcopy.records) {
+    const json = str(r.record);
+    if (r.parse_error !== undefined) {
+      throwsCode(() => m.verifyControlRecord(logL(), json), r.parse_error);
+      continue;
+    }
+    for (const c of r.checks) {
+      // The file's verdicts name the signer only (no key_seq).
+      const { key_seq: _, ...got } = verdictOf(c.chain, m.verifyControlRecord(rcopyLog({ chain: c.chain, now_ms: rcopy.cases[0].now_ms }), json));
+      same(got, c, `${r.label} on ${c.chain}`);
+      verdicts++;
+    }
+  }
+  if (verdicts < 100) throw new Error(`${verdicts} verdicts`);
+});
+check("resigned copy: every case through checkResignedCopy", () => {
+  same(m.resignedCopyCodes(), rcopy.codes, "codes");
+  const codes = new Set();
+  for (const c of rcopy.cases) {
+    const judge = () => m.checkResignedCopy(rcopyLog(c), c.original_json, c.copy_json, c.candidate_feed_id);
+    if (c.expect === undefined) {
+      const got = copyRefusal(judge);
+      same(got, { code: c.code, ...(c.detail !== undefined ? { detail: c.detail } : {}) }, c.label);
+      codes.add(got.code);
+      continue;
+    }
+    const v = judge();
+    const out = { original_record_id: v.originalRecordId, copy_record_id: v.copyRecordId, signer: v.signer, principal: v.principal, action: v.action };
+    if (v.feed !== null && v.feed !== undefined) out.feed = v.feed;
+    same(out, c.expect, c.label);
+  }
+  same([...codes].sort(), [...rcopy.codes].sort(), "every code");
+});
+check("resigned copy: the snapshot checker passes what the copy check refuses", () => {
+  for (const p of rcopy.checker_passes) {
+    const snap = p.snapshot;
+    const marks = Object.entries(snap.marks).map(([principal, markMs]) => ({ principal, markMs }));
+    const a = m.checkControlSnapshotConsistency(rcopyLog(p), snap.origin, snap.candidate_feed_id, snap.retained.map(rcopyRecord), snap.snapshot.map(rcopyRecord), marks, snap.covered, snap.provisioned);
+    same(snapshotOut(a), snap.expect, `${p.label}: consistent`);
+    const got = copyRefusal(() => m.checkResignedCopy(rcopyLog(p), rcopyRecord(p.original), rcopyRecord(p.copy), p.candidate_feed_id));
+    same(got, { code: p.code, detail: p.detail }, `${p.label}: refused as a copy`);
+  }
 });
 check("Station acks: a call never changes its handle; the state loads only as written", () => {
   const f = load("r9-control-ack-per-effect");

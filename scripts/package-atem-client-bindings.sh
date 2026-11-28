@@ -248,6 +248,11 @@ FILES+=("$SIGNER_VECTOR")
 BINDING_VECTOR="atem-client-${VERSION}-r9-vectors-station-binding.json"
 cp designs/protocol/fixtures/r9-vectors-station-binding.json "$OUT/$BINDING_VECTOR"
 FILES+=("$BINDING_VECTOR")
+# A current manager's re-signed copy of a former manager's stop
+# (host-work-v1 §11.1, condition (c); Astation #114).
+COPY_VECTOR="atem-client-${VERSION}-r9-vectors-resigned-copy.json"
+cp designs/protocol/fixtures/r9-vectors-resigned-copy.json "$OUT/$COPY_VECTOR"
+FILES+=("$COPY_VECTOR")
 # The Station's acknowledgment fixtures (test 48), for Station builders.
 for fixture in designs/protocol/fixtures/r9-control-ack-*.json; do
   ACK_FIXTURE="atem-client-${VERSION}-$(basename "$fixture")"

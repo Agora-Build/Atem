@@ -1579,11 +1579,11 @@ leaves the coverage on the old feed: its holds, revokes and interrupts
 still apply, so no stop is lost, but its releases are refused until a
 newer cover arrives.
 
-**Which principals a Station currently covers** (**Atem's reading, for
-Astation's agreement (Astation #114, comment 7207811340)**; it amends
-"Resets" above and design I.5.2, which the agreed text leaves undefined,
-and narrows the Station Builders contract's snapshot duty, so Auth/Portal
-is told on Portal #41). At origin O, a Station stops covering a service
+**Which principals a Station currently covers** (Atem's reading, **agreed
+with Astation (Astation #114 comments 7208700195 and 7209301522)**; it
+amends "Resets" above and design I.5.2, which the agreed text leaves
+undefined, and narrows the Station Builders contract's snapshot duty, so
+Auth/Portal is told on Portal #41). At origin O, a Station stops covering a service
 principal p at the first of:
 
 1. a revoke of p that the snapshot itself carries and that verifies at
@@ -1606,7 +1606,13 @@ missing `U_p`, nor the Station's own wish. A principal the snapshot
 revokes (or the device list removed) isn't currently covered: the
 snapshot carries its revoke and interrupts (as they are, a current
 manager's copies, or its own key's signed anew) and no cover, hold or
-release.
+release. A service the Station provisioned that the device list doesn't
+hold at the verifying head (its `service_add` not yet committed, or not
+yet carried to this list) can be neither covered (its cover is
+`principal_unknown`) nor stopped by item 1 or 2, so the checker's
+`coverage_dropped` (below) fails closed for it: leave a service out of
+`provisioned` until its `service_add` is in the list (**Atem's reading,
+for Astation's agreement**).
 
 | p at the cut | The snapshot holds |
 |---|---|
@@ -1626,19 +1632,29 @@ p's coverage there, since no newer cover moves it, and its delegated
 tasks keep running. That is why coverage ends only with a stop the
 snapshot carries, or with the device list. It also removes #114's R3
 deadlock for a revoked service: a carried stop needs no `U_p` (R4), a
-fresh cover does. The snapshot checker below is unchanged (`covered` is
-its caller's input); the `snapshots` vectors' `D` cases give each row's
+fresh cover does. The snapshot checker below takes `covered` as its
+caller's input and checks it against `provisioned` (`coverage_dropped`,
+below); the `snapshots` vectors' `D` cases give each row's
 main form, not the first row's hold or release signed anew after its
 cover nor item 1's revokes signed anew, and the last row is `I5`'s (a
 covered principal with no cover). A Station's own revoke signed anew is
 still held to the mark (`not_above_mark`), so for an R3-fenced principal
 whose retained revoke was lost the stop comes from a current manager (no
 change proposed: Astation #147's external ceiling makes `U_p` known
-going forward). An optional input, `provisioned` (the services the
-Station provisioned at O and hasn't handed over), with a code
-`coverage_dropped` for one in it that is neither covered, revoked by the
-snapshot nor removed at the verifying head, would make the rule
-mechanical for a Station's assembler: offered, not built.
+going forward). The checker takes `provisioned`, the services the Station
+provisioned at O and hasn't handed over (built for Astation's request,
+#114 comment 7208700195; required, and an empty set checks nothing), in
+the identity form `covered` uses (the principal: a service has one key in
+the device list's history, ids never reused and no entry changing a key,
+so a revoke valid at the head names its principal's one key, and one
+naming any other key is refused `key_mismatch` before coverage is
+judged; Atem's reading). Its `coverage_dropped` makes the rule mechanical
+for a Station's assembler: some p in `provisioned` is neither in
+`covered`, nor revoked by a `revoke` of p that the snapshot carries (valid
+at the verifying head), nor removed from the device list at the head. A
+Portal-only revoke, an expiry, an absent key or a missing reservation
+never clears coverage, and every required interrupt is still carried
+(`stop_lost` otherwise).
 
 **A replacement feed after a rollback** (Astation #114, items 2 and 6). A
 Station that recovers from a rollback publishes a replacement feed: a new
@@ -1683,7 +1699,9 @@ verifying head (never a frozen list), with each service principal's mark
 and the set of principals the snapshot covers (`covered`: the services the
 Station currently covers at the cut, as "Which principals a Station
 currently covers" above reads it; the caller's input, which the checker
-never derives). First over the retained
+never derives), and the services the Station provisioned at its origin
+and hasn't handed over (`provisioned`, the caller's input; required,
+possibly empty). First over the retained
 records, then record by record in publication order, then over the whole
 snapshot, it answers `Consistent` or the first inconsistency `{index, code, principal, record_id?, reason?,
 effect?, revoke_seq?}`, the codes in the order they are checked:
@@ -1698,8 +1716,9 @@ effect?, revoke_seq?}`, the codes in the order they are checked:
 | `cover_not_first` | a covered principal's first record isn't its cover, or a hold or release comes before its principal's cover; after the last record (`index`: the snapshot's length), a covered principal with no cover |
 | `uncovered_cover` | a cover of a principal outside the covered set |
 | `not_above_mark` | a record signed anew with the service's own key is issued at or below its principal's mark, or the principal has none (a retained stop carried unchanged needs no mark) |
+| `coverage_dropped` | after the last record (`index`: the snapshot's length; no `record_id`): a principal in `provisioned`, in sorted order, that is neither in `covered`, nor revoked by a `revoke` of it the snapshot carries, nor removed from the device list at the head. Its place, after `cover_not_first` for a covered principal with no cover and before the retained stops' effects, is **Atem's choice**. A provisioned service the list doesn't hold at the head is neither covered nor removed: `coverage_dropped` (fail closed); leave a service out of `provisioned` until its `service_add` is in the list (**Atem's reading, for Astation's agreement**) |
 | `stop_lost` | after the last record: an effect of a retained `revoke` or `interrupt_running` that is valid at the head (its principal's revocation, and the interrupt with it) isn't kept by the snapshot alone applied to a fresh state, as the paragraph below says (`effect`: `revocation` or `interrupt`; `record_id`: that retained stop; `revoke_seq`: a host principal's interrupt) |
-| `stop_not_resigned` | the same for a retained stop refused `removed_manager` (`reason`), a genuine stop whose signature verifies under its signer's key from the list's history: a current manager signs it again (I.5.4) |
+| `stop_not_resigned` | the same for a retained stop refused `removed_manager` (`reason`), a genuine stop whose signature verifies under its signer's key from the list's history: a current manager signs it again (I.5.4). Effect-only: any valid stop that keeps the original's effects passes it; whether a stop is a conforming copy is `check_resigned_copy`'s, stricter, below |
 
 Every retained stop counts, in the retained order, and a retained record
 that doesn't verify is reported before anything is compared. An effect is
@@ -1731,7 +1750,9 @@ holds, no more).
 typed primitive **agreed with Astation, Astation #114 comment
 7089435073**; the five points below the agreed text left open are
 Atem's readings, **agreed with Astation, Astation #114 comment
-7093796254**). Before a Station publishes a replacement feed, every
+7093796254**; version 2, its process roster, **agreed with Astation,
+Astation #114 comment 7208700195**: option (i) below). Before a Station
+publishes a replacement feed, every
 native manager that could have signed one of the plan's stops reports its
 signing journal, so the snapshot includes every stop that author can have
 signed. The author's own device holds a durable barrier from its report
@@ -1799,14 +1820,18 @@ core builds only the primitive.
   `malformed` when it is read (**Atem's reading, agreed with Astation, Astation #114 comment 7093796254**; a report body
   naming a service, a host, a grant or `recovery` is `unknown_signer`, as
   agreed).
-- **The body**, type `atem-signer-report`, `v` 1, signed by the member's
-  own `auth_key` over `enc(["atem-signer-report-v1", jcs(body)])`, with a
+- **The body**, type `atem-signer-report`, `v` 2, signed by the member's
+  own `auth_key` over `enc(["atem-signer-report-v2", jcs(body)])`, with a
   fresh confirmation (purpose `SignerReport`: the plan, the origin, the
   counts, and that the barrier holds this device's stops until the plan
-  ends; never in the background):
+  ends; never in the background). Version 2 adds the process roster
+  (`journal.processes`, `journal.processes_hash`); v1 (`v` 1, under
+  `atem-signer-report-v1`) is refused as `malformed` everywhere, with no
+  compatibility path (the owner's standing rule; Astation updates with
+  Atem):
 
   ```json
-  {"body":{"type":"atem-signer-report","v":1,
+  {"body":{"type":"atem-signer-report","v":2,
     "account_id":"…","genesis_hash":"<hex>","head":{"seq":9,"hash":"<hex>"},
     "signer":"member:dev-phone","slot":"astation-ios","process":"<b64u 16>",
     "challenge":{"origin":"https://station-dev.agora.build","connection":3,
@@ -1814,7 +1839,8 @@ core builds only the primitive.
     "recovery":{"generation":"7","plan_id":"<UUID v4>","candidate_feed_id":"<UUID v4>",
                 "source_hash":"<hex>","evidence_hash":"<hex>"},
     "journal":{"id":"<b64u 16>","since":4,"revision":118,
-               "records":3,"records_hash":"<hex>","drafts":0,"drafts_hash":"<hex>"}},
+               "records":3,"records_hash":"<hex>","drafts":0,"drafts_hash":"<hex>",
+               "processes":2,"processes_hash":"<hex>"}},
    "sig":"<b64u>"}
   ```
 
@@ -1829,17 +1855,33 @@ core builds only the primitive.
   SHA-256(enc(["atem-signer-report-records-v1", d1…dn]))`, each `d` the 32
   bytes of `SHA-256(jcs(body))`, sorted by bytes; `drafts` and
   `drafts_hash` the same over its unsigned drafts of the plan's records,
-  with `atem-signer-report-drafts-v1`. The rest is the verifier report's:
-  strict I-JSON, exact fields at every level, no `null`, no array, the
-  body's `jcs` at most 4,096 bytes and the object at most 16 KiB.
+  with `atem-signer-report-drafts-v1`. `processes` (1 to 2^53 − 1) and
+  `processes_hash` are over the journal's process roster: the process
+  generations attached to it (the adapter durably appends
+  `attach{process}` the first time a process takes the journal's lock,
+  before that process can append any `signing` entry), the reporter's own
+  among them: `processes_hash =
+  SHA-256(enc(["atem-signer-report-processes-v1", p1…pn]))`, each `p` the
+  16 raw bytes of a process generation (the body's `process` form),
+  sorted by bytes. The set-hash labels keep `-v1`: only the report's own
+  label moved. The rest is the verifier report's: strict I-JSON, exact
+  fields at every level, no `null`, no array, the body's `jcs` at most
+  4,096 bytes and the object at most 16 KiB.
 - **The builder** (`member_report::signer_report_body`; the bindings'
   immutable `SignerReportRequest`) takes the log, the challenge, the
   reporter's `member:<id>`, its slot, its configured Station and the
   journal's view `{id, since, revision, records: [body_json], drafts:
-  [body_json]}`, under the adapter's lock. It reads each body strictly as
+  [body_json], processes: [process]}`, under the adapter's lock
+  (`processes`: every process generation attached to the journal,
+  base64url as the body writes `process`). It reads each body strictly as
   one of the plan's records by this member (anything else, or a body
-  twice in one set, is `malformed`), computes the counts and the set
-  hashes itself (the caller supplies no hash), and refuses a challenge for
+  twice in one set, is `malformed`), refuses a roster without the
+  process the core minted for this process (`process_generation()`), or
+  with an id that isn't 16 bytes of base64url, an id twice or more than
+  4,096 ids (`malformed`; the bound is **Atem's reading**: nothing else a
+  report carries is bounded as a list, the records export only by its
+  count), computes the counts and the set hashes itself (the caller
+  supplies no hash), and refuses a challenge for
   another Station (`origin_mismatch`), signer or slot, and a signer that
   isn't a current native member (`unknown_signer`) or never held `manage`
   (`not_a_manager`). Two points are **Atem's reading, agreed with Astation, Astation #114 comment 7093796254**:
@@ -1871,15 +1913,16 @@ core builds only the primitive.
   the list's freeze and the member's standing change no answer (the
   builder refuses those itself). Which bodies are in the plan is the
   agreed B2 rule with the agreed reading on the plan's records above;
-  three points of the typed answer are **Atem's reading, for Astation's
-  confirmation (asked on Astation #114)**: a body of another account,
+  three points of the typed answer are Atem's reading, **agreed with
+  Astation (Astation #114 comment 7209301522)**: a body of another account,
   genesis or signer is **not in the plan** with a reason, never
   `malformed` (the builder refuses it either way); the order account,
   genesis, signer, action, origin (so another member's cover is
   `another_signer`, this member's own `malformed`); and the four reason
   codes.
 - **The verifier**, `verify_signer_report(log, report, expected_challenge,
-  exported_records[], now_ms)`, reads membership at the verifier's head;
+  exported_records[], exported_processes[], now_ms)`, reads membership at
+  the verifier's head;
   the first failure is the code, in this order: `malformed`, `frozen`,
   `wrong_account`, `unknown_signer` (services, hosts, `recovery` and
   grants included), `not_a_manager` (a current native that never held
@@ -1889,12 +1932,21 @@ core builds only the primitive.
   `records_mismatch` (an exported record that isn't a signed control
   record of the plan by this member, one whose signature doesn't verify
   under its `auth_key`, a duplicate, or another count or `records_hash`
-  than the report's), `expired`. It returns `{signer, slot, process,
-  connection, head, at_head, recovery, journal, records}`, `records` the
-  verified exported records.
+  than the report's), `processes_mismatch` (the exported roster, each a
+  process generation in base64url, isn't exactly the report's: a
+  malformed id, a duplicate, another count or `processes_hash` than the
+  report's, or a roster without the report's own `process`; the count
+  and the 4,096 bound are checked before any id is read), `expired`. It
+  returns `{signer, slot, process, connection, head, at_head, recovery,
+  journal, records, processes}`, `records` the verified exported records
+  and `processes` the verified roster, sorted by bytes.
 - **What it proves:** the report's signature, for this challenge and
-  plan, and that the export matches it. **It is consistency only, never
-  completeness of anything outside the journal.** A `signing` body with
+  plan, and that the export matches it. Its `processes` say that the
+  signer attested that these processes attached to journal `id`: the
+  adapter's word under B6, exactly as strong as `records`, never evidence
+  about a process absent from the set, nor about another journal. **It is
+  consistency only, never completeness of anything outside the
+  journal.** A `signing` body with
   no saved signature is in `records` and can't be exported as signed, so
   the report stays `records_mismatch` and reconciliation stays fenced until
   the exact evidence is recovered (Astation's conservative rule; there is
@@ -1917,8 +1969,8 @@ core builds only the primitive.
   - the barrier's persisted lifetime is independent of the challenge's and
     the report's short acceptance lease: an expired report may need a
     fresh one, and never clears the barrier.
-- **One journal, not one process** (**Atem's reading, for Astation's
-  agreement (Astation #114, comment 7207806862)**). No agreed record
+- **One journal, not one process** (**Atem's reading, agreed with
+  Astation (Astation #114 comments 7208700195 and 7209301522)**). No agreed record
   proves, on its own, that a displaced process stopped or that it signed
   only through the exclusive journal: a successor's report accounts for
   its journal's records, and a timeout, a matching key, a new process's
@@ -1929,35 +1981,36 @@ core builds only the primitive.
   it holds the successor. So what needs proving is that a process used
   journal J, not that it stopped, and no signature proves that: it is the
   adapter invariant every report rests on (B6).
-  - **Liveness, the risk to settle.** If every app relaunch counts as an
-    unresolved participant that only independent evidence clears, every
-    recovery after any relaunch stays blocked for good (unknown authors
-    still block reopening, above). Astation picks one:
-    - (i) a process roster in the journal, a new primitive version Atem
-      would build (with a new pin): the adapter durably appends
-      `attach{process}` the first time a process takes the journal's lock,
-      before that process can append any `signing` entry (B3's order); the
-      signer report gains `journal.processes` and `journal.processes_hash`
-      over the sorted process ids attached since `since`, the reporter's
-      own included, exported and checked as the records are. A displaced
-      process P of member M is accounted for by a verified report of M
-      naming journal J exactly when P is in J's attached set: the strength
-      of `records` (the adapter's word under B6), no more. A process that
-      bypassed the adapter (a build before the journal, another install's
-      journal, a rolled-back store), or one absent from J's set, stays
-      unresolved;
-    - (ii) judging per journal, processes used only to detect a second
-      journal or an unjournaled build;
-    - (iii) an owner-confirmed exit under the agreed impact bound (service
-      stops mirrored in the Portal, a `host:` revoke in the device list,
-      only interrupts lost, each bounded by its task's deadline):
-      Astation's policy, not the shared contract.
-
-    Atem recommends (i) or (ii). Nothing of (i) is built until Astation
-    chooses: a report names one process, its own (`process`).
-- **The final cut, a fixpoint** (**Atem's reading of "a report and a
-  publication use the same recovery tuple, head and commitments", for
-  Astation's agreement (Astation #114, comment 7207806862)**). A
+  - **Liveness, settled by the process roster** (option (i), **agreed
+    with Astation, Astation #114 comment 7208700195**; built: version 2
+    of the report). If every app relaunch counted as an unresolved
+    participant that only independent evidence clears, every recovery
+    after any relaunch would stay blocked for good (unknown authors still
+    block reopening, above). So the journal keeps a roster: the adapter
+    durably appends `attach{process}` the first time a process takes the
+    journal's lock, before that process can append any `signing` entry
+    (B3's order), and the signer report commits to the attached set
+    (`journal.processes`, `journal.processes_hash`, above), the reporter's
+    own included, exported and checked as the records are
+    (`processes_mismatch`). **The resolution rule:** a displaced process
+    P of member M is accounted for by a verified report R iff R's signer
+    is M and P is in R's `processes`: the strength of `records` (the
+    adapter's word under B6), no more. Comparing journals and generations
+    is the Station's. Legacy, absent or rolled-back journal evidence
+    stays unresolved: a process that bypassed the adapter (a build before
+    the journal, another install's journal, a rolled-back store), or one
+    absent from the set. (Options (ii), judging per journal, and (iii),
+    an owner-confirmed exit under the agreed impact bound, were not
+    taken.)
+- **The final cut, a fixpoint** (Atem's reading of "a report and a
+  publication use the same recovery tuple, head and commitments",
+  **agreed with Astation (Astation #114 comments 7208700195 and
+  7209301522)**: the final report round's challenge commits to its base;
+  every known author's latest report answers that round; newly exported
+  record digests extend the next round's base; holds persist through
+  re-reporting; a moved membership head is revalidated; if discovery
+  needs another stop signature after every eligible manager is held, the
+  plan is abandoned and the higher generation opened). A
   challenge's `evidence_hash` names its round's **base**: the evidence
   collected before the round opened. A round's own reports are its
   result, not part of its base. A round is final when every known
@@ -1972,9 +2025,9 @@ core builds only the primitive.
   suffices.
 - **A current manager's copy of a former manager's stop** (Astation's
   ordering of #114 comment 7120876576 agrees with B1 to B6 and the
-  snapshot contract; the points and conditions below are **Atem's
-  reading, for Astation's agreement (Astation #114, comment
-  7207806862)**). A copy repairs a `stop_not_resigned` (I.5.4):
+  snapshot contract; the points and conditions below are Atem's reading,
+  **agreed with Astation (Astation #114 comments 7208700195 and
+  7209301522)**). A copy repairs a `stop_not_resigned` (I.5.4):
   - it is signed before its author's own barrier, never after: a copy is
     one of the plan's records, so B2 refuses drafting or signing it after
     its author's report. Reporting again under the barrier is allowed (a
@@ -1989,13 +2042,16 @@ core builds only the primitive.
     verifying head (`verify_control` valid, its signer a current manager
     there); (b) it is in its author's final verified report (in
     `records`, exported signed, no `records_mismatch`); (c) it has the
-    original's **stop intent** (**corrected in Astation #114 (Atem's
-    comment after 7207806862)**): every body field equal but `signer` (a
+    original's **stop intent** (corrected in Astation #114, Atem's comment
+    7209160922, and **agreed with Astation, Astation #114 comment
+    7209301522**): every body field equal but `signer` (a
     current manager), `record_id` (a fresh UUID v4, never the
     original's), `issued_at` (display only for a native's record) and a
     service's `feed_id`, which is either the original's feed or the
     plan's candidate feed of the same origin (a current manager's stop
-    may name any feed of the origin, so both forms are valid). So
+    may name any feed of the origin, so both forms are valid; the
+    candidate feed's form is M8/M11's, and copies a Station retained in
+    that form stay eligible, Astation #114 comment 7209301522). So
     `account_id`, `genesis_hash`, `principal`, `principal_key`, `action`
     (and `interrupt_running` on a revoke), a service's `origin` (always
     the original's), a host principal's `revoke_seq`, and `about` are the
@@ -2004,8 +2060,9 @@ core builds only the primitive.
     `M11_interrupt_resigned_a2` name the candidate feed (`N3`, `N9`,
     `Q32`), `M4_revoke_resigned` the original's feed (`D8`); (d) the
     final snapshot is `Consistent`,
-    no `stop_not_resigned` for the original. A shared helper for (c)
-    (`check_resigned_copy`, with vectors) is offered, not built;
+    no `stop_not_resigned` for the original. Condition (c) is the shared
+    core's `control::check_resigned_copy` (below), so the Mac and the
+    Station judge a copy alike;
   - a moved head needs the copy verified again at the new head, which
     opens a new round (agreed input 4), never an outright refusal of new
     membership: it is refused only when (a) fails;
@@ -2018,8 +2075,60 @@ core builds only the primitive.
     this plan. The exit is B4's: the plan is abandoned and a higher
     generation opened, in which a manager signs the copy before
     reporting.
-- **The order of a recovery** (**Atem's recommendation, for Astation's
-  agreement (Astation #114, comment 7207806862)**): collect the retained,
+- **`check_resigned_copy(log, original_json, copy_json,
+  candidate_feed_id)`** (the shared core's `control::resign`; the
+  bindings' `check_resigned_copy`, JS `checkResignedCopy`; built for
+  Astation's ask, #114 comment 7208700195): condition (c) as one pure
+  judgement on the list at its head. It answers the copy, `{original_record_id,
+  copy_record_id, signer, principal, action, feed}` (`signer` the copy's,
+  a current manager; `feed` `original` or `candidate`, none for a host
+  principal's record), or the first refusal, in this order:
+  1. `malformed`: either object isn't a signed control record that reads
+     strictly (a `record_id` that isn't a UUID v4 among them), the
+     candidate feed isn't a UUID v4, or the list is frozen;
+  2. `not_a_stop`: the original is a `cover`, `hold` or `release`, never
+     copied (the Station signs those anew with its own key);
+  3. `original_invalid`: the original isn't a manager's stop that
+     verifies: its signer is a `member:` native that held `manage` at
+     some `seq` of the list (a viewer native's is `not_a_manager`, a
+     member the list records no key of `unknown_signer`), and its
+     signature verifies under an `auth_key` that member had in the
+     list's history (`bad_signature` otherwise); one signed with the
+     principal's own key is `service_key_signed` or `host_key_signed`.
+     Its signer may since have been removed or demoted, which is the
+     point;
+  4. `copy_invalid`: the copy isn't valid at the head
+     (`verify_control`) with a current native manager as its signer (the
+     verifier's pending or refusal code, or `signed_by_principal` for a
+     record valid under the principal's own key);
+  5. `same_record_id`: the copy's `record_id` is the original's;
+  6. field by field in the body's order, `intent_mismatch` naming the
+     first that differs (`account_id`, `genesis_hash`, `origin`,
+     `principal`, `principal_key`, `action`, `interrupt_running`,
+     `revoke_seq`, `about.integration_id`, `about.by`), and at `feed_id`'s
+     place (after `origin`) `feed_mismatch` for a service's copy naming
+     neither the original's feed nor the candidate. `signer`,
+     `record_id` and `issued_at` may differ; `origin` never.
+
+  The field order, the details, the frozen list's refusal,
+  `signed_by_principal` and the original's signer (a native that held
+  `manage` at some `seq`, never the principal's own key: only a
+  manager's stop is ever copied) are **Atem's reading**. **It is stricter than
+  the snapshot checker**, which stays the consistency-only check agreed
+  with #199: the checker's `stop_not_resigned` is an effect-only check,
+  which any valid stop keeping the original's effects satisfies (a
+  current manager's revoke with another `about` or another feed of the
+  origin, `interrupt_running` over the original's `false`, the
+  principal's own revoke signed anew above its mark: D's item 1 ends its
+  coverage). A conforming copy always keeps every effect of its
+  original, so the two never disagree in that direction; the snapshots
+  the checker passes and this refuses are the adapter's to refuse, with
+  this function: Astation's publication rule, "require a conforming copy
+  to discharge the original obligation" (#114 comment 7208700195), with
+  the final author's exported signed copy and the complete checked
+  snapshot. Vectors: `r9-vectors-resigned-copy` (below).
+- **The order of a recovery** (Atem's recommendation, **agreed as part
+  of C (Astation #114 comments 7208700195 and 7209301522)**): collect the retained,
   imported and Portal evidence; take first the reports of the authors who
   can no longer sign copies (demoted managers); compute the originals that
   need copies (`stop_not_resigned`); current managers sign every copy and
@@ -2061,8 +2170,9 @@ ordering can't stop a key holder. The Station's duties:
     back, or isn't trusted yet), it waits. It never signs at or below the
     mark and never bypasses it.
 - A Station re-issues covers only for principals it currently covers
-  ("Which principals a Station currently covers" above: **Atem's reading,
-  for Astation's agreement (Astation #114, comment 7207811340)**).
+  ("Which principals a Station currently covers" above: Atem's reading,
+  **agreed with Astation (Astation #114 comments 7208700195 and
+  7209301522)**).
 - A Station that hands an integration over stops signing for it, and the
   key leaves with it (or the integration is created again as a new
   principal).
@@ -2194,8 +2304,8 @@ replay); and `snapshots`, the cases of `check_snapshot_consistency` (one
 or more per code, and consistent ones, item 2's retained stop among
 them), each with its inputs, `expect` and `in_force`: the stops in force
 after the retained records, after the snapshot alone and after both.
-(**New with the coverage reading above, for Astation's agreement,
-Astation #114 comment 7207811340.**) The `D` cases give its rows' main
+(**New with the coverage reading above, agreed with Astation, Astation
+#114 comments 7208700195 and 7209301522.**) The `D` cases give its rows' main
 forms (not the first row's hold signed anew after its cover, nor item
 1's revokes signed anew; the last row is `I5`'s): a revoked service
 outside `covered` with its retained revoke carried (the Station's own, a
@@ -2206,15 +2316,73 @@ unrevoked one outside `covered` (on `E7`, for which `S1_cover` and
 `M2_interrupt` gain their verdicts) and a current manager's copy of a
 removed manager's revoke for an uncovered principal
 (`M4_revoke_resigned`, the copy naming the original's feed; `N3`'s
-`M8_revoke_resigned_a2` names the candidate feed).
+`M8_revoke_resigned_a2` names the candidate feed). Every case gives its
+`provisioned` (empty but in the `P` cases, today's verdicts unchanged);
+the `P` cases, Astation's requested ones (#114 comment 7208700195): a
+service stopped by a carried manager's copy on either feed (no
+`coverage_dropped`), a revoked service whose snapshot misses an
+`interrupt_running` in force (`stop_lost`), two enrolled principals on
+the file's own chain entry `SO7_add_svc_other` (dev-mac's `service_add`
+of `svc-other` on L, its key `svc-other` in `r9-vectors-keys`; the
+records `SO1_cover`, `SO2_revoke` and `SO3_cover_a2` its own key's):
+svc-discord's revoke alone (`coverage_dropped` for svc-other, `P12`),
+svc-other's alone (`coverage_dropped` for svc-discord, `P13`), both
+(consistent, `P14`) and svc-other covered with svc-discord revoked
+(consistent, `P15`), so a revoke clears only its own principal's
+coverage; a provisioned principal the list doesn't hold
+(`P4_unenrolled_principal`: `coverage_dropped`, Atem's fail-closed
+reading above), a revoke naming another key of the principal (`M12_revoke_another_key`,
+refused `key_mismatch` before coverage is judged), a Portal-only revoke
+(`coverage_dropped`) and the same with nothing provisioned (consistent),
+a removal at the head, a provisioned principal that is covered, and
+`coverage_dropped`'s place (after a covered principal's missing cover,
+before a retained stop's lost effect).
+The file carries its own `entries` (`SO7_add_svc_other`), which the
+chains name beside `r9-vectors-membership-log`'s.
 `scripts/check-r9-vectors.py` derives each snapshot case's answer and
 `in_force` from the records' verdicts on its chain, with no state
 machine, and checks every code is exercised.
 It derives no other verdict.
 Every SDK package's checksum manifest lists the file.
 
+**`r9-vectors-resigned-copy`** (`check_resigned_copy` above; condition
+(c), agreed with Astation, #114 comments 7208700195 and 7209301522): log
+L of `r9-vectors-membership-log` and its own `entries` (`RC7_hs7_revoke`,
+HS7_revoke byte for byte; `RC7_demote_phone` and `RC8_demote_phone`,
+dev-phone demoted on L and after HS7; `RC7_add_desk`, dev-desk added on
+L, a native without `manage`); `records`, each with its
+`verify_control` verdict on each of the file's chains (originals by
+dev-ipad, the manager E6 removed, and by dev-phone before its demotion;
+the same bodies but one field; originals that don't verify; dev-mac's
+copies and copies by others); `cases`, each `check_resigned_copy`'s
+answer on its list: valid copies (a service's revoke on the original's
+feed and on the candidate feed, a revoke with `interrupt_running`, a
+service's `interrupt_running`, a host principal's `interrupt_running`,
+a demoted manager's original) and every refusal (`malformed` in its
+forms, a non-v4 `record_id` among them; a cover and a hold never
+copied; originals forged, by an unknown member, by a viewer native
+(`not_a_manager`), by the service's own key and by a host's key; a
+frozen list (its `freeze` carriage, `malformed` `list frozen`); copies
+by a demoted and a removed manager, by the service's key, a cover, by a
+member not yet in the list, a host principal's before its revoke; the
+same `record_id`; each field of the stop intent once, a third feed's
+`feed_mismatch` and a host stop copied as a service's); and
+`checker_passes`, two snapshots `check_snapshot_consistency` finds
+consistent whose stop the copy check refuses (a current manager's
+revoke with another `about.by`, the service's own revoke signed anew).
+Its runners are `crates/atem-client/tests/resigned_copy.rs` (which also
+checks that every conforming copy satisfies the snapshot checker), the
+FFI's and the binding conformance suites (each also runs every record's
+`checks` through `verify_control_record`), and
+`scripts/check-r9-vectors.py`, which derives every answer from the
+bytes, each record's `verify_control` verdict from the replayed list
+(its `checks` only a cross-check). Every SDK package's checksum manifest
+lists the file.
+
 **`r9-vectors-signer-report`** (the signer report above; agreed with
-Astation, #114 comment 7089435073): log L of `r9-vectors-membership-log`
+Astation, #114 comment 7089435073; version 2, its process roster, agreed
+with Astation, #114 comment 7208700195, every case moved to v2): log L
+of `r9-vectors-membership-log`
 and its own `entries` (dev-desk, an Ed25519 native without `manage`, then
 made a manager; dev-phone demoted; R7 and A8 byte for byte: dev-newmac,
 added by the Recovery Kit, waiting, then a manager); `records`, the
@@ -2222,14 +2390,24 @@ control records the cases use; the challenges read or refused; valid
 reports (at the head and at an ancestor, with drafts, with zero records, a
 host sender's interrupt with a service's stops, a reinstalled journal, a
 demoted manager, an Ed25519 manager, a manager added by the Recovery Kit
-once its recovery took effect, records exported in another order);
+once its recovery took effect, records exported in another order; a
+roster of one process, of two and of three, the reporter's own among
+them, exported in another order);
 refused ones (every malformed form, the recovery and journal grammars
 included; each code in its order; `not_a_manager`; each challenge and
 recovery field mismatched; `records_mismatch` in each form: one missing,
 one extra, one signed after the report, a possibly signed body without a
 signature, a wrong signer, another origin, a duplicate, another key, a
 high S; a high-S report; substitution by another member and another slot;
-expiry); the builder's bodies and refusals; and the immutable request's
+expiry; `processes_mismatch` in each form: one missing, one extra, a
+duplicate, another set of the same count, the reporter's own absent, a
+count the hash doesn't hold, ids of 15 bytes, padded or not base64url,
+and its place between `records_mismatch` and `expired`; a v1 report
+signed under `atem-signer-report-v1`, and `v` 1 or 3 under v2's label,
+`malformed`); the builder's bodies (but their process and their
+roster's hash, both the loaded core's) and refusals (a roster without
+the builder's own process, an empty one, an id twice, ids out of their
+grammar); and the immutable request's
 finishes (the challenge grammar's forms and the builder's signers as
 #198's file has them, and journal bodies over 4,096 bytes of `jcs` and
 16 KiB of text); and `plan_predicate` (built for Astation's ask, #114

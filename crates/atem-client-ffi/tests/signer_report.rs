@@ -2,7 +2,8 @@
 //! manager's signed report of its control-record signing journal,
 //! host-work-v1 §11.1 "The signer report"; Astation #114 item 4): the
 //! challenge reader and builder, `verify_signer_report` with
-//! `Report{code}`, the immutable `SignerReportRequest` (its body, sign
+//! `Report{code}` and the exported roster (v2: `processes_mismatch`), the
+//! immutable `SignerReportRequest` (its body, its roster's hash, sign
 //! request and finishes) and the synchronous `sign_signer_report` through
 //! an app provider. The core's runner is
 //! `crates/atem-client/tests/signer_report.rs`.
@@ -88,14 +89,35 @@ fn strings(value: &Value) -> Vec<String> {
         .collect()
 }
 
-fn journal(value: &Value) -> SignerJournalView {
+/// A builder case's journal view: its roster the file's ids, then this
+/// loaded core's own process when the case's `own_process` says so.
+fn journal(case: &Value) -> SignerJournalView {
+    let value = &case["journal"];
+    let mut processes = strings(&value["processes"]);
+    if case["own_process"] == true {
+        processes.push(verifier_report_process());
+    }
     SignerJournalView {
         id: value["id"].as_str().unwrap().into(),
         since: value["since"].as_u64().unwrap(),
         revision: value["revision"].as_u64().unwrap(),
         records: strings(&value["records"]),
         drafts: strings(&value["drafts"]),
+        processes,
     }
+}
+
+/// `SHA-256(enc(["atem-signer-report-processes-v1", p1…pn]))` over the raw
+/// ids sorted by bytes, computed here on its own.
+fn processes_hash(ids: &[String]) -> String {
+    let mut raw: Vec<Vec<u8>> = ids
+        .iter()
+        .map(|p| atem_client::encoding::b64u_decode(p).unwrap())
+        .collect();
+    raw.sort();
+    let mut fields: Vec<&[u8]> = vec![b"atem-signer-report-processes-v1"];
+    fields.extend(raw.iter().map(|r| &r[..]));
+    atem_client::encoding::Hash32::of_enc(&fields).to_hex()
 }
 
 fn recovery_json(r: &SignerReportRecovery) -> Value {
@@ -116,8 +138,10 @@ fn verified_json(v: &VerifiedSignerReport) -> Value {
         "journal": {"id": v.journal.id, "since": v.journal.since,
                     "revision": v.journal.revision, "records": v.journal.records,
                     "records_hash": v.journal.records_hash, "drafts": v.journal.drafts,
-                    "drafts_hash": v.journal.drafts_hash},
+                    "drafts_hash": v.journal.drafts_hash, "processes": v.journal.processes,
+                    "processes_hash": v.journal.processes_hash},
         "records": v.records,
+        "processes": v.processes,
     })
 }
 
@@ -142,7 +166,7 @@ impl Keys {
     /// P-256 normalized to low S as a report carries it.
     fn sign_input(&self, key: &str, input: &[u8]) -> Vec<u8> {
         let fields = atem_client::encoding::dec(input).unwrap();
-        assert_eq!(fields[0], b"atem-signer-report-v1");
+        assert_eq!(fields[0], b"atem-signer-report-v2");
         let input = atem_client::SigningInput::new(atem_client::SignLabel::SignerReport, fields[1]);
         atem_client::provider::sign(&self.book.provider, &KeyId::new(key), &input).unwrap()
     }
@@ -308,6 +332,7 @@ fn reports_through_the_production_binding() {
             case["report"].as_str().unwrap().into(),
             text(&case["challenge"]),
             strings(&case["exported"]),
+            strings(&case["exported_processes"]),
             case["now_ms"].as_u64().unwrap(),
         );
         match case.get("expect") {
@@ -329,6 +354,7 @@ fn reports_through_the_production_binding() {
             case["report"].as_str().unwrap().into(),
             "{}".into(),
             strings(&case["exported"]),
+            strings(&case["exported_processes"]),
             case["now_ms"].as_u64().unwrap(),
         ),
         Err(AtemError::Invalid { .. })
@@ -401,7 +427,7 @@ fn requests_hold_the_body_the_core_builds() {
             case["signer"].as_str().unwrap().into(),
             case["slot"].as_str().unwrap().into(),
             case["station"].as_str().unwrap().into(),
-            journal(&case["journal"]),
+            journal(case),
             "key".into(),
             case["now_ms"].as_u64().unwrap(),
         );
@@ -411,6 +437,17 @@ fn requests_hold_the_body_the_core_builds() {
                 let mut body: Value = serde_json::from_str(&request.body_json()).unwrap();
                 assert_eq!(body["process"], json!(process), "{label}");
                 body.as_object_mut().unwrap().remove("process");
+                // The roster's hash covers this core's own process.
+                let hash = body["journal"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("processes_hash")
+                    .unwrap();
+                assert_eq!(
+                    hash,
+                    json!(processes_hash(&journal(case).processes)),
+                    "{label}"
+                );
                 assert_eq!(&body, want, "{label}");
             }
             None => {
@@ -422,7 +459,7 @@ fn requests_hold_the_body_the_core_builds() {
     // A journal id that isn't 16 bytes of base64url is the request's
     // malformed input.
     let case = &file["request"][0];
-    let mut bad = journal(&case["journal"]);
+    let mut bad = journal(case);
     bad.id = b64u(&[1u8; 15]);
     assert!(
         SignerReportRequest::new(
@@ -456,7 +493,7 @@ fn a_request_finishes_only_with_its_signers_signature_over_its_body() {
                 case["signer"].as_str().unwrap().into(),
                 slot.into(),
                 case["station"].as_str().unwrap().into(),
-                journal(&case["journal"]),
+                journal(case),
                 case["key"].as_str().unwrap().into(),
                 case["now_ms"].as_u64().unwrap(),
             )
@@ -472,7 +509,7 @@ fn a_request_finishes_only_with_its_signers_signature_over_its_body() {
         assert_eq!(sign.body_json.as_deref(), Some(held.as_str()));
         assert_eq!(
             sign.input,
-            enc(&[b"atem-signer-report-v1", held.as_bytes()])
+            enc(&[b"atem-signer-report-v2", held.as_bytes()])
         );
         for f in case["finishes"].as_array().unwrap() {
             let input = match f["over"].as_str() {
@@ -520,7 +557,7 @@ fn the_synchronous_helper_signs_through_the_apps_provider() {
             case["signer"].as_str().unwrap().into(),
             case["slot"].as_str().unwrap().into(),
             case["station"].as_str().unwrap().into(),
-            journal(&case["journal"]),
+            journal(case),
             key.into(),
             case["now_ms"].as_u64().unwrap(),
         )
@@ -538,16 +575,32 @@ fn the_synchronous_helper_signs_through_the_apps_provider() {
         })
         .map(|r| atem_client::canonical::jcs(&r["record"]).unwrap())
         .collect();
+    let roster = journal(case).processes;
     let verified = verify_signer_report(
         log.clone(),
-        report,
+        report.clone(),
         text(&case["challenge"]),
-        exported,
+        exported.clone(),
+        roster.clone(),
         case["now_ms"].as_u64().unwrap(),
     )
     .unwrap();
     assert_eq!(verified.process, verifier_report_process());
     assert_eq!(verified.journal.records, 3);
+    assert_eq!(verified.journal.processes, roster.len() as u64);
+    assert!(verified.processes.contains(&verifier_report_process()));
+    // The roster without this process: refused, its own `processes_mismatch`.
+    assert!(
+        verify_signer_report(
+            log.clone(),
+            report,
+            text(&case["challenge"]),
+            exported,
+            vec![verifier_report_process()],
+            case["now_ms"].as_u64().unwrap(),
+        )
+        .is_err_and(|e| report_code("processes_mismatch")(&e))
+    );
     let requests = keys.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].purpose, SigningPurpose::SignerReport);

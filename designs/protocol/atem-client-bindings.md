@@ -128,10 +128,15 @@ member's signed verifier report, agreed for implementation on Astation
 #101: a new file in the manifest),
 `atem-client-<version>-r9-vectors-signer-report.json` (amended for a
 native manager's signer report, **agreed with Astation, Astation #114
-comment 7089435073**: a new file in the manifest),
+comment 7089435073**: a new file in the manifest; version 2, its process
+roster, **agreed with Astation, Astation #114 comment 7208700195**),
 `atem-client-<version>-r9-vectors-station-binding.json` (amended for a
 native manager's Station binding proof, Atem's answer on #120 comment
-7207827118: a new file in the manifest) and the six
+7207827118: a new file in the manifest),
+`atem-client-<version>-r9-vectors-resigned-copy.json` (amended for the
+shared copy check, `check_resigned_copy`, **agreed with Astation,
+Astation #114 comments 7208700195 and 7209301522**: a new file in the
+manifest) and the six
 `atem-client-<version>-r9-control-ack-*.json` (amended for step 4: the
 sixth, `r9-control-ack-reasons`, is O5's, **for Astation's sign-off**) in its SHA-256
 manifest. These are the shared positive/negative request vectors from
@@ -160,9 +165,12 @@ manager's signer reports from `fixtures/r9-vectors-signer-report.json`
 (host-work-v1 §11.1; "A manager's signed signer report" below), a native
 manager's Station binding proofs, Astation's three posted examples among
 them, from `fixtures/r9-vectors-station-binding.json` (delegated host-work
-III.5 (b); "A manager's Station binding proof" below) and the Station's
-acknowledgment fixtures `fixtures/r9-control-ack-*.json` (§9, delegated
-host-work test 48).
+III.5 (b); "A manager's Station binding proof" below), a current
+manager's re-signed copies of former managers' stops judged by
+`check_resigned_copy` from `fixtures/r9-vectors-resigned-copy.json`
+(host-work-v1 §11.1, condition (c); §9 "The copy check" below) and the
+Station's acknowledgment fixtures `fixtures/r9-control-ack-*.json` (§9,
+delegated host-work test 48).
 The Rust core's tests run all of them; the Swift, Kotlin and WASM
 conformance suites run the framing vectors through the exports of
 [Prompt framing](#prompt-framing-delegated-host-work-design-iii2) (VII.C test
@@ -833,26 +841,34 @@ suites and `scripts/check-r9-vectors.py`; the FFI's
 
 **A manager's signed signer report** (built; **the author barrier and the
 typed primitive agreed with Astation, Astation #114 comment
-7089435073**; host-work-v1 §11.1 "The signer report"; the core's
-`atem_client::member_report::signer`, on the verifier report's core). How
+7089435073**; version 2, the process roster, **agreed with Astation,
+Astation #114 comment 7208700195**; host-work-v1 §11.1 "The signer
+report"; the core's `atem_client::member_report::signer`, on the verifier
+report's core). How
 a native manager reports its control-record signing journal to a Station
 recovering from a rollback, so the replacement feed's snapshot includes
 every stop of the plan that author can have signed. **The journal, its
 exclusive lock, the barrier (B1 to B6), the report's exposure and the
-publication are your adapter's**; these calls are the primitive only. Five
-points the agreed text left open are Atem's readings, **agreed with
-Astation, Astation #114 comment 7093796254**, listed after the table:
+publication are your adapter's**, and so is the journal's process roster:
+durably append `attach{process}` (this loaded core's
+`verifier_report_process()`) the first time a process takes the journal's
+lock, before that process can append any `signing` entry (B6). These
+calls are the primitive only. v1 reports (`v` 1, label
+`atem-signer-report-v1`) are refused as `Report{malformed}`: no
+compatibility path. Five points the agreed text left open are Atem's
+readings, **agreed with Astation, Astation #114 comment 7093796254**,
+listed after the table:
 
 | call | what it does |
 |---|---|
 | `signer_report_challenge(signer, slot, origin, connection, issued_at, expires_at, recovery)` (JS `signerReportChallenge`, `recovery` `{generation, planId, candidateFeedId, sourceHash, evidenceHash}`) | the Station's challenge as canonical JSON, a fresh 32-byte nonce from the OS CSPRNG: the verifier report's fields, `signer` a native member (`member:<device_id>`; reading (a)), and `recovery: SignerReportRecovery{generation, plan_id, candidate_feed_id, source_hash, evidence_hash}` (`generation` a canonical decimal string, 1 to 2^63 − 1, no sign or leading zero; the ids UUID v4; the hashes lowercase hex SHA-256). Store it |
 | `parse_signer_report_challenge(challenge_json)` | `SignerReportChallenge{signer, slot, origin, connection, nonce, issued_at, expires_at, recovery}`, read strictly: at most 4,096 bytes, exactly these fields at both levels, each one's grammar |
-| `SignerReportRequest(log, challenge_json, signer, slot, origin, journal, key_id, now_ms)` | an immutable handle (UniFFI Object, a WASM class) on the body the core builds from `journal: SignerJournalView{id, since, revision, records, drafts}`, which your adapter hands over under its journal lock after its barrier's durable commit (B1): `id` the journal's 16 random bytes (base64url), `since` the device-list `seq` at its creation, `revision` its append count, `records` the plan's bodies in `signing` or `signed` (one in `signing` with no saved signature included), `drafts` its unsigned drafts, each a control record's body as JSON. The core reads each body strictly as one of the plan's records by this member (a service's `revoke` or `interrupt_running` naming the challenge's origin, reading (c), or a `host:` principal's `interrupt_running`), and counts and hashes them itself: you supply no hash. Refused: a challenge for another Station (`origin_mismatch`), signer (`signer_mismatch`) or slot (`slot_mismatch`), a `signer` that isn't `member:<id>` or a field out of its grammar (`malformed`), the log frozen (`frozen`), a signer that isn't a current native member (`unknown_signer`) or never held `manage` (`not_a_manager`), the challenge expired at `now_ms` (`expired`; reading (b)), then a journal `id` that isn't 16 bytes, `since` 0, a body that isn't one of the plan's records by this member, or a body twice in a set (`malformed`; the same body as a record and as a draft is read, reading (d)) |
-| `signer_report_plan_record(log, body_json, member, origin)` (JS `signerReportPlanRecord`) | the plan predicate (built for Astation's ask, #114 comment 7093796254): whether `body_json`, a control record's body as your journal holds it, is one of the plan's records for `member` (`member:<device_id>`) at `origin` (the challenge's, exact), by exactly the rule `SignerReportRequest` reads a journal's bodies with, so your adapter selects its records and drafts, and checks its barrier before drafting and at the key-signing boundary, by the builder's own rule. `SignerPlanRecord::InPlan` (the request takes it; while the plan's barrier holds, refuse to draft or sign it), or `NotInPlan{reason}` (leave it out of this plan's report; this plan's barrier doesn't hold it), `reason` in the order checked: `another_account`, `another_genesis`, `another_signer` (another member, or the principal's own key), `another_origin` (a service's `revoke` or `interrupt_running` naming another origin); a `host:` principal's `interrupt_running` is `InPlan` at every origin. `Report{malformed}`: this member's `cover`, `hold` or `release` (reading (c), judged after the signer and before the origin: never skip it), a body that isn't a control record's, a `member` that isn't `member:<id>`, an `origin` not in its exact form. Bodies only: the list's freeze and the member's standing change no answer. **Atem's reading, for Astation's confirmation (asked on Astation #114):** another account, genesis or signer as `NotInPlan` with a reason (never `Report{malformed}`), the order account, genesis, signer, action, origin, and the four reason codes; which bodies are `InPlan` is the agreed B2 rule with reading (c). JS: `{type: "in_plan"}` or `{type: "not_in_plan", reason}` |
-| `request.sign_request()` / `request.body_json()` | the `SignRequest` for `key_id` (purpose `SignerReport`, `fresh_confirmation: true`, label `atem-signer-report-v1`, `input` = `enc([label, body])`, `body_json` the held body); the held body, read only |
+| `SignerReportRequest(log, challenge_json, signer, slot, origin, journal, key_id, now_ms)` | an immutable handle (UniFFI Object, a WASM class) on the body the core builds from `journal: SignerJournalView{id, since, revision, records, drafts, processes}`, which your adapter hands over under its journal lock after its barrier's durable commit (B1): `id` the journal's 16 random bytes (base64url), `since` the device-list `seq` at its creation, `revision` its append count, `records` the plan's bodies in `signing` or `signed` (one in `signing` with no saved signature included), `drafts` its unsigned drafts, each a control record's body as JSON, `processes` its roster, every process generation attached to the journal (base64url, `verifier_report_process()` among them, at most 4,096). The core reads each body strictly as one of the plan's records by this member (a service's `revoke` or `interrupt_running` naming the challenge's origin, reading (c), or a `host:` principal's `interrupt_running`), and counts and hashes them itself: you supply no hash. Refused: a challenge for another Station (`origin_mismatch`), signer (`signer_mismatch`) or slot (`slot_mismatch`), a `signer` that isn't `member:<id>` or a field out of its grammar (`malformed`), the log frozen (`frozen`), a signer that isn't a current native member (`unknown_signer`) or never held `manage` (`not_a_manager`), the challenge expired at `now_ms` (`expired`; reading (b)), then a journal `id` that isn't 16 bytes, `since` 0, a body that isn't one of the plan's records by this member, a body twice in a set (`malformed`; the same body as a record and as a draft is read, reading (d)), then a roster without this loaded core's own process, an id that isn't 16 bytes of base64url, an id twice, or more than 4,096 ids (`malformed`) |
+| `signer_report_plan_record(log, body_json, member, origin)` (JS `signerReportPlanRecord`) | the plan predicate (built for Astation's ask, #114 comment 7093796254): whether `body_json`, a control record's body as your journal holds it, is one of the plan's records for `member` (`member:<device_id>`) at `origin` (the challenge's, exact), by exactly the rule `SignerReportRequest` reads a journal's bodies with, so your adapter selects its records and drafts, and checks its barrier before drafting and at the key-signing boundary, by the builder's own rule. `SignerPlanRecord::InPlan` (the request takes it; while the plan's barrier holds, refuse to draft or sign it), or `NotInPlan{reason}` (leave it out of this plan's report; this plan's barrier doesn't hold it), `reason` in the order checked: `another_account`, `another_genesis`, `another_signer` (another member, or the principal's own key), `another_origin` (a service's `revoke` or `interrupt_running` naming another origin); a `host:` principal's `interrupt_running` is `InPlan` at every origin. `Report{malformed}`: this member's `cover`, `hold` or `release` (reading (c), judged after the signer and before the origin: never skip it), a body that isn't a control record's, a `member` that isn't `member:<id>`, an `origin` not in its exact form. Bodies only: the list's freeze and the member's standing change no answer. Atem's reading, **agreed with Astation (Astation #114 comment 7209301522):** another account, genesis or signer as `NotInPlan` with a reason (never `Report{malformed}`), the order account, genesis, signer, action, origin, and the four reason codes; which bodies are `InPlan` is the agreed B2 rule with reading (c). JS: `{type: "in_plan"}` or `{type: "not_in_plan", reason}` |
+| `request.sign_request()` / `request.body_json()` | the `SignRequest` for `key_id` (purpose `SignerReport`, `fresh_confirmation: true`, label `atem-signer-report-v2`, `input` = `enc([label, body])`, `body_json` the held body); the held body, read only |
 | `request.finish(signature)` | the report (canonical `{"body":<held body>,"sig":…}`) once `signature` (P-256 64-byte `r‖s`, either S, normalized to low S; or Ed25519) verifies under the signer's key at the log's head over the held body; anything else is `Report{bad_signature}`. The handle never changes |
 | `sign_signer_report(provider, log, challenge_json, signer, slot, origin, journal, key_id, now_ms)` (Swift, Kotlin; JS `signSignerReport(store, …)` with a `SoftwareKeyStore`, for tests and tools: a native's key is never a software key) | the request's checks, then the provider signs at once after the owner's fresh confirmation (no binding lock held meanwhile): the report, or `Report{signing_failed}` when the owner cancels or the provider fails, `Report{bad_signature}` when `key_id` isn't the signer's key in the log |
-| `verify_signer_report(log, report_json, expected_challenge_json, exported_records_json, now_ms)` | `VerifiedSignerReport{signer, slot, process, connection, head, at_head, recovery, journal: SignerReportJournal{id, since, revision, records, records_hash, drafts, drafts_hash}, records}` against `log` at its current head, the challenge the Station stored and the signed records exported with the report, or `Report{code}`: the first failure of `malformed`, `frozen`, `wrong_account`, `unknown_signer`, `not_a_manager`, `bad_signature`, `stale_log`, `fork`, `signer_mismatch`, `slot_mismatch`, `challenge_mismatch`, `recovery_mismatch`, `records_mismatch`, `expired`. `records_mismatch`: an exported record that isn't a signed control record of the plan by this member, one whose signature doesn't verify under its `auth_key`, a duplicate, or another count or `records_hash` than the report's. `records` are the verified records, as given. An expected challenge that doesn't read is `Invalid{malformed}` |
+| `verify_signer_report(log, report_json, expected_challenge_json, exported_records_json, exported_processes, now_ms)` | `VerifiedSignerReport{signer, slot, process, connection, head, at_head, recovery, journal: SignerReportJournal{id, since, revision, records, records_hash, drafts, drafts_hash, processes, processes_hash}, records, processes}` against `log` at its current head, the challenge the Station stored, the signed records and the roster exported with the report (`exported_processes`: base64url process generations), or `Report{code}`: the first failure of `malformed`, `frozen`, `wrong_account`, `unknown_signer`, `not_a_manager`, `bad_signature`, `stale_log`, `fork`, `signer_mismatch`, `slot_mismatch`, `challenge_mismatch`, `recovery_mismatch`, `records_mismatch`, `processes_mismatch`, `expired`. `records_mismatch`: an exported record that isn't a signed control record of the plan by this member, one whose signature doesn't verify under its `auth_key`, a duplicate, or another count or `records_hash` than the report's. `processes_mismatch`: an exported roster with a malformed id, a duplicate, another count or `processes_hash` than the report's, or without the report's own `process`. `records` are the verified records, as given; `processes` the verified roster, sorted by bytes. **What `processes` proves:** the signer attested that these processes attached to journal `id`, your adapter's word under B6, exactly as strong as `records`; never evidence about a process absent from the set, nor about another journal. **The resolution rule:** a displaced process P of member M is accounted for by a verified report R iff R's signer is M and P is in R's `processes`; comparing journals and generations is the Station's. An expected challenge that doesn't read is `Invalid{malformed}` |
 
 **Atem's readings, agreed with Astation, Astation #114 comment
 7093796254** (none was in the agreed text before; each is fail-closed):
@@ -870,9 +886,9 @@ Astation, Astation #114 comment 7093796254**, listed after the table:
   `cover`, `hold` or `release` this member's journal holds refuses the
   request (`malformed`), never skipped, and `signer_report_plan_record`
   refuses it too (after the account, genesis and signer and before the
-  origin: that order is Atem's reading, for Astation's confirmation, asked
-  on Astation #114). The agreed text says "a service's record naming this
-  origin".
+  origin: that order is Atem's reading, agreed with Astation, Astation
+  #114 comment 7209301522). The agreed text says "a service's record
+  naming this origin".
 - (d) One body may be both a record and a draft: each set is read on its
   own; only a body twice in one set is `malformed`.
 - (e) `journal.since` is compared with nothing, `head.seq` included:
@@ -891,7 +907,11 @@ never completeness of anything outside the journal**. A body your journal
 holds as `signing` with no saved signature is in `records` and can't be
 exported as signed, so the Station gets `records_mismatch` until its exact
 signature is recovered: never drop the body to make the check pass
-(Astation's conservative rule). Adding `SigningPurpose.SignerReport`,
+(Astation's conservative rule). Version 2 adds `SignerJournalView.processes`,
+the `exported_processes` argument, the journal's `processes` and
+`processes_hash`, `VerifiedSignerReport.processes` and the
+`processes_mismatch` code: a source change for every caller, with no
+compatibility path. Adding `SigningPurpose.SignerReport`,
 `SignLabelKind.SignerReport` and the new `Report` codes is a source change
 for an app that switches over them exhaustively. In JS, a time,
 `connection`, `since` or `revision` that isn't a non-negative safe integer
@@ -903,9 +923,12 @@ Tests: `r9-vectors-signer-report` (the challenges; valid reports at the
 head and at an ancestor, with drafts, with zero records, a host sender's
 interrupt with a service's stops, a reinstalled journal, a demoted
 manager, an Ed25519 manager, a manager added by the Recovery Kit once its
-recovery took effect; refused ones with every code, each challenge
-and recovery field mismatched, `records_mismatch` in each form, a high S,
-substitution; the builder's cases and the request's finishes; the plan
+recovery took effect, rosters of one, two and three processes; refused
+ones with every code, each challenge and recovery field mismatched,
+`records_mismatch` and `processes_mismatch` in each form, a v1 report, a
+high S, substitution; the builder's cases (each runner adds its own
+process to the case's roster when `own_process` says so, and checks the
+roster's hash itself) and the request's finishes; the plan
 predicate's bodies, each answer and reason, with the builder taking
 exactly the bodies in the plan) runs in the core's
 `tests/signer_report.rs` (with `tests/member_report_signer.rs`), the
@@ -1260,7 +1283,7 @@ errors: ProviderError.Cancelled{reason} | UnknownKey | OpenFailed | Failed{reaso
 
 | variant | `code` (stable) |
 |---|---|
-| `Invalid{code, detail}` | the crate's: `not_strict_json`, `not_canonical`, `too_large`, `null_value`, `malformed`, `unknown_type`, `array_not_canonical`, `kit_sig_missing`, `kit_sig_unexpected`, `bad_key`, `weak_key`, `wrong_alg`, `high_s`, `bad_signature`, `zero_shared_secret`, `open_failed`, `backup_invalid`, `kit_tag_mismatch`, `genesis_mismatch`, `unknown_key`, `provider_error`; `not_canonical` also for a caller's integer above 2^53 − 1 (a time, a version) that would enter a signed body; `malformed` for a `HostClock` time above 2^53 − 1; for a control record its parse refuses (§9), also `wrong_type`, `unknown_field`, `field_not_allowed`, `not_for_host_principal` (`detail` names the field) |
+| `Invalid{code, detail}` | the crate's: `not_strict_json`, `not_canonical`, `too_large`, `null_value`, `malformed`, `unknown_type`, `array_not_canonical`, `kit_sig_missing`, `kit_sig_unexpected`, `bad_key`, `weak_key`, `wrong_alg`, `high_s`, `bad_signature`, `zero_shared_secret`, `open_failed`, `backup_invalid`, `kit_tag_mismatch`, `genesis_mismatch`, `unknown_key`, `provider_error`; `not_canonical` also for a caller's integer above 2^53 − 1 (a time, a version) that would enter a signed body; `malformed` for a `HostClock` time above 2^53 − 1; for a control record its parse refuses (§9), also `wrong_type`, `unknown_field`, `field_not_allowed`, `not_for_host_principal` (`detail` names the field); for a copy `check_resigned_copy` refuses (§9 "The copy check"), also `not_a_stop`, `original_invalid`, `copy_invalid`, `same_record_id`, `intent_mismatch`, `feed_mismatch` (`detail` exactly what the refusal names: the first field that differs, the copy's verdict) |
 | `Membership{code, detail, index}` | `membership_invalid`; `detail` the verifier's (`bad_signature`, `gap`, `signer_not_manager`, `blob_version_not_increasing`, `kit_sig_missing`, …); `index` into what was passed |
 | `Channel{code, detail}` | `handshake_failed`, `stale_target`, `account_frozen`, `busy` (also as the host's clear, advisory error before the channel opens), `unknown_host`, `record_rejected`, `limit`, `too_large`, `closed`, `signing_failed`, `invalid_hello`, `cannot_carry` (a divergence deeper than any carriage) |
 | `Refused{code, detail, error_json, next}` | the host's session error code (`unauthorized`, `membership_invalid`, `membership_incomplete`, `recovery_pending`, `account_frozen`, `unsupported_version`, `busy`, …) |
@@ -1270,7 +1293,7 @@ errors: ProviderError.Cancelled{reason} | UnknownKey | OpenFailed | Failed{reaso
 | `Publish{code, detail}` | `outstanding` (also: another publisher or writer of this device holds a prepared body), `not_on_head`, `nothing_prepared`, `sign` |
 | `Push{code, detail}` | `malformed`, `binding`, `bad_signature`, `invalid_times`, `skew`, `stale`, `bad_sealed`, `duplicate` |
 | `Stored{code, detail}` | a stored snapshot didn't load. `MembershipLog::from_stored`: `too_large` (over 16 MiB), `malformed` (not strict JSON, not an object, no `v`, no `account_id`/`genesis_hash`), `unsupported_version` (a `v` other than 1), `account_mismatch`, `genesis_mismatch` (the snapshot's are not the caller's anchors), `stored_invalid` (the shared verifier refused it, or it isn't exactly `stored_json()`'s form); a malformed anchor argument is `Invalid`. `ControlStateHandle::from_json` (§9): `too_large` (over 64 MiB), `malformed` (not strict JSON, not an object, no `v`, an `account_id` or `genesis_hash` missing or not readable: such a header names no list; amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**), `unsupported_version` (a `v` other than 2: amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**), `account_mismatch`, `genesis_mismatch` (a well-formed header naming another device list: delete the state and start with `new`), `stored_invalid` (the state's own rules refuse it, or it isn't exactly `to_json()`'s form). `control_state_from_parts` (§9; amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**: new): `too_large` (over 64 MiB in all), `malformed` (a part that isn't strict JSON), `stored_invalid` (a principal given twice; a part of this list its rules refuse, that isn't exactly `part()`'s form, or whose principal is no principal; a part whose device list can't be read); never `account_mismatch` or `genesis_mismatch` (another list's parts are reported in `foreign`) |
-| `Report{code, detail}` | a member's verifier report, its challenge or its build refused: `malformed`, `frozen`, `wrong_account`, `unknown_signer`, `signer_expired`, `bad_signature`, `stale_log`, `fork`, `signer_mismatch`, `slot_mismatch`, `challenge_mismatch`, `expired` (the verifier's order); the reporter's `origin_mismatch` and `signing_failed` (JS `kind: "report"`; a new variant: a source change for an exhaustive switch). A manager's signer report (§2 "A manager's signed signer report") adds `not_a_manager`, `recovery_mismatch` and `records_mismatch`, in its own order. A manager's Station binding proof (§2 "A manager's Station binding proof") uses `malformed`, `frozen`, `wrong_account`, `unknown_signer`, `not_a_manager`, `bad_signature`, `stale_log`, `fork`, `challenge_mismatch`, `expired` in its verifier's order, and its builder adds `origin_mismatch`, `signer_mismatch` and `binding_mismatch` |
+| `Report{code, detail}` | a member's verifier report, its challenge or its build refused: `malformed`, `frozen`, `wrong_account`, `unknown_signer`, `signer_expired`, `bad_signature`, `stale_log`, `fork`, `signer_mismatch`, `slot_mismatch`, `challenge_mismatch`, `expired` (the verifier's order); the reporter's `origin_mismatch` and `signing_failed` (JS `kind: "report"`; a new variant: a source change for an exhaustive switch). A manager's signer report (§2 "A manager's signed signer report") adds `not_a_manager`, `recovery_mismatch`, `records_mismatch` and `processes_mismatch` (v2, its roster), in its own order. A manager's Station binding proof (§2 "A manager's Station binding proof") uses `malformed`, `frozen`, `wrong_account`, `unknown_signer`, `not_a_manager`, `bad_signature`, `stale_log`, `fork`, `challenge_mismatch`, `expired` in its verifier's order, and its builder adds `origin_mismatch`, `signer_mismatch` and `binding_mismatch` |
 | `State{detail}` | `state` (a call out of order: `already started`, `not waiting for accept`, `no signature pending`, …; or the object changed while the provider was signing) |
 
 `detail` is for logs and may change; branch on the variant and `code`.
@@ -1492,6 +1515,15 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   provider asked under `ServiceControl` (no confirmation) for the
   integration's own key and `ControlRecord` (a fresh confirmation of the
   body) for a native manager.
+- **The copy check** (`tests/resigned_copy.rs`, Rust; three conformance
+  checks per language): every record of `r9-vectors-resigned-copy`
+  through `verify_control_record` on each of its chains as its `checks`
+  say; every case through `check_resigned_copy` (on L, its chain and its
+  `freeze` carriage), the copy or `Invalid` with its code and detail,
+  every code among them and `resigned_copy_codes` in their order; and its
+  `checker_passes`: each snapshot consistent through
+  `check_control_snapshot_consistency` while its stop is refused as a
+  copy.
 - **The Station's side** (`tests/station.rs`, Rust; thirteen conformance
   checks per language, of the 70 and 72 above): every acknowledgment
   fixture (`r9-control-ack-*`, one check each, its `expect_counts` against
@@ -1576,6 +1608,7 @@ acknowledgments").
 | `parse_control_record(record_json)` | the body, field by field (strict JSON, at most 16 KiB, exactly the body's fields); no signature check. For a record text over 16 KiB this call and the page reader (`FeedEntry::parse_record`, a `control_sync_result`'s records) give different codes (`not_strict_json` here, `malformed` there), though both refuse the same records: compare whether it parses, not the code |
 | `control_why_codes()` | the shared vocabulary of reasons, every code once in a fixed order (JS `controlWhyCodes()`; **for Astation's sign-off**, amended for step 4, O5): the codes `ControlApplied.why` and `ControlEffectResult.why` take in this version. A well-formed reason outside it, read from a `control_ack`, is a later version's: treat it as unrecognized, information only. `r9-vectors-station-calls`'s `why_codes` pins it |
 | `verify_control_record(log, record_json)` | against a verified `MembershipLog`: `Valid{signer, key_seq, head}` (`signer` `service:<id>` for the principal's own key, from the entry at `key_seq`; `member:<id>` for a current native manager), `Pending{reason}` (`principal_unknown`, `signer_unknown`, `revoke_not_in_list`: verify again after the list advances) or `Refused{reason}` (`wrong_account`, `bad_signature`, `key_mismatch`, `signer_not_allowed`, `removed_manager`, `host_key_signed`, `not_a_service`, `not_a_revoke`: keep it as evidence). A record the parse refuses is `Invalid{code}` |
+| `check_resigned_copy(log, original_json, copy_json, candidate_feed_id)` (JS `checkResignedCopy`), `resigned_copy_codes()` (JS `resignedCopyCodes`) | whether `copy_json`, a current native manager's stop, is a re-signed copy of `original_json`, a stop a removed or demoted manager signed, that discharges the original's obligation (host-work-v1 §11.1, condition (c); §9 "The copy check" below): `ResignedCopy{original_record_id, copy_record_id, signer, principal, action, feed}` (`feed` `original` or `candidate`, `None` for a host principal's record), or `Invalid{code, detail}` with the copy check's code; the codes in their order |
 | `ControlStateHandle::new(log)`, `from_json(log, state_json)`, `to_json()`, `apply(record_json, log, pos, host_applied_seq)` | the reference control state of one device list, as a host keeps it. A handle never changes: `apply` verifies the record against `log` (the device list at the head of this transaction) and returns `ControlTransition{applied, next, touched}`, `applied` being `ControlApplied{result, effects, actions, evidence, why}` (`why`, amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**: `Applied::why`'s code, host-work-v1 §11.1, set exactly when the record is pending or refused or kept as evidence, else `None`; JS `null`; and each effect's `ControlEffectResult.why`, O5, **for Astation's sign-off**, the record's `why` exactly on an effect `pending` or `refused`, what a host writes in its `control_ack`), `next` the state after the record, a new handle, and `touched` the principals whose part it changed (the record's, or none). `pos` is `ControlFeedPos{origin, feed_id, feed_seq}`, where the record was read: its `origin` is always the Station origin you sync the feed from (a host's own configured Station), never one taken from a page or the record, which is what bounds a part's `order`; a record whose body names another `origin` or `feed_id` counts as read at no position (its hold still applies, its cover and release don't). Amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**: `touched`, and the rule that `pos`'s `origin` is the host's own configured Station origin, are new |
 | `principals()`, `part(principal)`, `control_state_from_parts(log, parts)` | the state one part per principal (amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**: new), for a store that keeps a row per principal: `part` is a principal's canonical JSON (`None` when the state has none); `control_state_from_parts` (JS `controlStateFromParts`) loads `ControlStatePart{principal, part_json}`s in any order, read as strictly as `from_json`, and returns `ControlLoadedParts{state, foreign}`. Every part names its device list (`account_id`, `genesis_hash`): one of another list (an earlier pairing's leftover) is skipped, never loaded, and its principal listed in `foreign`: delete those rows. The list loaded is always `log`, never inferred from the parts. Write the parts a transition `touched` (a touched principal always has a part in `next`); no other part changed |
 | `standing(principal)` | what is in force for `service:<id>` or `host:<host_id>` (amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**: new): `ControlStanding{revoked, interrupted, held, coverage}`: the revoking record's `record_id` (never for a host principal, whose revocation is a device-list entry), the revocations whose interrupt a record put in force (a service's revoking `record_id`, a host principal's `revoke_seq` in decimal; sorted as text, so `"10"` before `"9"`), the hold, and `ControlCoverage{origin, feed_id}`, the covering feed. A principal the state holds nothing for has nothing in force |
@@ -2121,7 +2154,7 @@ account's record); never re-sign it.
 ### The snapshot checker
 
 `check_control_snapshot_consistency(log, origin, candidate_feed_id,
-retained_json, snapshot_json, marks, covered)` checks a replacement
+retained_json, snapshot_json, marks, covered, provisioned)` checks a replacement
 feed's snapshot, before you publish it, for **consistency** with the
 records the restored Station retained. **It never says** that the
 retained records are the whole history, that a mark bounds every time the
@@ -2136,10 +2169,11 @@ you: what a rollback lost, nothing here can see (#114, items 1, 3 and 4).
 | `snapshot_json` | the snapshot's records, in publication order |
 | `marks` | `ControlSnapshotMark{principal, mark_ms}` per service principal, once each: a record its own key signs anew is issued strictly after `mark_ms` (`U_p` after a rollback, or the mark you sign above) |
 | `covered` | the principals the snapshot covers (`service:<id>`), once each: the services you currently cover at the cut (below) |
+| `provisioned` | the services you provisioned at your origin and haven't handed over (`service:<id>`, the identity `covered` uses), once each; required, and an empty list checks nothing (built for Astation's request, Astation #114 comment 7208700195): each must be in `covered`, revoked by a `revoke` of it the snapshot carries, or removed from the device list at the head, else `coverage_dropped`. A service the list doesn't hold at the head (its `service_add` not yet committed, or not yet carried to this list) is neither covered nor removed, so it is `coverage_dropped` (fail closed): leave it out until its `service_add` is in the list (**Atem's reading, for Astation's agreement**) |
 
-**What `covered` holds** (**Atem's reading, for Astation's agreement
-(Astation #114, comment 7207811340)**; host-work-v1 §11.1, "Which
-principals a Station currently covers"). The checker never derives it:
+**What `covered` holds** (Atem's reading, **agreed with Astation
+(Astation #114 comments 7208700195 and 7209301522)**; host-work-v1 §11.1,
+"Which principals a Station currently covers"). The checker never derives it:
 pass every service you provisioned at your origin and haven't handed
 over, except those whose coverage ended. Coverage of a service ends only
 at a revoke of it that the snapshot itself carries and that verifies at
@@ -2175,7 +2209,12 @@ feed), `cover_not_first` (each covered principal's cover first, a hold or
 release after it), `uncovered_cover`, `not_above_mark` (signed anew with
 the service's own key, issued at or below the mark, or no mark). Then,
 with `index` the snapshot's length: `cover_not_first` for a covered
-principal with no cover, and each effect of each retained `revoke` or
+principal with no cover, `coverage_dropped` for a provisioned service (in
+sorted order) neither covered, nor revoked by the snapshot, nor removed at
+the head (no `record_id`; a Portal-only revoke, an expiry, an absent key
+or a missing reservation never clears coverage; its place in the order is
+Atem's choice; one the list doesn't hold fails closed, Atem's reading
+above), and each effect of each retained `revoke` or
 `interrupt_running` that the snapshot alone doesn't keep on a fresh host
 (a revocation, or an interrupt due because its principal is revoked, in
 force; an interrupt not yet due, of a principal nothing revokes, an
@@ -2192,12 +2231,63 @@ old feed and needs no mark, but must still be valid at the head and of
 your origin. Errors: a record its parse refuses is `Invalid{code}`; any
 other input outside its grammar (an origin not in its exact form, a
 candidate that isn't a UUID v4, a principal that isn't `service:<id>`,
-marked or covered twice, a mark above 2^53 − 1, a frozen list)
-`Invalid{malformed}`. JS: `checkControlSnapshotConsistency(log, origin,
-candidateFeedId, retainedJson, snapshotJson, [{principal, markMs}],
-covered)` gives `{type: "consistent"}` or `{type: "inconsistent", index,
+marked, covered or provisioned twice, a mark above 2^53 − 1, a frozen
+list) `Invalid{malformed}`. `stop_not_resigned` is effect-only; whether a
+snapshot stop is a conforming copy is "The copy check"'s, below. JS:
+`checkControlSnapshotConsistency(log, origin, candidateFeedId,
+retainedJson, snapshotJson, [{principal, markMs}], covered, provisioned)` gives `{type: "consistent"}` or `{type: "inconsistent", index,
 code, principal, recordId, reason, effect, revokeSeq}` (`null` where
 none). Its cases: `r9-vectors-host-work-control`'s `snapshots`.
+
+### The copy check
+
+`check_resigned_copy(log, original_json, copy_json, candidate_feed_id)`
+(the shared core's `control::check_resigned_copy`; **agreed with
+Astation, Astation #114 comments 7208700195 and 7209301522**) is
+condition (c) of host-work-v1 §11.1's "A current manager's copy of a
+former manager's stop", one pure judgement, so your Station and the
+manager's app judge a copy alike: the copy, a current native manager's
+stop valid at `log`'s head, carries exactly the original's stop intent.
+It answers `ResignedCopy{original_record_id, copy_record_id, signer,
+principal, action, feed}`, or `Invalid{code, detail}`, the first that
+fails in this order: `malformed` (either object isn't a signed control
+record that reads strictly, a non-v4 `record_id` among them; the
+candidate feed isn't a UUID v4; the list is frozen; `detail`
+`original`, `copy`, `candidate_feed_id` or `list frozen`), `not_a_stop`
+(a `cover`, `hold` or `release` is never copied: you sign those anew
+with your own key), `original_invalid` (it isn't a manager's stop that
+verifies: `service_key_signed` or `host_key_signed` for the principal's
+own key, `unknown_signer` for a `member:` the list records no key of,
+`not_a_manager` for a native that never held `manage` at any `seq`,
+`bad_signature` when no `auth_key` that member had in the list's history
+verifies it), `copy_invalid` (the copy isn't valid at the head with a
+current native manager as its signer: the verifier's code, or
+`signed_by_principal`), `same_record_id`, then field by field in the
+body's order `intent_mismatch` (`detail` the first field that differs:
+`account_id`, `genesis_hash`, `origin`, `principal`, `principal_key`,
+`action`, `interrupt_running`, `revoke_seq`, `about.integration_id`,
+`about.by`) or, at `feed_id`'s place, `feed_mismatch` (a service's copy
+naming neither the original's feed nor `candidate_feed_id`). `signer`,
+`record_id` and `issued_at` may differ; `origin` never. `detail` is
+exactly what the refusal names, else empty. The field order, the
+details, the frozen list's refusal, `signed_by_principal`, the
+original's signer (a native that held `manage` at some `seq`, never the
+principal's own key) and the use of `Invalid` (no new error variant) are
+Atem's readings.
+
+**It is stricter than the snapshot checker, which stays effect-only.**
+`check_control_snapshot_consistency`'s `stop_not_resigned` fires only
+when the snapshot alone drops an effect of a removed manager's retained
+stop, so any valid stop that keeps those effects passes it: a current
+manager's revoke with another `about` or another feed of the origin,
+`interrupt_running` over the original's `false`, the service's own revoke
+signed anew above its mark. A conforming copy always keeps every effect,
+so the two never disagree in that direction. The snapshots the checker
+passes and this refuses are yours to refuse: require a conforming copy
+(this call), in its author's final verified signer report, before you
+count a removed or demoted manager's original as discharged. Its cases:
+`r9-vectors-resigned-copy` (`cases`, and `checker_passes`: two snapshots
+the checker passes whose stop this refuses).
 
 ### The Station binding proof
 

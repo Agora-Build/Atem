@@ -526,16 +526,17 @@ struct JsJournal {
     revision: f64,
     records: Vec<String>,
     drafts: Vec<String>,
+    processes: Vec<String>,
 }
 
 fn signer_journal(v: JsValue) -> JsResult<crate::types::SignerJournalView> {
     only_fields(
         &v,
-        &["id", "since", "revision", "records", "drafts"],
+        &["id", "since", "revision", "records", "drafts", "processes"],
         "journal",
     )?;
     let j: JsJournal = serde_wasm_bindgen::from_value(v)
-        .map_err(|_| bad("journal {id, since, revision, records, drafts}"))?;
+        .map_err(|_| bad("journal {id, since, revision, records, drafts, processes}"))?;
     let count = |v: f64, what: &str| {
         ms(v).map_err(|_| bad(&format!("journal.{what} is a non-negative safe integer")))
     };
@@ -545,6 +546,7 @@ fn signer_journal(v: JsValue) -> JsResult<crate::types::SignerJournalView> {
         revision: count(j.revision, "revision")?,
         records: j.records,
         drafts: j.drafts,
+        processes: j.processes,
     })
 }
 
@@ -587,17 +589,21 @@ pub fn parse_signer_report_challenge(challenge_json: String) -> JsResult<JsValue
 }
 
 /// Verifies a signer report against `log` at its head, the stored
-/// challenge and the exported signed records
+/// challenge, the exported signed records and the exported roster (each
+/// process generation base64url)
 /// (`member_report::signer::verify_signer_report`): `{signer, slot,
 /// process, connection, head, atHead, recovery, journal: {id, since,
-/// revision, records, recordsHash, drafts, draftsHash}, records}`, or
-/// throws `kind: "report"` with the first failure's `code`.
+/// revision, records, recordsHash, drafts, draftsHash, processes,
+/// processesHash}, records, processes}`, or throws `kind: "report"` with
+/// the first failure's `code` (`processes_mismatch` after
+/// `records_mismatch`).
 #[wasm_bindgen(js_name = verifySignerReport)]
 pub fn verify_signer_report(
     log: &MembershipLog,
     report_json: String,
     expected_challenge_json: String,
     exported_records_json: Vec<String>,
+    exported_processes: Vec<String>,
     now_ms: f64,
 ) -> JsResult<JsValue> {
     ok(crate::member_report::signer::verify_signer_report(
@@ -605,6 +611,7 @@ pub fn verify_signer_report(
         report_json,
         expected_challenge_json,
         exported_records_json,
+        exported_processes,
         ms(now_ms)?,
     ))
 }
@@ -615,8 +622,8 @@ pub fn verify_signer_report(
 /// `SignerReportRequest` reads a journal's bodies with: `{type: "in_plan"}`
 /// or `{type: "not_in_plan", reason}` (`another_account`,
 /// `another_genesis`, `another_signer`, `another_origin`; the reasons and
-/// their order Atem's reading, for Astation's confirmation, asked on
-/// Astation #114), or throws `kind: "report"`, `code: "malformed"` (this
+/// their order Atem's reading, agreed with Astation, Astation #114 comment
+/// 7209301522), or throws `kind: "report"`, `code: "malformed"` (this
 /// member's cover, hold or release; a body that isn't a control record's;
 /// a member or origin outside its grammar).
 #[wasm_bindgen(js_name = signerReportPlanRecord)]
@@ -637,7 +644,9 @@ pub fn signer_report_plan_record(
 /// A signer report waiting for its signature
 /// (`member_report::signer::SignerReportRequest`): an immutable handle on
 /// the body the core built from the journal (`{id, since, revision,
-/// records, drafts}`, the bodies as JSON texts). A key that answers later
+/// records, drafts, processes}`, the bodies as JSON texts, `processes` the
+/// journal's roster, this instance's own process among them). A key that
+/// answers later
 /// signs `signRequest().input` after the owner's fresh confirmation and
 /// hands the signature to `finish`, which takes only a signature over the
 /// held body by its signer.
@@ -1591,6 +1600,33 @@ pub fn verify_control_record(log: &MembershipLog, record_json: String) -> JsResu
     ))
 }
 
+/// A current manager's re-signed copy judged against a removed or demoted
+/// manager's stop (`control::check_resigned_copy`): `{originalRecordId,
+/// copyRecordId, signer, principal, action, feed?}` (`feed` `original` or
+/// `candidate`, absent for a host principal's record), or throws `kind:
+/// "invalid"` with the copy check's `code` and `detail`.
+#[wasm_bindgen(js_name = checkResignedCopy)]
+pub fn check_resigned_copy(
+    log: &MembershipLog,
+    original_json: String,
+    copy_json: String,
+    candidate_feed_id: String,
+) -> JsResult<JsValue> {
+    ok(crate::control::check_resigned_copy(
+        log.0.clone(),
+        original_json,
+        copy_json,
+        candidate_feed_id,
+    ))
+}
+
+/// `checkResignedCopy`'s codes, in the order its checks run
+/// (`control::resigned_copy_codes`).
+#[wasm_bindgen(js_name = resignedCopyCodes)]
+pub fn resigned_copy_codes() -> Vec<String> {
+    crate::control::resigned_copy_codes()
+}
+
 /// The bytes a key signs for `body` (`control_record_signing_input`): a
 /// Station's key in WebCrypto or a KMS signs them, then
 /// `controlRecordWithSignature` makes the record.
@@ -2351,10 +2387,16 @@ impl AckTransition {
 /// records the restored Station retained
 /// (`check_control_snapshot_consistency`): never a statement that a
 /// history, a clock or an author's stops are complete. `marks` is an array
-/// of `{principal, markMs}`; `covered` the principals the snapshot covers.
-/// Returns `{type: "consistent"}` or `{type: "inconsistent", index, code,
-/// principal, recordId, reason, effect, revokeSeq}` (`null` where none).
+/// of `{principal, markMs}`; `covered` the principals the snapshot covers;
+/// `provisioned` the services the Station provisioned at its origin and
+/// hasn't handed over (`coverage_dropped`; may be empty; one the list
+/// doesn't hold at the head is neither covered nor removed, so it fails
+/// closed, Atem's reading for Astation's agreement: leave it out until its
+/// `service_add` is in the list). Returns `{type:
+/// "consistent"}` or `{type: "inconsistent", index, code, principal,
+/// recordId, reason, effect, revokeSeq}` (`null` where none).
 #[wasm_bindgen(js_name = checkControlSnapshotConsistency)]
+#[allow(clippy::too_many_arguments)]
 pub fn check_control_snapshot_consistency(
     log: &MembershipLog,
     origin: String,
@@ -2363,6 +2405,7 @@ pub fn check_control_snapshot_consistency(
     snapshot_json: Vec<String>,
     marks: JsValue,
     covered: Vec<String>,
+    provisioned: Vec<String>,
 ) -> JsResult<JsValue> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -2391,6 +2434,7 @@ pub fn check_control_snapshot_consistency(
         snapshot_json,
         marks,
         covered,
+        provisioned,
     ))
 }
 

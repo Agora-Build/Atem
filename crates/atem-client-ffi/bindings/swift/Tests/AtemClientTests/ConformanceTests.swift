@@ -993,11 +993,13 @@ final class ConformanceTests: XCTestCase {
         }
         // A manager's signer report (host-work-v1 §11.1 "The signer
         // report"; Astation #114 item 4): each challenge read or refused;
-        // each report verified with its exported records, or refused as
-        // Report(code); each builder case as a SignerReportRequest (its body
-        // but the process, which is this core's); the immutable request's
-        // finishes, signed here with CryptoKit (another body, another member:
-        // refused); and the synchronous signer through the app's provider.
+        // each report verified with its exported records and roster (v2), or
+        // refused as Report(code); each builder case as a SignerReportRequest
+        // (its body but the process and the roster's hash, which are this
+        // core's: the hash recomputed here over the case's roster and this
+        // core's process); the immutable request's finishes, signed here with
+        // CryptoKit (another body, another member: refused); and the
+        // synchronous signer through the app's provider.
         let srep = try load("r9-vectors-signer-report")
         func srepLog(_ c: [String: Any]) throws -> MembershipLog {
             let at = HostClock(wallMs: u(c["now_ms"]), monoMs: 1000, bootId: "boot-1")
@@ -1015,9 +1017,19 @@ final class ConformanceTests: XCTestCase {
             SignerReportRecovery(generation: s(r["generation"]), planId: s(r["plan_id"]), candidateFeedId: s(r["candidate_feed_id"]),
                 sourceHash: s(r["source_hash"]), evidenceHash: s(r["evidence_hash"]))
         }
-        func journalIn(_ j: [String: Any]) -> SignerJournalView {
-            SignerJournalView(id: s(j["id"]), since: u(j["since"]), revision: u(j["revision"]),
-                records: a(j["records"]).map(s), drafts: a(j["drafts"]).map(s))
+        // A builder case's journal: its roster the file's ids, then this
+        // core's own process when the case's own_process says so.
+        func journalIn(_ c: [String: Any]) -> SignerJournalView {
+            let j = o(c["journal"])
+            let own = (c["own_process"] as? Bool) == true ? [verifierReportProcess()] : []
+            return SignerJournalView(id: s(j["id"]), since: u(j["since"]), revision: u(j["revision"]),
+                records: a(j["records"]).map(s), drafts: a(j["drafts"]).map(s), processes: a(j["processes"]).map(s) + own)
+        }
+        // SHA-256(enc(["atem-signer-report-processes-v1", p1…pn])) over the
+        // raw ids sorted by bytes.
+        func processesHash(_ ids: [String]) -> String {
+            let raw = ids.map(b64u).sorted { $0.lexicographicallyPrecedes($1) }
+            return hex(Data(SHA256.hash(data: encodeFields(fields: [utf8("atem-signer-report-processes-v1")] + raw))))
         }
         func srepOut(_ v: VerifiedSignerReport) -> [String: Any] {
             [
@@ -1027,13 +1039,15 @@ final class ConformanceTests: XCTestCase {
                 "recovery": recoveryOut(v.recovery),
                 "journal": ["id": v.journal.id, "since": v.journal.since, "revision": v.journal.revision,
                             "records": v.journal.records, "records_hash": v.journal.recordsHash,
-                            "drafts": v.journal.drafts, "drafts_hash": v.journal.draftsHash] as [String: Any],
+                            "drafts": v.journal.drafts, "drafts_hash": v.journal.draftsHash,
+                            "processes": v.journal.processes, "processes_hash": v.journal.processesHash] as [String: Any],
                 "records": v.records,
+                "processes": v.processes,
             ]
         }
         func srepRequest(_ log: MembershipLog, _ c: [String: Any], _ challenge: [String: Any], _ slot: String, _ key: String) throws -> SignerReportRequest {
             try SignerReportRequest(log: log, challengeJson: js(challenge), signer: s(c["signer"]), slot: slot,
-                origin: s(c["station"]), journal: journalIn(o(c["journal"])), keyId: key, nowMs: u(c["now_ms"]))
+                origin: s(c["station"]), journal: journalIn(c), keyId: key, nowMs: u(c["now_ms"]))
         }
         check("signer report: challenges") {
             for c in a(srep["challenges"]).map(o) {
@@ -1071,7 +1085,8 @@ final class ConformanceTests: XCTestCase {
         check("signer report: reports") {
             for c in a(srep["valid"]).map(o) + a(srep["invalid"]).map(o) {
                 let verify = { try verifySignerReport(log: try srepLog(c), reportJson: s(c["report"]),
-                    expectedChallengeJson: js(o(c["challenge"])), exportedRecordsJson: a(c["exported"]).map(s), nowMs: u(c["now_ms"])) }
+                    expectedChallengeJson: js(o(c["challenge"])), exportedRecordsJson: a(c["exported"]).map(s),
+                    exportedProcesses: a(c["exported_processes"]).map(s), nowMs: u(c["now_ms"])) }
                 if let expect = c["expect"] as? [String: Any] {
                     try eq(canon(srepOut(try verify())), canon(expect), s(c["label"]))
                 } else {
@@ -1085,6 +1100,8 @@ final class ConformanceTests: XCTestCase {
             try eq(s(byCase["records_possibly_signed"]!["code"]), "records_mismatch", "records_possibly_signed")
             try eq(s(byCase["not_a_manager"]!["code"]), "not_a_manager", "not_a_manager")
             try eq(s(byCase["high_s_signature"]!["code"]), "bad_signature", "high_s_signature")
+            try eq(s(byCase["processes_own_absent"]!["code"]), "processes_mismatch", "processes_own_absent")
+            try eq(s(byCase["v1_report"]!["code"]), "malformed", "v1_report")
         }
         check("signer report: the builder") {
             for c in a(srep["builder"]).map(o) + a(srep["request"]).map(o) {
@@ -1096,6 +1113,10 @@ final class ConformanceTests: XCTestCase {
                 let text = try build().bodyJson()
                 var body = o(try JSONSerialization.jsonObject(with: Data(text.utf8)))
                 try eq(body.removeValue(forKey: "process") as? String, verifierReportProcess(), "\(s(c["label"])): this core's process")
+                var journal = o(body["journal"])
+                try eq(journal.removeValue(forKey: "processes_hash") as? String, processesHash(journalIn(c).processes),
+                    "\(s(c["label"])): the roster's hash")
+                body["journal"] = journal
                 try eq(canon(body), canon(want), s(c["label"]))
             }
         }
@@ -1167,15 +1188,23 @@ final class ConformanceTests: XCTestCase {
             try phone.addP256("dev-mac/auth", secret: unhex(s(key("dev-mac", "auth")["secret_hex"])))
             func sign(_ keyId: String) throws -> String {
                 try signSignerReport(provider: phone, log: log, challengeJson: js(o(c["challenge"])), signer: s(c["signer"]),
-                    slot: s(c["slot"]), origin: s(c["station"]), journal: journalIn(o(c["journal"])), keyId: keyId, nowMs: u(c["now_ms"]))
+                    slot: s(c["slot"]), origin: s(c["station"]), journal: journalIn(c), keyId: keyId, nowMs: u(c["now_ms"]))
             }
             let records = try ["phone_revoke", "phone_interrupt", "phone_host_interrupt"].map { label in
                 try canonicalJson(json: js(o(a(srep["records"]).map(o).first { s($0["label"]) == label }!["record"])))
             }
-            let v = try verifySignerReport(log: log, reportJson: try sign("dev-phone/auth"),
-                expectedChallengeJson: js(o(c["challenge"])), exportedRecordsJson: records, nowMs: u(c["now_ms"]))
+            let roster = journalIn(c).processes
+            let report = try sign("dev-phone/auth")
+            let v = try verifySignerReport(log: log, reportJson: report,
+                expectedChallengeJson: js(o(c["challenge"])), exportedRecordsJson: records, exportedProcesses: roster, nowMs: u(c["now_ms"]))
             try eq(v.process, verifierReportProcess(), "process")
             try eq(v.journal.records, 3, "records")
+            try eq(v.journal.processes, UInt64(roster.count), "processes")
+            try eq(v.processes.contains(verifierReportProcess()), true, "its own process in the verified roster")
+            try reportError("processes_mismatch") {
+                _ = try verifySignerReport(log: log, reportJson: report, expectedChallengeJson: js(o(c["challenge"])),
+                    exportedRecordsJson: records, exportedProcesses: [verifierReportProcess()], nowMs: u(c["now_ms"]))
+            }
             try eq(phone.requests.count, 1, "one request")
             try eq(phone.requests[0].purpose, .signerReport, "purpose")
             try eq(phone.requests[0].freshConfirmation, true, "a fresh confirmation")
@@ -1434,6 +1463,10 @@ final class ConformanceTests: XCTestCase {
         // so a failed commit loses no effect); and a provider is asked under
         // the purpose the record's signer gives.
         let ctl = try load("r9-vectors-host-work-control")
+        // The entries the control vectors carry themselves (a second
+        // service's service_add, SO7), resolved by label in their chains as
+        // L's are.
+        for e in a(ctl["entries"]).map(o) { byLabel[s(e["label"])] = e }
         let ctlRecords = a(ctl["records"]).map(o)
         var ctlByLabel: [String: [String: Any]] = [:]
         for r in ctlRecords { ctlByLabel[s(r["label"])] = r }
@@ -1474,7 +1507,14 @@ final class ConformanceTests: XCTestCase {
         }
         check("control records: every record parses and verifies on its chains as the vectors say") {
             var verdicts = 0
-            let svc = o(o(o(ctl["services"])["svc-discord"])["auth_key"])
+            // A service's auth_key: the file's `services` (svc-discord), else
+            // the service_add among its own entries (svc-other, SO7).
+            func serviceKey(_ principal: String) -> [String: Any] {
+                let id = String(principal.dropFirst("service:".count))
+                if let service = o(ctl["services"])[id] { return o(o(service)["auth_key"]) }
+                let members = a(ctl["entries"]).compactMap { o(o(o($0)["entry"])["body"])["member"] as? [String: Any] }
+                return o(members.first { ($0["device_id"] as? String) == id }!["auth_key"])
+            }
             for r in ctlRecords {
                 let label = s(r["label"])
                 let json = js(r["record"]!)
@@ -1490,6 +1530,7 @@ final class ConformanceTests: XCTestCase {
                 try eq(hex(signingInput(label: .hostWorkControl, payload: utf8(s(r["jcs"])))), s(r["signing_input_hex"]), label)
                 let checks = a(r["checks"]).map(o)
                 if let r9 = r["r9_svc"] as? String {
+                    let svc = serviceKey(s(o(o(r["record"])["body"])["principal"]))
                     try eq(try serviceKeyFingerprint(authKey: PublicKeyData(alg: .ed25519, raw: b64u(s(svc["pub"])))), r9, label)
                     let principalKey = s(o(o(r["record"])["body"])["principal_key"])
                     try eq(principalKey == r9, (checks[0]["reason"] as? String) != "key_mismatch", "\(label) principal_key")
@@ -1902,14 +1943,16 @@ final class ConformanceTests: XCTestCase {
             }
         }
         func snapshotRun(_ c: [String: Any], origin: String? = nil, candidate: String? = nil, snapshot: [String]? = nil,
-                         marks: [ControlSnapshotMark]? = nil, covered: [String]? = nil) throws -> ControlSnapshotConsistency {
+                         marks: [ControlSnapshotMark]? = nil, covered: [String]? = nil,
+                         provisioned: [String]? = nil) throws -> ControlSnapshotConsistency {
             let defaultMarks = o(c["marks"]).map { ControlSnapshotMark(principal: $0.key, markMs: u($0.value)) }
             return try checkControlSnapshotConsistency(
                 log: logAfter(a(c["chain"]).map(s)), origin: origin ?? s(c["origin"]),
                 candidateFeedId: candidate ?? s(c["candidate_feed_id"]),
                 retainedJson: a(c["retained"]).map { ctlRecord(s($0)) },
                 snapshotJson: snapshot ?? a(c["snapshot"]).map { ctlRecord(s($0)) },
-                marks: marks ?? defaultMarks, covered: covered ?? a(c["covered"]).map(s))
+                marks: marks ?? defaultMarks, covered: covered ?? a(c["covered"]).map(s),
+                provisioned: provisioned ?? a(c["provisioned"]).map(s))
         }
         check("control snapshots: every case through checkControlSnapshotConsistency") {
             let cases = a(ctl["snapshots"]).map(o)
@@ -1917,6 +1960,7 @@ final class ConformanceTests: XCTestCase {
             for c in cases {
                 try eq(canon(snapshotOut(try snapshotRun(c))), canon(c["expect"]!), s(c["label"]))
             }
+            try eq(cases.contains { (o($0["expect"])["code"] as? String) == "coverage_dropped" }, true, "a coverage_dropped case")
             let n1 = cases.first { s($0["label"]) == "N1_retained_native_revoke" }!
             let mark = ControlSnapshotMark(principal: "service:svc-discord", markMs: u(o(n1["marks"])["service:svc-discord"]))
             try throwsCode("unknown_field") { _ = try snapshotRun(n1, snapshot: [ctlRecord("A2_cover"), ctlRecord("P4_unknown_field")]) }
@@ -1925,6 +1969,92 @@ final class ConformanceTests: XCTestCase {
             try throwsCode("malformed") { _ = try snapshotRun(n1, marks: [mark, mark]) }
             try throwsCode("malformed") { _ = try snapshotRun(n1, marks: [ControlSnapshotMark(principal: "member:dev-mac", markMs: 1)]) }
             try throwsCode("malformed") { _ = try snapshotRun(n1, covered: ["service:svc-discord", "service:svc-discord"]) }
+            try throwsCode("malformed") { _ = try snapshotRun(n1, provisioned: ["host:host-a"]) }
+            try throwsCode("malformed") { _ = try snapshotRun(n1, provisioned: ["service:svc-discord", "service:svc-discord"]) }
+        }
+        // A current manager's re-signed copy of a former manager's stop
+        // (r9-vectors-resigned-copy; host-work-v1 §11.1, condition (c)):
+        // each case through checkResignedCopy (the copy, or Invalid with the
+        // copy check's code and detail), and the snapshots the effect-only
+        // checker passes whose stop the copy check refuses.
+        let rcopy = try load("r9-vectors-resigned-copy")
+        func rcopyLog(_ c: [String: Any]) throws -> MembershipLog {
+            let at = HostClock(wallMs: u(c["now_ms"]), monoMs: 1000, bootId: "boot-1")
+            let entries = a(rcopy["entries"]).map(o)
+            let chain = a(c["chain"]).map { label in js(entries.first { s($0["label"]) == s(label) }!["entry"]!) }
+            let log = try MembershipLog.verify(accountId: account, genesisHash: genesis, entries: l + chain, now: at)
+            if let freeze = c["freeze"] { _ = try log.extend(entries: [entry(s(freeze))], now: at) }
+            return log
+        }
+        func rcopyRecord(_ label: Any?) -> String {
+            js(a(rcopy["records"]).map(o).first { s($0["label"]) == s(label) }!["record"]!)
+        }
+        func copyRefusal(_ f: () throws -> Void) throws -> [String: Any] {
+            do {
+                try f()
+            } catch let AtemError.Invalid(code, detail) {
+                var out: [String: Any] = ["code": code]
+                if !detail.isEmpty { out["detail"] = detail }
+                return out
+            }
+            throw Failure(description: "expected a refusal, nothing thrown")
+        }
+        check("resigned copy: every record verifies on its chains as `checks` says") {
+            var verdicts = 0
+            let nowMs = o(a(rcopy["cases"])[0])["now_ms"]!
+            for r in a(rcopy["records"]).map(o) {
+                let label = s(r["label"])
+                let json = js(r["record"]!)
+                if let parseError = r["parse_error"] as? String {
+                    try throwsCode(parseError) { _ = try verifyControlRecord(log: try logL(), recordJson: json) }
+                    continue
+                }
+                for c in a(r["checks"]).map(o) {
+                    let log = try rcopyLog(["chain": c["chain"]!, "now_ms": nowMs])
+                    // The file's verdicts name the signer only (no key_seq).
+                    var got = verdictOf(a(c["chain"]), try verifyControlRecord(log: log, recordJson: json))
+                    got["key_seq"] = nil
+                    try eq(canon(got), canon(c), "\(label) on \(a(c["chain"]).map(s))")
+                    verdicts += 1
+                }
+            }
+            if verdicts < 100 { throw Failure(description: "\(verdicts) verdicts") }
+        }
+        check("resigned copy: every case through checkResignedCopy") {
+            try eq(resignedCopyCodes(), a(rcopy["codes"]).map(s), "codes")
+            var codes = Set<String>()
+            for c in a(rcopy["cases"]).map(o) {
+                let judge = { try checkResignedCopy(log: try rcopyLog(c), originalJson: s(c["original_json"]),
+                    copyJson: s(c["copy_json"]), candidateFeedId: s(c["candidate_feed_id"])) }
+                guard let expect = c["expect"] as? [String: Any] else {
+                    let got = try copyRefusal { _ = try judge() }
+                    var want: [String: Any] = ["code": s(c["code"])]
+                    if let detail = c["detail"] { want["detail"] = s(detail) }
+                    try eq(canon(got), canon(want), s(c["label"]))
+                    codes.insert(s(got["code"]))
+                    continue
+                }
+                let v = try judge()
+                var out: [String: Any] = ["original_record_id": v.originalRecordId, "copy_record_id": v.copyRecordId,
+                    "signer": v.signer, "principal": v.principal, "action": v.action]
+                if let feed = v.feed { out["feed"] = feed }
+                try eq(canon(out), canon(expect), s(c["label"]))
+            }
+            try eq(codes.sorted(), a(rcopy["codes"]).map(s).sorted(), "every code")
+        }
+        check("resigned copy: the snapshot checker passes what the copy check refuses") {
+            for p in a(rcopy["checker_passes"]).map(o) {
+                let snap = o(p["snapshot"])
+                let marks = o(snap["marks"]).map { ControlSnapshotMark(principal: $0.key, markMs: u($0.value)) }
+                let answer = try checkControlSnapshotConsistency(log: try rcopyLog(p), origin: s(snap["origin"]),
+                    candidateFeedId: s(snap["candidate_feed_id"]), retainedJson: a(snap["retained"]).map(rcopyRecord),
+                    snapshotJson: a(snap["snapshot"]).map(rcopyRecord), marks: marks, covered: a(snap["covered"]).map(s),
+                    provisioned: a(snap["provisioned"]).map(s))
+                try eq(canon(snapshotOut(answer)), canon(snap["expect"]!), "\(s(p["label"])): consistent")
+                let got = try copyRefusal { _ = try checkResignedCopy(log: try rcopyLog(p), originalJson: rcopyRecord(p["original"]),
+                    copyJson: rcopyRecord(p["copy"]), candidateFeedId: s(p["candidate_feed_id"])) }
+                try eq(canon(got), canon(["code": s(p["code"]), "detail": s(p["detail"])]), "\(s(p["label"])): refused as a copy")
+            }
         }
         check("Station acks: a call never changes its handle; the state loads only as written") {
             let f = try load("r9-control-ack-per-effect")
@@ -3129,6 +3259,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 157)
+        XCTAssertEqual(passed, 160)
     }
 }

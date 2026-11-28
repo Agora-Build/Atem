@@ -15,12 +15,14 @@ use atem_client::control::{
     ControlAbout, ControlAction, ControlBody, ControlFeed, ControlPrincipal, ControlSigner,
     build_control, principal_key_of,
 };
-use atem_client::domain::{SIGNER_REPORT_DRAFTS, SIGNER_REPORT_RECORDS, SignLabel, SigningInput};
-use atem_client::encoding::{Hash32, b64u, enc};
+use atem_client::domain::{
+    SIGNER_REPORT_DRAFTS, SIGNER_REPORT_PROCESSES, SIGNER_REPORT_RECORDS, SignLabel, SigningInput,
+};
+use atem_client::encoding::{Hash32, b64u, b64u_decode, enc};
 use atem_client::member_report::{
-    JournalView, MAX_GENERATION, OutOfPlan, PlanRecord, RecoveryPlan, ReportRefusal,
-    SIGNER_VERIFY_ORDER, SignerReportChallenge, process_generation, sign_signer_report,
-    signer_report_body, signer_report_plan_record, verify_signer_report,
+    JournalView, MAX_GENERATION, MAX_JOURNAL_PROCESSES, OutOfPlan, PlanRecord, RecoveryPlan,
+    ReportRefusal, SIGNER_VERIFY_ORDER, SignerReportChallenge, process_generation,
+    sign_signer_report, signer_report_body, signer_report_plan_record, verify_signer_report,
 };
 use atem_client::membership::{
     Action, Member, MemberKind, Membership, Role, RolesChange, sign_entry,
@@ -199,7 +201,36 @@ fn journal_of(records: &[String], drafts: &[String]) -> JournalView {
         revision: 118,
         records: records.to_vec(),
         drafts: drafts.to_vec(),
+        processes: vec![own()],
     }
+}
+
+/// This loaded core's process generation, base64url: what the journal's
+/// roster holds for the reporter (the adapter appends `attach{process}`
+/// the first time a process takes the journal's lock, before it signs
+/// anything, B6).
+fn own() -> String {
+    b64u(&process_generation())
+}
+
+/// A process generation attached to the journal before this one (an
+/// earlier launch of the app), and one attached later.
+fn earlier() -> String {
+    b64u(b"earlier-process!")
+}
+
+fn later() -> String {
+    b64u(b"a-later-process!")
+}
+
+/// `SHA-256(enc(["atem-signer-report-processes-v1", p1…pn]))` over the raw
+/// ids sorted by bytes, computed here on its own.
+fn processes_hash(ids: &[String]) -> Hash32 {
+    let mut raw: Vec<Vec<u8>> = ids.iter().map(|p| b64u_decode(p).unwrap()).collect();
+    raw.sort();
+    let mut fields: Vec<&[u8]> = vec![b"atem-signer-report-processes-v1"];
+    fields.extend(raw.iter().map(|r| &r[..]));
+    Hash32(Sha256::digest(enc(&fields)).into())
 }
 
 fn journal(plan: &Plan) -> JournalView {
@@ -269,6 +300,8 @@ fn set_hash(label: &str, bodies: &[String]) -> Hash32 {
     Hash32(Sha256::digest(enc(&fields)).into())
 }
 
+/// `verify_signer_report` with the roster every journal here holds but
+/// where a test says otherwise: this core's own process alone.
 fn verify(
     log: &Membership,
     text: &str,
@@ -276,7 +309,7 @@ fn verify(
     exported: &[String],
     now: u64,
 ) -> Result<atem_client::member_report::VerifiedSignerReport, ReportRefusal> {
-    verify_signer_report(log, text.as_bytes(), expected, exported, now)
+    verify_signer_report(log, text.as_bytes(), expected, exported, &[own()], now)
 }
 
 #[test]
@@ -327,12 +360,15 @@ fn a_manager_reports_its_journal_at_the_head() {
         json!({"generation": "7", "plan_id": PLAN, "candidate_feed_id": CANDIDATE,
                "source_hash": "5a".repeat(32), "evidence_hash": "e7".repeat(32)})
     );
+    assert_eq!(body["v"], 2);
     assert_eq!(
         body["journal"],
         json!({"id": b64u(&JOURNAL_ID), "since": 4, "revision": 118,
                "records": 3, "records_hash": set_hash(SIGNER_REPORT_RECORDS, &journal.records).to_hex(),
-               "drafts": 1, "drafts_hash": set_hash(SIGNER_REPORT_DRAFTS, &journal.drafts).to_hex()})
+               "drafts": 1, "drafts_hash": set_hash(SIGNER_REPORT_DRAFTS, &journal.drafts).to_hex(),
+               "processes": 1, "processes_hash": processes_hash(&[own()]).to_hex()})
     );
+    assert_eq!(verified.processes, [process_generation()]);
     assert_eq!(
         body.as_object().unwrap().keys().collect::<Vec<_>>(),
         [
@@ -385,6 +421,7 @@ fn every_refusal_code_at_its_place_in_the_order() {
             "challenge_mismatch",
             "recovery_mismatch",
             "records_mismatch",
+            "processes_mismatch",
             "expired"
         ]
     );
@@ -412,6 +449,21 @@ fn every_refusal_code_at_its_place_in_the_order() {
         Ok(true)
     );
     assert_eq!(check(&log, &good, &expected, &all, EXPIRES), Err("expired"));
+    // The roster after the records, before the clock.
+    let no_roster = |exported: &[String], now: u64| {
+        verify_signer_report(
+            &log,
+            good.as_bytes(),
+            &expected,
+            exported,
+            &[earlier()],
+            now,
+        )
+        .map(|_| ())
+        .map_err(|r| r.code())
+    };
+    assert_eq!(no_roster(&all, EXPIRES), Err("processes_mismatch"));
+    assert_eq!(no_roster(missing, EXPIRES), Err("records_mismatch"));
     assert_eq!(
         check(&log, &good, &expected, missing, EXPIRES),
         Err("records_mismatch")
@@ -730,6 +782,7 @@ fn the_builder_reads_each_journal_body_strictly() {
         revision: 1 << 53,
         ..journal_of(&[], &[])
     };
+    // The roster's own refusals are in the_builder_needs_its_own_process.
     for journal in [bad_since, bad_revision] {
         assert_eq!(
             signer_report_body(&log, &challenge, PHONE, SLOT, STATION, &journal, NOW)
@@ -1539,6 +1592,7 @@ fn a_reinstalled_journal_is_valid_for_the_primitive() {
         revision: 0,
         records: Vec::new(),
         drafts: Vec::new(),
+        processes: vec![own()],
     };
     let text = report(
         &book,
@@ -1734,8 +1788,11 @@ fn a_label_collision_is_impossible() {
         &challenge,
         &journal_of(&[], &[]),
     );
+    // Relabelled as a verifier report (at that body's v1), signed under its
+    // label.
     let relabelled = resigned(keys, "dev-phone/auth", &good, |b| {
-        b["type"] = json!("atem-verifier-report")
+        b["type"] = json!("atem-verifier-report");
+        b["v"] = json!(1);
     });
     assert!(matches!(
         verify(&log, &relabelled, &challenge, &[], NOW),
@@ -1759,6 +1816,299 @@ fn the_process_is_the_loaded_cores() {
     );
     let verified = verify(&log, &text, &challenge, &[], NOW).unwrap();
     assert_eq!(verified.process, process_generation());
+}
+
+/// The report commits to its journal's process roster (v2, Astation #114
+/// comment 7208700195): `journal.processes` counts every process
+/// generation attached to the journal, the reporter's own among them, and
+/// `processes_hash` is SHA-256 over its label and the raw ids sorted by
+/// bytes. The verifier takes the exported roster as a set and gives it
+/// back sorted.
+#[test]
+fn the_report_commits_to_its_journals_process_roster() {
+    let (v, book) = (Vectors::load(), Book::load());
+    let log = log_l(&v);
+    let challenge = challenge(PHONE, SLOT);
+    let roster = vec![earlier(), own()];
+    let journal = JournalView {
+        processes: roster.clone(),
+        ..journal_of(&[], &[])
+    };
+    let body = signer_report_body(&log, &challenge, PHONE, SLOT, STATION, &journal, NOW).unwrap();
+    assert_eq!(body.journal().processes, 2);
+    assert_eq!(body.journal().processes_hash, processes_hash(&roster));
+    let json = body.to_json();
+    assert_eq!(json["v"], 2);
+    assert_eq!(
+        json["journal"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        [
+            "drafts",
+            "drafts_hash",
+            "id",
+            "processes",
+            "processes_hash",
+            "records",
+            "records_hash",
+            "revision",
+            "since"
+        ]
+    );
+    // Signed under the v2 label.
+    assert_eq!(
+        body.signing_input().as_bytes(),
+        enc(&[b"atem-signer-report-v2", body.jcs().as_bytes()])
+    );
+    assert_eq!(SIGNER_REPORT_PROCESSES, "atem-signer-report-processes-v1");
+    let text = sign_signer_report(&book.provider, &KeyId::new("dev-phone/auth"), &body)
+        .unwrap()
+        .to_json()
+        .to_string();
+    let mut sorted: Vec<[u8; 16]> = [b"earlier-process!".to_owned(), process_generation()].into();
+    sorted.sort();
+    // Exported in either order: the same set, given back sorted.
+    for exported in [vec![earlier(), own()], vec![own(), earlier()]] {
+        let verified = verify_signer_report(
+            &log,
+            text.as_bytes(),
+            &challenge,
+            &[] as &[String],
+            &exported,
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(verified.processes, sorted);
+        assert!(verified.processes.contains(&verified.process));
+        assert_eq!(verified.journal.processes, 2);
+    }
+    // The roster changes no other part of the journal: one process alone.
+    let one = signer_report_body(
+        &log,
+        &challenge,
+        PHONE,
+        SLOT,
+        STATION,
+        &journal_of(&[], &[]),
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(one.journal().processes, 1);
+    assert_eq!(one.journal().processes_hash, processes_hash(&[own()]));
+    assert_eq!(one.journal().records_hash, body.journal().records_hash);
+}
+
+/// The builder takes the roster as the adapter's journal holds it, and
+/// refuses (`malformed`) a roster without this core's own process (the
+/// adapter attached it before this process could sign anything, B6), an id
+/// that isn't 16 bytes of base64url, an id twice, or more than
+/// MAX_JOURNAL_PROCESSES ids.
+#[test]
+fn the_builder_needs_its_own_process_in_the_roster() {
+    let (v, _) = (Vectors::load(), Book::load());
+    let log = log_l(&v);
+    let challenge = challenge(PHONE, SLOT);
+    let build = |processes: Vec<String>| {
+        let journal = JournalView {
+            processes,
+            ..journal_of(&[], &[])
+        };
+        signer_report_body(&log, &challenge, PHONE, SLOT, STATION, &journal, NOW)
+            .map(|b| b.journal().processes)
+    };
+    assert_eq!(build(vec![own()]), Ok(1));
+    assert_eq!(build(vec![later(), own(), earlier()]), Ok(3));
+    let malformed = Err(ReportRefusal::Malformed("journal.processes"));
+    assert_eq!(build(vec![]), malformed, "none");
+    assert_eq!(build(vec![earlier()]), malformed, "not its own");
+    assert_eq!(build(vec![earlier(), later()]), malformed, "not its own");
+    assert_eq!(build(vec![own(), own()]), malformed, "its own twice");
+    assert_eq!(
+        build(vec![own(), earlier(), earlier()]),
+        malformed,
+        "another twice"
+    );
+    for bad in [
+        b64u(&[7u8; 15]),
+        b64u(&[7u8; 17]),
+        format!("{}==", earlier()),
+        earlier().replace('_', "/").replace('-', "+") + "+",
+        String::new(),
+    ] {
+        assert_eq!(build(vec![own(), bad.clone()]), malformed, "{bad:?}");
+    }
+    // The bound is MAX_JOURNAL_PROCESSES ids, the reporter's own included.
+    assert_eq!(MAX_JOURNAL_PROCESSES, 4096);
+    let many = |n: usize| -> Vec<String> {
+        let mut ids: Vec<String> = (1..n as u32)
+            .map(|i| {
+                let mut id = [0u8; 16];
+                id[..4].copy_from_slice(&i.to_be_bytes());
+                b64u(&id)
+            })
+            .collect();
+        ids.push(own());
+        ids
+    };
+    assert_eq!(build(many(MAX_JOURNAL_PROCESSES)), Ok(4096));
+    assert_eq!(build(many(MAX_JOURNAL_PROCESSES + 1)), malformed);
+}
+
+/// `processes_mismatch` in each form (Astation #114 comment 7208700195):
+/// the exported roster against the report's, each a 16-byte base64url
+/// id, none twice, its count and `processes_hash` the report's, and the
+/// report's own `process` among them. The count (and the bound) first,
+/// before any id is read.
+#[test]
+fn processes_mismatch_in_each_form() {
+    let (v, book) = (Vectors::load(), Book::load());
+    let keys = &book.provider;
+    let log = log_l(&v);
+    let challenge = challenge(PHONE, SLOT);
+    let roster = vec![earlier(), own()];
+    let journal = JournalView {
+        processes: roster.clone(),
+        ..journal_of(&[], &[])
+    };
+    let text = report(&book, "dev-phone/auth", &log, PHONE, &challenge, &journal);
+    let check = |text: &str, exported: &[String]| {
+        verify_signer_report(
+            &log,
+            text.as_bytes(),
+            &challenge,
+            &[] as &[String],
+            exported,
+            NOW,
+        )
+        .map(|_| ())
+    };
+    assert_eq!(check(&text, &roster), Ok(()));
+    let mismatch = ReportRefusal::ProcessesMismatch;
+    let flood: Vec<String> = (0..MAX_JOURNAL_PROCESSES + 1).map(|_| "?".into()).collect();
+    let cases: Vec<(&str, Vec<String>, &str)> = vec![
+        ("one missing", vec![own()], "count"),
+        ("none", vec![], "count"),
+        ("one extra", vec![earlier(), own(), later()], "count"),
+        ("4,097 against the body's 2, unread", flood, "count"),
+        (
+            "another set of the same count",
+            vec![later(), own()],
+            "processes_hash",
+        ),
+        ("its own twice", vec![own(), own()], "duplicate"),
+        ("an id of 15 bytes", vec![earlier(), b64u(&[7u8; 15])], "id"),
+        ("an id of 17 bytes", vec![b64u(&[7u8; 17]), own()], "id"),
+        ("a padded id", vec![format!("{}==", earlier()), own()], "id"),
+        (
+            "not base64url",
+            vec!["earlier process!".into(), own()],
+            "id",
+        ),
+    ];
+    for (what, exported, why) in &cases {
+        assert_eq!(check(&text, exported), Err(mismatch(why)), "{what}");
+        assert_eq!(
+            check(&text, exported).map_err(|r| r.code()),
+            Err("processes_mismatch"),
+            "{what}"
+        );
+    }
+    // A report whose roster omits its own process (no builder makes one):
+    // signed as it stands, its exported roster matching it.
+    let others = vec![earlier(), later()];
+    let without = resigned(keys, "dev-phone/auth", &text, |b| {
+        b["journal"]["processes_hash"] = json!(processes_hash(&others).to_hex());
+    });
+    assert_eq!(check(&without, &others), Err(mismatch("own process")));
+    // A count the hash doesn't hold: the exported roster can't match both.
+    let three = resigned(keys, "dev-phone/auth", &text, |b| {
+        b["journal"]["processes"] = json!(3);
+    });
+    assert_eq!(check(&three, &roster), Err(mismatch("count")));
+    assert_eq!(
+        check(&three, &[earlier(), own(), later()]),
+        Err(mismatch("processes_hash"))
+    );
+    // Over the bound: a body signed with 4,097 processes and their hash,
+    // its roster exported whole. The count matches; the bound refuses it
+    // before any id is read.
+    let over: Vec<String> = (1..=MAX_JOURNAL_PROCESSES as u32)
+        .map(|i| {
+            let mut id = [0u8; 16];
+            id[..4].copy_from_slice(&i.to_be_bytes());
+            b64u(&id)
+        })
+        .chain([own()])
+        .collect();
+    assert_eq!(over.len(), MAX_JOURNAL_PROCESSES + 1);
+    let too_many = resigned(keys, "dev-phone/auth", &text, |b| {
+        b["journal"]["processes"] = json!(over.len());
+        b["journal"]["processes_hash"] = json!(processes_hash(&over).to_hex());
+    });
+    assert_eq!(check(&too_many, &over), Err(mismatch("count")));
+}
+
+/// The v1 report is refused as `malformed` everywhere (the owner's rule:
+/// no compatibility path; Astation updates with Atem): its v1 shape signed
+/// under the retired v1 label, a v2 body that says `v: 1`, and one that
+/// says `v: 3`. Read as a signed object, a signer report must say `v: 2`.
+#[test]
+fn a_v1_report_is_malformed() {
+    let (v, book) = (Vectors::load(), Book::load());
+    let keys = &book.provider;
+    let log = log_l(&v);
+    let challenge = challenge(PHONE, SLOT);
+    let text = report(
+        &book,
+        "dev-phone/auth",
+        &log,
+        PHONE,
+        &challenge,
+        &journal_of(&[], &[]),
+    );
+    assert!(verify(&log, &text, &challenge, &[], NOW).is_ok());
+    let mut v1: Value = serde_json::from_str::<Value>(&text).unwrap()["body"].clone();
+    v1["v"] = json!(1);
+    let journal = v1["journal"].as_object_mut().unwrap();
+    journal.remove("processes");
+    journal.remove("processes_hash");
+    let jcs_v1 = jcs(&v1).unwrap();
+    let secret = book.keys["dev-phone"]["auth"]["secret_hex"]
+        .as_str()
+        .unwrap();
+    let signing = p256::ecdsa::SigningKey::from_slice(&unhex32(secret)).unwrap();
+    let sig: p256::ecdsa::Signature = p256::ecdsa::signature::Signer::sign(
+        &signing,
+        &enc(&[b"atem-signer-report-v1", jcs_v1.as_bytes()]),
+    );
+    let sig = sig.normalize_s().unwrap_or(sig);
+    let v1_text = format!(r#"{{"body":{jcs_v1},"sig":"{}"}}"#, b64u(&sig.to_bytes()));
+    assert!(matches!(
+        verify(&log, &v1_text, &challenge, &[], NOW),
+        Err(ReportRefusal::Malformed(_))
+    ));
+    assert!(SignedObject::parse(v1_text.as_bytes()).is_err());
+    for version in [1, 3] {
+        let mut body: Value = serde_json::from_str::<Value>(&text).unwrap()["body"].clone();
+        body["v"] = json!(version);
+        let jcs_body = jcs(&body).unwrap();
+        let sig = sign(
+            keys,
+            &KeyId::new("dev-phone/auth"),
+            &SigningInput::new(SignLabel::SignerReport, jcs_body.as_bytes()),
+        )
+        .unwrap();
+        let wire = format!(r#"{{"body":{jcs_body},"sig":"{}"}}"#, b64u(&sig));
+        assert!(
+            matches!(
+                verify(&log, &wire, &challenge, &[], NOW),
+                Err(ReportRefusal::Malformed(_))
+            ),
+            "v {version}"
+        );
+    }
 }
 
 /// `s` replaced by `n − s` (the other valid P-256 signature).

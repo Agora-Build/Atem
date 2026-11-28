@@ -163,8 +163,8 @@ unit_enum! {
         /// `atem-verifier-report-v1`: a member's verifier report
         /// (`verify_verifier_report`).
         VerifierReport,
-        /// `atem-signer-report-v1`: a native manager's signer report
-        /// (`verify_signer_report`).
+        /// `atem-signer-report-v2`: a native manager's signer report
+        /// (`verify_signer_report`; v2, its process roster: v1 is refused).
         SignerReport,
         /// `atem-station-binding-v1`: a native manager's Station binding
         /// proof (`verify_station_binding`).
@@ -446,13 +446,20 @@ record! {
     /// the plan's records it put into `signing` or `signed` (a body in
     /// `signing` with no saved signature included), and `drafts`, its
     /// unsigned drafts of the plan's records. The core counts and hashes
-    /// them; the app supplies no hash.
+    /// them; the app supplies no hash. `processes` is the journal's
+    /// process roster: every process generation attached to this journal
+    /// (each 16 bytes, base64url as a report writes `process`, at most
+    /// 4,096), this loaded core's own (`verifier_report_process()`) among
+    /// them: your adapter durably appends `attach{process}` the first time
+    /// a process takes the journal's lock, before that process can append
+    /// any `signing` entry (B6).
     pub struct SignerJournalView {
         pub id: String,
         pub since: u64,
         pub revision: u64,
         pub records: Vec<String>,
         pub drafts: Vec<String>,
+        pub processes: Vec<String>,
     }
 }
 
@@ -472,8 +479,8 @@ data_enum! {
         /// `another_account`, `another_genesis`, `another_signer` (another
         /// member, or the principal's own key), `another_origin` (a
         /// service's `revoke` or `interrupt_running` naming another
-        /// origin). These reasons and their order are Atem's reading, for
-        /// Astation's confirmation (asked on Astation #114).
+        /// origin). These reasons and their order are Atem's reading,
+        /// agreed with Astation (Astation #114 comment 7209301522).
         NotInPlan { reason: String },
     }
 }
@@ -481,7 +488,8 @@ data_enum! {
 record! {
     /// A signer report's `journal` as signed: the journal's `id`
     /// (base64url), `since` and `revision`, and each set's count and hash
-    /// (`records_hash`, `drafts_hash`: lowercase hex).
+    /// (`records_hash`, `drafts_hash`, `processes_hash`: lowercase hex), its
+    /// process roster's among them.
     pub struct SignerReportJournal {
         pub id: String,
         pub since: u64,
@@ -490,6 +498,8 @@ record! {
         pub records_hash: String,
         pub drafts: u64,
         pub drafts_hash: String,
+        pub processes: u64,
+        pub processes_hash: String,
     }
 }
 
@@ -498,10 +508,18 @@ record! {
     /// (`member:<device_id>`), in which slot and process (base64url, 16
     /// bytes), for which `connection`, at which head of the reporter's list
     /// (`at_head` false at an ancestor), the `recovery` and `journal` it
-    /// signed, and `records`, the exported records it verified (canonical
-    /// JSON, in the order given): exactly the report's records. It proves
-    /// the report's signature and that the export matches it; consistency
-    /// only, never completeness of anything outside the journal.
+    /// signed, `records`, the exported records it verified (canonical
+    /// JSON, in the order given): exactly the report's records, and
+    /// `processes`, the exported roster it verified (base64url, sorted by
+    /// bytes): exactly the report's, `process` among them. It proves the
+    /// report's signature and that the export matches it; consistency only,
+    /// never completeness of anything outside the journal. `processes` says
+    /// the signer attested that these processes attached to journal `id`:
+    /// your adapter's word under B6, exactly as strong as `records`, never
+    /// evidence about a process absent from the set nor about another
+    /// journal. A displaced process P of member M is accounted for by a
+    /// verified report R iff R's signer is M and P is in R's `processes`;
+    /// comparing journals and generations is the Station's.
     pub struct VerifiedSignerReport {
         pub signer: String,
         pub slot: String,
@@ -512,6 +530,7 @@ record! {
         pub recovery: SignerReportRecovery,
         pub journal: SignerReportJournal,
         pub records: Vec<String>,
+        pub processes: Vec<String>,
     }
 }
 
@@ -1296,6 +1315,24 @@ record! {
     }
 }
 
+record! {
+    /// A current manager's re-signed copy that discharges its original
+    /// (`check_resigned_copy`; host-work-v1 §11.1, condition (c)): the two
+    /// records' ids, the copy's signer (`member:<device_id>`, a current
+    /// native manager), the principal, the stop (`revoke` or
+    /// `interrupt_running`), and which feed a service's copy names:
+    /// `original` (the original's) or `candidate` (the plan's candidate
+    /// feed); `None` for a host principal's record, which names no feed.
+    pub struct ResignedCopy {
+        pub original_record_id: String,
+        pub copy_record_id: String,
+        pub signer: String,
+        pub principal: String,
+        pub action: String,
+        pub feed: Option<String>,
+    }
+}
+
 data_enum! {
     /// A record against a device list (`verify_control_record`, I.5.4).
     pub enum ControlCheckInfo {
@@ -1588,15 +1625,21 @@ data_enum! {
         /// doesn't verify, never re-sign it), `invalid_record` (`reason`:
         /// the verifier's pending or refusal code), `wrong_origin`,
         /// `not_signed_anew`, `not_candidate_feed`, `cover_not_first`,
-        /// `uncovered_cover`, `not_above_mark`, then `stop_lost` or
-        /// `stop_not_resigned` (a removed manager's retained stop, `reason`
-        /// `removed_manager`: a current manager signs it again; `effect`:
-        /// `revocation` or `interrupt`; `revoke_seq`: a host principal's
-        /// interrupt). `index` is otherwise the snapshot record's position
-        /// (from 0), or the snapshot's length for what only the whole
-        /// snapshot shows (a covered principal with no cover, a retained
-        /// stop's effect not kept). `record_id` is that snapshot
-        /// record's, or the retained record's.
+        /// `uncovered_cover`, `not_above_mark`, then `coverage_dropped` (a
+        /// provisioned service neither covered, nor revoked by the
+        /// snapshot, nor removed at the head; no `record_id`; Atem's
+        /// reading, for Astation's agreement: a provisioned service the
+        /// list doesn't hold at the head is neither, so it fails closed:
+        /// leave it out of `provisioned` until its `service_add` is in the
+        /// list), then `stop_lost` or `stop_not_resigned` (a removed
+        /// manager's retained stop, `reason` `removed_manager`: a current
+        /// manager signs it again; `effect`: `revocation` or `interrupt`;
+        /// `revoke_seq`: a host principal's interrupt). `index` is
+        /// otherwise the snapshot record's position (from 0), or the
+        /// snapshot's length for what only the whole snapshot shows (a
+        /// covered principal with no cover, `coverage_dropped`, a retained
+        /// stop's effect not kept). `record_id` is that snapshot record's,
+        /// or the retained record's.
         Inconsistent {
             index: u64,
             code: String,

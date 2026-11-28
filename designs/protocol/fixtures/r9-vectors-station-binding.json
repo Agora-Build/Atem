@@ -5636,7 +5636,7 @@
       "label": "signed_under_signer_report_label",
       "note": "the binding's body (typed atem-station-binding) signed by dev-phone under another label: a relabelled body",
       "now_ms": 1793264001000,
-      "proof": "{\"body\":{\"account_id\":\"acct-test-1\",\"action\":\"bind\",\"auth_time\":1793263400,\"expected_binding\":{\"state\":\"never_bound\"},\"expires_at\":1793264030000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"issued_at\":1793264000000,\"issuer\":\"https://auth.dev.agora.build\",\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"origin\":\"https://station-dev.agora.build\",\"signer\":\"member:dev-phone\",\"subject\":\"ab00000000000000000000000001\",\"type\":\"atem-station-binding\",\"v\":1},\"sig\":\"0cKz3XqqqHr1KGqYKc9pf31h6t_yOlyjb3rm43e0TUcaVcH1jj46nOUPcFzkttnDT9bXmoRx4wEFAu6bxRGqng\"}"
+      "proof": "{\"body\":{\"account_id\":\"acct-test-1\",\"action\":\"bind\",\"auth_time\":1793263400,\"expected_binding\":{\"state\":\"never_bound\"},\"expires_at\":1793264030000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"issued_at\":1793264000000,\"issuer\":\"https://auth.dev.agora.build\",\"nonce\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8\",\"origin\":\"https://station-dev.agora.build\",\"signer\":\"member:dev-phone\",\"subject\":\"ab00000000000000000000000001\",\"type\":\"atem-station-binding\",\"v\":1},\"sig\":\"7seusc2V5GoUCeJE3s_ZbbxZ5NFpleImXubOYKPM-9o_4B-U0dVQDbaFJstMjqD98RoKwljtY_6LEX4PFvWbhA\"}"
     },
     {
       "chain": [],

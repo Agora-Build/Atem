@@ -1,18 +1,22 @@
 //! A native manager's signed report of its control-record signing journal
 //! (`atem_client::member_report`'s signer report; host-work-v1 §11.1 "The
 //! signer report", agreed with Astation, #114 comment 7089435073), for a
-//! Station recovering from a rollback.
+//! Station recovering from a rollback. Version 2: the report commits to its
+//! journal's process roster (Astation #114 comment 7208700195); v1 is
+//! refused as `Report{malformed}`.
 //!
 //! - **The minter** (the Station) issues a single-use challenge with
 //!   `signer_report_challenge` (a fresh nonce, the recovery it collects
 //!   for; canonical JSON: store it, carry it), and verifies the answer with
 //!   `verify_signer_report` against its log at its current head, the
-//!   challenge it stored and the signed records exported with the report:
-//!   a `VerifiedSignerReport`, or `Report{code}` with the first failure in
-//!   the agreed order.
+//!   challenge it stored, the signed records and the roster exported with
+//!   the report: a `VerifiedSignerReport`, or `Report{code}` with the first
+//!   failure in the agreed order.
 //! - **The reporter**, under its journal adapter's lock and barrier (B1 to
-//!   B6, the app's), hands the journal's own bodies (`SignerJournalView`)
-//!   to `sign_signer_report` (its own key through the app's provider), or,
+//!   B6, the app's), hands the journal's own bodies and process roster
+//!   (`SignerJournalView`: every process generation attached to the
+//!   journal, this loaded core's own among them) to `sign_signer_report`
+//!   (its own key through the app's provider), or,
 //!   when its key answers later, builds a `SignerReportRequest`, has the
 //!   input of its `sign_request()` signed and hands the signature to
 //!   `finish`. It selects the plan's records and drafts, and checks its
@@ -39,7 +43,11 @@
 //! consistency only, never completeness of anything outside the journal. A
 //! body the journal holds as `signing` with no saved signature is in its
 //! `records` and can't be exported as signed, so its report stays
-//! `records_mismatch`.
+//! `records_mismatch`. A verified roster says the signer attested that
+//! these processes attached to journal `id` (your adapter's word under B6,
+//! as strong as `records`): a displaced process P of member M is accounted
+//! for by a verified report R iff R's signer is M and P is in R's
+//! `processes`.
 use std::sync::Arc;
 
 use atem_client::KeyId;
@@ -82,7 +90,7 @@ fn recovery_info(r: &RecoveryPlan) -> SignerReportRecovery {
 }
 
 /// The journal view, its `id` 16 bytes of base64url (`Report{malformed}`
-/// otherwise; the core checks the rest).
+/// otherwise; the core checks the rest, the roster included).
 fn journal_of(j: &SignerJournalView) -> Result<JournalView> {
     let id = b64u_decode_array::<JOURNAL_ID_BYTES>(&j.id)
         .map_err(|_| AtemError::from(ReportRefusal::Malformed("journal.id")))?;
@@ -92,6 +100,7 @@ fn journal_of(j: &SignerJournalView) -> Result<JournalView> {
         revision: j.revision,
         records: j.records.clone(),
         drafts: j.drafts.clone(),
+        processes: j.processes.clone(),
     })
 }
 
@@ -104,6 +113,8 @@ fn journal_info(j: &JournalSummary) -> SignerReportJournal {
         records_hash: j.records_hash.to_hex(),
         drafts: j.drafts,
         drafts_hash: j.drafts_hash.to_hex(),
+        processes: j.processes,
+        processes_hash: j.processes_hash.to_hex(),
     }
 }
 
@@ -176,7 +187,7 @@ pub fn parse_signer_report_challenge(challenge_json: String) -> Result<SignerRep
 /// a control record's (read as the request reads one). Bodies only: the
 /// list's freeze and the member's standing change no answer. Which bodies
 /// are `InPlan` is the agreed B2 rule with reading (c); Atem's reading,
-/// for Astation's confirmation (asked on Astation #114): another account,
+/// agreed with Astation (Astation #114 comment 7209301522): another account,
 /// genesis or signer as `NotInPlan{reason}` (never `Report{malformed}`),
 /// the order account, genesis, signer, action, origin, and the four
 /// reason codes.
@@ -253,7 +264,10 @@ impl SignerReportRequest {
     /// `manage` (`not_a_manager`); the challenge expired (`expired`); then
     /// the journal: an `id` that isn't 16 bytes of base64url, `since` 0 or
     /// `revision` beyond 2^53 − 1, a body that isn't one of the plan's
-    /// records by this member, or a body twice in a set (`malformed`).
+    /// records by this member, a body twice in a set, then a roster without
+    /// this loaded core's own process (`verifier_report_process()`), with
+    /// an id that isn't 16 bytes of base64url, an id twice, or more than
+    /// 4,096 ids (`malformed`).
     #[cfg_attr(feature = "uniffi", uniffi::constructor)]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -280,7 +294,7 @@ impl SignerReportRequest {
     }
 
     /// What `key_id` signs: purpose `SignerReport` (a fresh confirmation),
-    /// label `atem-signer-report-v1`, `input` its signing input and
+    /// label `atem-signer-report-v2`, `input` its signing input and
     /// `body_json` the held body.
     pub fn sign_request(&self) -> SignRequest {
         crate::provider::sign_request(&KeyId::new(self.key_id.clone()), &self.body.signing_input())
@@ -363,22 +377,28 @@ pub fn sign_signer_report(
 
 /// Verifies `report_json` against `log` at its current head, the challenge
 /// the minter stored (`expected_challenge_json`, as
-/// `signer_report_challenge` made it) and the signed records exported with
-/// the report (`exported_records_json`, each `{"body","sig"}`), at `now_ms`
-/// on the verifier's clock. Membership and keys are read at the verifier's
-/// head. A refusal is `Report{code}`, the first failure of `malformed`,
-/// `frozen`, `wrong_account`, `unknown_signer`, `not_a_manager`,
-/// `bad_signature`, `stale_log`, `fork`, `signer_mismatch`,
-/// `slot_mismatch`, `challenge_mismatch`, `recovery_mismatch`,
-/// `records_mismatch`, `expired`. An expected challenge that doesn't read
-/// is the caller's input: `Invalid{malformed}`. Consistency only: never
-/// completeness of anything outside the journal.
+/// `signer_report_challenge` made it), the signed records exported with
+/// the report (`exported_records_json`, each `{"body","sig"}`) and its
+/// exported roster (`exported_processes`, each process generation
+/// base64url), at `now_ms` on the verifier's clock. Membership and keys
+/// are read at the verifier's head. A refusal is `Report{code}`, the first
+/// failure of `malformed`, `frozen`, `wrong_account`, `unknown_signer`,
+/// `not_a_manager`, `bad_signature`, `stale_log`, `fork`,
+/// `signer_mismatch`, `slot_mismatch`, `challenge_mismatch`,
+/// `recovery_mismatch`, `records_mismatch`, `processes_mismatch` (an
+/// exported roster that isn't exactly the report's: a malformed id, a
+/// duplicate, another count or `processes_hash`, or one without the
+/// report's own `process`), `expired`. A v1 report is `malformed`. An
+/// expected challenge that doesn't read is the caller's input:
+/// `Invalid{malformed}`. Consistency only: never completeness of anything
+/// outside the journal.
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 pub fn verify_signer_report(
     log: Arc<MembershipLog>,
     report_json: String,
     expected_challenge_json: String,
     exported_records_json: Vec<String>,
+    exported_processes: Vec<String>,
     now_ms: u64,
 ) -> Result<VerifiedSignerReport> {
     let expected = CoreChallenge::parse(expected_challenge_json.as_bytes())
@@ -388,6 +408,7 @@ pub fn verify_signer_report(
         report_json.as_bytes(),
         &expected,
         &exported_records_json,
+        &exported_processes,
         now_ms,
     )?;
     Ok(verified_info(verified))
@@ -404,5 +425,6 @@ fn verified_info(v: CoreVerified) -> VerifiedSignerReport {
         recovery: recovery_info(&v.recovery),
         journal: journal_info(&v.journal),
         records: v.records.iter().map(|r| object_json(r.object())).collect(),
+        processes: v.processes.iter().map(|p| b64u(p)).collect(),
     }
 }

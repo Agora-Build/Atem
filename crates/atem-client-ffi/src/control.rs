@@ -32,10 +32,16 @@
 //!   `from_json` or `control_state_from_parts` at start. `standing` is what
 //!   is in force for one principal.
 //!
+//! - **Judge a copy**: `check_resigned_copy` says whether a current
+//!   manager's re-signed copy discharges a removed or demoted manager's
+//!   stop (host-work-v1 §11.1, condition (c)): the one judgement the Mac and
+//!   the Station share.
+//!
 //! Errors: a record its parse refuses is `Invalid{code}` (`malformed`,
 //! `unknown_field`, `field_not_allowed`, `not_for_host_principal`,
 //! `wrong_type`, or the signed-object layer's code); a state that doesn't
-//! load is `Stored{code}`.
+//! load is `Stored{code}`; a copy that doesn't discharge its original is
+//! `Invalid{code, detail}` with the copy check's code.
 use std::sync::Arc;
 
 use atem_client::KeyId;
@@ -55,7 +61,7 @@ use crate::log::{MembershipLog, object_json};
 use crate::types::{
     ControlApplied, ControlCheckInfo, ControlCoverage, ControlEffectKind, ControlEffectResult,
     ControlFeedPos, ControlHostAction, ControlRecordBody, ControlResultKind, ControlStanding,
-    ControlStatePart, PublicKeyData,
+    ControlStatePart, PublicKeyData, ResignedCopy,
 };
 
 /// Largest control state `ControlStateHandle::from_json` reads, checked
@@ -231,6 +237,78 @@ pub fn verify_control_record(
 ) -> Result<ControlCheckInfo> {
     let rec = record(&record_json)?;
     Ok(check_info(&rec, &verify_control(&rec, &log.lock())))
+}
+
+/// Judges `copy_json`, a current native manager's stop, as a re-signed
+/// copy of `original_json`, a stop a removed or demoted manager signed
+/// (each `{"body","sig"}` as received), on `log` at its head, with
+/// `candidate_feed_id` the plan's candidate feed (host-work-v1 §11.1, "A
+/// current manager's copy of a former manager's stop", condition (c);
+/// agreed with Astation, Astation #114 comments 7208700195 and
+/// 7209301522). Pure: the Mac and the Station judge a copy alike with it.
+///
+/// The copy discharges the original's obligation (`ResignedCopy`) when it
+/// carries exactly the original's stop intent. Otherwise
+/// `Invalid{code, detail}`, the first that fails in this order: `malformed`
+/// (either object isn't a signed control record that reads strictly, the
+/// candidate feed isn't a UUID v4, the list is frozen; `detail` which);
+/// `not_a_stop` (the original is a `cover`, `hold` or `release`: never
+/// copied, the Station signs those anew); `original_invalid` (it isn't a
+/// manager's stop that verifies: `service_key_signed` or
+/// `host_key_signed` for the principal's own key, `unknown_signer` for a
+/// `member:` the list records no key of, `not_a_manager` for one that
+/// never held `manage` at any `seq`, `bad_signature` when no `auth_key`
+/// that member had in the list's history verifies it; the original's
+/// signer is Atem's reading; its signer may since have been removed or
+/// demoted); `copy_invalid` (the
+/// copy isn't valid at the head with a current native manager as its
+/// signer: the verifier's pending or refusal code, or
+/// `signed_by_principal`); `same_record_id`; then field by field in the
+/// body's order, `intent_mismatch` naming the first field that differs
+/// (`account_id`, `genesis_hash`, `origin`, `principal`, `principal_key`,
+/// `action`, `interrupt_running`, `revoke_seq`, `about.integration_id`,
+/// `about.by`), or at `feed_id`'s place `feed_mismatch` for a service's
+/// copy naming neither the original's feed nor the candidate. `signer`,
+/// `record_id` and `issued_at` may differ; `origin` never.
+///
+/// It is stricter than `check_control_snapshot_consistency`, whose
+/// `stop_not_resigned` is effect-only: a conforming copy always keeps every
+/// effect of its original, but the checker passes some snapshots this
+/// refuses (a current manager's revoke with another `about`, the
+/// principal's own revoke signed anew). Refuse those in your adapter with
+/// this.
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub fn check_resigned_copy(
+    log: Arc<MembershipLog>,
+    original_json: String,
+    copy_json: String,
+    candidate_feed_id: String,
+) -> Result<ResignedCopy> {
+    let copy = atem_client::control::check_resigned_copy(
+        &log.lock(),
+        original_json.as_bytes(),
+        copy_json.as_bytes(),
+        &candidate_feed_id,
+    )?;
+    Ok(ResignedCopy {
+        original_record_id: copy.original_record_id,
+        copy_record_id: copy.copy_record_id,
+        signer: copy.signer,
+        principal: copy.principal,
+        action: copy.action.name().into(),
+        feed: copy.feed.map(|feed| feed.code().into()),
+    })
+}
+
+/// `check_resigned_copy`'s codes, in the order its checks run
+/// (`intent_mismatch` and `feed_mismatch` interleave in the body's field
+/// order).
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub fn resigned_copy_codes() -> Vec<String> {
+    atem_client::control::COPY_CHECK_CODES
+        .iter()
+        .map(|code| (*code).to_owned())
+        .collect()
 }
 
 fn check_info(rec: &ControlRecord, check: &ControlCheck) -> ControlCheckInfo {
