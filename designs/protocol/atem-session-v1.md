@@ -5396,7 +5396,10 @@ below. Item 8's request stays open.
          refusal with it).
        - **What the host does with the entry** (the key file following the
          committed list entry by entry, the stamp, the 24 h window on the
-         delegated clock and what ends it early, retirement and the record
+         delegated clock, its elapsed ceiling (24 h of the boot-time counter
+         on the stamp's boot, a reboot ending it: Atem's follow-up to
+         Astation's review, #120 comment 7208696433) and what ends it
+         early, retirement and the record
          of retired keys, the receiver's view following the committed list
          only, mail in flight and results back under `retire_previous`):
          host-work-v1 §11.5, "The routine rotation of a host's key".

@@ -1210,15 +1210,29 @@ fn the_start_reading_takes_the_records_clock() {
     clock.tick(&store);
     let at = |os: &Os| super::start_reading_at(&store.state, &os.now()).expect("a record");
     let snapshot = clock.snapshot().unwrap();
-    assert_eq!(at(&os), (snapshot.d_ms().unwrap(), snapshot.mark()));
+    let start = at(&os);
+    let (d, boot) = snapshot.key_now().unwrap();
+    assert_eq!(
+        (start.d_ms, start.clock, start.boot),
+        (d, snapshot.mark(), Some(boot))
+    );
+    assert_eq!(
+        boot,
+        super::boot_at(&os.now()),
+        "the reading's own boot and counter"
+    );
     // Down for an hour of the same boot, the wall clock set back 10 minutes.
     os.pass(HOUR);
     os.set_wall(os.wall() - 10 * MIN, Synced::Yes);
-    let (d, mark) = at(&os);
+    let start = at(&os);
     let mut clock = HostClock::with_reader(&store, os.reader());
     clock.tick(&store);
     let first = clock.snapshot().unwrap();
-    assert_eq!((d, mark), (first.d_ms().unwrap(), first.mark()));
+    let (d, boot) = first.key_now().unwrap();
+    assert_eq!(
+        (start.d_ms, start.clock, start.boot),
+        (d, first.mark(), Some(boot))
+    );
     // The OS's own reading (no hook here) reads the record too.
     assert!(super::start_reading(&store.state).is_some());
     let empty = tempfile::tempdir().unwrap();
@@ -1295,4 +1309,44 @@ fn a_fresh_start_changes_the_clocks_mark() {
     let station_mark = clock.snapshot().unwrap().mark();
     assert!(![mark, afresh_mark, none_mark].contains(&station_mark));
     logged();
+}
+
+/// Host senders' key stamps (host-work-v1 §11.5: the previous key's
+/// elapsed ceiling) keep the boot as `boot_mark` names it: one boot is the
+/// clock's (the same boot id, machine and boot-time namespace offset), so
+/// a change of any of the three is another boot, and the counter and the
+/// wall clock are no part of it. `boot_at` gives it with the counter in ms.
+#[test]
+fn the_boot_mark_names_the_clocks_one_boot() {
+    let os = Os::new(T, 100 * SEC, "boot-a", Synced::Yes);
+    let r = os.now();
+    let mark = super::boot_mark(&r);
+    let mut later = r.clone();
+    later.boot_ns += HOUR * 1_000_000;
+    later.wall_ms += 2 * HOUR;
+    assert_eq!(super::boot_mark(&later), mark, "the same boot, later");
+    let changed = [
+        OsReading {
+            boot_id: "boot-b".into(),
+            ..r.clone()
+        },
+        OsReading {
+            machine: [0x22; 16],
+            ..r.clone()
+        },
+        OsReading {
+            timens_boot_ns: 1,
+            ..r.clone()
+        },
+    ];
+    for other in &changed {
+        assert_ne!(super::boot_mark(other), mark, "{other:?}");
+    }
+    assert_eq!(
+        super::boot_at(&r),
+        BootAt {
+            boot: mark,
+            ms: 100 * SEC
+        }
+    );
 }

@@ -5,7 +5,9 @@
 //! so a move is in force once its write returns and the clocks go on
 //! without one. The delegated clock (host-work-v1 §11.6) reads the same
 //! file; `set_delegated` adds its optional fields (boot-time counter, sync
-//! report, machine, namespace offset), else it takes their defaults.
+//! report, machine, namespace offset), else it takes their defaults, and
+//! `set_boot_ms` moves its boot-time counter alone. `set_boot_id` changes
+//! the boot (a reboot, for both clocks).
 //!
 //! (The tests wrote the clocks themselves, every 20 ms from a thread, and a
 //! move only stored the new offsets: a write landing late under load let
@@ -22,7 +24,6 @@ const PASS: Duration = Duration::from_millis(100);
 pub struct HostClock {
     /// The file to pass as `ATEM_TEST_HOST_CLOCK`.
     pub path: PathBuf,
-    boot: String,
     /// What the file says; held while it is written.
     offsets: Mutex<Offsets>,
 }
@@ -31,6 +32,7 @@ struct Offsets {
     /// The wall offset (negative: behind).
     wall: i64,
     mono: u64,
+    boot: String,
     delegated: Option<Delegated>,
 }
 
@@ -69,6 +71,17 @@ fn real_wall_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// The real `CLOCK_MONOTONIC`, in ms: what the runtime adds the offsets to.
+fn real_mono_ms() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid timespec for the call to fill.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000
+}
+
 impl HostClock {
     /// The real clocks, in `dir`/`name`.
     pub fn start(dir: &Path, name: &str) -> HostClock {
@@ -77,10 +90,10 @@ impl HostClock {
             .unwrap_or_else(|_| "boot".into());
         let clock = HostClock {
             path: dir.join(name),
-            boot,
             offsets: Mutex::new(Offsets {
                 wall: 0,
                 mono: 0,
+                boot,
                 delegated: None,
             }),
         };
@@ -93,7 +106,7 @@ impl HostClock {
         let mut offsets = self.offsets.lock().unwrap();
         change(&mut offsets);
         let tmp = self.path.with_extension("tmp");
-        let mut text = format!("offsets {} {} {}", offsets.wall, offsets.mono, self.boot);
+        let mut text = format!("offsets {} {} {}", offsets.wall, offsets.mono, offsets.boot);
         if let Some(d) = &offsets.delegated {
             let synced = match d.synced {
                 Some(true) => "1",
@@ -135,6 +148,33 @@ impl HostClock {
     /// waits one host pass.
     pub fn set_delegated(&self, delegated: Option<Delegated>) {
         self.apply(|o| o.delegated = delegated);
+        std::thread::sleep(PASS);
+    }
+
+    /// Sets the delegated clock's boot-time counter to read `boot_ms` now
+    /// (an offset from the real monotonic clock, so it goes on from there),
+    /// its other fields as they were (else their defaults), then waits one
+    /// host pass. The wall clock, and so the device list's host clock,
+    /// stays as it is.
+    pub fn set_boot_ms(&self, boot_ms: u64) {
+        let offset = boot_ms as i64 - real_mono_ms() as i64;
+        self.apply(|o| {
+            let fields = o
+                .delegated
+                .take()
+                .unwrap_or_else(|| Delegated::defaults(o.mono));
+            o.delegated = Some(Delegated {
+                boot_ms: offset,
+                ..fields
+            });
+        });
+        std::thread::sleep(PASS);
+    }
+
+    /// Sets the boot id (a reboot, as both clocks read one), then waits one
+    /// host pass.
+    pub fn set_boot_id(&self, id: &str) {
+        self.apply(|o| o.boot = id.to_string());
         std::thread::sleep(PASS);
     }
 

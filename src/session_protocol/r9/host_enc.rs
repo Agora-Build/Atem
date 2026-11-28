@@ -14,16 +14,20 @@
 //!                                         "current":{"secret":"<b64u>","pub":"<b64u>"},
 //!                                         "pending":{"secret":…,"pub":…},
 //!                                         "previous":{"secret":…,"pub":…,"replaced_at_seq":S,
-//!                                                     "applied_d_ms":D,"clock":C},
+//!                                                     "applied_d_ms":D,"clock":C,"boot":B,
+//!                                                     "applied_boot_ms":M},
 //!                                         "applied":{"seq":S,"hash":"<64 hex>","d_ms":D,
-//!                                                    "clock":C}}
+//!                                                    "clock":C,"boot":B,"boot_ms":M}}
 //! <profile>/pairing/host_enc_generated  {"v":2,"host_trust_gen":N,"kids":["<16 hex>",…],
 //!                                         "retired":["<16 hex>",…],
 //!                                         "requests":[{"request_id","kid","pub"},…]}
 //! ```
 //!
 //! Each slot of the key file is optional (`C`, the delegated clock's mark,
-//! `host_clock::mark_of`, is a number); a v1 file
+//! `host_clock::mark_of`, is a number; so is `B`, the boot's,
+//! `host_clock::boot_mark`, beside `M`, its boot-time counter in ms; a
+//! stamp or previous key read without `B` and `M`, which this format never
+//! writes, is no evidence: retired at once, no migration); a v1 file
 //! (`{"v":1, "host_trust_gen", "secret", "pub"}`, a current key only) and a
 //! v1 record (no `retired`, no `requests`) are read as such and written as
 //! v2 at their next change.
@@ -87,8 +91,9 @@
 //!   watch): just before the list writes a commit whose newest
 //!   `host_enc_key` entry for this host turns a key the host holds into the
 //!   list's previous key (not retired), the delegated clock's `D` (read
-//!   fresh) and its mark (its record's epoch, drawn at every fresh start,
-//!   and its latest repair or lowering) are written into the key file
+//!   fresh), its mark (its record's epoch, drawn at every fresh start,
+//!   and its latest repair or lowering) and its boot-time counter with its
+//!   boot (at the reading that gave `D`) are written into the key file
 //!   with that entry's `seq` and hash, durably: the evidence of when the
 //!   host applied it. A stamp is written once per entry; a later commit of
 //!   the same entry keeps it. A carriage replayed at a start is stamped at
@@ -96,11 +101,17 @@
 //! - **Following the list** ([`reconcile`]; the bridge runs it on every pass
 //!   where the list moved or a deadline is due, and before building the
 //!   receiver's view, so before any mail is opened). The previous key opens
-//!   mail until `D` reaches its stamp's `D` plus 24 h ([`RETAIN_MS`]); with
-//!   no stamp naming the entry the list holds, `D` below the stamp, or the
-//!   clock's mark changed since the stamp (a repair, a lowering, or a fresh
-//!   start: a damaged record started afresh, a record read as none), it is
-//!   erased at once (fail closed: never a fresh or longer window). A
+//!   mail until the first of `D` reaching its stamp's `D` plus 24 h
+//!   ([`RETAIN_MS`]) and, on the boot its stamp was taken on, the boot-time
+//!   counter reaching its stamp's plus 24 h (Atem's follow-up to Astation's
+//!   review, #120 comment 7208696433: `D` follows a slow wall clock down at
+//!   up to 500 ppm, so the window is also a strict 24 h of elapsed time);
+//!   with no stamp naming the entry the list holds, `D` below the stamp,
+//!   the clock's mark changed since the stamp (a repair, a lowering, or a
+//!   fresh start: a damaged record started afresh, a record read as none),
+//!   another boot (a reboot: elapsed time across it can't be established),
+//!   or the counter below the stamp's, it is erased at once (fail closed:
+//!   never a fresh or longer window). A
 //!   crash between the list's commit and the key file following it never
 //!   restarts or lengthens the window: the stamp is absolute. Each erasure
 //!   writes the ids to `retired` first, then the key file.
@@ -147,12 +158,26 @@ const KEY_NAME: &str = "host_enc_key";
 const PREVIOUS_NAME: &str = "host_enc_key.previous";
 
 /// The delegated clock now, as the key file's windows are judged on it:
-/// `D`, and its mark (`host_clock::mark_of`: its record's epoch and its
-/// latest repair or lowering; it changes at each, and at a fresh start).
+/// `D`, its mark (`host_clock::mark_of`: its record's epoch and its latest
+/// repair or lowering; it changes at each, and at a fresh start), and the
+/// boot-time counter at the reading that gave `D`, with its boot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DNow {
     pub d_ms: u64,
     pub clock: u64,
+    /// None: no reading of the counter (no window is open on it).
+    pub boot: Option<BootAt>,
+}
+
+/// The delegated clock's boot-time counter (§11.6: it counts a suspend)
+/// and the boot it was read in: the boot's mark (`host_clock::boot_mark`:
+/// the boot id, machine identity and boot-time namespace offset that make
+/// one boot for that clock, as 64 bits of SHA-256) and the counter in ms.
+/// Two counters compare within one boot only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootAt {
+    pub boot: u64,
+    pub ms: u64,
 }
 
 /// A host encryption key, as handed out: its generation, its public half
@@ -237,23 +262,29 @@ impl Slot {
 
 /// When the host applied the entry at `seq` (its hash `hash`) that turned
 /// a key it holds into the list's previous key: `D` read before the list
-/// committed it, and the delegated clock's mark then.
+/// committed it, the delegated clock's mark then, and the boot-time counter
+/// at that reading with its boot (none only in a file without them, which
+/// this format never writes: no evidence then).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Applied {
     seq: u64,
     hash: Hash32,
     d_ms: u64,
     clock: u64,
+    boot: Option<BootAt>,
 }
 
 /// A routine rotation's previous key: the `seq` of the entry that replaced
 /// it, `D` when the host applied that entry (its window ends [`RETAIN_MS`]
-/// later), and the clock's mark then.
+/// later), the clock's mark then, and the boot-time counter then with its
+/// boot (the window ends after [`RETAIN_MS`] of it too, and at another
+/// boot; none: see [`Applied`]).
 struct Previous {
     slot: Slot,
     replaced_at_seq: u64,
     applied_d_ms: u64,
     clock: u64,
+    boot: Option<BootAt>,
 }
 
 impl Previous {
@@ -261,20 +292,51 @@ impl Previous {
         self.applied_d_ms.saturating_add(RETAIN_MS)
     }
 
-    /// Why its window is over at `now` (passed, `D` below its application,
-    /// or the clock repaired, lowered or started afresh since: its mark
-    /// differs), if it is.
+    /// Its elapsed ceiling: its stamp's boot, the counter [`RETAIN_MS`] on.
+    fn retire_boot(&self) -> Option<BootAt> {
+        self.boot.map(|b| BootAt {
+            boot: b.boot,
+            ms: b.ms.saturating_add(RETAIN_MS),
+        })
+    }
+
+    /// Why its window is over at `now`, if it is: on `D` (passed, `D` below
+    /// its application, or the clock repaired, lowered or started afresh
+    /// since: its mark differs), or on the boot-time counter (Atem's
+    /// follow-up to Astation's review, #120 comment 7208696433: `D`
+    /// follows a slow wall clock down at up to 500 ppm, which the mark
+    /// doesn't count, so the window is also a strict [`RETAIN_MS`] of
+    /// elapsed time; a boot other than its stamp's, a counter below its
+    /// stamp's, or a counter or stamp missing can't establish that time
+    /// and ends it at once).
     fn over(&self, now: &DNow) -> Option<&'static str> {
         if now.d_ms < self.applied_d_ms {
             Some("the delegated clock reads below its application; its window can't be established")
         } else if now.d_ms >= self.retire_at() {
-            Some("its 24 h window ended")
+            Some("its 24 h window on the delegated clock ended")
         } else if now.clock != self.clock {
             Some(
                 "the delegated clock was repaired, lowered or started afresh after its application; its window can't be established",
             )
         } else {
-            None
+            match (self.boot, now.boot) {
+                (None, _) => {
+                    Some("its application's boot isn't recorded; its window can't be established")
+                }
+                (_, None) => {
+                    Some("no reading of the boot-time counter; its window can't be established")
+                }
+                (Some(at), Some(now)) if now.boot != at.boot => Some(
+                    "the host rebooted since its application; elapsed time across a reboot can't be established",
+                ),
+                (Some(at), Some(now)) if now.ms < at.ms => Some(
+                    "the boot-time counter reads below its application; its window can't be established",
+                ),
+                (Some(at), Some(now)) if now.ms >= at.ms.saturating_add(RETAIN_MS) => {
+                    Some("24 h elapsed since its application")
+                }
+                _ => None,
+            }
         }
     }
 }
@@ -328,7 +390,8 @@ impl Ring {
                 hex(&p.slot.kid),
                 p.replaced_at_seq,
                 p.applied_d_ms,
-                p.clock
+                p.clock,
+                p.boot
             )),
             self.applied
         )
@@ -361,18 +424,32 @@ fn ring_bytes(ring: &Ring) -> Zeroizing<Vec<u8>> {
     if let Some(previous) = &ring.previous {
         slot_head(&mut parts, "previous", &previous.slot);
         parts.push(plain(format!(
-            r#","replaced_at_seq":{},"applied_d_ms":{},"clock":{}}}"#,
+            r#","replaced_at_seq":{},"applied_d_ms":{},"clock":{}"#,
             previous.replaced_at_seq, previous.applied_d_ms, previous.clock
         )));
+        if let Some(boot) = &previous.boot {
+            parts.push(plain(format!(
+                r#","boot":{},"applied_boot_ms":{}"#,
+                boot.boot, boot.ms
+            )));
+        }
+        parts.push(plain("}".into()));
     }
     if let Some(a) = &ring.applied {
         parts.push(plain(format!(
-            r#","applied":{{"seq":{},"hash":"{}","d_ms":{},"clock":{}}}"#,
+            r#","applied":{{"seq":{},"hash":"{}","d_ms":{},"clock":{}"#,
             a.seq,
             a.hash.to_hex(),
             a.d_ms,
             a.clock
         )));
+        if let Some(boot) = &a.boot {
+            parts.push(plain(format!(
+                r#","boot":{},"boot_ms":{}"#,
+                boot.boot, boot.ms
+            )));
+        }
+        parts.push(plain("}".into()));
     }
     parts.push(plain("}".into()));
     // Its exact size: the buffer never grows (a reallocation would leave an
@@ -418,6 +495,8 @@ struct AppliedV2 {
     hash: String,
     d_ms: u64,
     clock: u64,
+    boot: Option<u64>,
+    boot_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -429,6 +508,16 @@ struct PreviousV2 {
     replaced_at_seq: u64,
     applied_d_ms: u64,
     clock: u64,
+    boot: Option<u64>,
+    applied_boot_ms: Option<u64>,
+}
+
+/// A stamp's boot and counter, as read: none unless both are there.
+fn boot_of(boot: Option<u64>, ms: Option<u64>) -> Option<BootAt> {
+    Some(BootAt {
+        boot: boot?,
+        ms: ms?,
+    })
 }
 
 #[derive(Deserialize)]
@@ -498,6 +587,7 @@ fn parse_ring(bytes: &[u8]) -> Option<Ring> {
                         replaced_at_seq: p.replaced_at_seq,
                         applied_d_ms: p.applied_d_ms,
                         clock: p.clock,
+                        boot: boot_of(p.boot, p.applied_boot_ms),
                     }),
                     None => None,
                 },
@@ -507,6 +597,7 @@ fn parse_ring(bytes: &[u8]) -> Option<Ring> {
                         hash: Hash32::from_hex(&a.hash).ok()?,
                         d_ms: a.d_ms,
                         clock: a.clock,
+                        boot: boot_of(a.boot, a.boot_ms),
                     }),
                     None => None,
                 },
@@ -1171,9 +1262,9 @@ pub fn stamp_application_locked(
     if ring.applied.is_some_and(|a| a.seq == seq && a.hash == hash) {
         return Vec::new();
     }
-    let Some(now) = now else {
+    let Some((now, boot)) = now.and_then(|now| Some((now, now.boot?))) else {
         return vec![format!(
-            "the entry at seq {seq} makes {} the previous key, and the delegated clock has no reading: its application time isn't recorded, so it will be retired at once",
+            "the entry at seq {seq} makes {} the previous key, and the delegated clock has no reading with its boot-time counter: its application time isn't recorded, so it will be retired at once",
             hex(&previous)
         )];
     };
@@ -1182,6 +1273,7 @@ pub fn stamp_application_locked(
         hash,
         d_ms: now.d_ms,
         clock: now.clock,
+        boot: Some(boot),
     });
     match store.replace(DlFile::HostEncKey, &ring_bytes(&ring)) {
         Ok(()) => Vec::new(),
@@ -1202,6 +1294,10 @@ pub struct Reconciled {
     pub changed: bool,
     /// When the previous key's window ends, on `D` (none: no previous key).
     pub retire_at: Option<u64>,
+    /// When its elapsed ceiling comes: its stamp's boot and the counter
+    /// [`RETAIN_MS`] after the stamp's (none: no previous key, or no boot
+    /// recorded for it).
+    pub retire_boot: Option<BootAt>,
     /// What happened, as runtime.log lines.
     pub lines: Vec<String>,
 }
@@ -1268,6 +1364,7 @@ enum From {
         replaced_at_seq: u64,
         applied_d_ms: u64,
         clock: u64,
+        boot: Option<BootAt>,
     },
 }
 
@@ -1308,6 +1405,7 @@ fn reconcile_locked(
                 replaced_at_seq: p.replaced_at_seq,
                 applied_d_ms: p.applied_d_ms,
                 clock: p.clock,
+                boot: p.boot,
             },
         )
     }));
@@ -1337,12 +1435,14 @@ fn reconcile_locked(
                         replaced_at_seq,
                         applied_d_ms,
                         clock,
+                        boot,
                     } => {
                         ring.previous = Some(Previous {
                             slot,
                             replaced_at_seq,
                             applied_d_ms,
                             clock,
+                            boot,
                         })
                     }
                 }
@@ -1391,8 +1491,9 @@ fn reconcile_locked(
                                 replaced_at_seq,
                                 applied_d_ms,
                                 clock,
+                                boot,
                             } if replaced_at_seq == p.replaced_at_seq => {
-                                Some((applied_d_ms, clock))
+                                Some((applied_d_ms, clock, boot))
                             }
                             _ => ring
                                 .applied
@@ -1400,9 +1501,9 @@ fn reconcile_locked(
                                     a.seq == p.replaced_at_seq
                                         && m.entry_hash_at(a.seq) == Some(a.hash)
                                 })
-                                .map(|a| (a.d_ms, a.clock)),
+                                .map(|a| (a.d_ms, a.clock, a.boot)),
                         };
-                        let Some((applied_d_ms, clock)) = window else {
+                        let Some((applied_d_ms, clock, boot)) = window else {
                             gone(
                                 slot,
                                 "retired at once: the entry's application time isn't known (no stamp before the commit)".into(),
@@ -1415,6 +1516,7 @@ fn reconcile_locked(
                             replaced_at_seq: p.replaced_at_seq,
                             applied_d_ms,
                             clock,
+                            boot,
                         };
                         match now.as_ref().and_then(|now| previous.over(now)) {
                             Some(why) => gone(previous.slot, why.into(), &mut lines),
@@ -1483,6 +1585,7 @@ fn reconcile_locked(
     Ok(Reconciled {
         changed,
         retire_at: ring.previous.as_ref().map(Previous::retire_at),
+        retire_boot: ring.previous.as_ref().and_then(Previous::retire_boot),
         lines,
     })
 }
@@ -1601,9 +1704,13 @@ pub(crate) fn recipient_with(
 
 /// `atem status`'s `Host key:` text, read from the files (no lock: each is
 /// replaced whole): the current key's id, a pending one, and the previous
-/// one with when its window ends on the delegated clock. `None` without a
-/// key file (the hook never made one).
-pub fn status_text(pairing: &PairingPaths) -> Option<String> {
+/// one with when its window ends, the earlier of its end on the delegated
+/// clock and its elapsed ceiling, placed on the wall clock of `now` (the
+/// boot-time counter and the wall clock at one reading,
+/// `host_clock::status_reading`; none: the end on `D` only), and that a
+/// reboot ends it (one since its stamp: it goes at the next check). `None`
+/// without a key file (the hook never made one).
+pub fn status_text(pairing: &PairingPaths, now: Option<(BootAt, u64)>) -> Option<String> {
     let store = Store::new(pairing, &journal_of(pairing));
     let ring = match read_ring(&store) {
         Held::Missing => return None,
@@ -1618,11 +1725,25 @@ pub fn status_text(pairing: &PairingPaths) -> Option<String> {
         parts.push(format!("{} pending", hex(&pending.kid)));
     }
     if let Some(previous) = &ring.previous {
-        parts.push(format!(
-            "{} previous until {} on the delegated clock",
-            hex(&previous.slot.kid),
-            utc(previous.retire_at())
-        ));
+        let kid = hex(&previous.slot.kid);
+        parts.push(match (previous.retire_boot(), now) {
+            (None, _) => format!(
+                "{kid} previous, retired at the next check (its application's boot isn't recorded)"
+            ),
+            (Some(ceiling), Some((now, _))) if now.boot != ceiling.boot => format!(
+                "{kid} previous, retired at the next check (the host rebooted since its application)"
+            ),
+            (Some(ceiling), now) => {
+                let elapsed_end = now.map(|(now, wall_ms)| {
+                    wall_ms.saturating_add(ceiling.ms.saturating_sub(now.ms))
+                });
+                let end = elapsed_end.map_or(previous.retire_at(), |e| e.min(previous.retire_at()));
+                format!(
+                    "{kid} previous until {} (24 h on the delegated clock or elapsed, whichever ends first), or until a reboot",
+                    utc(end)
+                )
+            }
+        });
     }
     Some(parts.join("; "))
 }
@@ -1663,12 +1784,20 @@ mod tests {
                 hash: Hash32([3; 32]),
                 d_ms: u64::MAX,
                 clock: 6,
+                boot: Some(BootAt {
+                    boot: u64::MAX,
+                    ms: 8,
+                }),
             });
             ring.previous = Some(Previous {
                 slot: Slot::of(Zeroizing::new([4; 32])),
                 replaced_at_seq: 7,
                 applied_d_ms: 5,
                 clock: u64::MAX,
+                boot: Some(BootAt {
+                    boot: 1,
+                    ms: u64::MAX,
+                }),
             });
             let bytes = ring_bytes(&ring);
             assert_eq!(bytes.capacity(), bytes.len(), "{generation}");

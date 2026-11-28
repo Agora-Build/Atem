@@ -4342,18 +4342,24 @@ are marked **Atem's reading, for Astation's confirmation**.
   retired), it writes the entry's `seq` and hash, `D` (the delegated
   clock's reading, §11.6, taken fresh at that moment; every later check of
   the window reads `D` the same way, the later of its pass's reading and a
-  fresh one, so a stamp is never above the `D` it is compared with) and the
+  fresh one, so a stamp is never above the `D` it is compared with), the
   clock's mark (§11.6's record's epoch, drawn whenever the clock starts
-  afresh, and its latest repair or lowering, as 64 bits of SHA-256) into
-  the key file (`applied`), one atomic
+  afresh, and its latest repair or lowering, as 64 bits of SHA-256), and
+  the boot-time counter (§11.6's, which counts a suspend) at the reading
+  that gave `D`, with that reading's boot (`boot`: 64 bits of SHA-256 over
+  the boot id, machine identity and boot-time namespace offset, §11.6's
+  "one boot"; every later check reads the counter from the same reading as
+  its `D`) into the key file (`applied`), one atomic
   replace, under the same lock as the commit. Every such entry gets its own
   stamp, once: a later commit of the same entry keeps the earlier time, so
   nothing moves a window later. A carriage the start replays (§R9.3) is the
   entry's first durable application and is stamped at that commit, `D`
   and the mark taken from the clock's record, observed at a reading as the
-  clock observes one (review L1; re-review I1). No reading, or a write that
-  fails: no stamp, a runtime.log line, and the key is retired at once
-  (below).
+  clock observes one (review L1; re-review I1). No reading (of `D` or of
+  the counter), or a write that fails: no stamp, a runtime.log line, and
+  the key is retired at once (below). A stamp or previous key read without
+  its boot and counter (which this format never writes) is no evidence:
+  retired at once, with no migration.
 - **Following the list** happens whenever the host brings its key file to
   its committed list: at every pass where the list moved, at the previous
   key's deadline, once a minute, and **before any mail is opened** (the
@@ -4376,12 +4382,26 @@ are marked **Atem's reading, for Astation's confirmation**.
   starts again at the truth). Each changes the clock's mark; a mark at a
   check other than the stamp's retires the key at once (fix round 1,
   ruling R63; fix round 2, re-review N1), and so does `D` reading below
-  the stamp: a window can then only end early, never run longer than 24 h
-  of real time. The follow-downs of `wall_hw` (when the wall clock is
+  the stamp. The follow-downs of `wall_hw` (when the wall clock is
   behind it) and of the floor (500 ppm, at most 43 s a day each) are not
-  counted.
-- **Retirement**: at the deadline (or the clock's mark changed: a repair,
-  a lowering, a fresh start; or `D` below the stamp), at a `retire_previous`, at a newer rotation, and for every key of
+  counted by the mark, so on `D` alone a continuously slow clock could
+  keep the key up to 43 s past 24 h of elapsed time (Astation's review,
+  #120 comment 7208696433). **The elapsed ceiling** (Atem's follow-up to
+  that review; **Atem's reading, for Astation's confirmation**, where it
+  goes beyond the agreed text): the window also ends once the boot-time
+  counter, on the boot the stamp was taken on, reaches the stamp's counter
+  plus 24 h; a check on another boot (a reboot inside the window) retires
+  the key at once, since elapsed time across a reboot can't be
+  established (fail closed, as a crash before the stamp), and so does a
+  counter below the stamp's on its boot. So the window ends at the first
+  of 24 h on `D` and 24 h elapsed, and never runs longer than 24 h of real
+  time. A restart on the same boot keeps both, measured from the stamp
+  (a binary test kills the runtime between the list's commit and the
+  promotion, then moves the counter alone).
+- **Retirement**: at the deadline (24 h on `D` or 24 h elapsed, the first;
+  or the clock's mark changed: a repair, a lowering, a fresh start; or `D`
+  below the stamp; or another boot, or the counter below the stamp's), at
+  a `retire_previous`, at a newer rotation, and for every key of
   a voided generation. The key's id is appended to the record's `retired`
   (synced) first, then the key file is replaced without the secret. A
   retired id is never accepted and never waits again, whatever a restored or
@@ -4394,9 +4414,11 @@ are marked **Atem's reading, for Astation's confirmation**.
   together) re-applies that entry and stamps it anew, as the project's other
   whole-directory restores are residuals (session-v1 R9.13).
   **Erasure at the deadline** waits for the next pass at which the list
-  serves and `D` reads (the hook on): nothing is opened with the key
-  meanwhile, since every open brings the key file to the list first and
-  judges the window on `D` (review L6).
+  serves and `D` reads (the hook on; the pass is due at the deadline on
+  `D` and at the elapsed ceiling, or another boot, on the counter of the
+  clock's last reading): nothing is opened with the key meanwhile, since
+  every open brings the key file to the list first and judges the window
+  on `D` and the counter (review L6).
 - **Mail in flight**: after a routine rotation, mail sealed to the old key
   (a sender whose list is behind) still opens for 24 h. After a
   `retire_previous` it is refused `enc_key_not_accepted` and never
@@ -4428,8 +4450,11 @@ are marked **Atem's reading, for Astation's confirmation**.
   ends either way). The bindings return it with `check_change`'s refusal,
   if any.
 - **`atem status`** shows `Host key:` (the current key's `enc_kid`, a
-  pending one, and the previous one with when its window ends on the
-  delegated clock), from the key file, while the hook made one.
+  pending one, and the previous one with when its window ends: the earlier
+  of its end on the delegated clock and its elapsed ceiling, placed on the
+  wall clock of the status's own reading of the counter, and that a reboot
+  ends it; after one, that it goes at the next check), from the key file,
+  while the hook made one.
 - **What a rotation can't do**: static-key HPKE gives no forward secrecy
   across a key compromise (design VI); `retire_previous` stops new exposure
   only.

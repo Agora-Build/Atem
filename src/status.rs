@@ -440,8 +440,11 @@ pub fn gather_full(
         clock,
         feeds,
         delegated,
-        host_key: crate::session_protocol::r9::host_enc::status_text(&src.paths.pairing)
-            .map(Line::new),
+        host_key: crate::session_protocol::r9::host_enc::status_text(
+            &src.paths.pairing,
+            crate::runtime::host_clock::status_reading(),
+        )
+        .map(Line::new),
         notes,
     }
 }

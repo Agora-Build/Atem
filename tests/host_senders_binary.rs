@@ -1123,9 +1123,13 @@ fn publish_to_b(
 /// A real crash point (review L7): B's runtime is SIGKILLed after its
 /// device list committed the rotation's entry and before its key file
 /// followed it (`crash_before_enc_key_promotion`). The key file then holds
-/// the new key still pending and the entry's stamp. Restarted, B promotes
-/// it with the old key's window from that stamp (never restarted at the
-/// restart), and A's mail in flight to the old key opens.
+/// the new key still pending and the entry's stamp. Restarted on the same
+/// boot, B promotes it with the old key's window from that stamp (never
+/// restarted at the restart), and A's mail in flight to the old key opens.
+/// The window's elapsed ceiling (#120 comment 7208696433) runs from the
+/// stamp too: B's boot-time counter moved on alone (its wall clock not, so
+/// `D` follows the counter at most 500 ppm short), the old key is kept 24 h
+/// less a minute after the stamp and retired at 24 h, on the counter.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
@@ -1157,6 +1161,10 @@ fn a_kill_after_the_list_commit_keeps_the_stamps_window() {
     let stamp = file["applied"]["d_ms"]
         .as_u64()
         .expect("stamped before the commit");
+    let boot = file["applied"]["boot"].as_u64().expect("the stamp's boot");
+    let boot_ms = file["applied"]["boot_ms"]
+        .as_u64()
+        .expect("the stamp's boot-time counter");
     pair.b.gone();
     pair.b.start_again();
     pair.b.within("B follows its list after the restart", || {
@@ -1169,11 +1177,32 @@ fn a_kill_after_the_list_commit_keeps_the_stamps_window() {
         file["previous"]["applied_d_ms"], stamp,
         "the stamp's window"
     );
+    assert_eq!(
+        (
+            &file["previous"]["boot"],
+            &file["previous"]["applied_boot_ms"]
+        ),
+        (&json!(boot), &json!(boot_ms)),
+        "the stamp's boot and counter"
+    );
     let id = pair.send(1, &format!("atem:{B}"), "HS_AFTER_THE_KILL", false);
     let task = pair.b.task_of(&id);
     support::delegated::in_turn(&pair.b, &task, "HS_AFTER_THE_KILL");
     assert_eq!(put_kids(&pair, &id).first(), Some(&old));
     support::delegated::complete_turn(&pair.b, &task);
+    const DAY: u64 = 24 * 3_600_000;
+    pair.b.clock.set_boot_ms(boot_ms + DAY - 60_000);
+    std::thread::sleep(Duration::from_secs(1));
+    let file = key_file(&pair.b);
+    assert_eq!(kid_of_slot(&file["previous"]), old, "in its window: {file}");
+    pair.b.clock.set_boot_ms(boot_ms + DAY);
+    // On the counter, not on `D`: the line is written after the key file.
+    pair.b.within("B retires the old key at 24 h elapsed", || {
+        pair.b
+            .runtime_log()
+            .contains("retired: 24 h elapsed since its application")
+    });
+    assert!(key_file(&pair.b).get("previous").is_none());
 }
 
 /// The routine rotation of the receiving host's key (agreed with Astation

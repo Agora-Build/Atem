@@ -227,6 +227,70 @@ fn the_window_runs_on_the_delegated_clock_through_sleep_and_a_clock_set_back() {
     });
 }
 
+/// Astation's review (#120 comment 7208696433) in the bridge, on a slow
+/// clock: the wall clock 500 ppm slow behind the boot-time counter, so `D`
+/// follows it down (§11.6) and reads about 43 s short of the stamp's `D` +
+/// 24 h once 24 h have elapsed. B's mail sealed to the old key opens
+/// before that elapsed ceiling and is refused `enc_key_not_accepted` at
+/// it, the key pass erasing the old secret then (its due check on the
+/// counter); the new key's mail still opens.
+#[test]
+fn on_a_slow_clock_the_old_key_goes_at_24_hours_elapsed() {
+    local_test(async |root| {
+        use crate::runtime::host_clock::state::RHO_PPM;
+        use crate::session_protocol::r9::host_enc::RETAIN_MS;
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = mb_host(&mut rig, root, &os);
+        hk_tick(&mut rig);
+        let d0 = rig.bridge.start_view().now_d_ms.unwrap();
+        let old = host.enc_pub.clone();
+        let new = hk_new_key(&rig);
+        hk_rotate(&mut rig, &mut host, &new, false);
+        rig.bridge.host_key_pass();
+        let file = hk_file(&rig);
+        assert_eq!(file["previous"]["applied_d_ms"], d0);
+        let b0 = file["previous"]["applied_boot_ms"].as_u64().unwrap();
+        // `ms` of boot time, the wall clock 500 ppm behind it, then a tick.
+        let slow = |rig: &mut LocalRig, ms: u64| {
+            {
+                let mut r = os.0.lock().unwrap();
+                r.boot_ns += ms * 1_000_000;
+                r.wall_ms += ms - ms * RHO_PPM / 1_000_000;
+            }
+            hk_tick(rig);
+        };
+        for _ in 0..23 {
+            slow(&mut rig, HOUR);
+        }
+        // 10 s before the ceiling: the old key's mail opens.
+        slow(&mut rig, HOUR - 10_000);
+        let mut position = 0;
+        assert_eq!(hk_deliver(&mut rig, &mut host, &old, &mut position), Ok(()));
+        rig.bridge.host_key_pass();
+        assert!(
+            hk_file(&rig).get("previous").is_some(),
+            "still in its window"
+        );
+        // 24 h elapsed on the counter; `D` short of its deadline.
+        slow(&mut rig, 10_000);
+        let boot = os.0.lock().unwrap().boot_ns / 1_000_000;
+        assert_eq!(boot, b0 + RETAIN_MS);
+        let d = rig.bridge.start_view().now_d_ms.unwrap();
+        assert!(d + 40_000 < d0 + RETAIN_MS, "D {d} against {d0}");
+        rig.bridge.host_key_pass();
+        assert!(
+            hk_file(&rig).get("previous").is_none(),
+            "erased at the elapsed ceiling"
+        );
+        assert_eq!(
+            hk_deliver(&mut rig, &mut host, &old, &mut position),
+            Err("enc_key_not_accepted".into())
+        );
+        assert_eq!(hk_deliver(&mut rig, &mut host, &new, &mut position), Ok(()));
+    });
+}
+
 /// Crash point: after the device list committed the rotation's entry,
 /// before the promotion (the runtime gone with the key file still holding
 /// the pending key, its stamp written). The restarted host promotes it
