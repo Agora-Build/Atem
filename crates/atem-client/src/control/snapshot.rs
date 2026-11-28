@@ -58,7 +58,7 @@
 //!    missing covers and before the retained stops' effects, is Atem's
 //!    choice. Atem's reading, for Astation's agreement: a provisioned
 //!    service the device list doesn't hold at the head (its `service_add`
-//!    not yet committed, or a `recovery_add` still pending) is neither
+//!    not yet committed, or not yet carried to this list) is neither
 //!    covered (its cover would be `invalid_record`, `principal_unknown`)
 //!    nor removed, so it is `coverage_dropped`: fail closed. Leave a
 //!    service out of `provisioned` until its `service_add` is in the list.

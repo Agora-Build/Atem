@@ -778,7 +778,7 @@ def check_host_work_control(file, data, report, context):
     signing input and signature (by the test key named, and that key is the
     one the chain names for the body's signer wherever the chain holds
     it), each service record's principal_key against the r9_svc of the
-    principal's auth_key, each step's position against the stations, and
+    principal's auth_key on the record's own chains, each step's position against the stations, and
     the record digests a sequence's state keeps (by principal, then
     record_id: the SHA-256 of a body of that principal with that id), each
     `why` (of its kind, and on each effect exactly when it isn't in force),
@@ -847,11 +847,16 @@ def check_host_work_control(file, data, report, context):
                         f"{body['signer']}'s key in L + {chain}",
                     )
 
-            # A service record's principal_key beside its key's r9_svc.
+            # A service record's principal_key beside its key's r9_svc, the
+            # key looked up on the record's own chains (the first that holds
+            # the principal: L for svc-discord, SO7 for svc-other; L for a
+            # record the parse refuses, which has none).
             if "r9_svc" in vector:
                 kind, _, name = body["principal"].partition(":")
-                key = replay([]).members.get(name)
-                case.check(kind == "service" and key is not None, "a service of log L")
+                chains = [c["chain"] for c in checks] or [[]]
+                held = [k for k in (replay(chain).members.get(name) for chain in chains) if k is not None]
+                case.check(kind == "service" and bool(held), "a service one of its chains holds")
+                key = held[0]
                 r9_svc = sha256(b64u_decode(key["pub"])).hex()
                 case.equal(r9_svc, vector["r9_svc"], "r9_svc = SHA-256 of the principal's auth_key")
                 if "key_mismatch" in reasons:

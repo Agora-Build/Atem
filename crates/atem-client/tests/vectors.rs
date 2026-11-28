@@ -5329,8 +5329,11 @@ impl<'a> ControlGen<'a> {
             "jcs": object.jcs(),
             "signing_input_hex": hex(object.signing_input().as_bytes()),
         });
+        // A service record's principal_key beside its key's r9Svc.
         if object.body()["principal"] == SVC {
             v["r9_svc"] = self.r9_svc("svc-discord").to_hex().into();
+        } else if object.body()["principal"] == SVC_OTHER {
+            v["r9_svc"] = self.r9_svc("svc-other").to_hex().into();
         }
         match outcome {
             Ok(checks) => v["checks"] = Value::Array(checks),
@@ -7728,6 +7731,16 @@ fn host_work_control() {
         "E5 enrolled svc-discord's key"
     );
     run.pass("services: svc-discord's r9_svc is its E5 auth_key's service_key_fingerprint");
+    let other_key = book.signer_public("svc-other");
+    assert_eq!(
+        ctx.chain(&["SO7_add_svc_other"])
+            .member("svc-other")
+            .unwrap()
+            .member
+            .auth_key,
+        other_key,
+        "SO7 enrolled svc-other's key"
+    );
 
     // ---- records
     let records = run.get("records");
@@ -7773,9 +7786,15 @@ fn host_work_control() {
             "{label}: signed with {}",
             s(v, "signed_with")
         );
-        // A service record's principal_key beside its key's r9Svc.
-        if rec.principal().name() == SVC {
-            let r9_svc = principal_key_of(&svc_key).unwrap();
+        // A service record's principal_key beside its key's r9Svc:
+        // svc-discord's (E5) or svc-other's (SO7).
+        let key_of = match rec.principal().name().as_str() {
+            SVC => Some(&svc_key),
+            SVC_OTHER => Some(&other_key),
+            _ => None,
+        };
+        if let Some(key) = key_of {
+            let r9_svc = principal_key_of(key).unwrap();
             assert_eq!(s(v, "r9_svc"), r9_svc.to_hex(), "{label}");
             let mismatch = v["checks"][0]["reason"] == "key_mismatch";
             assert_eq!(rec.principal_key() == Some(r9_svc), !mismatch, "{label}");

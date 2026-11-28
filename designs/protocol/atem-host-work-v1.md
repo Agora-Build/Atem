@@ -1607,8 +1607,8 @@ revokes (or the device list removed) isn't currently covered: the
 snapshot carries its revoke and interrupts (as they are, a current
 manager's copies, or its own key's signed anew) and no cover, hold or
 release. A service the Station provisioned that the device list doesn't
-hold at the verifying head (its `service_add` not yet committed, or a
-`recovery_add` still pending) can be neither covered (its cover is
+hold at the verifying head (its `service_add` not yet committed, or not
+yet carried to this list) can be neither covered (its cover is
 `principal_unknown`) nor stopped by item 1 or 2, so the checker's
 `coverage_dropped` (below) fails closed for it: leave a service out of
 `provisioned` until its `service_add` is in the list (**Atem's reading,

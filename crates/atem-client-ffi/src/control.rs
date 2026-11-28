@@ -253,10 +253,14 @@ pub fn verify_control_record(
 /// (either object isn't a signed control record that reads strictly, the
 /// candidate feed isn't a UUID v4, the list is frozen; `detail` which);
 /// `not_a_stop` (the original is a `cover`, `hold` or `release`: never
-/// copied, the Station signs those anew); `original_invalid` (the
-/// original's signature verifies under no `auth_key` its signer had in the
-/// list's history: `unknown_signer`, `host_key_signed`, `bad_signature`;
-/// its signer may since have been removed or demoted); `copy_invalid` (the
+/// copied, the Station signs those anew); `original_invalid` (it isn't a
+/// manager's stop that verifies: `service_key_signed` or
+/// `host_key_signed` for the principal's own key, `unknown_signer` for a
+/// `member:` the list records no key of, `not_a_manager` for one that
+/// never held `manage` at any `seq`, `bad_signature` when no `auth_key`
+/// that member had in the list's history verifies it; the original's
+/// signer is Atem's reading; its signer may since have been removed or
+/// demoted); `copy_invalid` (the
 /// copy isn't valid at the head with a current native manager as its
 /// signer: the verifier's pending or refusal code, or
 /// `signed_by_principal`); `same_record_id`; then field by field in the

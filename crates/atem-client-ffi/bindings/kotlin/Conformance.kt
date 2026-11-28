@@ -1231,7 +1231,13 @@ fun main(args: Array<String>) {
     }
     check("control records: every record parses and verifies on its chains as the vectors say") {
         var verdicts = 0
-        val svc = ctl["services"]["svc-discord"]["auth_key"]
+        // A service's auth_key: the file's `services` (svc-discord), else the
+        // service_add among its own entries (svc-other, SO7).
+        fun serviceKey(principal: String): Any? {
+            val id = principal.removePrefix("service:")
+            return ctl["services"].obj()[id]?.get("auth_key")
+                ?: ctl["entries"].arr().map { it["entry"]["body"]["member"] }.first { it != null && it["device_id"] == id }["auth_key"]
+        }
         for (r in ctlRecords) {
             val label = r["label"].s()
             val json = Json.write(r["record"])
@@ -1247,6 +1253,7 @@ fun main(args: Array<String>) {
             eq(hex(info.signingInput), r["signing_input_hex"], label)
             eq(hex(signingInput(SignLabelKind.HOST_WORK_CONTROL, utf8(r["jcs"].s()))), r["signing_input_hex"], label)
             if (r.obj().containsKey("r9_svc")) {
+                val svc = serviceKey(r["record"]["body"]["principal"].s())
                 eq(serviceKeyFingerprint(PublicKeyData(KeyAlg.ED25519, b64u(svc["pub"].s()))), r["r9_svc"], label)
                 eq(r["record"]["body"]["principal_key"] == r["r9_svc"], r["checks"][0]["reason"] != "key_mismatch", "$label principal_key")
             }

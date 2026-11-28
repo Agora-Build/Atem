@@ -1507,7 +1507,14 @@ final class ConformanceTests: XCTestCase {
         }
         check("control records: every record parses and verifies on its chains as the vectors say") {
             var verdicts = 0
-            let svc = o(o(o(ctl["services"])["svc-discord"])["auth_key"])
+            // A service's auth_key: the file's `services` (svc-discord), else
+            // the service_add among its own entries (svc-other, SO7).
+            func serviceKey(_ principal: String) -> [String: Any] {
+                let id = String(principal.dropFirst("service:".count))
+                if let service = o(ctl["services"])[id] { return o(o(service)["auth_key"]) }
+                let members = a(ctl["entries"]).compactMap { o(o(o($0)["entry"])["body"])["member"] as? [String: Any] }
+                return o(members.first { ($0["device_id"] as? String) == id }!["auth_key"])
+            }
             for r in ctlRecords {
                 let label = s(r["label"])
                 let json = js(r["record"]!)
@@ -1523,6 +1530,7 @@ final class ConformanceTests: XCTestCase {
                 try eq(hex(signingInput(label: .hostWorkControl, payload: utf8(s(r["jcs"])))), s(r["signing_input_hex"]), label)
                 let checks = a(r["checks"]).map(o)
                 if let r9 = r["r9_svc"] as? String {
+                    let svc = serviceKey(s(o(o(r["record"])["body"])["principal"]))
                     try eq(try serviceKeyFingerprint(authKey: PublicKeyData(alg: .ed25519, raw: b64u(s(svc["pub"])))), r9, label)
                     let principalKey = s(o(o(r["record"])["body"])["principal_key"])
                     try eq(principalKey == r9, (checks[0]["reason"] as? String) != "key_mismatch", "\(label) principal_key")

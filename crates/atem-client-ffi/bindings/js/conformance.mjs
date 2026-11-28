@@ -1010,7 +1010,12 @@ const verdictOf = (chain, got) => {
 };
 check("control records: every record parses and verifies on its chains as the vectors say", () => {
   let verdicts = 0;
-  const svc = ctl.services["svc-discord"].auth_key;
+  // A service's auth_key: the file's `services` (svc-discord), else the
+  // service_add among its own entries (svc-other, SO7).
+  const serviceKey = (principal) => {
+    const id = principal.slice("service:".length);
+    return ctl.services[id]?.auth_key ?? ctl.entries.map((e) => e.entry.body.member).find((x) => x?.device_id === id).auth_key;
+  };
   for (const r of ctl.records) {
     const json = str(r.record);
     if (r.parse_error !== undefined) {
@@ -1024,6 +1029,7 @@ check("control records: every record parses and verifies on its chains as the ve
     eq(hex(info.signingInput), r.signing_input_hex, r.label);
     eq(hex(m.signingInput("host_work_control", utf8(r.jcs))), r.signing_input_hex, r.label);
     if (r.r9_svc !== undefined) {
+      const svc = serviceKey(r.record.body.principal);
       eq(m.serviceKeyFingerprint(svc.alg, b64u(svc.pub)), r.r9_svc, r.label);
       eq(r.record.body.principal_key === r.r9_svc, r.checks[0].reason !== "key_mismatch", `${r.label} principal_key`);
     }

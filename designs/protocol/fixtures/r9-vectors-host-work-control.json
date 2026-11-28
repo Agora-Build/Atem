@@ -2851,6 +2851,7 @@
       "jcs": "{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793621012000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-other\",\"principal_key\":\"83abc39e96ac6387a1804428626ce5134f5177fe26ca1ad5e58381cc61381574\",\"record_id\":\"00000000-0000-4000-8000-000000000070\",\"signer\":\"service:svc-other\",\"type\":\"atem-host-work-control\",\"v\":1}",
       "label": "SO1_cover",
       "note": "station-dev covers svc-other (signed with its own service key) on the old feed",
+      "r9_svc": "83abc39e96ac6387a1804428626ce5134f5177fe26ca1ad5e58381cc61381574",
       "record": {
         "body": {
           "about": {
@@ -2894,6 +2895,7 @@
       "jcs": "{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793621013000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-other\",\"principal_key\":\"83abc39e96ac6387a1804428626ce5134f5177fe26ca1ad5e58381cc61381574\",\"record_id\":\"00000000-0000-4000-8000-000000000071\",\"signer\":\"service:svc-other\",\"type\":\"atem-host-work-control\",\"v\":1}",
       "label": "SO2_revoke",
       "note": "svc-other's own revoke on the old feed (retained, carried unchanged)",
+      "r9_svc": "83abc39e96ac6387a1804428626ce5134f5177fe26ca1ad5e58381cc61381574",
       "record": {
         "body": {
           "about": {
@@ -2933,6 +2935,7 @@
       "jcs": "{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793621014000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-other\",\"principal_key\":\"83abc39e96ac6387a1804428626ce5134f5177fe26ca1ad5e58381cc61381574\",\"record_id\":\"00000000-0000-4000-8000-000000000072\",\"signer\":\"service:svc-other\",\"type\":\"atem-host-work-control\",\"v\":1}",
       "label": "SO3_cover_a2",
       "note": "svc-other's cover signed anew for the replacement feed A2, above its mark",
+      "r9_svc": "83abc39e96ac6387a1804428626ce5134f5177fe26ca1ad5e58381cc61381574",
       "record": {
         "body": {
           "about": {
